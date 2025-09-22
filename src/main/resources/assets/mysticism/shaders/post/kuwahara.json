@@ -1,0 +1,29 @@
+{
+  "targets": {
+    "swap": {}
+  },
+  "passes": [
+    {
+      "vertex_shader":   "mysticism:kuwahara",
+      "fragment_shader": "mysticism:kuwahara",
+
+      "input":  "minecraft:main",
+      "output": "swap",
+
+      "samplers": [
+        { "name": "DiffuseSampler", "target": "minecraft:main" }
+      ]
+    },
+    {
+      "vertex_shader":   "minecraft:blit",
+      "fragment_shader": "minecraft:blit",
+
+      "input":  "swap",
+      "output": "minecraft:main",
+
+      "samplers": [
+        { "name": "DiffuseSampler", "target": "swap" }
+      ]
+    }
+  ]
+}

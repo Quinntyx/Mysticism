@@ -1,0 +1,10 @@
+{
+  "type": "mysticism:spirit",
+  "generator": {
+    "type": "mysticism:spirit_generator",
+    "biome_source": { "type": "minecraft:fixed", "biome": "minecraft:the_void" },
+    "min_y": 0,
+    "height": 384,
+    "sea_level": 0
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "id": "mysticism",
+  "version": "${version}",
+  "name": "mysticism",
+  "description": "A minecraft mod that implements sympathetic magic and mysticism. ",
+  "authors": ["Quinntyx"],
+  "contact": {},
+  "license": "MIT",
+  "icon": "assets/mysticism/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "fabric-datagen": [
+      "io.github.mysticism.client.MysticismDataGenerator"
+    ],
+    "client": [
+      "io.github.mysticism.client.MysticismClient"
+    ],
+    "main": [
+      "io.github.mysticism.Mysticism"
+    ],
+    "cardinal-components-entity": [
+      "io.github.mysticism.component.MysticismEntityComponents"
+    ]
+  },
+  "mixins": [
+    "mysticism.mixins.json",
+    {
+      "config": "mysticism.client.mixins.json",
+      "environment": "client"
+    }
+  ],
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "fabric": "*",
+    "fabric-api": "*",
+    "minecraft": "${minecraft_version}"
+  },
+  "custom": {
+    "cardinal-components": [
+      "mysticism:latent_pos",
+      "mysticism:latent_basis",
+      "mysticism:latent_attunement"
+    ]
+  }
+}
