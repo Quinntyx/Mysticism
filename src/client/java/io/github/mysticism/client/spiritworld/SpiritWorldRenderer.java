@@ -60,7 +60,7 @@ public final class SpiritWorldRenderer {
 
             // 1–3: Δ384 → project onto basis → add player world pos
             final Vec3d worldPos = Projection384f.projectToWorld(
-                    obj, you, basis, camera.getPos(), 20.0f);
+                    obj, you, basis, camera.getPos(), 30.0f);
 
             if (ctx.frustum() == null) {
                 continue;
@@ -86,8 +86,8 @@ public final class SpiritWorldRenderer {
                 matrices.multiply(RotationAxis.POSITIVE_X.rotationDegrees(camera.getPitch()));
             }
 
-//            var scale = (float) (Math.sqrt(obj.squareDistance(you)));
-            var scale = 1f;
+            var scale = (float) (1 / Math.sqrt(obj.squareDistance(you)));
+//            var scale = 1f;
 //            LOGGER.info("Square Distance for item {}: {}", id, obj.squareDistance(you));
 //            LOGGER.info("Scale: {}", scale);
 //             Scale down a bit
