@@ -22,6 +22,11 @@ import java.util.stream.IntStream;
 
 import static net.minecraft.server.command.CommandManager.literal;
 
+/**
+ * /latent commands.
+ * NOTE: Latent vectors (pos, attunement) are treated as RAW here (no normalization).
+ *       Only basis construction normalizes/orthonormalizes its axes.
+ */
 public final class LatentCommands {
     // simple per-player “actionbar logging” toggle
     private static final Set<UUID> LOG = new HashSet<>();
@@ -89,9 +94,9 @@ public final class LatentCommands {
         ServerPlayerEntity p = src.getPlayer();
         if (p == null) return 0;
 
-        var pos = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
-        var basis = p.getComponent(MysticismEntityComponents.LATENT_BASIS).get();
-        var att = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).get();
+        var pos = p.getComponent(MysticismEntityComponents.LATENT_POS).get();                 // RAW
+        var basis = p.getComponent(MysticismEntityComponents.LATENT_BASIS).get();             // Orthonormal
+        var att = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).get();          // RAW
 
         List<String> items = visibleItems(src.getServer(), p, 15);
 
@@ -109,11 +114,11 @@ public final class LatentCommands {
         ServerPlayerEntity p = src.getPlayer(); if (p == null) return 0;
         switch (which) {
             case "pos" -> {
-                var v = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
+                var v = p.getComponent(MysticismEntityComponents.LATENT_POS).get(); // RAW
                 src.sendFeedback(() -> Text.literal("pos = " + fmt(v)), false);
             }
             case "attune" -> {
-                var v = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).get();
+                var v = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).get(); // RAW
                 src.sendFeedback(() -> Text.literal("attunement = " + fmt(v)), false);
             }
             case "basis" -> {
@@ -132,7 +137,7 @@ public final class LatentCommands {
         ServerPlayerEntity p = src.getPlayer(); if (p == null) return 0;
 
         var id = Objects.requireNonNull(stack.getItem().getRegistryEntry().registryKey().getValue()).toString();
-        var v = embeddingForItem(src.getServer(), id);
+        var v = embeddingForItem(src.getServer(), id); // RAW embedding from your index
         if (v == null) {
             src.sendError(Text.literal("No embedding for item: " + id));
             return 0;
@@ -140,21 +145,23 @@ public final class LatentCommands {
 
         switch (target) {
             case "pos" -> {
+                // RAW set (no normalization)
                 p.getComponent(MysticismEntityComponents.LATENT_POS).set(v.clone());
                 MysticismEntityComponents.LATENT_POS.sync(p);
-                src.sendFeedback(() -> Text.literal("Set pos to item embedding of " + id), false);
+                src.sendFeedback(() -> Text.literal("Set pos to RAW item embedding of " + id), false);
             }
             case "attune" -> {
-                var u = v.clone(); normalizeInPlace(u);
-                p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).set(u);
+                // RAW set (no normalization)
+                p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).set(v.clone());
                 MysticismEntityComponents.LATENT_ATTUNEMENT.sync(p);
-                src.sendFeedback(() -> Text.literal("Set attunement to unit(item) of " + id), false);
+                src.sendFeedback(() -> Text.literal("Set attunement to RAW item embedding of " + id), false);
             }
             case "basis" -> {
+                // Basis MUST be orthonormal for projection; use direction of v + Gram–Schmidt.
                 Basis384f B = orthonormalBasisFrom(v, p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).get());
                 p.getComponent(MysticismEntityComponents.LATENT_BASIS).set(B);
                 MysticismEntityComponents.LATENT_BASIS.sync(p);
-                src.sendFeedback(() -> Text.literal("Aligned basis to item " + id + " (i forward)"), false);
+                src.sendFeedback(() -> Text.literal("Aligned basis to item " + id + " (i forward; orthonormal)"), false);
             }
         }
         return 1;
@@ -163,12 +170,12 @@ public final class LatentCommands {
     // /latent set basis <itemId> (string shortcut)
     private static int setBasisByItemId(ServerCommandSource src, String itemId) {
         ServerPlayerEntity p = src.getPlayer(); if (p == null) return 0;
-        var v = embeddingForItem(src.getServer(), itemId);
+        var v = embeddingForItem(src.getServer(), itemId); // RAW
         if (v == null) { src.sendError(Text.literal("No embedding for item: " + itemId)); return 0; }
         Basis384f B = orthonormalBasisFrom(v, p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).get());
         p.getComponent(MysticismEntityComponents.LATENT_BASIS).set(B);
         MysticismEntityComponents.LATENT_BASIS.sync(p);
-        src.sendFeedback(() -> Text.literal("Aligned basis to item " + itemId + " (i forward)"), false);
+        src.sendFeedback(() -> Text.literal("Aligned basis to item " + itemId + " (i forward; orthonormal)"), false);
         return 1;
     }
 
@@ -190,37 +197,32 @@ public final class LatentCommands {
 
     private static Vec384f embeddingForItem(MinecraftServer server, String itemId) {
         var state = io.github.mysticism.world.state.ItemEmbeddingIndexState.get(server);
-        // your index should be able to return the vector by id
+        // your index should be able to return the vector by id (RAW)
         return state.getIndex().get(itemId);
     }
 
     /**
-     * Build an orthonormal basis with i = normalize(vItem).
-     * j is obtained by Gram-Schmidt using a seed (prefer attunement; else fallback to a fixed canonical seed).
-     * k = i × j in the 384-D sense: we can’t cross-product in >3D, so we Gram-Schmidt a second seed.
+     * Build an orthonormal basis with i = direction of vItem (normalized).
+     * j is obtained by Gram–Schmidt using a seed (prefer attunement; else fallback).
+     * k orthogonalized similarly. Only the basis is normalized; pos/attune stay RAW.
      */
-    private static Basis384f orthonormalBasisFrom(Vec384f vItem, Vec384f attunement) {
+    private static Basis384f orthonormalBasisFrom(Vec384f vItem, Vec384f attunementRaw) {
         Vec384f i = vItem.clone(); normalizeInPlace(i);
 
-        // pick a seed not collinear with i
-        Vec384f seed1 = (attunement != null && attunement.length() > 1e-6f) ? attunement.clone() : canonicalSeed();
-        // j = (seed1 - <seed1,i> i) normalized
+        // seed not collinear with i
+        Vec384f seed1 = (attunementRaw != null && attunementRaw.length() > 1e-6f) ? attunementRaw.clone() : canonicalSeed();
+
+        // j = normalize(seed1 - <seed1,i> i)
         Vec384f j = seed1.sub(i.clone().mul(seed1.dot(i)));
-        if (j.length() < 1e-6f) {
-            // extremely aligned; use fallback seed
-            j = canonicalSeed().sub(i.clone().mul(canonicalSeed().dot(i)));
-        }
+        if (j.length() < 1e-6f) j = canonicalSeed().sub(i.clone().mul(canonicalSeed().dot(i)));
         normalizeInPlace(j);
 
-        // k: use a different seed, orthogonalize against both i and j
+        // k from another seed, orthogonalize against i & j
         Vec384f seed2 = altSeed();
-        Vec384f k = seed2
-                .sub(i.clone().mul(seed2.dot(i)))
-                .sub(j.clone().mul(seed2.dot(j)));
+        Vec384f k = seed2.sub(i.clone().mul(seed2.dot(i))).sub(j.clone().mul(seed2.dot(j)));
         if (k.length() < 1e-6f) {
-            // ultimate fallback: random but deterministic from vItem hash
-            k = hashedSeed(vItem).sub(i.clone().mul(hashedSeed(vItem).dot(i)))
-                    .sub(j.clone().mul(hashedSeed(vItem).dot(j)));
+            Vec384f h = hashedSeed(vItem);
+            k = h.sub(i.clone().mul(h.dot(i))).sub(j.clone().mul(h.dot(j)));
         }
         normalizeInPlace(k);
 
@@ -233,44 +235,41 @@ public final class LatentCommands {
     }
 
     private static Vec384f canonicalSeed() {
-        // e1 unit axis in 384-D
         float[] a = new float[384];
         a[0] = 1f;
         return new Vec384f(a);
     }
 
     private static Vec384f altSeed() {
-        // e2 axis
         float[] a = new float[384];
         a[1] = 1f;
         return new Vec384f(a);
     }
 
     private static Vec384f hashedSeed(Vec384f v) {
-        int h = Arrays.hashCode(v.data()); // assuming package-private access; else expose a hash
+        int h = Arrays.hashCode(v.data()); // uses a clone; fine for a seed
         Random r = new Random(h);
         float[] a = new float[384];
         for (int i = 0; i < 384; i++) a[i] = (r.nextFloat() - 0.5f);
         return new Vec384f(a);
     }
 
-    // same “/horizonseeder” compact formatting vibe
+    // compact formatting for logs/chat; does not normalize
     private static String fmt(Vec384f v) {
-        // show first few comps + norm for sanity
         float n = v.length();
-        float[] d = v.data(); // if private, add an accessor that returns a read-only copy or first N elements
+        float[] d = v.data(); // RAW snapshot
         int show = Math.min(6, d.length);
         String head = IntStream.range(0, show)
                 .mapToObj(i -> String.format("%.3f", d[i]))
                 .collect(Collectors.joining(", "));
-        ;
         return "[" + head + (d.length > show ? ", …" : "") + "] |‖v‖=" + String.format("%.3f", n);
     }
 
     private static List<String> visibleItems(MinecraftServer server, ServerPlayerEntity p, int k) {
         if (!SpiritVisibilityService.isSpiritWorld(p)) return List.of();
         var state = io.github.mysticism.world.state.ItemEmbeddingIndexState.get(server);
-        var q = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
+        var q = p.getComponent(MysticismEntityComponents.LATENT_POS).get(); // RAW
+        // Adapt to your API; this assumes state exposes a nearestIds(k, q) over RAW vectors.
         return state.nearestIds(k, q);
     }
 

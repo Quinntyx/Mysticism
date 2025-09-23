@@ -30,25 +30,24 @@ public class SpiritWorldPostEffectProcessor {
     private static final RegistryKey<World> SPIRIT_DIM =
             RegistryKey.of(RegistryKeys.WORLD, Identifier.of("mysticism", "spirit"));
 
-    // Chain id and resources
     private static final Identifier POST_ID   = Identifier.of("mysticism", "kuwahara");
     private static final Identifier POST_JSON = Identifier.of("mysticism", "shaders/post/kuwahara.json");
     private static final Identifier VSH_ID    = Identifier.of("mysticism", "shaders/program/kuwahara.vsh");
     private static final Identifier FSH_ID    = Identifier.of("mysticism", "shaders/program/kuwahara.fsh");
 
     private static final int RETRY_COOLDOWN_TICKS = 5;
-    private static final int ENTER_WARMUP_TICKS    = 1;
-    private static final int POSTLOAD_SKIP_TICKS   = 1;   // <— NEW: skip first render tick after load
+    private static final int ENTER_WARMUP_TICKS    = 10; // wait ~10 frames after entering spirit dim
+    private static final int POSTLOAD_SKIP_TICKS   = 1;
 
-    private PostEffectProcessor chain;
     private final Pool pool = new Pool(3);
+    private PostEffectProcessor chain;
 
     private int lastW = -1, lastH = -1;
-
     private int retryCooldown = 0;
     private int ticksInSpirit = 0;
-    private int justLoadedSkipTicks = 0;                  // <— NEW
+    private int justLoadedSkipTicks = 0;
     private boolean resourcesVerified = false;
+    private boolean shaderLoaderPrimed = false; // <— NEW: only load after a resource reload has completed
 
     /** Call once per frame at WorldRenderEvents.END */
     public void onWorldRenderEnd() {
@@ -65,12 +64,13 @@ public class SpiritWorldPostEffectProcessor {
             return;
         }
 
+        // Do not attempt to load until a resource reload event has completed.
+        // This avoids the first-frame "could not find post chain" entirely.
+        if (!shaderLoaderPrimed) return;
+
         ticksInSpirit++;
 
-        if (retryCooldown > 0) {
-            retryCooldown--;
-            return;
-        }
+        if (retryCooldown > 0) { retryCooldown--; return; }
 
         // Verify req’d resources once per lifecycle
         if (!resourcesVerified) {
@@ -87,9 +87,8 @@ public class SpiritWorldPostEffectProcessor {
             resourcesVerified = true;
         }
 
-        if (ticksInSpirit <= ENTER_WARMUP_TICKS) {
-            return;
-        }
+        // Give the world a short warmup after entering the dim
+        if (ticksInSpirit <= ENTER_WARMUP_TICKS) return;
 
         // Build/rebuild on size change
         final int w = mc.getWindow().getFramebufferWidth();
@@ -99,31 +98,26 @@ public class SpiritWorldPostEffectProcessor {
         if (chain == null || sizeChanged) {
             close();
             try {
-                // IMPORTANT: use ALL targets so chains that rely on translucent/particles/etc. work
-                chain = mc.getShaderLoader().loadPostEffect(POST_ID, DefaultFramebufferSet.MAIN_ONLY);
-                lastW = w;
-                lastH = h;
-                justLoadedSkipTicks = POSTLOAD_SKIP_TICKS;     // <— NEW
+                // Use ALL built-in targets; many chains require more than main
+                chain = mc.getShaderLoader().loadPostEffect(POST_ID, DefaultFramebufferSet.STAGES);
+                lastW = w; lastH = h;
+                justLoadedSkipTicks = POSTLOAD_SKIP_TICKS;
                 LOGGER.info("Loaded post chain {} ({}x{}) on {}", POST_ID, w, h, Thread.currentThread().getName());
             } catch (Throwable t) {
                 retryCooldown = RETRY_COOLDOWN_TICKS;
-                LOGGER.error("Failed to load post chain {} on {}. Will retry in {} ticks.",
+                // Mojang's ShaderLoader logs its own error before throwing; we keep ours terse.
+                LOGGER.debug("loadPostEffect threw for {} on {}; retrying in {} ticks",
                         POST_ID, Thread.currentThread().getName(), RETRY_COOLDOWN_TICKS, t);
                 return;
             }
         }
 
-        // Give internal targets/samplers one tick to settle after load
-        if (justLoadedSkipTicks > 0) {
-            justLoadedSkipTicks--;
-            return;
-        }
+        // Give targets/samplers one tick to settle after a fresh load
+        if (justLoadedSkipTicks > 0) { justLoadedSkipTicks--; return; }
 
         // Run the chain
         try {
-            if (chain != null) {
-                chain.render(mc.getFramebuffer(), pool);
-            }
+            if (chain != null) chain.render(mc.getFramebuffer(), pool);
         } catch (Throwable t) {
             LOGGER.error("Render pass threw; cleaning up", t);
             close();
@@ -134,22 +128,19 @@ public class SpiritWorldPostEffectProcessor {
     /** Call from ClientLifecycleEvents.CLIENT_STOPPING and on dimension leave */
     public void close() {
         if (chain != null) {
-            try {
-                chain.close();
-            } catch (Throwable t) {
-                LOGGER.error("close() failed", t);
-            }
+            try { chain.close(); } catch (Throwable t) { LOGGER.error("close() failed", t); }
             chain = null;
         }
     }
 
-    /** Call on resource reload (F3+T) */
+    /** Call on resource reload (F3+T) — IMPORTANT: wire this to Fabric's reload listener */
     public void onResourcesReloaded() {
-        LOGGER.info("resource reload -> dropping post chain");
+        LOGGER.info("resource reload -> dropping post chain and priming loader");
         close();
         resourcesVerified = false;
+        shaderLoaderPrimed = true; // <— we will only attempt loads after at least one reload
 
-        // Validate & summarize post JSON OFF the render loop (for visibility)
+        // Optional: schema check + summary for debugging (off render loop)
         final MinecraftClient mc = MinecraftClient.getInstance();
         final ResourceManager rm = mc.getResourceManager();
         rm.getResource(POST_JSON).ifPresent(res -> {
@@ -159,7 +150,6 @@ public class SpiritWorldPostEffectProcessor {
                 parsed.resultOrPartial(msg -> LOGGER.error("[Mysticism] POST JSON decode error: {}", msg))
                         .ifPresent(p -> LOGGER.info("[Mysticism] POST JSON decoded OK"));
 
-                // lightweight human-readable summary of targets & passes
                 if (root.isJsonObject()) {
                     JsonObject obj = root.getAsJsonObject();
                     List<String> targets = new ArrayList<>();
@@ -190,13 +180,11 @@ public class SpiritWorldPostEffectProcessor {
     }
 
     private void resetOutsideSpirit() {
-        if (ticksInSpirit != 0) {
-            close();
-        }
+        if (ticksInSpirit != 0) close();
         ticksInSpirit = 0;
         retryCooldown = 0;
         justLoadedSkipTicks = 0;
-        lastW = -1;
-        lastH = -1;
+        lastW = -1; lastH = -1;
+        // keep shaderLoaderPrimed as-is; it persists across dims until next reload
     }
 }

@@ -1,6 +1,7 @@
 package io.github.mysticism.client;
 
 import io.github.mysticism.client.net.SpiritNetworkingClient;
+import io.github.mysticism.client.spiritworld.ClientLatentPredictor;
 import io.github.mysticism.client.spiritworld.ClientSpiritCache;
 import io.github.mysticism.client.spiritworld.SpiritWorldPostEffectProcessor;
 import io.github.mysticism.client.spiritworld.SpiritWorldRenderer;
@@ -35,7 +36,7 @@ public class MysticismClient implements ClientModInitializer {
         });
 
         SpiritNetworkingClient.init();
-        ClientSpiritCache.init();
+        ClientLatentPredictor.init();
         SpiritWorldRenderer.init();
 
         WorldRenderEvents.END.register(ctx -> POST.onWorldRenderEnd());

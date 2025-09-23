@@ -3,7 +3,7 @@ package io.github.mysticism.vector;
 import java.util.Arrays;
 import java.util.List;
 
-public class Basis384f {
+public class Basis384f  {
     public Vec384f i;
     public Vec384f j;
     public Vec384f k;

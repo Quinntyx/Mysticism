@@ -19,7 +19,10 @@ import net.minecraft.util.math.Box;
 import net.minecraft.util.math.RotationAxis;
 import net.minecraft.util.math.Vec3d;
 
+import java.util.Arrays;
 import java.util.Objects;
+
+import static io.github.mysticism.client.MysticismClient.LOGGER;
 
 /**
  * Draws each visible embedding as a billboarded item at:
@@ -57,7 +60,7 @@ public final class SpiritWorldRenderer {
 
             // 1–3: Δ384 → project onto basis → add player world pos
             final Vec3d worldPos = Projection384f.projectToWorld(
-                    obj, you, basis, camera.getPos(), 20.f);
+                    obj, you, basis, camera.getPos(), 20.0f);
 
             if (ctx.frustum() == null) {
                 continue;
@@ -83,8 +86,13 @@ public final class SpiritWorldRenderer {
                 matrices.multiply(RotationAxis.POSITIVE_X.rotationDegrees(camera.getPitch()));
             }
 
-            // Scale down a bit
-            matrices.scale(0.5f, 0.5f, 0.5f);
+//            var scale = (float) (Math.sqrt(obj.squareDistance(you)));
+            var scale = 1f;
+//            LOGGER.info("Square Distance for item {}: {}", id, obj.squareDistance(you));
+//            LOGGER.info("Scale: {}", scale);
+//             Scale down a bit
+//            LOGGER.info("Vec for {}: {}", id, Arrays.copyOfRange(obj.data(), 0, 5));
+            matrices.scale(scale, scale, scale);
 
             // Resolve an icon (try id as an Item identifier; otherwise fallback)
 

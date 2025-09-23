@@ -32,11 +32,15 @@ public class SpiritBasisEvolver {
             double dx = now.x - last.x, dy = now.y - last.y, dz = now.z - last.z;
             var basis = p.getComponent(MysticismEntityComponents.LATENT_BASIS).get();
             var att = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).get();
+            var pos = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
 
-            boolean changed = BasisIntegrator384f.step(basis, att, dx, dy, dz, eta);
-            // Optional drift confirmation every 2 seconds:
-            if (changed && (server.getTicks() % 40 == 0)) {
+            pos.converge(att, (float) Math.sqrt(Math.pow(dx, 2) + Math.pow(dy, 2) + Math.pow(dz, 2)) * 0.01f);
+
+            BasisIntegrator384f.step(basis, att, dx, dy, dz, eta);
+            // drift confirmation every 2 seconds:
+            if (server.getTicks() % 40 == 0) {
                 MysticismEntityComponents.LATENT_BASIS.sync(p);
+                MysticismEntityComponents.LATENT_POS.sync(p);
             }
         }
     }

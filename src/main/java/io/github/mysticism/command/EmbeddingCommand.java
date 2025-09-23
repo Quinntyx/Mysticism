@@ -441,13 +441,15 @@ public class EmbeddingCommand {
 
         String itemName = itemStack.getName().getString();
         try {
-            float[] embedding = EmbeddingHelper.getEmbedding(itemName).thenApply(Vec384f::data).get();
+            Vec384f embeddingObj = EmbeddingHelper.getEmbedding(itemName).get();
+            float[] embedding = embeddingObj.data();
 
             source.sendFeedback(() -> Text.literal("Item: ").formatted(Formatting.AQUA)
                     .append(Text.literal(itemName).formatted(Formatting.WHITE))
                     .append(Text.literal(" (Slot: " + slotName + ")").formatted(Formatting.GRAY)), false);
 
-            source.sendFeedback(() -> Text.literal("Embedding Vector Length: " + embedding.length).formatted(Formatting.GREEN), false);
+            source.sendFeedback(() -> Text.literal("Embedding Vector Dimensionality: " + embedding.length).formatted(Formatting.GREEN), false);
+            source.sendFeedback(() -> Text.literal("Embedding Vector Dimensionality: " + embeddingObj.length()).formatted(Formatting.GREEN), false);
 
             StringBuilder embeddingStr = new StringBuilder();
             embeddingStr.append("[");
