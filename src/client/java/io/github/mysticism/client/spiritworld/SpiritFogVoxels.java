@@ -14,6 +14,8 @@ import net.minecraft.util.math.Box;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 
+import static io.github.mysticism.client.util.Color.packRGBA;
+
 @Environment(EnvType.CLIENT)
 public final class SpiritFogVoxels {
     private static final Identifier SPIRIT_DIM = Identifier.of("mysticism", "spirit");
@@ -46,11 +48,11 @@ public final class SpiritFogVoxels {
             // -------- Tunables (yours) --------
             final float scale         = 120.0f;   // noise world→latent scale (bigger => larger features)
             final float cellSize      = 32.0f;    // base cell extent (meters)
-            final float maxRadius     = 512.0f;   // half-extent of top-level volume
-            final float alphaPerBlock = 0.03f;    // base alpha for a 1m block (scaled by size)
+            final float maxRadius     = 256.0f;   // half-extent of top-level volume
+            final float alphaPerBlock = 0.01f;    // base alpha for a 1m block (scaled by size)
             final float threshold     = 0.45f;    // density threshold
             final float detailScale   = 1.5f;     // LOD aggressiveness
-            final float jitterFrac    = 0.0125f;  // per-box jitter fraction (anti z-fight)
+            final float jitterFrac    = 0.5f;  // per-box jitter fraction (anti z-fight)
 
             // NEW: how much latent motion warps the field (phase integrator gain)
             final float latentGain    = 0.02f;    // try 0.01–0.05
@@ -288,14 +290,6 @@ public final class SpiritFogVoxels {
         } else {
             vc.normal(nx, ny, nz);
         }
-    }
-
-    private static int packRGBA(float r, float g, float b, float a) {
-        int ri = (int)(r * 255f);
-        int gi = (int)(g * 255f);
-        int bi = (int)(b * 255f);
-        int ai = (int)(a * 255f);
-        return (ai << 24) | (ri << 16) | (gi << 8) | bi;
     }
 
     private static void ensureWhiteTexture() {
