@@ -26,6 +26,12 @@ public final class SpiritFogVoxels {
     private static Identifier WHITE_TEX_ID;
     private static NativeImageBackedTexture WHITE_TEX;
 
+    // ---- NEW: world/latent phase accumulators (no API changes) ----
+    private static double CAM_X, CAM_Y, CAM_Z;
+    private static boolean PHASE_INIT = false;
+    private static float phaseX = 0f, phaseY = 0f, phaseZ = 0f;
+    private static float prevOx = 0f, prevOy = 0f, prevOz = 0f;
+
     private SpiritFogVoxels() {}
 
     public static void init() {
@@ -42,13 +48,16 @@ public final class SpiritFogVoxels {
             if (matrices == null || consumers == null || camera == null) return;
 
             // -------- Tunables (yours) --------
-            final float scale         = 120.0f;  // noise world→latent scale (bigger => larger features)
-            final float cellSize      = 32.0f;   // base cell extent (meters)
+            final float scale         = 120.0f;   // noise world→latent scale (bigger => larger features)
+            final float cellSize      = 32.0f;    // base cell extent (meters)
             final float maxRadius     = 512.0f;   // half-extent of top-level volume
-            final float alphaPerBlock = 0.03f;   // base alpha for a 1m block (we scale by volume later)
-            final float threshold     = 0.45f;   // density threshold
-            final float detailScale   = 1.5f;   // LOD aggressiveness
-            final float jitterFrac    = 0.0125f; // per-box jitter fraction of box size (anti z-fight)
+            final float alphaPerBlock = 0.03f;    // base alpha for a 1m block (scaled by size)
+            final float threshold     = 0.45f;    // density threshold
+            final float detailScale   = 1.5f;     // LOD aggressiveness
+            final float jitterFrac    = 0.0125f;  // per-box jitter fraction (anti z-fight)
+
+            // NEW: how much latent motion warps the field (phase integrator gain)
+            final float latentGain    = 0.02f;    // try 0.01–0.05
 
             Vec3d cam = camera.getPos();
 
@@ -76,9 +85,28 @@ public final class SpiritFogVoxels {
                 }
             } catch (Throwable ignored) {}
 
-            // Move world so camera is origin (critical for coherent LOD around the player)
+            // NEW: world anchor and latent phase integration
+            CAM_X = cam.x; CAM_Y = cam.y; CAM_Z = cam.z;
+            if (!PHASE_INIT) {
+                prevOx = ox; prevOy = oy; prevOz = oz;
+                PHASE_INIT = true;
+            } else {
+                float dOx = ox - prevOx;
+                float dOy = oy - prevOy;
+                float dOz = oz - prevOz;
+                phaseX += latentGain * dOx;
+                phaseY += latentGain * dOy;
+                phaseZ += latentGain * dOz;
+                prevOx = ox; prevOy = oy; prevOz = oz;
+                // keep phases in a sane numeric range (mod a big-ish period)
+                final float PHASE_WRAP = 8192f / scale; // wraps about every ~8192 world units of noise-space
+                phaseX = wrapPhase(phaseX, PHASE_WRAP);
+                phaseY = wrapPhase(phaseY, PHASE_WRAP);
+                phaseZ = wrapPhase(phaseZ, PHASE_WRAP);
+            }
+
+            // NOTE: DO NOT translate by -cam; matrices are already camera-relative in this event
             matrices.push();
-//            matrices.translate(-cam.x, -cam.y, -cam.z);
 
             RenderLayer layer = RenderLayer.getEntityTranslucent(WHITE_TEX_ID);
             VertexConsumer vc = consumers.getBuffer(layer);
@@ -92,10 +120,10 @@ public final class SpiritFogVoxels {
                         float dist = MathHelper.sqrt(cx*cx + cy*cy + cz*cz);
                         int maxDepth = Math.min(
                                 (int)Math.ceil((1.0f / Math.max(0.001f, dist)) * 128.0f * detailScale),
-                                6 // hard cap to stop runaway recursion
+                                6 // cap recursion
                         );
 
-                        // Construct the top box in world (camera-centered) space
+                        // Construct the top box in camera-centered space
                         Box box = new Box(
                                 cx - cellSize * 0.5f, cy - cellSize * 0.5f, cz - cellSize * 0.5f,
                                 cx + cellSize * 0.5f, cy + cellSize * 0.5f, cz + cellSize * 0.5f
@@ -110,13 +138,6 @@ public final class SpiritFogVoxels {
         });
     }
 
-    /**
-     * Recursive emission with early empty/full classification:
-     * - Compute 8 samples at the box corners in NOISE space: (corner / scale) + offsets
-     * - If (max < threshold): fully empty → return (keep it a void)
-     * - Else if (min >= threshold): fully full → emit this box once (with size-scaled alpha)
-     * - Else subdivide into 8 octants (until maxDepth)
-     */
     private static void emitBoxRecursive(
             VertexConsumer vc, MatrixStack.Entry e, Box box,
             float alphaPerBlock, int maxDepth, float scale, float ox, float oy, float oz,
@@ -124,58 +145,59 @@ public final class SpiritFogVoxels {
     ) {
         if (maxDepth <= 0) return;
 
-        // Corners in world space (camera-centered)
-        final double x0 = box.minX, x1 = box.maxX;
-        final double y0 = box.minY, y1 = box.maxY;
-        final double z0 = box.minZ, z1 = box.maxZ;
+        // World-space corners for sampling (camera-centered geometry, so add CAM_* for world)
+        final double x0 = box.minX + CAM_X, x1 = box.maxX + CAM_X;
+        final double y0 = box.minY + CAM_Y, y1 = box.maxY + CAM_Y;
+        final double z0 = box.minZ + CAM_Z, z1 = box.maxZ + CAM_Z;
 
-        // --- sample density at 8 corners in NOISE space (correct scale!) ---
-        float f000 = fbm((float)(x0/scale + ox), (float)(y0/scale + oy), (float)(z0/scale + oz));
-        float f001 = fbm((float)(x0/scale + ox), (float)(y0/scale + oy), (float)(z1/scale + oz));
-        float f010 = fbm((float)(x0/scale + ox), (float)(y1/scale + oy), (float)(z0/scale + oz));
-        float f011 = fbm((float)(x0/scale + ox), (float)(y1/scale + oy), (float)(z1/scale + oz));
-        float f100 = fbm((float)(x1/scale + ox), (float)(y0/scale + oy), (float)(z0/scale + oz));
-        float f101 = fbm((float)(x1/scale + ox), (float)(y0/scale + oy), (float)(z1/scale + oz));
-        float f110 = fbm((float)(x1/scale + ox), (float)(y1/scale + oy), (float)(z0/scale + oz));
-        float f111 = fbm((float)(x1/scale + ox), (float)(y1/scale + oy), (float)(z1/scale + oz));
+        // --- sample density at 8 corners ---
+        // Add: (corner_world / scale)  + integrated latent phase per axis
+        float f000 = fbm((float)(x0/scale + phaseX), (float)(y0/scale + phaseY), (float)(z0/scale + phaseZ));
+        float f001 = fbm((float)(x0/scale + phaseX), (float)(y0/scale + phaseY), (float)(z1/scale + phaseZ));
+        float f010 = fbm((float)(x0/scale + phaseX), (float)(y1/scale + phaseY), (float)(z0/scale + phaseZ));
+        float f011 = fbm((float)(x0/scale + phaseX), (float)(y1/scale + phaseY), (float)(z1/scale + phaseZ));
+        float f100 = fbm((float)(x1/scale + phaseX), (float)(y0/scale + phaseY), (float)(z0/scale + phaseZ));
+        float f101 = fbm((float)(x1/scale + phaseX), (float)(y0/scale + phaseY), (float)(z1/scale + phaseZ));
+        float f110 = fbm((float)(x1/scale + phaseX), (float)(y1/scale + phaseY), (float)(z0/scale + phaseZ));
+        float f111 = fbm((float)(x1/scale + phaseX), (float)(y1/scale + phaseY), (float)(z1/scale + phaseZ));
 
         float minF = min8(f000,f001,f010,f011,f100,f101,f110,f111);
         float maxF = max8(f000,f001,f010,f011,f100,f101,f110,f111);
 
-        // --- early classification ---
-        if (maxF < threshold) {
-            // fully empty: it's a coherent void → stop here
-            return;
-        }
+        if (maxF < threshold) return; // coherent void
         if (minF >= threshold) {
-            // fully full: draw once with alpha scaled by volume (size perception)
+            // emit once with size-scaled alpha
             float sizeX = (float)(x1 - x0);
             float sizeY = (float)(y1 - y0);
             float sizeZ = (float)(z1 - z0);
-
-            // alpha scales ~ with projected “amount of faces” (use average side)
             float avgSide = (sizeX + sizeY + sizeZ) / 3f;
             float alpha = MathHelper.clamp(alphaPerBlock * avgSide, 0f, 1f);
 
-            // tiny jitter to de-align neighbors (anti z-fight). Stable per-box.
-            int hx = fastFloor((float)((x0 + x1) * 0.5f / sizeX));
-            int hy = fastFloor((float)((y0 + y1) * 0.5f / sizeY));
-            int hz = fastFloor((float)((z0 + z1) * 0.5f / sizeZ));
-            float jx = (hash3(hx, hy, hz)        - 0.5f) * jitterFrac * sizeX;
-            float jy = (hash3(hx*7+3, hy*11+5,hz)- 0.5f) * jitterFrac * sizeY;
-            float jz = (hash3(hx, hy*13+1, hz*5) - 0.5f) * jitterFrac * sizeZ;
+            // jitter in CAMERA space so de-align neighbors visually; convert back by removing CAM_* shift
+            float jx = (hash3(fastFloor((float)((x0+x1)*0.5/sizeX)),
+                    fastFloor((float)((y0+y1)*0.5/sizeY)),
+                    fastFloor((float)((z0+z1)*0.5/sizeZ))) - 0.5f) * jitterFrac * sizeX;
+            float jy = (hash3(fastFloor((float)((x0+x1)*0.5/sizeX))*7+3,
+                    fastFloor((float)((y0+y1)*0.5/sizeY))*11+5,
+                    fastFloor((float)((z0+z1)*0.5/sizeZ))) - 0.5f) * jitterFrac * sizeY;
+            float jz = (hash3(fastFloor((float)((x0+x1)*0.5/sizeX)),
+                    fastFloor((float)((y0+y1)*0.5/sizeY))*13+1,
+                    fastFloor((float)((z0+z1)*0.5/sizeZ))*5) - 0.5f) * jitterFrac * sizeZ;
 
-            Box jb = new Box(x0 + jx, y0 + jy, z0 + jz, x1 + jx, y1 + jy, z1 + jz);
+            // Build the box back in CAMERA space for rendering (subtract CAM_*)
+            Box jb = new Box(
+                    x0 - CAM_X + jx, y0 - CAM_Y + jy, z0 - CAM_Z + jz,
+                    x1 - CAM_X + jx, y1 - CAM_Y + jy, z1 - CAM_Z + jz
+            );
             int argb = packRGBA(1, 1, 1, alpha);
             emitBox(vc, e, jb, argb);
             return;
         }
 
-        // mixed: subdivide into 8 children
         if (maxDepth <= 1) {
-            // last level: render a small box if majority is inside
-            float inside = (f000>=threshold?1:0)+(f001>=threshold?1:0)+(f010>=threshold?1:0)+(f011>=threshold?1:0)+
-                    (f100>=threshold?1:0)+(f101>=threshold?1:0)+(f110>=threshold?1:0)+(f111>=threshold?1:0);
+            // last level: render if majority inside
+            int inside = (f000>=t(threshold)?1:0)+(f001>=t(threshold)?1:0)+(f010>=t(threshold)?1:0)+(f011>=t(threshold)?1:0)+
+                    (f100>=t(threshold)?1:0)+(f101>=t(threshold)?1:0)+(f110>=t(threshold)?1:0)+(f111>=t(threshold)?1:0);
             if (inside >= 5) {
                 float sizeX = (float)(x1 - x0);
                 float sizeY = (float)(y1 - y0);
@@ -183,21 +205,30 @@ public final class SpiritFogVoxels {
                 float avgSide = (sizeX + sizeY + sizeZ) / 3f;
                 float alpha = MathHelper.clamp(alphaPerBlock * avgSide, 0f, 1f);
 
-                int hx = fastFloor((float)((x0 + x1) * 0.5f / sizeX));
-                int hy = fastFloor((float)((y0 + y1) * 0.5f / sizeY));
-                int hz = fastFloor((float)((z0 + z1) * 0.5f / sizeZ));
-                float jx = (hash3(hx, hy, hz)        - 0.5f) * jitterFrac * sizeX;
-                float jy = (hash3(hx*7+3, hy*11+5,hz)- 0.5f) * jitterFrac * sizeY;
-                float jz = (hash3(hx, hy*13+1, hz*5) - 0.5f) * jitterFrac * sizeZ;
+                float jx = (hash3(fastFloor((float)((x0+x1)*0.5/sizeX)),
+                        fastFloor((float)((y0+y1)*0.5/sizeY)),
+                        fastFloor((float)((z0+z1)*0.5/sizeZ))) - 0.5f) * jitterFrac * sizeX;
+                float jy = (hash3(fastFloor((float)((x0+x1)*0.5/sizeX))*7+3,
+                        fastFloor((float)((y0+y1)*0.5/sizeY))*11+5,
+                        fastFloor((float)((z0+z1)*0.5/sizeZ))) - 0.5f) * jitterFrac * sizeY;
+                float jz = (hash3(fastFloor((float)((x0+x1)*0.5/sizeX)),
+                        fastFloor((float)((y0+y1)*0.5/sizeY))*13+1,
+                        fastFloor((float)((z0+z1)*0.5/sizeZ))*5) - 0.5f) * jitterFrac * sizeZ;
 
-                Box jb = new Box(x0 + jx, y0 + jy, z0 + jz, x1 + jx, y1 + jy, z1 + jz);
+                Box jb = new Box(
+                        x0 - CAM_X + jx, y0 - CAM_Y + jy, z0 - CAM_Z + jz,
+                        x1 - CAM_X + jx, y1 - CAM_Y + jy, z1 - CAM_Z + jz
+                );
                 int argb = packRGBA(1, 1, 1, alpha);
                 emitBox(vc, e, jb, argb);
             }
             return;
         }
 
-        for (Box child : splitBoxOct(box)) {
+        for (Box child : splitBoxOct(new Box(
+                x0 - CAM_X, y0 - CAM_Y, z0 - CAM_Z,
+                x1 - CAM_X, y1 - CAM_Y, z1 - CAM_Z
+        ))) {
             emitBoxRecursive(vc, e, child, alphaPerBlock, maxDepth - 1, scale, ox, oy, oz, threshold, jitterFrac);
         }
     }
@@ -332,7 +363,6 @@ public final class SpiritFogVoxels {
         final double cy = (y0 + y1) * 0.5;
         final double cz = (z0 + z1) * 0.5;
 
-        // 8 children, exactly the 8 octants around (cx,cy,cz)
         return new Box[] {
                 new Box(x0, y0, z0, cx, cy, cz),
                 new Box(x0, y0, cz, cx, cy, z1),
@@ -344,4 +374,13 @@ public final class SpiritFogVoxels {
                 new Box(cx, cy, cz, x1, y1, z1)
         };
     }
+
+    private static float wrapPhase(float p, float span) {
+        // map to [-span, +span] without heavy modulo
+        if (p >  span) p -= 2f*span;
+        if (p < -span) p += 2f*span;
+        return p;
+    }
+
+    private static float t(float threshold) { return threshold; }
 }
