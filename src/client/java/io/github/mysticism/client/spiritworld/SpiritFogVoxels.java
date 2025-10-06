@@ -1,15 +1,11 @@
 package io.github.mysticism.client.spiritworld;
 
+import com.mojang.blaze3d.vertex.VertexFormat;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.minecraft.client.MinecraftClient;
-import net.minecraft.client.render.Camera;
-import net.minecraft.client.render.LightmapTextureManager;
-import net.minecraft.client.render.OverlayTexture;
-import net.minecraft.client.render.RenderLayer;
-import net.minecraft.client.render.VertexConsumer;
-import net.minecraft.client.render.VertexConsumerProvider;
+import net.minecraft.client.render.*;
 import net.minecraft.client.texture.NativeImage;
 import net.minecraft.client.texture.NativeImageBackedTexture;
 import net.minecraft.client.util.math.MatrixStack;
@@ -108,7 +104,7 @@ public final class SpiritFogVoxels {
             // NOTE: DO NOT translate by -cam; matrices are already camera-relative in this event
             matrices.push();
 
-            RenderLayer layer = RenderLayer.getEntityTranslucent(WHITE_TEX_ID);
+            RenderLayer layer = RenderLayer.getEntityTranslucentEmissive(WHITE_TEX_ID);
             VertexConsumer vc = consumers.getBuffer(layer);
             MatrixStack.Entry e = matrices.peek();
 
