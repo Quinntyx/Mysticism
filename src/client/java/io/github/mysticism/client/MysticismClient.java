@@ -1,16 +1,15 @@
 package io.github.mysticism.client;
 
 import io.github.mysticism.client.net.SpiritNetworkingClient;
-import io.github.mysticism.client.spiritworld.ClientLatentPredictor;
-import io.github.mysticism.client.spiritworld.ClientSpiritCache;
-import io.github.mysticism.client.spiritworld.SpiritWorldPostEffectProcessor;
-import io.github.mysticism.client.spiritworld.SpiritWorldRenderer;
+import io.github.mysticism.client.spiritworld.*;
 import io.github.mysticism.embedding.EmbeddingHelper;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+import net.minecraft.client.MinecraftClient;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.util.Identifier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -40,6 +39,8 @@ public class MysticismClient implements ClientModInitializer {
         SpiritWorldRenderer.init();
 
         WorldRenderEvents.END.register(ctx -> POST.onWorldRenderEnd());
+        SpiritFogVoxels.init();
+
 
         // Clean up on client shutdown
         ClientLifecycleEvents.CLIENT_STOPPING.register(client -> POST.close());

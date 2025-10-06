@@ -60,7 +60,7 @@ public final class SpiritVisibilityService {
 
     public static void init() {
         ServerTickEvents.END_SERVER_TICK.register((server) -> {
-            tick(server, 30);
+            tick(server, 1643);
         });
     }
 }

@@ -1,0 +1,20 @@
+{
+  "targets": [
+    "minecraft:main"
+  ],
+  "passes": [
+    {
+      "name": "spirit_fog",
+      "vertex": "mysticism:spirit_fog",
+      "fragment": "mysticism:spirit_fog",
+      "intarget": "minecraft:main",
+      "outtarget": "minecraft:main",
+      "inputs": [
+        { "sampler": "Params", "texture": "mysticism:spirit_params", "mipmap": 0, "lod": 0, "linear": false },
+        { "sampler": "Depth",  "target":  "minecraft:depth", "linear": false, "compare": false }
+      ],
+      "uniforms": { }
+    }
+  ],
+  "internal_targets": { }
+}
