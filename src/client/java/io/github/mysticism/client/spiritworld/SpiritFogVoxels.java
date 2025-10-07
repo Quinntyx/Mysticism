@@ -1,6 +1,5 @@
 package io.github.mysticism.client.spiritworld;
 
-import com.mojang.blaze3d.vertex.VertexFormat;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
@@ -47,8 +46,8 @@ public final class SpiritFogVoxels {
 
             // -------- Tunables (yours) --------
             final float scale         = 120.0f;   // noise world→latent scale (bigger => larger features)
-            final float cellSize      = 32.0f;    // base cell extent (meters)
-            final float maxRadius     = 256.0f;   // half-extent of top-level volume
+            final float cellSize      = 64.0f;    // base cell extent (meters)
+            final float maxRadius     = 1024.0f;   // half-extent of top-level volume
             final float alphaPerBlock = 0.01f;    // base alpha for a 1m block (scaled by size)
             final float threshold     = 0.45f;    // density threshold
             final float detailScale   = 1.5f;     // LOD aggressiveness
@@ -298,7 +297,7 @@ public final class SpiritFogVoxels {
         WHITE_TEX_ID = Identifier.of("mysticism", "textures/misc/white.png");
         NativeImage img = new NativeImage(NativeImage.Format.RGBA, 1, 1, false);
         img.setColorArgb(0, 0, 0xFFFFFFFF);
-        WHITE_TEX = new NativeImageBackedTexture(() -> "mysticism:fog", img);
+        WHITE_TEX = new NativeImageBackedTexture(img);
         mc.getTextureManager().registerTexture(WHITE_TEX_ID, WHITE_TEX);
     }
 

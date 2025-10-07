@@ -3,16 +3,19 @@ package io.github.mysticism.world.state;
 import ai.djl.util.Pair;
 import com.mojang.serialization.Codec;
 import com.mojang.serialization.DataResult;
+import com.mojang.serialization.Dynamic;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import io.github.mysticism.Codecs;
 import io.github.mysticism.vector.KnnIndex;
 import io.github.mysticism.vector.Metric;
 import io.github.mysticism.vector.SimpleKnnIndex;
 import io.github.mysticism.vector.Vec384f;
+import net.minecraft.nbt.NbtCompound;
+import net.minecraft.nbt.NbtOps;
+import net.minecraft.registry.RegistryWrapper;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.world.PersistentState;
-import net.minecraft.world.PersistentStateType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -44,7 +47,7 @@ public class ItemEmbeddingIndexState extends PersistentState {
         ItemEmbeddingIndexState s = new ItemEmbeddingIndexState();
         snapshot.forEach((id, v) -> {
             s.index.upsert(id, v);
-            LOGGER.info("Loading embedding for {}", id);
+//            LOGGER.info("Loading embedding for {}", id);
         });
         s.populated = populated;
         return s;
@@ -59,19 +62,54 @@ public class ItemEmbeddingIndexState extends PersistentState {
         return out;
     }
 
-    /** Simple supplier-based type; DFU fixes not needed -> null */
-    public static final PersistentStateType<ItemEmbeddingIndexState> TYPE =
-            new PersistentStateType<>(SAVE_KEY, ItemEmbeddingIndexState::new, CODEC, null);
+    // ======== 1.21.4 Changes Start ========
 
-    /** Accessor that creates/loads on world startup */
+    /**
+     * Creates a state object from NBT data using the codec.
+     * This is the deserializer function required by PersistentState.Type.
+     */
+    public static ItemEmbeddingIndexState fromNbt(NbtCompound nbt, RegistryWrapper.WrapperLookup wrapperLookup) {
+        return CODEC.parse(new Dynamic<>(NbtOps.INSTANCE, nbt))
+                .resultOrPartial(LOGGER::error)
+                .orElseGet(ItemEmbeddingIndexState::new);
+    }
+
+    /**
+     * Writes the state object to NBT data using the codec.
+     * This overrides the method in PersistentState.
+     */
+    @Override
+    public NbtCompound writeNbt(NbtCompound nbt, RegistryWrapper.WrapperLookup wrapperLookup) {
+        CODEC.encodeStart(NbtOps.INSTANCE, this)
+                .resultOrPartial(LOGGER::error)
+                .ifPresent(encodedNbt -> {
+                    if (encodedNbt instanceof NbtCompound compound) {
+                        compound.getKeys().forEach(key -> nbt.put(key, compound.get(key)));
+                    }
+                });
+        return nbt;
+    }
+
+    /**
+     * The state type for 1.21.4, which takes a supplier and a deserializer.
+     * The third argument (DataFixTypes) can be null if you are not using data fixers.
+     */
+    public static final PersistentState.Type<ItemEmbeddingIndexState> TYPE =
+            new PersistentState.Type<>(ItemEmbeddingIndexState::new, ItemEmbeddingIndexState::fromNbt, null);
+
+    /**
+     * Accessor that creates/loads on world startup.
+     * The save key is now passed as a separate argument to getOrCreate.
+     */
     public static ItemEmbeddingIndexState get(MinecraftServer server) {
-//        LOGGER.info("Item Embedding accessed");
         ServerWorld overworld = server.getOverworld();
         if (overworld == null) {
             throw new IllegalStateException("Overworld not available yet.");
         }
-        return overworld.getPersistentStateManager().getOrCreate(TYPE);
+        return overworld.getPersistentStateManager().getOrCreate(TYPE, SAVE_KEY);
     }
+
+    // ======== 1.21.4 Changes End ========
 
     public boolean populateIfNeeded(Runnable seeder) {
         LOGGER.info("Attempting to populate item embedding...");

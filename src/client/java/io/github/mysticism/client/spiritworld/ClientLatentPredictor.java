@@ -41,30 +41,30 @@ public final class ClientLatentPredictor {
             return;
         }
 
-        // 3D movement this frame (ticks)
         Vec3d now = mc.player.getPos();
         if (lastPos == null) { lastPos = now; return; }
         double dx = now.x - lastPos.x, dy = now.y - lastPos.y, dz = now.z - lastPos.z;
         lastPos = now;
 
         double dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
-        if (dist < 1e-8) return; // idle
+        if (dist < 1e-8) return;
 
-        // Live component instances (mutable) — DO NOT clone; mutate in place so renderer sees updates.
+        // Get the live, mutable component instances
         Basis384f basis = mc.player.getComponent(MysticismEntityComponents.LATENT_BASIS).get();
         Vec384f    pos  = mc.player.getComponent(MysticismEntityComponents.LATENT_POS).get();
         Vec384f    att  = mc.player.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).get();
 
-        // 1) Basis prediction: stable small-angle rotation in the (u, t) plane
+        // Perform mutation on the live components
         BasisIntegrator384f.step(basis, att, dx, dy, dz, BASIS_ROTATION_PER_BLOCK);
-
-        // 2) Latent pos prediction: converge toward attunement by ~1% per block moved
         float f = (float)(POS_LERP_PER_BLOCK * dist);
         if (f > 0f) pos.converge(att, f);
 
-        // 3) Mirror into your client cache for the renderer (if you use it)
-        ClientSpiritCache.playerLatentBasis = basis;
-        ClientSpiritCache.playerLatentPos   = pos;
-        ClientSpiritCache.playerLatentAttunement        = att;
+        // --- THE SOLUTION ---
+        // Mirror IMMUTABLE SNAPSHOTS into your client cache for the renderer.
+        // The .clone() method creates a new object with a copy of the data at this exact moment.
+        // The renderer will now have a stable, thread-safe copy to work with for the entire frame.
+        ClientSpiritCache.playerLatentBasis = basis.clone();
+        ClientSpiritCache.playerLatentPos   = pos.clone();
+        ClientSpiritCache.playerLatentAttunement = att.clone();
     }
 }

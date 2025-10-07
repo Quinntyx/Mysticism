@@ -11,7 +11,6 @@ import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.util.Identifier;
 
 import io.github.mysticism.Mysticism;
-import io.github.mysticism.entity.LatentGlyphEntity;
 
 public final class MysticismEntityComponents implements EntityComponentInitializer {
     public static final ComponentKey<LatentPos>   LATENT_POS   =
@@ -30,7 +29,7 @@ public final class MysticismEntityComponents implements EntityComponentInitializ
         registry.registerForPlayers(LATENT_ATTUNEMENT, p -> new LatentAttunement(), RespawnCopyStrategy.ALWAYS_COPY);
 
         // Your custom glyph/entity can carry a latent vector too (no respawn semantics needed)
-        registry.registerFor(LatentGlyphEntity.class, LATENT_POS, e -> new LatentPos());
+//        registry.registerFor(LatentGlyphEntity.class, LATENT_POS, e -> new LatentPos());
     }
 
     // Convenience helpers

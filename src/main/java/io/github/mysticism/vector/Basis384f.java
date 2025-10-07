@@ -3,7 +3,7 @@ package io.github.mysticism.vector;
 import java.util.Arrays;
 import java.util.List;
 
-public class Basis384f  {
+public class Basis384f implements Cloneable {
     public Vec384f i;
     public Vec384f j;
     public Vec384f k;
@@ -33,6 +33,14 @@ public class Basis384f  {
                 Vec384f.fromBits(Arrays.copyOfRange(bits, 0, 384)),
                 Vec384f.fromBits(Arrays.copyOfRange(bits, 384, 768)),
                 Vec384f.fromBits(Arrays.copyOfRange(bits, 768, 1152))
+        );
+    }
+
+    public Basis384f clone() {
+        return new Basis384f(
+            i.clone(),
+            j.clone(),
+            k.clone()
         );
     }
 }

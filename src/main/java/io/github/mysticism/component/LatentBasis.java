@@ -2,8 +2,9 @@ package io.github.mysticism.component;
 
 import io.github.mysticism.vector.Basis384f;
 import io.github.mysticism.vector.Vec384f;
-import net.minecraft.storage.ReadView;
-import net.minecraft.storage.WriteView;
+import net.minecraft.nbt.NbtCompound;
+import net.minecraft.nbt.NbtElement;
+import net.minecraft.registry.RegistryWrapper;
 import org.ladysnake.cca.api.v3.component.ComponentV3;
 import org.ladysnake.cca.api.v3.component.sync.AutoSyncedComponent;
 
@@ -52,15 +53,19 @@ public final class LatentBasis implements ComponentV3, AutoSyncedComponent {
     public Vec384f getJ() { return this.basis.j; }
     public Vec384f getK() { return this.basis.k; }
 
-    /* ------------------- CCA 7+ persistence/sync ------------------- */
+    /* ------------------- CCA < 7 persistence/sync ------------------- */
 
     @Override
-    public void readData(ReadView readView) {
-        this.basis = readView.getOptionalIntArray("b").map(Basis384f::fromBits).orElseGet(Basis384f::new);
+    public void readFromNbt(NbtCompound tag, RegistryWrapper.WrapperLookup wrapperLookup) {
+        if (tag.contains("b", NbtElement.INT_ARRAY_TYPE)) {
+            this.basis = Basis384f.fromBits(tag.getIntArray("b"));
+        } else {
+            this.basis = new Basis384f();
+        }
     }
 
     @Override
-    public void writeData(WriteView writeView) {
-        writeView.putIntArray("b", this.basis.toBits());
+    public void writeToNbt(NbtCompound tag, RegistryWrapper.WrapperLookup wrapperLookup) {
+        tag.putIntArray("b", this.basis.toBits());
     }
 }

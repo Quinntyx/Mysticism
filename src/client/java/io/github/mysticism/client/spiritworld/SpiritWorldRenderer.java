@@ -1,5 +1,6 @@
 package io.github.mysticism.client.spiritworld;
 
+import io.github.mysticism.vector.Basis384f;
 import io.github.mysticism.vector.Projection384f;
 import io.github.mysticism.vector.Vec384f;
 import net.fabricmc.api.EnvType;
@@ -19,15 +20,6 @@ import net.minecraft.util.math.Box;
 import net.minecraft.util.math.RotationAxis;
 import net.minecraft.util.math.Vec3d;
 
-import java.util.Arrays;
-import java.util.Objects;
-
-import static io.github.mysticism.client.MysticismClient.LOGGER;
-
-/**
- * Draws each visible embedding as a billboarded item at:
- * playerWorldPos + project( (obj384 - player384) onto {i,j,k} ).
- */
 @Environment(EnvType.CLIENT)
 public final class SpiritWorldRenderer {
     private SpiritWorldRenderer() {}
@@ -44,11 +36,10 @@ public final class SpiritWorldRenderer {
         if (!mc.world.getRegistryKey().getValue().equals(Identifier.of("mysticism", "spirit"))) return;
 
         final MatrixStack matrices = ctx.matrixStack();
-        assert matrices != null;
         final VertexConsumerProvider consumers = ctx.consumers();
         final var camera = ctx.camera();
 
-        final var basis   = ClientSpiritCache.playerLatentBasis;
+        final Basis384f basis = ClientSpiritCache.playerLatentBasis;
         final Vec384f you = ClientSpiritCache.playerLatentPos;
 
         final ItemRenderer itemRenderer = mc.getItemRenderer();
@@ -58,51 +49,49 @@ public final class SpiritWorldRenderer {
             final Vec384f obj = ClientSpiritCache.VEC.get(id);
             if (obj == null) continue;
 
-            // 1–3: Δ384 → project onto basis → add player world pos
+            // --- THE DEFINITIVE FIX: Use defensive cloning ---
+            // This prevents the mutable math in your other classes from corrupting
+            // the cached data and causing all items to render at the same spot.
             final Vec3d worldPos = Projection384f.projectToWorld(
-                    obj, you, basis, camera.getPos(), 30.0f);
+                    obj.clone(), you.clone(), basis.clone(),
+                    camera.getPos(), 30.0f);
 
-            if (ctx.frustum() == null) {
+            // Frustum culling
+            if (ctx.frustum() == null || !ctx.frustum().isVisible(Box.of(worldPos, 1, 1, 1))) {
                 continue;
             }
 
-            if (!Objects.requireNonNull(ctx.frustum()).isVisible(new Box(worldPos.x - 0.5, worldPos.y - 0.5, worldPos.z - 0.5,
-                    worldPos.x + 0.5, worldPos.y + 0.5, worldPos.z + 0.5))) {
-                continue;
-            }
-
-            // Draw a billboarded item at worldPos
             matrices.push();
 
-            // Move to world position relative to camera
+            // Translate matrix to the object's world position, relative to the camera
             Vec3d cam = camera.getPos();
             matrices.translate(worldPos.x - cam.x, worldPos.y - cam.y, worldPos.z - cam.z);
 
-            ItemStack stack = resolveIcon(id);
-
-            if (!(stack.getItem() instanceof BlockItem)) {
-                // Face the camera (billboard)
-                matrices.multiply(RotationAxis.POSITIVE_Y.rotationDegrees(-camera.getYaw()));
-                matrices.multiply(RotationAxis.POSITIVE_X.rotationDegrees(camera.getPitch()));
+            // Calculate scale based on distance
+            double sqDist = obj.squareDistance(you);
+            float scale = (float) (1.0 / Math.sqrt(sqDist));
+            if (!Float.isFinite(scale)) { // Sanity check for division by zero or negative sqrt
+                scale = 1.0f;
             }
-
-            var scale = (float) (1 / Math.sqrt(obj.squareDistance(you)));
-//            var scale = 1f;
-//            LOGGER.info("Square Distance for item {}: {}", id, obj.squareDistance(you));
-//            LOGGER.info("Scale: {}", scale);
-//             Scale down a bit
-//            LOGGER.info("Vec for {}: {}", id, Arrays.copyOfRange(obj.data(), 0, 5));
             matrices.scale(scale, scale, scale);
 
-            // Resolve an icon (try id as an Item identifier; otherwise fallback)
+            ItemStack stack = resolveIcon(id);
+            ModelTransformationMode transformMode;
 
+            // Apply billboarding for non-blocks
+            if (!(stack.getItem() instanceof BlockItem)) {
+                matrices.multiply(RotationAxis.POSITIVE_Y.rotationDegrees(-camera.getYaw()));
+                matrices.multiply(RotationAxis.POSITIVE_X.rotationDegrees(camera.getPitch()));
+                transformMode = ModelTransformationMode.NONE;
+            } else {
+                transformMode = ModelTransformationMode.GROUND;
+            }
 
-            // Fullbright so void stays readable; change if you want world lighting
+            // Render the item
             final int light = LightmapTextureManager.MAX_LIGHT_COORDINATE;
-
             itemRenderer.renderItem(
                     stack,
-                    ItemDisplayContext.GROUND,
+                    transformMode,
                     light,
                     OverlayTexture.DEFAULT_UV,
                     matrices,
@@ -121,11 +110,9 @@ public final class SpiritWorldRenderer {
     private static ItemStack resolveIcon(String id) {
         try {
             Identifier ident = Identifier.of(id);
-            Item item = null;
-            try {
-                item = Registries.ITEM.get(ident);
-            } catch (Exception ignored) {
-                item = Items.AMETHYST_SHARD;
+            Item item = Registries.ITEM.get(ident);
+            if (item == Items.AIR) {
+                return new ItemStack(Items.AMETHYST_SHARD);
             }
             return new ItemStack(item);
         } catch (Exception ignored) {

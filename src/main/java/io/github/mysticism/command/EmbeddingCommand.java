@@ -23,6 +23,7 @@ import net.minecraft.registry.Registries;
 import net.minecraft.server.command.CommandManager;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.server.world.ServerWorld;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.Identifier;
@@ -179,7 +180,7 @@ public class EmbeddingCommand {
             return 0;
         }
 
-        BlockPos dest = region.resolveSpawn(player.getWorld());
+        BlockPos dest = region.resolveSpawn((ServerWorld) player.getWorld());
         player.networkHandler.requestTeleport(dest.getX() + 0.5, dest.getY() + 1.01, dest.getZ() + 0.5, player.getYaw(), player.getPitch());
         ctx.getSource().sendFeedback(() -> Text.literal("Teleported to " + dest + " via " + regionId).formatted(Formatting.GREEN), false);
         return 1;

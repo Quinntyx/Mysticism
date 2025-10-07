@@ -4,26 +4,32 @@
   },
   "passes": [
     {
-      "vertex_shader":   "mysticism:kuwahara",
-      "fragment_shader": "mysticism:kuwahara",
-
-      "input":  "minecraft:main",
+      "vertex_shader": "mysticism:program/post",
+      "fragment_shader": "mysticism:program/kuwahara",
+      "inputs": [
+        {
+          "sampler_name": "Diffuse",
+          "target": "minecraft:main"
+        }
+      ],
       "output": "swap",
-
-      "samplers": [
-        { "name": "DiffuseSampler", "target": "minecraft:main" }
-      ]
+      "depth_test": {
+        "func": "always"
+      }
     },
     {
-      "vertex_shader":   "minecraft:blit",
-      "fragment_shader": "minecraft:blit",
-
-      "input":  "swap",
+      "vertex_shader": "mysticism:program/post",
+      "fragment_shader": "mysticism:program/blit",
+      "inputs": [
+        {
+          "sampler_name": "Diffuse",
+          "target": "swap"
+        }
+      ],
       "output": "minecraft:main",
-
-      "samplers": [
-        { "name": "DiffuseSampler", "target": "swap" }
-      ]
+      "depth_test": {
+        "func": "always"
+      }
     }
   ]
 }

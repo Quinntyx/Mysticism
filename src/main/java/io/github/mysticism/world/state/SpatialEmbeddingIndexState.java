@@ -1,6 +1,7 @@
 package io.github.mysticism.world.state;
 
 import com.mojang.serialization.Codec;
+import com.mojang.serialization.Dynamic;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import io.github.mysticism.Codecs;
 import io.github.mysticism.vector.KnnIndex;
@@ -8,10 +9,12 @@ import io.github.mysticism.vector.SimpleKnnIndex;
 import io.github.mysticism.vector.Vec384f;
 import io.github.mysticism.world.region.impl.BiomeSpiritualRegion;
 import io.github.mysticism.world.region.ISpiritualRegion;
+import net.minecraft.nbt.NbtCompound;
+import net.minecraft.nbt.NbtOps;
+import net.minecraft.registry.RegistryWrapper;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.world.PersistentState;
-import net.minecraft.world.PersistentStateType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -81,6 +84,56 @@ public class SpatialEmbeddingIndexState extends PersistentState {
         return out;
     }
 
+    // ======== 1.21.4 Changes Start ========
+
+    /**
+     * Creates a state object from NBT data using the codec.
+     * This is the deserializer function required by PersistentState.Type.
+     */
+    // THIS IS THE LINE THAT WAS FIXED:
+    public static SpatialEmbeddingIndexState fromNbt(NbtCompound nbt, RegistryWrapper.WrapperLookup wrapperLookup) {
+        return CODEC.parse(new Dynamic<>(NbtOps.INSTANCE, nbt))
+                .resultOrPartial(LOGGER::error)
+                .orElseGet(SpatialEmbeddingIndexState::new);
+    }
+
+    /**
+     * Writes the state object to NBT data using the codec.
+     * This overrides the method in PersistentState.
+     */
+    @Override
+    public NbtCompound writeNbt(NbtCompound nbt, RegistryWrapper.WrapperLookup wrapperLookup) {
+        CODEC.encodeStart(NbtOps.INSTANCE, this)
+                .resultOrPartial(LOGGER::error)
+                .ifPresent(encodedNbt -> {
+                    if (encodedNbt instanceof NbtCompound compound) {
+                        compound.getKeys().forEach(key -> nbt.put(key, compound.get(key)));
+                    }
+                });
+        return nbt;
+    }
+
+    /**
+     * The state type for 1.21.4, which takes a supplier and a deserializer.
+     * The third argument (DataFixTypes) can be null if you are not using data fixers.
+     */
+    public static final PersistentState.Type<SpatialEmbeddingIndexState> TYPE =
+            new PersistentState.Type<>(SpatialEmbeddingIndexState::new, SpatialEmbeddingIndexState::fromNbt, null);
+
+    /**
+     * Accessor that creates/loads on world startup.
+     * The save key is now passed as a separate argument to getOrCreate.
+     */
+    public static SpatialEmbeddingIndexState get(MinecraftServer server) {
+        ServerWorld overworld = server.getOverworld();
+        if (overworld == null) {
+            throw new IllegalStateException("Overworld not available yet.");
+        }
+        return overworld.getPersistentStateManager().getOrCreate(TYPE, SAVE_KEY);
+    }
+
+    // ======== 1.21.4 Changes End ========
+
     /** Insert if absent; also upserts the embedding. */
     public boolean putIfAbsent(String id, ISpiritualRegion region, Vec384f embedding) {
         if (regions.containsKey(id)) return false;
@@ -105,18 +158,5 @@ public class SpatialEmbeddingIndexState extends PersistentState {
             if (key.startsWith(prefix)) return true;
         }
         return false;
-    }
-
-    /** Simple supplier-based type; DFU fixes not needed -> null */
-    public static final PersistentStateType<SpatialEmbeddingIndexState> TYPE =
-            new PersistentStateType<>(SAVE_KEY, SpatialEmbeddingIndexState::new, CODEC, null);
-
-    /** Accessor that creates/loads on world startup */
-    public static SpatialEmbeddingIndexState get(MinecraftServer server) {
-        ServerWorld overworld = server.getOverworld();
-        if (overworld == null) {
-            throw new IllegalStateException("Overworld not available yet.");
-        }
-        return overworld.getPersistentStateManager().getOrCreate(TYPE);
     }
 }

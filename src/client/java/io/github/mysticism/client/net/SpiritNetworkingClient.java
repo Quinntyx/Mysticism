@@ -21,7 +21,7 @@ public final class SpiritNetworkingClient {
                 payload.add().forEach(a -> {
                     ClientSpiritCache.VEC.put(a.id(), Vec384f.fromBits(a.bits()));
                     ClientSpiritCache.VISIBLE.add(a.id());
-                    LOGGER.info("Length of {}: {}", a.id(), Vec384f.fromBits(a.bits()).length());
+//                    LOGGER.info("Length of {}: {}", a.id(), Vec384f.fromBits(a.bits()).length());
                 });
                 // remove
                 payload.remove().forEach(ClientSpiritCache.VISIBLE::remove);

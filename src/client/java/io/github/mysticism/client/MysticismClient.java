@@ -2,6 +2,7 @@ package io.github.mysticism.client;
 
 import io.github.mysticism.client.net.SpiritNetworkingClient;
 import io.github.mysticism.client.spiritworld.*;
+import io.github.mysticism.client.util.Color;
 import io.github.mysticism.embedding.EmbeddingHelper;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
@@ -19,8 +20,6 @@ public class MysticismClient implements ClientModInitializer {
     // Flag to track if we've initialized on client side (for singleplayer)
     private static boolean clientInitialized = false;
 
-    private static final SpiritWorldPostEffectProcessor POST = new SpiritWorldPostEffectProcessor();
-
     @Override
     public void onInitializeClient() {
         LOGGER.info("Mysticism client initializing...");
@@ -37,13 +36,11 @@ public class MysticismClient implements ClientModInitializer {
         SpiritNetworkingClient.init();
         ClientLatentPredictor.init();
         SpiritWorldRenderer.init();
+        SpiritSkybox.init();
 
-        WorldRenderEvents.END.register(ctx -> POST.onWorldRenderEnd());
+        SpiritSkybox.setMode(SpiritSkybox.Mode.FLAT);
+
         SpiritFogVoxels.init();
-
-
-        // Clean up on client shutdown
-        ClientLifecycleEvents.CLIENT_STOPPING.register(client -> POST.close());
     }
 
     private void onIntegratedServerStarted(MinecraftServer server) {

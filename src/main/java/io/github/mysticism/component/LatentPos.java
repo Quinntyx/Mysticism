@@ -1,35 +1,36 @@
 package io.github.mysticism.component;
 
 import io.github.mysticism.vector.Vec384f;
-import net.minecraft.storage.ReadView;
-import net.minecraft.storage.WriteView;
+import net.minecraft.nbt.NbtCompound;
+import net.minecraft.nbt.NbtElement;
+import net.minecraft.registry.RegistryWrapper; // Re-add this import
 import org.ladysnake.cca.api.v3.component.ComponentV3;
 import org.ladysnake.cca.api.v3.component.sync.AutoSyncedComponent;
 
-/**
- * Player/entity 384-D position, persisted & auto-synced via CCA.
- */
 public final class LatentPos implements ComponentV3, AutoSyncedComponent {
     private Vec384f v = Vec384f.ZERO();
 
     public LatentPos() { }
     public LatentPos(Vec384f initial) { this.v = (initial != null ? initial.clone() : Vec384f.ZERO()); }
 
-    /** Returns the live vector (mutable). Call MysticismEntityComponents.LATENT_POS.sync(player) after mutating. */
     public Vec384f get() { return v; }
-
-    /** Replaces the vector. */
     public void set(Vec384f value) { this.v = (value != null ? value.clone() : Vec384f.ZERO()); }
 
-    /* ------------------- Serialization (CCA 7+) ------------------- */
+    /* ------------------- Persistence (Corrected) ------------------- */
+
+    // Restore the RegistryWrapper.WrapperLookup parameter
     @Override
-    public void readData(ReadView readView) {
-        // Stored as raw float bits to avoid precision or NBT type shenanigans.
-        v = readView.getOptionalIntArray("v").map(Vec384f::fromBits).orElse(Vec384f.ZERO());
+    public void readFromNbt(NbtCompound tag, RegistryWrapper.WrapperLookup wrapperLookup) {
+        if (tag.contains("v", NbtElement.INT_ARRAY_TYPE)) {
+            this.v = Vec384f.fromBits(tag.getIntArray("v"));
+        } else {
+            this.v = Vec384f.ZERO();
+        }
     }
 
+    // Restore the RegistryWrapper.WrapperLookup parameter
     @Override
-    public void writeData(WriteView writeView) {
-        writeView.putIntArray("v", this.v.toBits());
+    public void writeToNbt(NbtCompound tag, RegistryWrapper.WrapperLookup wrapperLookup) {
+        tag.putIntArray("v", this.v.toBits());
     }
 }
