@@ -37,10 +37,10 @@ public class MysticismClient implements ClientModInitializer {
         ClientLatentPredictor.init();
         SpiritWorldRenderer.init();
         SpiritSkybox.init();
+        ShaderManager.init();
+        SpiritFogVoxels.init();
 
         SpiritSkybox.setMode(SpiritSkybox.Mode.FLAT);
-
-        SpiritFogVoxels.init();
     }
 
     private void onIntegratedServerStarted(MinecraftServer server) {

@@ -1,35 +1,17 @@
 {
-  "targets": {
-    "swap": {}
-  },
+  "targets": [
+    "swap"
+  ],
   "passes": [
     {
-      "vertex_shader": "mysticism:program/post",
-      "fragment_shader": "mysticism:program/kuwahara",
-      "inputs": [
-        {
-          "sampler_name": "Diffuse",
-          "target": "minecraft:main"
-        }
-      ],
-      "output": "swap",
-      "depth_test": {
-        "func": "always"
-      }
+      "name": "mysticism:kuwahara",
+      "intarget": "minecraft:main",
+      "outtarget": "swap"
     },
     {
-      "vertex_shader": "mysticism:program/post",
-      "fragment_shader": "mysticism:program/blit",
-      "inputs": [
-        {
-          "sampler_name": "Diffuse",
-          "target": "swap"
-        }
-      ],
-      "output": "minecraft:main",
-      "depth_test": {
-        "func": "always"
-      }
+      "name": "blit",
+      "intarget": "swap",
+      "outtarget": "minecraft:main"
     }
   ]
 }

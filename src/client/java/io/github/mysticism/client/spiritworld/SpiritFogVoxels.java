@@ -296,7 +296,7 @@ public final class SpiritFogVoxels {
         var mc = MinecraftClient.getInstance();
         WHITE_TEX_ID = Identifier.of("mysticism", "textures/misc/white.png");
         NativeImage img = new NativeImage(NativeImage.Format.RGBA, 1, 1, false);
-        img.setColorArgb(0, 0, 0xFFFFFFFF);
+        img.setColor(0, 0, 0xFFFFFFFF);
         WHITE_TEX = new NativeImageBackedTexture(img);
         mc.getTextureManager().registerTexture(WHITE_TEX_ID, WHITE_TEX);
     }

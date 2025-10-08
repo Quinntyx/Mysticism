@@ -35,6 +35,11 @@ repositories {
     maven {
         name = "Ladysnake Mods"
         url = 'https://maven.ladysnake.org/releases'
+//        content {
+//            includeGroup 'io.github.ladysnake'
+//            includeGroup 'org.ladysnake'
+//            includeGroupByRegex 'dev\\.onyxstudios.*'
+//        }
     }
     exclusiveContent {
         forRepository { maven { url = "https://api.modrinth.com/maven" } }

@@ -7,17 +7,16 @@ import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.registry.DynamicRegistryManager;
 import net.minecraft.registry.RegistryKeys;
-import net.minecraft.registry.RegistryWrapper;
-import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.ChunkRegion;
 import net.minecraft.world.HeightLimitView;
 import net.minecraft.world.Heightmap;
-import net.minecraft.world.biome.Biome;
 import net.minecraft.world.biome.BiomeKeys;
+import net.minecraft.world.biome.source.BiomeAccess;
 import net.minecraft.world.biome.source.BiomeSource;
 import net.minecraft.world.biome.source.FixedBiomeSource;
 import net.minecraft.world.chunk.Chunk;
+import net.minecraft.world.gen.GenerationStep;
 import net.minecraft.world.gen.StructureAccessor;
 import net.minecraft.world.gen.chunk.Blender;
 import net.minecraft.world.gen.chunk.ChunkGenerator;
@@ -30,7 +29,6 @@ import java.util.concurrent.CompletableFuture;
 
 public class SpiritWorldGenerator extends ChunkGenerator {
 
-    // --- Data-driven codec (optional but nice to have)
     public static final MapCodec<SpiritWorldGenerator> CODEC = RecordCodecBuilder.mapCodec(instance ->
             instance.group(
                     BiomeSource.CODEC.fieldOf("biome_source").forGetter(g -> g.biomeSource),
@@ -40,12 +38,11 @@ public class SpiritWorldGenerator extends ChunkGenerator {
             ).apply(instance, SpiritWorldGenerator::new)
     );
 
-    private final BiomeSource biomeSource; // keep a ref so the codec can serialize it
+    private final BiomeSource biomeSource;
     private final int minY;
     private final int height;
     private final int seaLevel;
 
-    /** Main ctor used by codec & programmatic creation */
     public SpiritWorldGenerator(BiomeSource biomeSource, int minY, int height, int seaLevel) {
         super(biomeSource);
         this.biomeSource = biomeSource;
@@ -54,17 +51,19 @@ public class SpiritWorldGenerator extends ChunkGenerator {
         this.seaLevel = seaLevel;
     }
 
-    /** Convenience: build a generator that uses minecraft:the_void via the dynamic registry. */
     public static SpiritWorldGenerator createVoid(DynamicRegistryManager drm,
                                                   int minY, int height, int seaLevel) {
-        var biomes = drm.getOrThrow(RegistryKeys.BIOME);
-        var voidBiome = biomes.getEntry(biomes.get(BiomeKeys.THE_VOID)); // (sometimes named getOrCreateEntry)
+        // --- FINAL FIX for 1.21.1 ---
+        // 1. Get the registry directly (it's not an Optional)
+        var biomeRegistry = drm.get(RegistryKeys.BIOME);
+
+        // 2. Call .getEntry() on the registry, which *does* return an Optional.
+        // 3. Handle that Optional.
+        var voidBiome = biomeRegistry.getEntry(BiomeKeys.THE_VOID)
+                .orElseThrow(() -> new IllegalStateException("Could not find THE_VOID biome"));
+
         return new SpiritWorldGenerator(new FixedBiomeSource(voidBiome), minY, height, seaLevel);
     }
-
-
-
-    // --- Void world: everything below is a no-op or "all air"
 
     @Override
     protected MapCodec<? extends ChunkGenerator> getCodec() {
@@ -73,34 +72,42 @@ public class SpiritWorldGenerator extends ChunkGenerator {
 
     @Override
     public void carve(ChunkRegion chunkRegion, long seed, NoiseConfig noiseConfig,
-                      net.minecraft.world.biome.source.BiomeAccess biomeAccess,
-                      StructureAccessor structureAccessor, Chunk chunk) { }
+                      BiomeAccess biomeAccess, StructureAccessor structureAccessor,
+                      Chunk chunk, GenerationStep.Carver carverStep) {
+    }
 
     @Override
-    public void buildSurface(ChunkRegion region, StructureAccessor structures, NoiseConfig noiseConfig, Chunk chunk) { }
+    public void buildSurface(ChunkRegion region, StructureAccessor structures, NoiseConfig noiseConfig, Chunk chunk) {
+    }
 
     @Override
-    public void populateEntities(ChunkRegion region) { }
+    public void populateEntities(ChunkRegion region) {
+    }
 
     @Override
-    public int getWorldHeight() { return height; }
+    public int getWorldHeight() {
+        return height;
+    }
 
     @Override
     public CompletableFuture<Chunk> populateNoise(Blender blender, NoiseConfig noiseConfig,
                                                   StructureAccessor structureAccessor, Chunk chunk) {
-        // air-only
         return CompletableFuture.completedFuture(chunk);
     }
 
     @Override
-    public int getSeaLevel() { return seaLevel; }
+    public int getSeaLevel() {
+        return seaLevel;
+    }
 
     @Override
-    public int getMinimumY() { return minY; }
+    public int getMinimumY() {
+        return minY;
+    }
 
     @Override
     public int getHeight(int x, int z, Heightmap.Type type, HeightLimitView world, NoiseConfig noiseConfig) {
-        return minY; // void
+        return minY;
     }
 
     @Override
@@ -111,7 +118,7 @@ public class SpiritWorldGenerator extends ChunkGenerator {
     }
 
     @Override
-    public void appendDebugHudText(List<String> text, NoiseConfig noiseConfig, BlockPos pos) {
+    public void getDebugHudText(List<String> text, NoiseConfig noiseConfig, BlockPos pos) {
         text.add("SpiritWorldGenerator (void)");
         text.add("minY=" + minY + " height=" + height + " seaLevel=" + seaLevel);
     }
