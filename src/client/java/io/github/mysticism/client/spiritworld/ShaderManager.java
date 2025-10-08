@@ -7,8 +7,6 @@ import org.ladysnake.satin.api.managed.ShaderEffectManager;
 import net.minecraft.util.Identifier;
 
 public final class ShaderManager {
-    // 1. Declare the shader effect, using the new simplified identifier.
-    //    "mysticism" is your mod ID, "red_channel" is the name of your .json file.
     public static final ManagedShaderEffect KUWAHARA_SHADER = ShaderEffectManager.getInstance()
             .manage(Identifier.of("mysticism", "shaders/post/kuwahara.json"));
 
