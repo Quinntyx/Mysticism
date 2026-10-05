@@ -115,6 +115,60 @@ public final class LandmarkCoreSelfTest {
         var distorted=one.select(List.of(landmark(31,0,0.5),hidden),embedding(0,0,0,0),1,frame(new Point3(0,0,0)),new Point3(0,0,0),new FogHorizons(1,2,3),policy,0,1,null,Set.of());
         check(distorted.representatives().getFirst().distortion()>0,"projection distortion reported/penalized");
     }
+    private static void radiusSafeLinearMedoids() {
+        var policy=new ImportancePolicy(1,20,0,0);
+        var selector=new RepresentativeSelector(new RepresentativeSelector.Config(10,1,4096,1,10000,1,1,0,0,100,1));
+        var frame=frame(new Point3(0,0,0)); var horizons=new FogHorizons(1000,2000,3000);
+        Landmark seed=landmark(1000,0,1),left=landmark(1001,-0.9,0.01);
+        List<Landmark> adversarial=new ArrayList<>(List.of(seed,left));
+        for(int i=0;i<10;i++) adversarial.add(landmark(1002+i,0.8+i*0.001,0.1));
+        var result=selector.select(adversarial,embedding(0,0,0,0),0,frame,new Point3(0,0,0),horizons,policy,0,0,null,Set.of());
+        Landmark medoid=adversarial.stream().filter(l->l.id().equals(result.representatives().getFirst().landmarkId())).findFirst().orElseThrow();
+        for(Landmark member:adversarial) check(medoid.baseEmbedding().distanceSquared(member.baseEmbedding())<1,"replacement honors reconstruction radius");
+        var invalidPrevious=new RepresentativeSelector.RepresentativeSet(0,frame.epoch(),0,PROFILE,List.of(
+                new RepresentativeSelector.Representative(seed.id(),adversarial.get(4).id(),1,0)));
+        var retained=selector.select(adversarial,embedding(0,0,0,0),1,frame,new Point3(0,0,0),horizons,policy,0,0,invalidPrevious,Set.of());
+        check(retained.representatives().getFirst().landmarkId().equals(seed.id()),"hysteresis cannot retain radius-invalid medoid");
+        Landmark pin=adversarial.get(4);
+        var pinned=selector.select(adversarial,embedding(0,0,0,0),1,frame,new Point3(0,0,0),horizons,policy,0,0,invalidPrevious,Set.of(pin.id()));
+        check(pinned.representatives().getFirst().landmarkId().equals(pin.id()),"pin preserves interactive medoid");
+        check(pin.baseEmbedding().distanceSquared(left.baseEmbedding())>1,"adversarial left member cannot remain assigned to pin");
+        check(pinned.equals(selector.select(adversarial.stream().filter(l->!l.id().equals(left.id())).toList(),embedding(0,0,0,0),1,frame,
+                new Point3(0,0,0),horizons,policy,0,0,invalidPrevious,Set.of(pin.id()))),"pinned medoid cost excludes radius-invalid member after reassignment");
+        var two=new RepresentativeSelector(new RepresentativeSelector.Config(10,1,4096,2,10000,2,1,0,0,100,1));
+        var covered=two.select(adversarial,embedding(0,0,0,0),1,frame,new Point3(0,0,0),horizons,policy,0,0,invalidPrevious,Set.of(pin.id()));
+        check(covered.representatives().size()==2 && covered.representatives().stream().anyMatch(r->r.landmarkId().equals(left.id())),"coverage seeds use pinned centers, not displaced seed anchors");
+        // Reassigning to pinned center excludes the far left member; ensure input ordering has no effect.
+        Collections.reverse(adversarial);
+        check(result.equals(selector.select(adversarial,embedding(0,0,0,0),0,frame,new Point3(0,0,0),horizons,policy,0,0,null,Set.of())),"radius certificate repeatable under order reversal");
+        List<Landmark> dense=new ArrayList<>();
+        for(int i=0;i<4096;i++) dense.add(landmark(20000+i,(i%128-64)*0.002,0.5));
+        long start=System.nanoTime();
+        var large=selector.select(dense,embedding(0,0,0,0),0,frame,new Point3(0,0,0),horizons,policy,0,0,null,Set.of());
+        var stats=selector.lastStats();
+        check(large.representatives().size()==1,"4096-candidate single cluster selection");
+        check(stats.medoidComponentOperations()<=4L*dense.size()*PROFILE.dimensions(),"medoid costs/certificates use linear component work");
+        check(stats.semanticDistanceEvaluations()<=4L*dense.size(),"seed and assignment distances linear for single representative");
+        System.out.println("4096 candidate selection: "+((System.nanoTime()-start)/1_000_000)+" ms; "+stats);
+        // Moment cost must agree with an explicit all-pairs reference on a small complete cluster.
+        List<Landmark> reference=new ArrayList<>(); Random random=new Random(809);
+        for(int i=0;i<12;i++) reference.add(landmark(new BlockPoint(40000+i,0,0),Bounds.cube(40000+i,0,0,1),
+                embedding(random.nextDouble()*0.1,random.nextDouble()*0.1,0,random.nextDouble()*0.1),0.2+random.nextDouble()*0.5,new SourceGeometry(List.of(),List.of()),0,new Ownership(List.of())));
+        Landmark best=null; double bestCost=Double.POSITIVE_INFINITY;
+        for(Landmark candidate:reference) {
+            double weight=0,reconstruction=0,distortion=0;
+            for(Landmark member:reference) {
+                double w=0.01+policy.score(member.baseEmbedding().distanceSquared(embedding(0,0,0,0)),10,member.baseImportance(),member.activity(),0);
+                double d=candidate.baseEmbedding().distanceSquared(member.baseEmbedding());
+                double p=frame.project(candidate.baseEmbedding()).distanceSquared(frame.project(member.baseEmbedding()))/10000;
+                weight+=w; reconstruction+=w*d; distortion+=w*Math.max(0,d-p);
+            }
+            double cost=(reconstruction+distortion)/weight/100;
+            if(cost<bestCost || cost==bestCost && candidate.id().compareTo(best.id())<0) { best=candidate; bestCost=cost; }
+        }
+        check(selector.select(reference,embedding(0,0,0,0),0,frame,new Point3(0,0,0),horizons,policy,0,0,null,Set.of())
+                .representatives().getFirst().landmarkId().equals(best.id()),"weighted moments match quadratic reference with hidden-axis distortion");
+    }
     private static void projectionAndDither() {
         Vec384f axis=vector(1,0,0,0); ProjectionFrame frame=new ProjectionFrame(5,7,embedding(0,0,0,0),new Point3(100,20,-30),axis,vector(0,1,0,0),vector(0,0,1,0),10); axis.mul(10); frame.axisX().mul(10);
         check(frame.project(embedding(1,2,3,0)).equals(new Point3(110,40,0)),"frozen basis and absolute origin");
@@ -193,7 +247,7 @@ public final class LandmarkCoreSelfTest {
         check(merged.geometry().sample(0,0,0).occupancy()==BlockSample.Occupancy.SOLID,"merge preserves source material");
     }
     public static void main(String[] args) {
-        octree(); geometryAndVectors(); importanceAndSelection(); projectionAndDither(); aliasesAndSplits(); reconciledMerges();
+        octree(); geometryAndVectors(); importanceAndSelection(); radiusSafeLinearMedoids(); projectionAndDither(); aliasesAndSplits(); reconciledMerges();
         System.out.println("LandmarkCoreSelfTest PASS ("+checks+" explicit checks)");
     }
 }

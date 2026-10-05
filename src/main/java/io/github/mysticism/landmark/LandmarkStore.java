@@ -8,6 +8,7 @@ import net.minecraft.util.WorldSavePath;
 import net.minecraft.world.PersistentState;
 import net.minecraft.world.PersistentStateManager;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.*;
 import java.util.function.Supplier;
 
@@ -22,6 +23,7 @@ public final class LandmarkStore extends PersistentState {
     public static final Type<LandmarkStore> TYPE=new Type<>(LandmarkStore::new,LandmarkStore::fromNbt,DataFixTypes.SAVED_DATA_COMMAND_STORAGE);
     private record Ref(String key,long revision) {}
     private record PageWrite(String key,Supplier<NbtCompound> encode) {}
+    private record CachedPage(GeometryPage page,int leaves) {}
     private final NavigableMap<String,Ref> records=new TreeMap<>();
     private final NavigableMap<String,String> aliases=new TreeMap<>();
     private final NavigableMap<String,Long> tombstones=new TreeMap<>();
@@ -30,24 +32,36 @@ public final class LandmarkStore extends PersistentState {
     private transient PersistentStateManager manager;
     private transient Thread owner;
     private transient PendingMutation pending;
+    private transient Path dataDirectory;
+    private transient GeometryRead activeRead;
+    public static final int DECODED_PAGE_LIMIT=8, DECODED_LEAF_LIMIT=65536;
+    private final LinkedHashMap<String,CachedPage> decoded=new LinkedHashMap<>(16,0.75f,true);
+    private final LinkedHashMap<String,LandmarkMetadata> metadataCache=new LinkedHashMap<>(16,0.75f,true);
+    private int residentLeaves;
+    private long decodedLeavesTotal;
+    public record CacheStats(int pages,int leaves,long reconstructedLeaves) {}
+    public CacheStats cacheStats() { checkThread(); return new CacheStats(decoded.size(),residentLeaves,decodedLeavesTotal); }
     private LandmarkStore() {}
     public static LandmarkStore get(MinecraftServer server) {
         if(!server.isOnThread()) throw new IllegalStateException("landmark store requires server thread");
         var world=server.getOverworld(); if(world==null) throw new IllegalStateException("overworld unavailable");
         var manager=world.getPersistentStateManager();
         LandmarkStore state=manager.get(TYPE,SAVE_KEY);
-        if(state==null && Files.exists(server.getSavePath(WorldSavePath.ROOT).resolve("data").resolve(SAVE_KEY+".dat")))
+        if(state==null && !Files.notExists(server.getSavePath(WorldSavePath.ROOT).resolve("data").resolve(SAVE_KEY+".dat")))
             throw new IllegalStateException("landmark manifest exists but could not be decoded");
         if(state==null) { state=new LandmarkStore(); manager.set(SAVE_KEY,state); }
-        state.attach(manager); return state;
+        state.attach(manager,server.getSavePath(WorldSavePath.ROOT).resolve("data")); return state;
     }
     // Package-private independent-manager entrypoint for deterministic persistence checks.
-    static LandmarkStore open(PersistentStateManager manager) {
-        LandmarkStore state=manager.getOrCreate(TYPE,SAVE_KEY); state.attach(manager); return state;
+    static LandmarkStore open(PersistentStateManager manager,Path directory) {
+        LandmarkStore state=manager.get(TYPE,SAVE_KEY);
+        if(state==null && !Files.notExists(directory.resolve(SAVE_KEY+".dat"))) throw new IllegalStateException("unreadable manifest");
+        if(state==null) { state=new LandmarkStore(); manager.set(SAVE_KEY,state); }
+        state.attach(manager,directory); return state;
     }
-    private void attach(PersistentStateManager manager) {
+    private void attach(PersistentStateManager manager,Path directory) {
         if(owner!=null && owner!=Thread.currentThread()) throw new IllegalStateException("different store thread");
-        this.manager=manager; owner=Thread.currentThread();
+        this.manager=manager; dataDirectory=directory; owner=Thread.currentThread();
     }
     private void checkThread() {
         if(manager==null || owner!=Thread.currentThread()) throw new IllegalStateException("unattached/off-thread landmark store");
@@ -61,21 +75,100 @@ public final class LandmarkStore extends PersistentState {
     public Map<String,String> aliases() { checkThread(); return Collections.unmodifiableMap(new TreeMap<>(aliases)); }
     public Map<String,Long> tombstones() { checkThread(); return Collections.unmodifiableMap(new TreeMap<>(tombstones)); }
     public Map<String,List<String>> lineage() { checkThread(); return Collections.unmodifiableMap(new TreeMap<>(lineage)); }
-    public Optional<Landmark> find(String id) {
+    /** Metadata-only: no geometry NBT copies or reconstruction. */
+    public Optional<LandmarkMetadata> metadata(String id) {
         checkThread(); id=resolve(id); Ref ref=records.get(id); if(ref==null) return Optional.empty();
-        Landmark value=LandmarkNbt.decodeLandmark(load(ref.key),this::loadGeometry);
+        LandmarkMetadata value=metadataCache.get(ref.key);
+        if(value==null) {
+            value=LandmarkNbt.decodeMetadata(load(ref.key)); metadataCache.put(ref.key,value);
+            while(metadataCache.size()>128) metadataCache.remove(metadataCache.keySet().iterator().next());
+        }
         if(!value.id().equals(id) || value.revision()!=ref.revision) throw new IllegalStateException("record/reference mismatch");
-        profile.requireCompatible(value.baseEmbedding().profile()); return Optional.of(value);
+        profile.requireCompatible(value.header().baseEmbedding().profile());
+        value.geometryKeys().forEach(LandmarkStore::checkKey); return Optional.of(value);
+    }
+    /** Compatibility lookup is cache-only. Explicit geometry reads are required on cache miss. */
+    public Optional<Landmark> find(String id) {
+        var metadata=metadata(id); if(metadata.isEmpty()) return Optional.empty();
+        if(metadata.get().geometryKeys().size()>DECODED_PAGE_LIMIT) throw new IllegalStateException("large landmark: stream beginGeometryRead batches instead of find");
+        List<GeometryPage> pages=new ArrayList<>();
+        for(String key:metadata.get().geometryKeys()) {
+            CachedPage cached=decoded.get(key);
+            if(cached==null) throw new IllegalStateException("geometry not hydrated; use beginGeometryRead: "+key);
+            pages.add(cached.page);
+        }
+        return Optional.of(LandmarkNbt.hydrate(metadata.get(),pages));
+    }
+    public List<LandmarkMetadata> sourceRange(String dimension,Bounds range,int maxResults,int maxScanned) {
+        return metadataRange(maxResults,maxScanned,m->m.header().dimension().equals(dimension) && m.header().bounds().intersects(range));
+    }
+    public List<LandmarkMetadata> semanticRange(LandmarkEmbedding current,double radius,int maxResults,int maxScanned) {
+        checkThread();
+        if(!Double.isFinite(radius) || radius<=0 || !Double.isFinite(radius*radius) || radius*radius==0) throw new IllegalArgumentException("radius");
+        if(profile!=null) profile.requireCompatible(current.profile());
+        return metadataRange(maxResults,maxScanned,m->m.header().baseEmbedding().distanceSquared(current)<radius*radius);
+    }
+    private List<LandmarkMetadata> metadataRange(int maxResults,int maxScanned,java.util.function.Predicate<LandmarkMetadata> filter) {
+        checkThread(); if(maxResults<0 || maxScanned<0 || records.size()>maxScanned) throw new IllegalArgumentException("metadata scan budget");
+        List<LandmarkMetadata> result=new ArrayList<>();
+        for(String id:records.keySet()) { LandmarkMetadata m=metadata(id).orElseThrow(); if(filter.test(m)) { if(result.size()==maxResults) throw new IllegalArgumentException("result budget"); result.add(m); } }
+        return List.copyOf(result);
+    }
+    private BlobState blob(String key) {
+        checkKey(key); BlobState state=manager.get(BlobState.TYPE,key);
+        // Vanilla get() conflates absent files with failed decoding (and caches null).
+        // Only a positively absent file permits creation; unreadability is NEVER replacement.
+        if(state==null && !Files.notExists(dataDirectory.resolve(key+".dat"))) throw new IllegalStateException("unreadable landmark page: "+key);
+        return state;
     }
     private NbtCompound load(String key) {
-        checkKey(key); BlobState blob=manager.get(BlobState.TYPE,key);
-        if(blob==null || blob.payload==null) throw new IllegalStateException("missing/corrupt landmark page: "+key);
-        return blob.payload.copy();
+        BlobState state=blob(key);
+        if(state==null || state.payload==null) throw new IllegalStateException("missing/corrupt landmark page: "+key);
+        return state.payload; // private read-only codecs; never exposed to callers
     }
-    private GeometryPage loadGeometry(String key) {
-        GeometryPage page=LandmarkNbt.decodeGeometry(load(key));
-        if(!geometryKey(page).equals(key)) throw new IllegalStateException("geometry/reference mismatch");
-        return page;
+    public GeometryRead beginGeometryRead(String id) {
+        checkThread(); if(activeRead!=null) throw new IllegalStateException("another geometry read is active");
+        activeRead=new GeometryRead(metadata(id).orElseThrow(()->new IllegalStateException("missing landmark"))); return activeRead;
+    }
+    /** One active read; batches hold <=8 pages. Drain before advancing. Budgets count cache hits too. */
+    public final class GeometryRead {
+        private final LandmarkMetadata metadata;
+        private final List<GeometryPage> ready=new ArrayList<>();
+        private int cursor;
+        private LandmarkNbt.GeometryDecoder decoder;
+        private boolean cancelled;
+        public boolean isCurrent() { checkThread(); Ref ref=records.get(metadata.id()); return ref!=null && ref.revision==metadata.revision(); }
+        private GeometryRead(LandmarkMetadata metadata) { this.metadata=metadata; }
+        public LandmarkMetadata metadata() { checkThread(); return metadata; }
+        public boolean complete() { checkThread(); return cursor==metadata.geometryKeys().size(); }
+        public int advance(int maxPages,int maxLeaves) {
+            checkThread(); if(cancelled) throw new IllegalStateException("cancelled read");
+            if(maxPages<1 || maxPages>DECODED_PAGE_LIMIT || maxLeaves<1 || maxLeaves>GeometryPage.MAX_LEAVES || !ready.isEmpty()) throw new IllegalArgumentException("read budget/drain required");
+            int pages=0,leaves=0;
+            while(!complete() && pages<maxPages && leaves<maxLeaves) {
+                String key=metadata.geometryKeys().get(cursor); CachedPage cached=decoded.get(key); GeometryPage page=cached==null?null:cached.page;
+                if(page==null) {
+                    if(decoder==null) decoder=new LandmarkNbt.GeometryDecoder(load(key));
+                    int worked=decoder.advance(maxLeaves-leaves); leaves+=worked; decodedLeavesTotal+=worked;
+                    if(!decoder.complete()) break;
+                    page=decoder.result(); int leafCount=decoder.leafCount(); decoder=null;
+                    if(!geometryKey(page).equals(key)) throw new IllegalStateException("geometry/reference mismatch");
+                    cache(key,page,leafCount);
+                }
+                if(!metadata.header().bounds().contains(page.bounds())) throw new IllegalStateException("page outside landmark");
+                ready.add(page); cursor++; pages++;
+            }
+            if(complete()) activeRead=null;
+            return leaves;
+        }
+        public List<GeometryPage> drain() { checkThread(); List<GeometryPage> out=List.copyOf(ready); ready.clear(); return out; }
+        public void cancel() { checkThread(); cancelled=true; decoder=null; ready.clear(); if(activeRead==this) activeRead=null; }
+    }
+    private void cache(String key,GeometryPage page,int leaves) {
+        CachedPage old=decoded.put(key,new CachedPage(page,leaves)); residentLeaves+=leaves-(old==null?0:old.leaves);
+        while(decoded.size()>DECODED_PAGE_LIMIT || residentLeaves>DECODED_LEAF_LIMIT) {
+            String first=decoded.keySet().iterator().next(); residentLeaves-=decoded.remove(first).leaves;
+        }
     }
     private static void checkKey(String key) {
         if(!key.matches("mysticism[.]landmark[.](geometry|record)[.]lm-[0-9a-f]{64}[.][0-9]+")) throw new IllegalArgumentException("invalid landmark page key");
@@ -90,7 +183,18 @@ public final class LandmarkStore extends PersistentState {
         Ref old=records.get(value.id());
         if(expectedRevision==-1?old!=null:old==null || old.revision!=expectedRevision) throw new IllegalStateException("stale landmark revision");
         if(old!=null && value.revision()<=old.revision) throw new IllegalArgumentException("non-increasing revision");
+        if(old!=null) metadata(value.id()).orElseThrow(()->new IllegalStateException("missing record")); // never bypass corrupt existing versions
         return stage(List.of(value),Set.of(),Map.of(),Map.of(),Map.of());
+    }
+    /** Activity/claims CAS retaining geometry references, without decoding any geometry leaves. */
+    public PendingMutation stageActivity(LandmarkRepository.RevisionRef ref,ActivityMetadata activity,Ownership ownership) {
+        unlocked(); LandmarkMetadata old=metadata(ref.id()).orElseThrow(()->new IllegalStateException("missing record"));
+        if(old.revision()!=ref.revision()) throw new IllegalStateException("stale landmark revision");
+        LandmarkMetadata next=new LandmarkMetadata(old.header().withActivity(activity,ownership),old.geometryKeys());
+        List<PageWrite> writes=new ArrayList<>();
+        for(String key:old.geometryKeys()) writes.add(new PageWrite(key,null)); // required immutable references; never recreated
+        writes.add(new PageWrite(recordKey(next.header()),()->LandmarkNbt.encodeMetadata(next)));
+        pending=new PendingMutation(List.copyOf(writes),List.of(next),Set.of(),Map.of(),Map.of(),Map.of(),profile); return pending;
     }
     public PendingMutation stageMerge(LandmarkRepository.VerifiedConnectivity proof,long tick,ImportancePolicy policy) {
         return stageMerge(proof,tick,policy,null);
@@ -112,7 +216,7 @@ public final class LandmarkStore extends PersistentState {
         var snapshot=repo.snapshot(); return stage(snapshot.landmarks(),Set.of(old.id()),Map.of(),snapshot.tombstones(),snapshot.lineage());
     }
     public PendingMutation stageDelete(LandmarkRepository.RevisionRef ref) {
-        unlocked(); Landmark l=find(ref.id()).orElseThrow(()->new IllegalStateException("missing record"));
+        unlocked(); Landmark l=metadata(ref.id()).orElseThrow(()->new IllegalStateException("missing record")).header();
         if(l.revision()!=ref.revision()) throw new IllegalStateException("stale landmark revision");
         return stage(List.of(),Set.of(l.id()),Map.of(),Map.of(l.id(),Math.addExact(l.revision(),1)),Map.of());
     }
@@ -130,11 +234,12 @@ public final class LandmarkStore extends PersistentState {
         }
         unique.forEach((key,page)->writes.add(new PageWrite(key,()->LandmarkNbt.encodeGeometry(page))));
         for(Landmark l:values) { String key=recordKey(l); checkKey(key); List<String> geometryKeys=l.geometry().pages().stream().map(LandmarkStore::geometryKey).toList(); writes.add(new PageWrite(key,()->LandmarkNbt.encodeLandmark(l,geometryKeys))); }
-        pending=new PendingMutation(List.copyOf(writes),List.copyOf(values),Set.copyOf(removals),Map.copyOf(newAliases),Map.copyOf(retired),Map.copyOf(history),nextProfile); return pending;
+        List<LandmarkMetadata> metadata=values.stream().map(l->LandmarkNbt.decodeMetadata(LandmarkNbt.encodeLandmark(l,l.geometry().pages().stream().map(LandmarkStore::geometryKey).toList()))).toList();
+        pending=new PendingMutation(List.copyOf(writes),metadata,Set.copyOf(removals),Map.copyOf(newAliases),Map.copyOf(retired),Map.copyOf(history),nextProfile); return pending;
     }
     public final class PendingMutation {
         private final List<PageWrite> writes;
-        private final List<Landmark> values;
+        private final List<LandmarkMetadata> values;
         private final Set<String> removals;
         private final Map<String,String> newAliases;
         private final Map<String,Long> retired;
@@ -142,7 +247,7 @@ public final class LandmarkStore extends PersistentState {
         private final EmbeddingProfile nextProfile;
         private int cursor;
         private boolean complete,cancelled;
-        private PendingMutation(List<PageWrite> writes,List<Landmark> values,Set<String> removals,Map<String,String> newAliases,Map<String,Long> retired,Map<String,List<String>> history,EmbeddingProfile nextProfile) {
+        private PendingMutation(List<PageWrite> writes,List<LandmarkMetadata> values,Set<String> removals,Map<String,String> newAliases,Map<String,Long> retired,Map<String,List<String>> history,EmbeddingProfile nextProfile) {
             this.writes=writes; this.values=values; this.removals=removals; this.newAliases=newAliases; this.retired=retired; this.history=history; this.nextProfile=nextProfile;
         }
         public boolean complete() { checkThread(); return complete; }
@@ -155,13 +260,18 @@ public final class LandmarkStore extends PersistentState {
             if(maxPages<=0) throw new IllegalArgumentException("page budget"); if(complete) return 0;
             int worked=0;
             while(cursor<writes.size() && worked<maxPages) {
-                PageWrite write=writes.get(cursor); NbtCompound encoded=write.encode.get(); BlobState old=manager.get(BlobState.TYPE,write.key);
-                if(old==null) { old=new BlobState(); old.payload=encoded.copy(); old.markDirty(); manager.set(write.key,old); }
-                else if(!encoded.equals(old.payload)) throw new IllegalStateException("immutable page version conflict: "+write.key);
+                PageWrite write=writes.get(cursor); BlobState old=blob(write.key);
+                if(write.encode==null) {
+                    if(old==null || old.payload==null) throw new IllegalStateException("missing geometry reference: "+write.key);
+                } else {
+                    NbtCompound encoded=write.encode.get();
+                    if(old==null) { old=new BlobState(); old.payload=encoded; old.markDirty(); manager.set(write.key,old); }
+                    else if(!encoded.equals(old.payload)) throw new IllegalStateException("immutable page version conflict: "+write.key);
+                }
                 cursor++; worked++;
             }
             if(cursor==writes.size() && worked<maxPages) {
-                removals.forEach(records::remove); for(Landmark l:values) records.put(l.id(),new Ref(recordKey(l),l.revision()));
+                removals.forEach(records::remove); for(LandmarkMetadata l:values) records.put(l.id(),new Ref(recordKey(l.header()),l.revision()));
                 aliases.putAll(newAliases); tombstones.putAll(retired); lineage.putAll(history); profile=nextProfile;
                 for(String id:List.copyOf(aliases.keySet())) aliases.put(id,resolve(id));
                 markDirty(); complete=true; pending=null; worked++;
@@ -175,7 +285,7 @@ public final class LandmarkStore extends PersistentState {
         private NbtCompound payload;
         private static final Type<BlobState> TYPE=new Type<>(BlobState::new,(n,r)->{
             if(!n.contains("payload",NbtElement.COMPOUND_TYPE)) throw new IllegalArgumentException("invalid page payload");
-            BlobState s=new BlobState(); s.payload=n.getCompound("payload").copy(); return s;
+            BlobState s=new BlobState(); s.payload=n.getCompound("payload"); return s;
         },DataFixTypes.SAVED_DATA_COMMAND_STORAGE);
         @Override public NbtCompound writeNbt(NbtCompound n,RegistryWrapper.WrapperLookup r) {
             if(payload==null) throw new IllegalStateException("uninitialized page"); n.put("payload",payload.copy()); return n;

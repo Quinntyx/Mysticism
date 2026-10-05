@@ -78,7 +78,9 @@ FrontierFace(String dimension,Bounds missingBounds,FrontierFace.Direction direct
   `WEST,EAST,DOWN,UP,NORTH,SOUTH`. Missing bounds, observation revision and resumable cursor
   are separately persisted; they are never inserted into known-air cells. Empty frontiers
   permit identity finalization, but do not prove geometric classification/connectivity.
-* A page is <=64 blocks on each axis with <=32768 known leaves and <=4096 palette entries.
+* `GeometryPage` is an immutable final value class (constructor/accessors/equality preserved,
+  not a Java record); the internal incremental codec certifies leaves as it reads them.
+  A page is <=64 blocks on each axis with <=32768 known leaves and <=4096 palette entries.
   Source geometry sorts pages/frontiers. Page AABBs may overlap only if their known masks
   are disjoint; conflicting known occupancy must be explicitly reconciled by an extractor.
 * `GeometryPage.knownCells()` returns full known leaves. `SourceGeometry.sample(long x,
@@ -180,6 +182,8 @@ RepresentativeSet select(Collection<Landmark> input,LandmarkEmbedding current,
 record Representative(String seedId,String landmarkId,double importance,double distortion)
 record RepresentativeSet(long attunementRevision,long projectionEpoch,long clusterEpoch,
     EmbeddingProfile profile,List<Representative> representatives)
+record SelectionStats(long semanticDistanceEvaluations,long medoidComponentOperations)
+SelectionStats lastStats()
 ```
 
 Semantic radius is Euclidean semantic units; cluster radius is the strict semantic
@@ -195,14 +199,29 @@ over-budget eligible pins/spatial pin quota conflicts throw instead of silently 
 
 Candidate budget uses bounded importance and ID ties, not nearest-distance truncation.
 Existing seed IDs survive compatible projection/cluster epochs, then deterministic weighted
-farthest-coverage seeds fill uncovered clusters. Members use nearest stable seed inside
-cluster radius; ties use IDs. Representatives minimize importance-weighted semantic
+farthest-coverage seeds fill uncovered clusters. Members use nearest assignment center inside
+cluster radius; ties use IDs. Unpinned clusters use their stable seed as assignment center.
+A pinned medoid becomes its seed's assignment/coverage center, so members are deterministically
+reassigned before pin decisions; retained unpinned medoids must certify the original group. Representatives minimize importance-weighted semantic
 reconstruction error + projection distortion + projected crowding + replacement cost.
 Semantic/error terms are normalized by semanticRadius squared; distortion measures lost
 squared semantic separation in the frozen 3D basis. Hysteresis is an additive normalized
 cost allowance for the retained medoid. Pinned medoids retain prior seed IDs when eligible.
-Spatial quotas apply during medoid choice. Uncovered/quota-constrained clusters can remain
-unrepresented; the result need not contain exactly maxRepresentatives.
+Spatial quotas apply during medoid choice. Every replacement and hysteretically retained
+medoid must certify strict cluster-radius coverage of every assigned member. The assignment
+center is already certified by membership gates; other candidates use a conservative
+coordinate-AABB farthest-corner certificate. This can reject an otherwise valid medoid,
+but never accepts an out-of-radius one. Pins remain centers and cannot retain far members.
+Uncovered/quota-constrained clusters can remain unrepresented; the result need not contain
+exactly maxRepresentatives.
+
+Weighted local-origin Welford moments evaluate quadratic semantic reconstruction and
+projected reconstruction in O(dimensions) per medoid, not all-pairs work. Distortion is
+clamped aggregate lost squared separation. With C capped candidates, K representatives
+and D dimensions, assignment/selection is O(C*K*D), excluding supplied-input enumeration
+and sorting; single-cluster medoid evaluation is O(C*D). `lastStats()` exposes deterministic
+operation counters for the latest call; selector instances are thread-confined. Retention
+hysteresis never bypasses the radius certificate.
 
 ## Frozen continuous projection, placement, dither and fog
 
@@ -244,9 +263,21 @@ never seed with chunk index, frame or camera. Preserve collision floors/portals 
 
 ```java
 static LandmarkStore get(MinecraftServer server)
-List<String> ids(); String resolve(String id); Optional<Landmark> find(String id);
+List<String> ids(); String resolve(String id);
+Optional<LandmarkMetadata> metadata(String id)
+List<LandmarkMetadata> sourceRange(String dimension,Bounds range,int maxResults,int maxScanned)
+List<LandmarkMetadata> semanticRange(LandmarkEmbedding current,double radius,int maxResults,int maxScanned)
+GeometryRead beginGeometryRead(String id)
+int GeometryRead.advance(int maxPages,int maxLeaves)
+List<GeometryPage> GeometryRead.drain()
+LandmarkMetadata GeometryRead.metadata()
+boolean GeometryRead.complete(); boolean GeometryRead.isCurrent(); void GeometryRead.cancel()
+Optional<Landmark> find(String id) // resident-cache only; throws when pages are not resident
+record CacheStats(int pages,int leaves,long reconstructedLeaves)
+CacheStats cacheStats()
 Map<String,String> aliases(); Map<String,Long> tombstones(); Map<String,List<String>> lineage();
 PendingMutation stagePut(Landmark value,long expectedRevision)
+PendingMutation stageActivity(RevisionRef ref,ActivityMetadata activity,Ownership ownership)
 PendingMutation stageMerge(VerifiedConnectivity proof,long tick,ImportancePolicy policy)
 PendingMutation stageMerge(VerifiedConnectivity proof,long tick,ImportancePolicy policy,
     SourceGeometry reconciled)
@@ -264,6 +295,28 @@ for source landmarks in other dimensions. Reads/mutations reject off-thread acce
 source chunk access is performed. One mutation may be pending at a time. Stage calls
 validate topology/profile; repeatedly advance with a positive per-tick page budget.
 
+`LandmarkMetadata(Landmark header,List<String> geometryKeys)` is immutable: `header()` has
+all identity/embedding/activity/claims/frontier metadata but **no geometry pages**. Its
+`id()` and `revision()` delegate to the header; keys refer to opaque immutable page versions.
+Do not interpret the empty header pages as known empty terrain. Metadata lookups and
+source/semantic ranges never copy or reconstruct geometry NBT. Range calls are separate
+source-AABB/semantic-radius operations; require `maxScanned >= ids().size()` and reject
+result overflow instead of truncating. Metadata LRU holds at most 128 decoded headers.
+
+One geometry cursor can be active. Advance with 1..8 pages and 1..32768 leaves of work;
+return value counts newly reconstructed leaves (cached pages count against the page budget).
+Drain the immutable batch before advancing again. Incomplete reads retain only one partial
+page and a batch of at most eight pages. Check `isCurrent()` before publishing an asynchronous
+result; activity changes also invalidate its metadata revision. Decoded geometry LRU is
+bounded by `DECODED_PAGE_LIMIT=8` and `DECODED_LEAF_LIMIT=65536`; original page versions
+are immutable and repeated resident reads reuse them. `find()` never performs cold geometry
+reads: warm all required pages first, or stream larger landmarks page-by-page via the cursor.
+`find()` throws if the full geometry exceeds these residency limits or has missing resident
+pages. Geometry-dependent merge/split convenience APIs likewise require resident geometry;
+large extraction/topology integrations must explicitly stream/reconcile within their budgets.
+`stageActivity()` retains opaque references and CAS-updates activity/claims without leaf
+reconstruction; each retained reference still consumes one bounded advance operation.
+
 Save key is `mysticism.landmarks.v1`. Geometry versions and landmark metadata versions are
 independent immutable PersistentStates, keyed `mysticism.landmark.geometry.<id>.<revision>`
 and `mysticism.landmark.record.<id>.<revision>`. Metadata refs are limited to 4096 geometry
@@ -276,7 +329,10 @@ all pages are staged. Cancellation leaves old topology and unreferenced pages.
 Vanilla `PersistentStateManager.save()` performs disk writes; staging does not force IO.
 States use `DataFixTypes.SAVED_DATA_COMMAND_STORAGE` (required non-null in Yarn 1.21.1),
 with independent strict landmark schema 1; no automatic custom-schema migration. Missing
-or invalid refs/pages/embeddings fail loudly. Vanilla files are **not a multi-file crash
+or invalid refs/pages/embeddings fail loudly. Vanilla conflates missing files with decoder
+failures; this store only creates a page after positively checking file absence. An existing
+unreadable geometry/record file throws and is never dirtied or replaced, even when vanilla
+has cached a failed read as null. Vanilla files are **not a multi-file crash
 transaction**: an interrupted cross-file save may require repair and will fail on missing
 pages rather than invent empty geometry. Old/unreferenced versions are retained (no unsafe
 automatic deletion); vanilla owns its state cache. Budgeted writes are not a claim of
@@ -286,10 +342,18 @@ whole-world memory eviction or disk compaction.
 `decodeProfile(NbtCompound)`, `encodeGeometry(GeometryPage)`, `decodeGeometry(NbtCompound)`,
 `encodeLandmark(Landmark,List<String> geometryKeys)`,
 `decodeLandmark(NbtCompound,Function<String,GeometryPage> geometryLoader)`,
+`encodeMetadata(LandmarkMetadata)`, `decodeMetadata(NbtCompound)`,
+`hydrate(LandmarkMetadata,List<GeometryPage>)`,
 `putBounds(NbtCompound,String,Bounds)`, `getBounds(NbtCompound,String)`.
 Encoders return compounds except putBounds. Store also exposes standard
 `fromNbt(NbtCompound,RegistryWrapper.WrapperLookup)` / `writeNbt(...)` PersistentState hooks.
 Manifest aliases/tombstones/lineage are validated without loading geometry pages.
+`GeometryDecoder(NbtCompound)` offers `advance(int maxLeaves)`, `leafCount()`, `complete()`
+and `result()` for incremental reconstruction. Do not mutate its NBT input while a decode
+is active. Serialized leaves must be aligned power-of-two cubes so one entry cannot expand
+into many leaves and evade budgets. Header/palette decode and vanilla compressed-NBT reads
+are page-bounded but synchronous: leaf/page budgets are **not** a wall-clock/byte IO guarantee.
+Vanilla retains its raw PersistentStates independently of this bounded decoded cache.
 
 ## Checks and actual build status
 
@@ -309,6 +373,13 @@ randomized octree writes, negative boundaries, order-independent medoids/aliases
 caps/pins, projection/dither borders, reconciliation, strict NBT, bounded staging/cancel,
 thread guards, and actual compressed PersistentState disk reload of aliases/splits.
 The disk fixture uses an identity DFU test helper; production uses the server's real fixer.
+Review regressions cover compressed missing-payload and raw unreadable geometry/record
+files (expected vanilla error logs), byte-for-byte preservation after failed updates/save,
+metadata-only lookup/ranges/activity CAS, incremental 32768-leaf checkerboards, decoded LRU
+limits, cancelled/stale cursors, adversarial radius-invalid replacements/retention/pins,
+weighted-moment agreement with a quadratic reference, and deterministic operation caps for
+4096-candidate single-cluster selection. Timings are printed for diagnostics, never flaky
+pass/fail thresholds. Latest executed run: 802 core checks and 909 disk/NBT checks.
 
 Full Gradle `compileJava compileTestJava` was attempted with the supplied Gradle 8.13;
 it fails during existing build configuration because Loom 1.11-SNAPSHOT requires >=8.14.

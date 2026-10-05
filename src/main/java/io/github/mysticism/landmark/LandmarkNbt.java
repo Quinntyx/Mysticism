@@ -53,20 +53,56 @@ public final class LandmarkNbt {
         n.put("leaves",leaves); return n;
     }
     public static GeometryPage decodeGeometry(NbtCompound n) {
-        version(n); require(n,"resolution",NbtElement.INT_TYPE);
-        List<BlockPalette.State> palette=new ArrayList<>();
-        for(NbtElement element:list(n,"palette",NbtElement.COMPOUND_TYPE,4096)) {
-            NbtCompound entry=(NbtCompound)element,props=compound(entry,"properties"); Map<String,String> properties=new TreeMap<>();
-            for(String key:props.getKeys()) properties.put(key,string(props,key));
-            palette.add(new BlockPalette.State(string(entry,"block"),properties));
+        GeometryDecoder decoder=new GeometryDecoder(n);
+        decoder.advance(GeometryPage.MAX_LEAVES);
+        return decoder.result();
+    }
+    /** Incremental leaf reconstruction. Input is private store-owned NBT, never mutated here. */
+    public static final class GeometryDecoder {
+        private final String id;
+        private final long revision;
+        private final Bounds bounds;
+        private final BlockPalette palette;
+        private final NbtList leaves;
+        private SparseOctree<BlockSample> tree;
+        private int cursor;
+        private GeometryPage result;
+        public GeometryDecoder(NbtCompound n) {
+            version(n); require(n,"resolution",NbtElement.INT_TYPE);
+            id=string(n,"id"); revision=number(n,"revision"); bounds=getBounds(n,"bounds");
+            GeometryPage.validateHeader(id,revision,bounds);
+            List<BlockPalette.State> palette=new ArrayList<>();
+            for(NbtElement element:list(n,"palette",NbtElement.COMPOUND_TYPE,4096)) {
+                NbtCompound entry=(NbtCompound)element,props=compound(entry,"properties"); Map<String,String> properties=new TreeMap<>();
+                for(String key:props.getKeys()) properties.put(key,string(props,key));
+                palette.add(new BlockPalette.State(string(entry,"block"),properties));
+            }
+            this.palette=new BlockPalette(palette);
+            tree=SparseOctree.empty(getBounds(n,"root"),n.getInt("resolution"),number(n,"maxSide"));
+            leaves=list(n,"leaves",NbtElement.COMPOUND_TYPE,GeometryPage.MAX_LEAVES);
         }
-        SparseOctree<BlockSample> tree=SparseOctree.empty(getBounds(n,"root"),n.getInt("resolution"),number(n,"maxSide"));
-        for(NbtElement element:list(n,"leaves",NbtElement.COMPOUND_TYPE,GeometryPage.MAX_LEAVES)) {
-            NbtCompound entry=(NbtCompound)element; Bounds b=getBounds(entry,"bounds"); require(entry,"palette",NbtElement.INT_TYPE);
-            if(!tree.rootBounds().contains(b) || !tree.query(b,1).isEmpty()) throw new IllegalArgumentException("overlapping/outside geometry leaves");
-            tree=tree.with(b,new BlockSample(BlockSample.Occupancy.valueOf(string(entry,"occupancy")),entry.getInt("palette")),8192);
+        public int advance(int maxLeaves) {
+            if(maxLeaves<1) throw new IllegalArgumentException("leaf budget");
+            int worked=0;
+            while(cursor<leaves.size() && worked<maxLeaves) {
+                NbtCompound entry=(NbtCompound)leaves.get(cursor); Bounds b=getBounds(entry,"bounds"); require(entry,"palette",NbtElement.INT_TYPE);
+                Bounds root=tree.rootBounds(); long side=b.maxX()-b.minX();
+                // Serialized entries must be actual leaves, not rectangles which could
+                // expand into many leaves and evade reconstruction/cache budgets.
+                if(!root.contains(b) || (side&(side-1))!=0 || b.maxY()-b.minY()!=side || b.maxZ()-b.minZ()!=side
+                        || (b.minX()-root.minX())%side!=0 || (b.minY()-root.minY())%side!=0 || (b.minZ()-root.minZ())%side!=0
+                        || !tree.query(b,1).isEmpty()) throw new IllegalArgumentException("unaligned/overlapping/outside geometry leaf");
+                BlockSample sample=new BlockSample(BlockSample.Occupancy.valueOf(string(entry,"occupancy")),entry.getInt("palette"));
+                GeometryPage.validateLeaf(bounds,palette,b,sample);
+                tree=tree.with(b,sample,8192);
+                cursor++; worked++;
+            }
+            if(cursor==leaves.size() && result==null) result=GeometryPage.decoded(id,revision,bounds,palette,tree);
+            return worked;
         }
-        return new GeometryPage(string(n,"id"),number(n,"revision"),getBounds(n,"bounds"),new BlockPalette(palette),tree);
+        public int leafCount() { return leaves.size(); }
+        public boolean complete() { return result!=null; }
+        public GeometryPage result() { if(result==null) throw new IllegalStateException("geometry read incomplete"); return result; }
     }
     public static NbtCompound encodeLandmark(Landmark l,List<String> geometryKeys) {
         if(geometryKeys.size()!=l.geometry().pages().size() || geometryKeys.size()>MAX_GEOMETRY_REFS
@@ -82,16 +118,31 @@ public final class LandmarkNbt {
         } n.put("frontiers",frontiers); return n;
     }
     public static Landmark decodeLandmark(NbtCompound n,Function<String,GeometryPage> geometryLoader) {
+        LandmarkMetadata metadata=decodeMetadata(n);
+        return hydrate(metadata,metadata.geometryKeys().stream().map(geometryLoader).toList());
+    }
+    public static Landmark hydrate(LandmarkMetadata metadata,List<GeometryPage> pages) {
+        Landmark l=metadata.header();
+        if(pages.size()!=metadata.geometryKeys().size()) throw new IllegalArgumentException("page count");
+        for(int i=0;i<pages.size();i++) if(!metadata.geometryKeys().get(i).equals("mysticism.landmark.geometry."+pages.get(i).id()+"."+pages.get(i).revision()))
+            throw new IllegalArgumentException("page reference mismatch");
+        return new Landmark(l.id(),l.dimension(),l.algorithmVersion(),l.kind(),l.biome(),l.anchor(),l.bounds(),l.baseEmbedding(),l.baseImportance(),l.activity(),l.ownership(),new SourceGeometry(pages,l.geometry().frontiers()),l.revision(),l.provenance());
+    }
+    public static NbtCompound encodeMetadata(LandmarkMetadata metadata) {
+        NbtCompound n=encodeLandmark(metadata.header(),List.of()); NbtList refs=new NbtList();
+        metadata.geometryKeys().forEach(key->refs.add(NbtString.of(key))); n.put("geometry",refs); return n;
+    }
+    public static LandmarkMetadata decodeMetadata(NbtCompound n) {
         version(n); require(n,"anchor",NbtElement.LONG_ARRAY_TYPE); long[] a=n.getLongArray("anchor"); if(a.length!=3) throw new IllegalArgumentException("anchor length");
         EmbeddingProfile profile=decodeProfile(compound(n,"profile")); require(n,"embedding",NbtElement.INT_ARRAY_TYPE); int[] bits=n.getIntArray("embedding");
         if(bits.length!=profile.dimensions()) throw new IllegalArgumentException("embedding dimension");
         float[] values=new float[bits.length]; for(int i=0;i<bits.length;i++) values[i]=Float.intBitsToFloat(bits[i]);
-        List<GeometryPage> pages=new ArrayList<>(); for(NbtElement ref:list(n,"geometry",NbtElement.STRING_TYPE,MAX_GEOMETRY_REFS)) pages.add(geometryLoader.apply(ref.asString()));
+        List<String> keys=new ArrayList<>(); for(NbtElement ref:list(n,"geometry",NbtElement.STRING_TYPE,MAX_GEOMETRY_REFS)) keys.add(ref.asString());
         List<Ownership.Claim> claims=new ArrayList<>(); for(NbtElement e:list(n,"claims",NbtElement.COMPOUND_TYPE,MAX_CLAIMS)) { NbtCompound c=(NbtCompound)e; claims.add(new Ownership.Claim(UUID.fromString(string(c,"player")),number(c,"tick"))); }
         List<FrontierFace> frontiers=new ArrayList<>(); for(NbtElement e:list(n,"frontiers",NbtElement.COMPOUND_TYPE,MAX_FRONTIERS)) {
             NbtCompound f=(NbtCompound)e; frontiers.add(new FrontierFace(string(f,"dimension"),getBounds(f,"missing"),FrontierFace.Direction.valueOf(string(f,"direction")),number(f,"revision"),string(f,"cursor")));
         }
-        return new Landmark(string(n,"id"),string(n,"dimension"),string(n,"algorithm"),Landmark.Kind.valueOf(string(n,"kind")),string(n,"biome"),new BlockPoint(a[0],a[1],a[2]),getBounds(n,"bounds"),
-                new LandmarkEmbedding(profile,new Vec384f(values)),real(n,"importance"),new ActivityMetadata(real(n,"activity"),number(n,"activityTick")),new Ownership(claims),new SourceGeometry(pages,frontiers),number(n,"revision"),string(n,"provenance"));
+        return new LandmarkMetadata(new Landmark(string(n,"id"),string(n,"dimension"),string(n,"algorithm"),Landmark.Kind.valueOf(string(n,"kind")),string(n,"biome"),new BlockPoint(a[0],a[1],a[2]),getBounds(n,"bounds"),
+                new LandmarkEmbedding(profile,new Vec384f(values)),real(n,"importance"),new ActivityMetadata(real(n,"activity"),number(n,"activityTick")),new Ownership(claims),new SourceGeometry(List.of(),frontiers),number(n,"revision"),string(n,"provenance")),keys);
     }
 }
