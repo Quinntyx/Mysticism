@@ -16,6 +16,13 @@ public final class PackagingSelfTest {
         if (!PackagingSelfTest.class.desiredAssertionStatus()) throw new IllegalStateException("Run with -ea");
         var good = fixture();
         ProductionJarVerifier.verify(archive(good), "1.0-test");
+        var escapedMetadata = new LinkedHashMap<>(good);
+        escapedMetadata.put("fabric.mod.json", text(new String(good.get("fabric.mod.json"), StandardCharsets.UTF_8)
+                .replace(">=21", "\\u003e\\u003d21")));
+        if (!new String(escapedMetadata.get("fabric.mod.json"), StandardCharsets.UTF_8)
+                .contains("\\u003e\\u003d21")) throw new AssertionError("Missing Unicode-escape fixture");
+        ProductionJarVerifier.verify(archive(escapedMetadata), "1.0-test");
+        descriptorRegressions();
         expectFailure(() -> ProductionJarVerifier.verify(archive(good), "wrong-version"), "Wrong mod version");
         for (String missing : new String[]{"LICENSE_mysticism.txt", "assets/mysticism/lang/en_us.json",
                 "mysticism.client.mixins.json", "io/github/mysticism/client/MysticismClient.class", "META-INF/jars/library.jar"}) {
@@ -81,13 +88,126 @@ public final class PackagingSelfTest {
             data.writeInt(0xCAFEBABE);
             data.writeShort(0);
             data.writeShort(major);
-            data.writeShort(3);
-            data.writeByte(1);
-            data.writeUTF(name);
-            data.writeByte(7);
-            data.writeShort(1);
+            data.writeShort(7);
+            utf8(data, "fixture/ClassReference");
+            data.writeByte(7); data.writeShort(1);
+            utf8(data, "java/lang/Object");
+            data.writeByte(7); data.writeShort(3);
+            utf8(data, name);
+            data.writeByte(7); data.writeShort(5);
+            classBody(data, false, false);
         }
         return output.toByteArray();
+    }
+
+    private enum DescriptorSite { FIELD, METHOD, NAME_AND_TYPE, METHOD_TYPE, STRING_LITERAL }
+
+    private static byte[] descriptorFixture(DescriptorSite site, String descriptor) throws Exception {
+        var output = new ByteArrayOutputStream();
+        try (var data = new DataOutputStream(output)) {
+            data.writeInt(0xCAFEBABE);
+            data.writeShort(0);
+            data.writeShort(65);
+            boolean extra = site != DescriptorSite.FIELD && site != DescriptorSite.METHOD;
+            data.writeShort(extra ? 8 : 7);
+            utf8(data, "fixture/DescriptorReference");
+            data.writeByte(7); data.writeShort(1);
+            utf8(data, "java/lang/Object");
+            data.writeByte(7); data.writeShort(3);
+            utf8(data, "value");
+            utf8(data, descriptor);
+            switch (site) {
+                case NAME_AND_TYPE -> { data.writeByte(12); data.writeShort(5); data.writeShort(6); }
+                case METHOD_TYPE -> { data.writeByte(16); data.writeShort(6); }
+                case STRING_LITERAL -> { data.writeByte(8); data.writeShort(6); }
+                default -> { }
+            }
+            classBody(data, site == DescriptorSite.FIELD, site == DescriptorSite.METHOD);
+        }
+        return output.toByteArray();
+    }
+
+    private static void classBody(DataOutputStream data, boolean field, boolean method) throws Exception {
+        data.writeShort(0x0421); // public abstract class, ACC_SUPER
+        data.writeShort(2); // this_class
+        data.writeShort(4); // super_class: java/lang/Object
+        data.writeShort(0); // interfaces
+        data.writeShort(field ? 1 : 0);
+        if (field) member(data, 0x0001);
+        data.writeShort(method ? 1 : 0);
+        if (method) member(data, 0x0401); // public abstract method
+        data.writeShort(0); // class attributes
+    }
+
+    private static void member(DataOutputStream data, int flags) throws Exception {
+        data.writeShort(flags);
+        data.writeShort(5); // name_index
+        data.writeShort(6); // descriptor_index, never CONSTANT_Class
+        data.writeShort(0); // attributes
+    }
+
+    private static void utf8(DataOutputStream data, String value) throws Exception {
+        data.writeByte(1);
+        data.writeUTF(value);
+    }
+
+    private static Class<?> defineFixture(byte[] bytes) {
+        // Check that descriptor regressions are complete JVM-valid classes, not
+        // truncated constant-pool fragments. Every fixture gets a fresh loader.
+        return new ClassLoader(null) {
+            Class<?> define() { return defineClass(null, bytes, 0, bytes.length); }
+        }.define();
+    }
+
+    private static void descriptorRegressions() throws Exception {
+        for (Class<?> type : new Class<?>[]{PackagingSelfTest.class, SelfTestRunner.class, ProductionJarVerifier.class}) {
+            try (var bytes = type.getResourceAsStream("/" + type.getName().replace('.', '/') + ".class")) {
+                if (bytes == null) throw new AssertionError("Missing compiled verifier fixture");
+                ProductionJarVerifier.verifyClass(bytes.readAllBytes());
+            }
+        }
+        for (String descriptor : new String[]{"()V", "(BCDFIJSZ)[[I"}) {
+            byte[] good = descriptorFixture(DescriptorSite.METHOD, descriptor);
+            defineFixture(good);
+            ProductionJarVerifier.verifyClass(good);
+        }
+        for (DescriptorSite site : DescriptorSite.values()) {
+            boolean method = site == DescriptorSite.METHOD || site == DescriptorSite.METHOD_TYPE;
+            String positive = method ? "(I[[Lnet/minecraft/class_2338;)Lnet/minecraft/server/MinecraftServer;"
+                    : "[[Lnet/minecraft/class_2338;";
+            byte[] good = descriptorFixture(site, positive);
+            defineFixture(good);
+            ProductionJarVerifier.verifyClass(good);
+            for (String type : new String[]{"ai/djl/Model", "net/minecraft/client/MinecraftClient"}) {
+                String descriptor = method ? "(I[L" + type + ";)V" : "L" + type + ";";
+                byte[] bad = descriptorFixture(site, descriptor);
+                Class<?> defined = defineFixture(bad);
+                if (site == DescriptorSite.STRING_LITERAL) {
+                    ProductionJarVerifier.verifyClass(bad); // literals are not linkage references
+                } else {
+                    expectFailure(() -> ProductionJarVerifier.verifyClass(bad),
+                            type.startsWith("ai/djl/") ? "Local model runtime class reference" : "Unremapped Minecraft class reference");
+                    if (site == DescriptorSite.FIELD) {
+                        try {
+                            defined.getDeclaredFields();
+                            throw new AssertionError("Descriptor fixture did not reproduce missing field type");
+                        } catch (NoClassDefFoundError expected) {
+                            // Isolated fixture loader deliberately cannot resolve the field type.
+                        }
+                    }
+                }
+            }
+        }
+        // Return-only references must be checked too, including arrays.
+        for (DescriptorSite site : new DescriptorSite[]{DescriptorSite.METHOD, DescriptorSite.NAME_AND_TYPE, DescriptorSite.METHOD_TYPE}) {
+            for (String type : new String[]{"ai/djl/Model", "net/minecraft/client/MinecraftClient"}) {
+                byte[] bad = descriptorFixture(site, "(IZ)[[L" + type + ";");
+                defineFixture(bad);
+                expectFailure(() -> ProductionJarVerifier.verifyClass(bad),
+                        type.startsWith("ai/djl/") ? "Local model runtime class reference" : "Unremapped Minecraft class reference");
+            }
+        }
+        System.out.println("Descriptor regressions passed (14 descriptor-only rejections, valid signatures, literal preservation)");
     }
 
     private static byte[] archive(Map<String, byte[]> entries) throws Exception {

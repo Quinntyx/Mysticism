@@ -49,7 +49,11 @@ tmux wait-for -S mysticism-build-done
 positive and negative packaging fixtures plus runner discovery/failure fixtures,
 and is independent of Minecraft source compilation. It checks missing resources/licenses/icons, unexpanded metadata,
 model-runtime leakage (including nested jars), Java versions and unmapped Minecraft
-class references. It can also run without Gradle or network access:
+class references, including field/method, name-and-type and method-type descriptors.
+Arbitrary string literals are not treated as linkage references. The Gradle task
+also validates the decoded `depends.java` value with its existing JsonSlurper,
+accepting Loom's Unicode-escaped comparison operators. The JDK-only packaging
+and bytecode checks can also run without Gradle or network access:
 
 ```sh
 mkdir -p build/build-selftest
@@ -130,3 +134,25 @@ agent owning the affected source, then rerun `build` and `verifyProductionJar`.
 
 Do not use the temporary diagnostic to claim a successful production build.
 The parent must merge the source migration and rerun normal checks.
+
+### Independent-review regression checks
+
+The review fixes add escaped-metadata acceptance and decoded Java requirement
+rejection tests, plus 14 descriptor-only rejection fixtures. The descriptor
+fixtures are complete Java 21 classes accepted by an isolated JVM class loader;
+field reflection reproduces `NoClassDefFoundError` for the missing types.
+Valid primitive/array/method signatures, real compiled verifier classes and
+arbitrary class-name string literals remain accepted.
+
+The following commands were run visibly in tmux with cached Gradle, offline:
+
+```sh
+./gradlew --offline --no-daemon --console=plain buildSelfTest processResources processClientResources
+./gradlew --offline --no-daemon --console=plain --continue build compileJava compileClientJava
+```
+
+The first passed. The second still failed on the same 19 unresolved DJL errors;
+client compilation was blocked. These fixes do not migrate application sources.
+The diagnostic artifact remains non-distributable; after merging the separately
+owned source migration, rerun normal `build` without exclusions or diagnostic
+classpath overrides.

@@ -73,7 +73,6 @@ public final class ProductionJarVerifier {
         }
         var icon = Pattern.compile("\"icon\"\\s*:\\s*\"([^\"]+)\"").matcher(metadata);
         if (icon.find()) required(entries, icon.group(1));
-        require(Pattern.compile("\"java\"\\s*:\\s*\">=21\"").matcher(metadata).find(), "Missing Java 21 requirement");
     }
 
     private static Map<String, byte[]> inspectArchive(byte[] bytes, int depth) throws IOException {
@@ -111,29 +110,106 @@ public final class ProductionJarVerifier {
             int size = input.readUnsignedShort();
             String[] utf8 = new String[size];
             int[] classes = new int[size];
+            int[] descriptors = new int[size];
             for (int i = 1; i < size; i++) {
                 switch (input.readUnsignedByte()) {
                     case 1 -> utf8[i] = input.readUTF();
                     case 7 -> classes[i] = input.readUnsignedShort();
-                    case 3, 4, 9, 10, 11, 12, 17, 18 -> input.skipNBytes(4);
+                    case 12 -> { // CONSTANT_NameAndType: field or method descriptor
+                        input.readUnsignedShort();
+                        descriptors[i] = input.readUnsignedShort();
+                    }
+                    case 16 -> descriptors[i] = input.readUnsignedShort(); // CONSTANT_MethodType
+                    case 3, 4, 9, 10, 11, 17, 18 -> input.skipNBytes(4);
                     case 5, 6 -> { input.skipNBytes(8); i++; }
-                    case 8, 16, 19, 20 -> input.skipNBytes(2);
+                    case 8, 19, 20 -> input.skipNBytes(2);
                     case 15 -> input.skipNBytes(3);
                     default -> throw new IOException("Unknown class constant pool tag");
                 }
             }
             for (int index : classes) {
                 if (index == 0) continue;
-                require(index < size && utf8[index] != null, "Invalid class reference");
-                String name = utf8[index];
-                // Array class entries use descriptors, e.g. [Lnet/minecraft/class_2338;.
-                name = name.replaceFirst("^\\[+L", "").replaceFirst(";$", "");
-                require(!name.startsWith("ai/djl/"), "Local model runtime class reference: " + name);
-                if (name.startsWith("net/minecraft/")) {
-                    require(STABLE_MINECRAFT_NAMES.contains(name) || name.matches("net/minecraft/class_[0-9]+(\\$.*)?"),
-                            "Unremapped Minecraft class reference: " + name);
-                }
+                String name = utf8At(utf8, index);
+                if (name.startsWith("[")) verifyDescriptor(name);
+                else verifyReference(name);
             }
+            // Only descriptor-bearing structures are inspected. CONSTANT_String and
+            // unrelated UTF-8 entries may legitimately contain named class literals.
+            for (int index : descriptors) {
+                if (index != 0) verifyDescriptor(utf8At(utf8, index));
+            }
+            input.skipNBytes(6); // access_flags, this_class, super_class
+            input.skipNBytes(2L * input.readUnsignedShort()); // interfaces
+            verifyMembers(input, utf8); // fields
+            verifyMembers(input, utf8); // methods
+            skipAttributes(input);
+            require(input.read() == -1, "Trailing class file data");
+        }
+    }
+
+    private static String utf8At(String[] utf8, int index) {
+        require(index > 0 && index < utf8.length && utf8[index] != null, "Invalid UTF-8 reference");
+        return utf8[index];
+    }
+
+    private static void verifyReference(String name) {
+        require(!name.startsWith("ai/djl/"), "Local model runtime class reference: " + name);
+        if (name.startsWith("net/minecraft/")) {
+            require(STABLE_MINECRAFT_NAMES.contains(name) || name.matches("net/minecraft/class_[0-9]+(\\$.*)?"),
+                    "Unremapped Minecraft class reference: " + name);
+        }
+    }
+
+    private static void verifyDescriptor(String descriptor) {
+        require(!descriptor.isEmpty(), "Empty class descriptor");
+        int offset = 0;
+        if (descriptor.charAt(0) == '(') {
+            offset = 1;
+            while (offset < descriptor.length() && descriptor.charAt(offset) != ')') {
+                offset = verifyType(descriptor, offset, false);
+            }
+            require(offset < descriptor.length(), "Unterminated method descriptor");
+            offset = verifyType(descriptor, offset + 1, true);
+        } else {
+            offset = verifyType(descriptor, offset, false);
+        }
+        require(offset == descriptor.length(), "Trailing class descriptor data");
+    }
+
+    private static int verifyType(String descriptor, int offset, boolean allowVoid) {
+        int dimensions = 0;
+        while (offset < descriptor.length() && descriptor.charAt(offset) == '[') {
+            require(++dimensions <= 255, "Excessive array dimensions");
+            offset++;
+        }
+        require(offset < descriptor.length(), "Incomplete class descriptor");
+        char type = descriptor.charAt(offset++);
+        if (type == 'L') {
+            int end = descriptor.indexOf(';', offset);
+            require(end > offset, "Unterminated or empty object descriptor");
+            verifyReference(descriptor.substring(offset, end));
+            return end + 1;
+        }
+        require("BCDFIJSZ".indexOf(type) >= 0 || (type == 'V' && allowVoid && dimensions == 0),
+                "Invalid descriptor type: " + type);
+        return offset;
+    }
+
+    private static void verifyMembers(DataInputStream input, String[] utf8) throws IOException {
+        int count = input.readUnsignedShort();
+        for (int i = 0; i < count; i++) {
+            input.readUnsignedShort(); // access_flags
+            utf8At(utf8, input.readUnsignedShort()); // name_index
+            verifyDescriptor(utf8At(utf8, input.readUnsignedShort()));
+            skipAttributes(input);
+        }
+    }
+
+    private static void skipAttributes(DataInputStream input) throws IOException {
+        int count = input.readUnsignedShort();
+        for (int i = 0; i < count; i++) {
+            input.readUnsignedShort(); // attribute_name_index
+            input.skipNBytes(Integer.toUnsignedLong(input.readInt()));
         }
     }
 
