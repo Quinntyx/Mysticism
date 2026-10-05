@@ -1,0 +1,22 @@
+// Optional Gradle init script: adds executable regressions, changes no plugin/dependency versions.
+allprojects {
+    afterEvaluate {
+        if (plugins.hasPlugin('java')) {
+            tasks.register('embeddingPipelineRegression', JavaExec) {
+                dependsOn tasks.named('testClasses')
+                classpath = sourceSets.test.runtimeClasspath
+                mainClass = 'io.github.mysticism.embedding.EmbeddingPipelineTest'
+                workingDir = layout.buildDirectory.dir('embedding-tests-runtime').get().asFile
+                doFirst { workingDir.mkdirs() }
+                jvmArgs '--add-modules', 'jdk.httpserver'
+            }
+            tasks.register('embeddingPersistenceRegression', JavaExec) {
+                dependsOn tasks.named('testClasses')
+                classpath = sourceSets.test.runtimeClasspath
+                mainClass = 'io.github.mysticism.embedding.EmbeddingPersistenceTest'
+                workingDir = layout.buildDirectory.dir('embedding-tests-runtime').get().asFile
+                doFirst { workingDir.mkdirs() }
+            }
+        }
+    }
+}

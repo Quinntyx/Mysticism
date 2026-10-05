@@ -9,30 +9,36 @@ public class Basis384f implements Cloneable {
     public Vec384f k;
 
     public Basis384f(Vec384f i, Vec384f j, Vec384f k) {
-        this.i = i;
-        this.j = j;
-        this.k = k;
+        EmbeddingSpace.requireCurrent(i); EmbeddingSpace.requireCurrent(j); EmbeddingSpace.requireCurrent(k);
+        this.i = i.clone();
+        this.j = j.clone();
+        this.k = k.clone();
     }
 
     public Basis384f() {
-        this(Vec384f.ZERO(), Vec384f.ZERO(), Vec384f.ZERO());
+        this(unitAxis(0), unitAxis(1), unitAxis(2));
     }
 
-    private static Basis384f createUnInit() {
-        return new Basis384f(null, null, null);
+    private static Vec384f unitAxis(int index) {
+        float[] values = new float[EmbeddingSpace.DIMENSIONS];
+        values[index] = 1;
+        return new Vec384f(values);
     }
 
     public int[] toBits() {
+        EmbeddingSpace.requireCurrent(i); EmbeddingSpace.requireCurrent(j); EmbeddingSpace.requireCurrent(k);
         return Arrays.stream(new int[][]{i.toBits(), j.toBits(), k.toBits()})
                 .flatMapToInt(Arrays::stream)
                 .toArray();
     }
 
     public static Basis384f fromBits(int[] bits) {
+        int d = EmbeddingSpace.DIMENSIONS;
+        if (bits.length != 3*d) throw new IllegalArgumentException("Invalid basis bit length");
         return new Basis384f(
-                Vec384f.fromBits(Arrays.copyOfRange(bits, 0, 384)),
-                Vec384f.fromBits(Arrays.copyOfRange(bits, 384, 768)),
-                Vec384f.fromBits(Arrays.copyOfRange(bits, 768, 1152))
+                Vec384f.fromBits(Arrays.copyOfRange(bits, 0, d)),
+                Vec384f.fromBits(Arrays.copyOfRange(bits, d, 2*d)),
+                Vec384f.fromBits(Arrays.copyOfRange(bits, 2*d, 3*d))
         );
     }
 

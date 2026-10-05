@@ -166,8 +166,8 @@ public final class BiomeSpiritualRegion implements ISpiritualRegion {
      * Scans positions in a 16×16 spiral centered at (8,8).
      */
     private static Optional<BlockPos> findSpawnInChunk(ServerWorld world, ChunkPos chunk) {
-        // ensure chunk is generated/loaded (blocking on server thread)
-        world.getChunk(chunk.x, chunk.z); // FULL by default
+        // Resolve only already-loaded chunks. Teleport discovery must not generate terrain.
+        if (!world.getChunkManager().isChunkLoaded(chunk.x, chunk.z)) return Optional.empty();
 
         // Spiral over local positions with center bias
         final int cx = (chunk.getStartX()) + 8;
@@ -203,6 +203,7 @@ public final class BiomeSpiritualRegion implements ISpiritualRegion {
 
     /** Column test at (x,z): SKY, no water, walkable below, air at pos. */
     private static Optional<BlockPos> tryColumn(ServerWorld world, int x, int z) {
+        if (!world.getChunkManager().isChunkLoaded(x >> 4, z >> 4)) return Optional.empty();
         int y = world.getTopY(Heightmap.Type.WORLD_SURFACE, x, z); // topmost ground-ish
         BlockPos pos = new BlockPos(x, y, z);
 

@@ -1,245 +1,119 @@
 package io.github.mysticism.embedding;
 
-import ai.djl.Application;
-import ai.djl.Model;
-import ai.djl.huggingface.translator.TextEmbeddingTranslatorFactory;
-import ai.djl.inference.Predictor;
-import ai.djl.repository.zoo.Criteria;
-import ai.djl.repository.zoo.ZooModel;
-import ai.djl.translate.TranslateException;
-import ai.djl.util.Progress;
-import io.github.mysticism.vector.Vec384f;
-import org.jetbrains.annotations.Nullable;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.io.InputStream;
-import java.net.URL;
+import com.google.gson.*;
+import io.github.mysticism.vector.*;
+import java.net.URI;
+import java.net.http.*;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.security.CodeSource;
-import java.util.Enumeration;
-import java.util.ServiceLoader;
-import ai.djl.repository.zoo.ZooProvider;
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.Flow;
 
-import java.nio.file.Path;
-import java.nio.file.Paths;
-
-public class EmbeddingService {
-    private static final Logger LOGGER = LoggerFactory.getLogger("Mysticism-EmbeddingService");
-
-    private Predictor<String, float[]> predictor;
-    private ZooModel<String, float[]> model;
-
+/** Official Ollama /api/tags and /api/embed protocol, including compatible deployments.
+ * Only reads administrator-provisioned models. No pull, zoo, fallback, or software installer.
+ */
+public final class EmbeddingService implements EmbeddingProvider {
+    private static final int MAX_RESPONSE_BYTES = 131072;
+    private final URI endpoint;
+    private final Duration timeout;
+    private final HttpClient client;
+    private volatile boolean closed;
     public EmbeddingService() {
-        LOGGER.info("Starting EmbeddingService initialization...");
-
-        try {
-            String svc = "META-INF/services/ai.djl.repository.zoo.ZooProvider";
-            ClassLoader cl = Thread.currentThread().getContextClassLoader();
-            Enumeration<URL> urls = cl.getResources(svc);
-            while (urls.hasMoreElements()) {
-                URL u = urls.nextElement();
-                LOGGER.info("[DJL] Service file: {}", u);
-                try (InputStream in = u.openStream()) {
-                    String text = new String(in.readAllBytes(), StandardCharsets.UTF_8);
-                    LOGGER.info("[DJL] Service contents:\n{}", text);
-                }
-            }
-
-            Thread.currentThread().setContextClassLoader(
-                    ai.djl.repository.zoo.ZooProvider.class.getClassLoader()
-            );
-
-            ServiceLoader<ZooProvider> loader = ServiceLoader.load(ZooProvider.class);
-            LOGGER.info("ZooProvider iface loaded by: " + ZooProvider.class.getClassLoader());
-
-            for (ZooProvider p : loader) {
-                Class<?> c = p.getClass();
-                CodeSource cs = c.getProtectionDomain().getCodeSource();
-                LOGGER.info("Found provider: " + c.getName());
-                LOGGER.info("  from JAR: " + (cs == null ? "unknown" : cs.getLocation()));
-                LOGGER.info("  classloader: " + c.getClassLoader());
-            }
-        } catch (Throwable t) {
-            t.printStackTrace();
-        }
-
-        long startTime = System.currentTimeMillis();
-
-        try {
-            LOGGER.info("Creating predictor for embedding model...");
-            this.model = loadModel();
-
-            if (this.model != null) {
-                this.predictor = this.model.newPredictor();
-
-                long duration = System.currentTimeMillis() - startTime;
-                LOGGER.info("EmbeddingService initialized successfully in {}ms", duration);
-
-                // Test the service
-                LOGGER.info("Running initialization test...");
-                try {
-                    float[] testEmbedding = this.predictor.predict("test");
-                    LOGGER.info("Initialization test passed - embedding dimension: {}", testEmbedding.length);
-                } catch (Exception e) {
-                    LOGGER.error("Initialization test failed!", e);
-                }
-            } else {
-                LOGGER.error("Failed to initialize model - model is null");
-            }
-        } catch (Exception e) {
-            LOGGER.error("Failed to initialize the embedding model!", e);
-            this.predictor = null;
-            this.model = null;
-        }
+        this(URI.create(System.getProperty("mysticism.embedding.endpoint", "http://127.0.0.1:11434/")),
+            Duration.ofMillis(Long.getLong("mysticism.embedding.connectTimeoutMillis", 2000)),
+            Duration.ofMillis(Long.getLong("mysticism.embedding.requestTimeoutMillis", 10000)));
     }
-
-    @Nullable
-    private ZooModel<String, float[]> loadModel() {
-        // Create progress tracker
-        Progress progressTracker = new LoggingProgress();
-
-        // Try with PyTorch zoo URL for MiniLM-L12-v2
-        try {
-            LOGGER.info("Attempting to load sentence-transformers/all-MiniLM-L12-v2...");
-            Criteria<String, float[]> criteria = Criteria.builder()
-                    .optApplication(Application.NLP.TEXT_EMBEDDING)
-                    .setTypes(String.class, float[].class)
-                    .optModelUrls("djl://ai.djl.huggingface.pytorch/sentence-transformers/all-MiniLM-L12-v2")
-                    .optEngine("PyTorch")
-                    .optProgress(progressTracker)
-                    .optTranslatorFactory(new TextEmbeddingTranslatorFactory())
-                    .build();
-
-            return criteria.loadModel();
-        } catch (Exception e) {
-            LOGGER.warn("HuggingFace Zoo MiniLM loading failed: {}", e.getMessage());
-        }
-
-        // Fallback to any available text embedding model
-        try {
-            LOGGER.info("Fallback: Attempting to load any available text embedding model...");
-            Criteria<String, float[]> criteria = Criteria.builder()
-                    .setTypes(String.class, float[].class)
-                    .optApplication(ai.djl.Application.NLP.TEXT_EMBEDDING)
-                    .optEngine("PyTorch")
-                    .optProgress(progressTracker)
-                    .build();
-
-            ZooModel<String, float[]> model = criteria.loadModel();
-            LOGGER.warn("Loaded fallback text embedding model instead of MiniLM-L12-v2");
-            return model;
-        } catch (Exception e) {
-            LOGGER.error("Fallback text embedding model failed: {}", e.getMessage());
-        }
-
-        LOGGER.error("All model loading attempts failed");
-        return null;
+    public EmbeddingService(URI endpoint, Duration connectTimeout, Duration requestTimeout) {
+        if (!Set.of("http","https").contains(endpoint.getScheme()) || endpoint.getHost()==null || endpoint.getUserInfo()!=null || endpoint.getQuery()!=null || endpoint.getFragment()!=null)
+            throw new IllegalArgumentException("Expected HTTP(S) Ollama base URL without credentials/query");
+        if (connectTimeout.toMillis()<1 || connectTimeout.toMillis()>120000 || requestTimeout.toMillis()<1 || requestTimeout.toMillis()>120000)
+            throw new IllegalArgumentException("Timeouts must be positive; requests at most 120 seconds");
+        if (!EmbeddingSpace.REVISION.matches("[a-f0-9]{64}")) throw new IllegalArgumentException("Model revision must be full SHA256 Ollama manifest digest");
+        this.endpoint=URI.create(endpoint.toString().replaceAll("/+$", "")+"/");this.timeout=requestTimeout;
+        this.client=HttpClient.newBuilder().connectTimeout(connectTimeout).followRedirects(HttpClient.Redirect.NEVER).build();
     }
-
-    /**
-     * Generates an embedding for a given text.
-     * @param text The item name (e.g., "Diamond Sword").
-     * @return A float array representing the vector, or null if prediction fails.
-     */
-    public Vec384f getEmbedding(String text) {
-        if (predictor == null) {
-            LOGGER.error("Predictor is not initialized, cannot get embedding for: {}", text);
-            return null;
-        }
-
-        try {
-            LOGGER.debug("Generating embedding for: {}", text);
-            float[] result = predictor.predict(text);
-            LOGGER.debug("Generated embedding with {} dimensions", result.length);
-            return new Vec384f(result);
-        } catch (TranslateException e) {
-            LOGGER.error("Failed to generate embedding for text: {}", text, e);
-            return null;
-        }
-    }
-
-    public void close() {
-        if (predictor != null) {
-            LOGGER.info("Closing EmbeddingService predictor...");
-            predictor.close();
-        }
-        if (model != null) {
-            LOGGER.info("Closing EmbeddingService model...");
-            model.close();
-            LOGGER.info("EmbeddingService closed");
-        }
-    }
-
-    /**
-     * Custom Progress implementation that logs progress to our logger
-     */
-    private static class LoggingProgress implements Progress {
-        private String currentTask = "";
-        private long totalBytes = 0;
-        private long lastUpdateTime = 0;
-        private long lastProgress = 0;
-        private static final long UPDATE_INTERVAL_MS = 1000; // Update every second
-
-        @Override
-        public void reset(String task, long max) {
-            this.currentTask = task != null ? task : "Model Download";
-            this.totalBytes = max;
-            this.lastProgress = 0;
-            this.lastUpdateTime = System.currentTimeMillis();
-            LOGGER.info("Starting: {} (Total: {})", currentTask, max > 0 ? max + " bytes" : "unknown size");
-        }
-
-        @Override
-        public void reset(String task, long max, String message) {
-            reset(task, max);
-            if (message != null && !message.isEmpty()) {
-                LOGGER.info("Additional info: {}", message);
+    public EmbeddingProfile profile() { return EmbeddingProfile.current(); }
+    public void checkReady() throws Exception { verifyRevision(); infer("readiness probe"); verifyRevision(); }
+    private static String canonicalModel(String model) { return model.contains(":")?model:model+":latest"; }
+    private void verifyRevision() throws Exception {
+        JsonObject response=request("api/tags",null);
+        JsonArray models=response.getAsJsonArray("models");
+        if(models==null)throw new IllegalStateException("Ollama /api/tags missing models");
+        for(JsonElement entry:models) {
+            JsonObject model=entry.getAsJsonObject();
+            if(model.has("name") && canonicalModel(model.get("name").getAsString()).equals(canonicalModel(EmbeddingSpace.MODEL))) {
+                String digest=model.get("digest").getAsString().replaceFirst("^sha256:", "");
+                if(!EmbeddingSpace.REVISION.equals(digest))throw new IllegalStateException("Ollama model revision mismatch; refusing mixed embeddings");
+                return;
             }
         }
-
-        @Override
-        public void start(long initialProgress) {
-            this.lastProgress = initialProgress;
-            if (initialProgress > 0) {
-                LOGGER.info("Resuming from: {} bytes", initialProgress);
-            }
-        }
-
-        @Override
-        public void end() {
-            LOGGER.info("Completed: {}", currentTask);
-        }
-
-        @Override
-        public void increment(long increment) {
-            update(lastProgress + increment);
-        }
-
-        @Override
-        public void update(long progress) {
-            update(progress, null);
-        }
-
-        @Override
-        public void update(long progress, String message) {
-            this.lastProgress = progress;
-
-            long currentTime = System.currentTimeMillis();
-            if (currentTime - lastUpdateTime >= UPDATE_INTERVAL_MS) {
-                lastUpdateTime = currentTime;
-
-                if (totalBytes > 0) {
-                    double percentage = (progress * 100.0) / totalBytes;
-                    LOGGER.info("{}: {}% ({} / {} bytes) {}",
-                            currentTask, String.format("%.1f", percentage), progress, totalBytes,
-                            message != null ? " - " + message : "");
-                } else {
-                    LOGGER.info("{}: {} bytes downloaded {}",
-                            currentTask, progress,
-                            message != null ? " - " + message : "");
-                }
-            }
-        }
+        throw new IllegalStateException("Ollama model not provisioned: "+EmbeddingSpace.MODEL+" (administrator must provision explicitly)");
     }
+    public Vec384f getEmbedding(String descriptor) throws Exception {
+        verifyRevision();
+        Vec384f vector=infer(descriptor);
+        verifyRevision(); // Do not publish vectors if a deployment changed its tag during inference.
+        return vector;
+    }
+    private Vec384f infer(String descriptor) throws Exception {
+        if(descriptor==null || descriptor.isBlank() || descriptor.length()>8192)throw new IllegalArgumentException("Descriptor must be nonempty and at most 8192 characters");
+        JsonObject body=new JsonObject();body.addProperty("model",EmbeddingSpace.MODEL);
+        body.addProperty("input","search_document: "+descriptor);
+        body.addProperty("truncate",false); // 512-token overflow must be explicit, not silently changed semantics
+        JsonObject response=request("api/embed",body.toString());
+        if(!response.has("model") || !canonicalModel(response.get("model").getAsString()).equals(canonicalModel(EmbeddingSpace.MODEL)))
+            throw new IllegalStateException("Ollama response model mismatch");
+        return decodeEmbedding(response);
+    }
+    /** Native v2 768 -> first 256 -> L2, as documented. Reject all other lengths. */
+    public static Vec384f decodeEmbedding(JsonObject response) {
+        JsonArray batch=response.getAsJsonArray("embeddings");
+        if(batch==null || batch.size()!=1)throw new IllegalArgumentException("Expected exactly one embedding");
+        JsonArray values=batch.get(0).getAsJsonArray();
+        if(values.size()!=EmbeddingSpace.NATIVE_DIMENSIONS)throw new IllegalArgumentException("Expected native Nomic v2 768 dimensions, got "+values.size());
+        float[] reduced=new float[EmbeddingSpace.DIMENSIONS];
+        for(int i=0;i<values.size();i++) {
+            JsonElement value=values.get(i);
+            if(!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber())throw new IllegalArgumentException("Non-numeric embedding");
+            double number=value.getAsDouble();
+            if(!Double.isFinite(number) || Math.abs(number)>Float.MAX_VALUE)throw new IllegalArgumentException("Nonfinite embedding");
+            if(i<reduced.length)reduced[i]=(float)number;
+        }
+        Vec384f vector=new Vec384f(reduced);
+        if(vector.length()==0)throw new IllegalArgumentException("Zero embedding");
+        return new Vec384f(vector.norm());
+    }
+    private JsonObject request(String path,String body) throws Exception {
+        if(closed)throw new IllegalStateException("Embedding provider closed");
+        HttpRequest.Builder request=HttpRequest.newBuilder(endpoint.resolve(path)).timeout(timeout).header("Accept","application/json");
+        if(body==null)request.GET();else request.header("Content-Type","application/json").POST(HttpRequest.BodyPublishers.ofString(body));
+        CompletableFuture<HttpResponse<byte[]>> future=client.sendAsync(request.build(), info->new LimitedBody());
+        try {
+            HttpResponse<byte[]> response=future.get(timeout.toMillis(),TimeUnit.MILLISECONDS);
+            if(response.statusCode()!=200)throw new IllegalStateException("Ollama HTTP "+response.statusCode()+" for "+path);
+            JsonElement parsed=JsonParser.parseString(new String(response.body(),StandardCharsets.UTF_8));
+            if(!parsed.isJsonObject())throw new IllegalArgumentException("Expected JSON response object");
+            return parsed.getAsJsonObject();
+        } catch(InterruptedException e){Thread.currentThread().interrupt();throw e;}
+        finally { if(!future.isDone())future.cancel(true); }
+    }
+    private static final class LimitedBody implements HttpResponse.BodySubscriber<byte[]> {
+        private final CompletableFuture<byte[]> result=new CompletableFuture<>();
+        private final java.io.ByteArrayOutputStream bytes=new java.io.ByteArrayOutputStream();
+        private Flow.Subscription subscription;
+        public CompletionStage<byte[]> getBody(){return result;}
+        public void onSubscribe(Flow.Subscription value){subscription=value;value.request(1);}
+        public void onNext(List<ByteBuffer> buffers){
+            for(ByteBuffer buffer:buffers){
+                if(buffer.remaining()>MAX_RESPONSE_BYTES-bytes.size()){subscription.cancel();result.completeExceptionally(new IllegalArgumentException("Oversized Ollama response"));return;}
+                byte[] chunk=new byte[buffer.remaining()];buffer.get(chunk);bytes.writeBytes(chunk);
+            }
+            subscription.request(1);
+        }
+        public void onError(Throwable error){result.completeExceptionally(error);}
+        public void onComplete(){result.complete(bytes.toByteArray());}
+    }
+    public void close(){closed=true;client.shutdownNow();}
 }

@@ -56,6 +56,7 @@ public class Mysticism implements ModInitializer, DedicatedServerModInitializer 
                 SpiritWorldGenerator.CODEC);
 
         ServerLifecycleEvents.SERVER_STARTED.register(this::onServerStarted);
+        ServerLifecycleEvents.SERVER_STOPPING.register(server -> EmbeddingHelper.shutdown());
         ServerWorldEvents.LOAD.register(this::onWorldLoad);
     }
 
@@ -67,19 +68,19 @@ public class Mysticism implements ModInitializer, DedicatedServerModInitializer 
     private void onServerStarted(MinecraftServer server) {
         LOGGER.info("Server started - initializing EmbeddingHelper without toast");
         EmbeddingHelper.initializeServer();
-        EmbeddingHelper.awaitReady();
         ItemEmbeddingIndexState itemIndex = ItemEmbeddingIndexState.get(server);
-        itemIndex.populateIfNeeded(() -> {
-            for (var item : Registries.ITEM) {
-                String id = Registries.ITEM.getId(item).toString();
-                io.github.mysticism.world.state.ItemEmbeddingIndexState.LOGGER.info("Indexing {}...", id);
-                itemIndex.getIndex().upsert(
-                    id,
-                    EmbeddingHelper.getEmbeddingBlocking(id).orElseThrow(() -> new IllegalStateException("Initial embedding cannot fail"))
-                );
+        var spatialIndex = io.github.mysticism.world.state.SpatialEmbeddingIndexState.get(server);
+        // Loading state never performs inference; no startup joins or model downloads.
+        EmbeddingHelper.readiness().whenComplete((ignored, error) -> {
+            if (error != null) {
+                LOGGER.warn("Embeddings unavailable; server remains usable. {}", error.toString());
+                return;
             }
-            itemIndex.touch();
         });
+        // Validate canonical registry/tag generations even when HTTP readiness fails.
+        // Generation builders compose readiness asynchronously; the server never joins.
+        itemIndex.populateAsync(server);
+        spatialIndex.rebuildAsync(server);
 
 
         // Start the horizon seeder

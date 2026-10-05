@@ -2,6 +2,7 @@ package io.github.mysticism.component;
 
 import io.github.mysticism.vector.Basis384f;
 import io.github.mysticism.vector.Vec384f;
+import io.github.mysticism.embedding.EmbeddingNbt;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtElement;
 import net.minecraft.registry.RegistryWrapper;
@@ -9,13 +10,14 @@ import org.ladysnake.cca.api.v3.component.ComponentV3;
 import org.ladysnake.cca.api.v3.component.sync.AutoSyncedComponent;
 
 /**
- * Three 384-D basis vectors stored as a {@link Basis384f}.
+ * Three current-profile basis vectors stored as a {@link Basis384f}.
  * Uses CCA's data API for persistence and sync.
  * <p>
  * NOTE: Mutating the returned Basis384f (e.g., setI/J/K) changes this component;
  * remember to call MysticismEntityComponents.LATENT_BASIS.sync(player) after edits.
  */
 public final class LatentBasis implements ComponentV3, AutoSyncedComponent {
+    private NbtCompound archive;
 
     // Requires Basis384f to have public constructors.
     private Basis384f basis = new Basis384f();
@@ -45,9 +47,9 @@ public final class LatentBasis implements ComponentV3, AutoSyncedComponent {
         );
     }
 
-    public void setI(Vec384f i) { this.basis.i = (i != null ? i.clone() : Vec384f.ZERO()); }
-    public void setJ(Vec384f j) { this.basis.j = (j != null ? j.clone() : Vec384f.ZERO()); }
-    public void setK(Vec384f k) { this.basis.k = (k != null ? k.clone() : Vec384f.ZERO()); }
+    public void setI(Vec384f i) { if (i != null) io.github.mysticism.vector.EmbeddingSpace.requireCurrent(i); this.basis.i = (i != null ? i.clone() : Vec384f.ZERO()); }
+    public void setJ(Vec384f j) { if (j != null) io.github.mysticism.vector.EmbeddingSpace.requireCurrent(j); this.basis.j = (j != null ? j.clone() : Vec384f.ZERO()); }
+    public void setK(Vec384f k) { if (k != null) io.github.mysticism.vector.EmbeddingSpace.requireCurrent(k); this.basis.k = (k != null ? k.clone() : Vec384f.ZERO()); }
 
     public Vec384f getI() { return this.basis.i; }
     public Vec384f getJ() { return this.basis.j; }
@@ -57,15 +59,19 @@ public final class LatentBasis implements ComponentV3, AutoSyncedComponent {
 
     @Override
     public void readFromNbt(NbtCompound tag, RegistryWrapper.WrapperLookup wrapperLookup) {
-        if (tag.contains("b", NbtElement.INT_ARRAY_TYPE)) {
-            this.basis = Basis384f.fromBits(tag.getIntArray("b"));
-        } else {
-            this.basis = new Basis384f();
+        archive = tag.contains("embeddingArchive") ? tag.getCompound("embeddingArchive").copy() : null;
+        if (EmbeddingNbt.compatible(tag) && tag.contains("b", NbtElement.INT_ARRAY_TYPE)) {
+            try { this.basis = Basis384f.fromBits(tag.getIntArray("b")); return; }
+            catch (IllegalArgumentException incompatible) { /* Preserve corrupt payload below. */ }
         }
+        archive = tag.copy();
+        this.basis = new Basis384f();
     }
 
     @Override
     public void writeToNbt(NbtCompound tag, RegistryWrapper.WrapperLookup wrapperLookup) {
+        EmbeddingNbt.stamp(tag);
         tag.putIntArray("b", this.basis.toBits());
+        if (archive != null) tag.put("embeddingArchive", archive.copy());
     }
 }
