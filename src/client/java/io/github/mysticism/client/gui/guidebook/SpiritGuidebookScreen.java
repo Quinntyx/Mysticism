@@ -28,6 +28,7 @@ public final class SpiritGuidebookScreen extends GuidebookScreen {
     private final Set<String> studied = new HashSet<>();
     private final List<IconPlacement> icons = new ArrayList<>();
     private Guidebook book;
+    private GuidebookConnections connections;
     private long revision = -1;
     private String entryId;
     private int page, focusIndex;
@@ -53,6 +54,7 @@ public final class SpiritGuidebookScreen extends GuidebookScreen {
         GuidebookLoader.Snapshot snapshot = GuidebookLoader.snapshot();
         if (snapshot.revision() != revision) {
             book = snapshot.book(); revision = snapshot.revision();
+            connections = new GuidebookConnections(book);
             Set<String> ids = new HashSet<>(); book.entries().forEach(e -> ids.add(e.id()));
             studied.retainAll(ids); history.removeIf(l -> l.id != null && !ids.contains(l.id));
             if (entryId != null && !ids.contains(entryId)) { entryId = null; page = 0; }
@@ -232,16 +234,7 @@ public final class SpiritGuidebookScreen extends GuidebookScreen {
         if (GuidebookLoader.snapshot().failed()) context.drawTextWithShadow(textRenderer, tr("guidebook.mysticism.reload_warning"), 8, 1, 0xffa0a0);
     }
     private void renderTree(DrawContext context) {
-        for (Guidebook.Entry e : book.entries()) for (String parent : e.parents()) {
-            Guidebook.Entry p = book.entry(parent);
-            GuidebookViewport.Point a = viewport.toScreen(p.x(), p.y(), originX(), originY());
-            GuidebookViewport.Point b = viewport.toScreen(e.x(), e.y(), originX(), originY());
-            // Vanilla axis-aligned elbow connections, bounded coordinates guaranteed by schema.
-            int ax = (int)a.x(), ay = (int)a.y(), bx = (int)b.x(), by = (int)b.y();
-            int color = studied.contains(parent) ? 0xffa185bc : 0xff53405f;
-            context.drawHorizontalLine(Math.min(ax, bx), Math.max(ax, bx), ay, color);
-            context.drawVerticalLine(bx, Math.min(ay, by), Math.max(ay, by), color);
-        }
+        connections.render(context, viewport, originX(), originY(), left, top, right, bottom, studied);
         for (int i = 0; i < book.entries().size(); i++) {
             Guidebook.Entry e = book.entries().get(i);
             GuidebookViewport.Point p = viewport.toScreen(e.x(), e.y(), originX(), originY());

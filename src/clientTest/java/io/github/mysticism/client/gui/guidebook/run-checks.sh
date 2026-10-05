@@ -30,3 +30,9 @@ javac --release 21 -encoding UTF-8 -d "$lifecycle" \
     "$pkg/GuidebookScreen.java" "$pkg/GuidebookShimmer.java" \
     "$root/src/clientTest/java/io/github/mysticism/client/gui/guidebook/GuidebookLifecycleChecks.java"
 java -ea -cp "$lifecycle" io.github.mysticism.client.gui.guidebook.GuidebookLifecycleChecks "$root"
+
+# Reuse the same submission-count fixture with real validated dense DAGs and viewport math.
+javac --release 21 -encoding UTF-8 -cp "$lifecycle:$out:$GSON_JAR" -d "$lifecycle" \
+    "$pkg/GuidebookConnections.java" \
+    "$root/src/clientTest/java/io/github/mysticism/client/gui/guidebook/GuidebookConnectionChecks.java"
+java -ea -cp "$lifecycle:$out:$GSON_JAR" io.github.mysticism.client.gui.guidebook.GuidebookConnectionChecks "$root"

@@ -108,6 +108,7 @@ public final class GuidebookLifecycleChecks {
                 int stride = Math.max(18, (int)Math.ceil(Math.sqrt((double)size[0]*size[1]/1600)));
                 int pixels = ((size[0]+stride-1)/stride)*((size[1]+stride-1)/stride);
                 check(context.fills == (reduced ? 0 : pixels), "All pixels batched; reduced motion draws no pixels");
+                check(context.rectangles.stream().allMatch(r -> r.x2() - r.x1() == 2 && r.y2() - r.y1() == 2), "Shimmer cells retain two-pixel dimensions");
                 if (size[0] == 1920 && !reduced) check(context.fills == 1620, "Original full-HD shimmer density retained");
             }
         }
