@@ -50,8 +50,28 @@ public final class EmbeddingPipelineTest {
         for(Metric metric:Metric.values()){
             var a=one.kNN(2,axis(0),metric);var b=two.kNN(2,axis(0),metric);
             check(a.stream().map(p->p.getKey()).toList().equals(List.of("a","m")),"KNN stable ties");check(a.equals(b),"Insertion-independent KNN");
+            for(int count:List.of(1,2,8)){
+                var results=one.kNN(count,axis(0),metric);
+                // Exact comparator used by the existing item/spatial command callers.
+                results.sort((x,y)->Float.compare(y.getValue(),x.getValue()));
+                var expected=List.of("a","m","z").subList(0,Math.min(count,3));
+                check(results.stream().map(p->p.getKey()).toList().equals(expected),"Command-compatible mutable KNN results");
+                results.clear();
+                check(one.kNN(count,axis(0),metric).stream().map(p->p.getKey()).toList().equals(expected),"Caller mutation cannot affect index or later results");
+            }
         }
         check(one.kNN(0,axis(0),Metric.COSINE).isEmpty(),"Zero k");
+        for(int count:List.of(0,-1)){
+            var empty=one.kNN(count,axis(0),Metric.COSINE);
+            empty.sort((x,y)->Float.compare(y.getValue(),x.getValue()));
+            empty.addAll(one.kNN(1,axis(0),Metric.COSINE));
+            check(empty.size()==1&&one.kNN(count,axis(0),Metric.COSINE).isEmpty(),"Nonpositive k returns independently owned mutable list");
+        }
+        SimpleKnnIndex emptyIndex=new SimpleKnnIndex();
+        var missing=emptyIndex.kNN(1,axis(0),Metric.COSINE);
+        missing.sort((x,y)->Float.compare(y.getValue(),x.getValue()));
+        missing.addAll(one.kNN(1,axis(0),Metric.COSINE));
+        check(emptyIndex.size()==0&&emptyIndex.kNN(1,axis(0),Metric.COSINE).isEmpty(),"Empty index result remains mutable and independent");
         Vec384f submitted=axis(1);one.upsert("copy",submitted);submitted.mul(0);near(one.get("copy").length(),1);
         one.get("copy").mul(0);one.forEach((id,v)->v.mul(0));near(one.get("copy").length(),1);
         rejects(()->one.upsert("foreign",new Vec384f(axis(0).data(),"foreign")));

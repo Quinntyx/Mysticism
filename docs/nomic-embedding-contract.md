@@ -138,7 +138,9 @@ results, weighted inputs, indices and their snapshots are defensively copied.
 Clone before your own mutation. Provenance travels with clones; cross-profile
 math/index/weighted composition is rejected. `Vec384f.fromBits` is for **already
 profile-validated current state**, not a migration API. Never pad/truncate old
-MiniLM vectors. `SimpleKnnIndex.kNN` returns score-descending, ID-ascending ties;
+MiniLM vectors. `SimpleKnnIndex.kNN` returns an independently owned mutable list, sorted
+score-descending with ID-ascending ties (including mutable empty results);
+callers may sort or modify that list without changing the index.
 EUCLIDEAN scores are negative squared distances. Snapshot iteration/get/upsert
 cannot alias cached vectors. `BasisIntegrator384f.step(basis, current, target, ...)`
 uses target minus current; convergence clamps its factor to [0,1].

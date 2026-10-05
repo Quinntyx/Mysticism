@@ -5,6 +5,7 @@ import java.util.*;
 import java.util.function.BiConsumer;
 
 /** Exact KNN with copied snapshots and deterministic score-descending/id-ascending order.
+ * Results are independently owned, mutable lists for compatibility with callers that sort them.
  * EUCLIDEAN scores are negative squared distances, preserving the existing contract.
  */
 public final class SimpleKnnIndex implements KnnIndex {
@@ -19,7 +20,7 @@ public final class SimpleKnnIndex implements KnnIndex {
     private synchronized Map<String,Vec384f> snapshot() { Map<String,Vec384f> result=new TreeMap<>();data.forEach((id,v)->result.put(id,v.clone()));return result; }
     public List<Pair<String,Float>> kNN(int k,Vec384f query,Metric metric) {
         EmbeddingSpace.requireCurrent(query); Objects.requireNonNull(metric);
-        if(k<=0)return List.of();
+        if(k<=0)return new ArrayList<>();
         Vec384f q=query.clone();
         Comparator<Pair<String,Float>> best = Comparator.<Pair<String,Float>>comparingDouble(Pair::getValue).reversed().thenComparing(Pair::getKey);
         PriorityQueue<Pair<String,Float>> heap=new PriorityQueue<>(best.reversed());
@@ -29,7 +30,7 @@ public final class SimpleKnnIndex implements KnnIndex {
             Pair<String,Float> candidate=new Pair<>(id,score);
             if(heap.size()<k)heap.add(candidate);else if(best.compare(candidate,heap.peek())<0){heap.poll();heap.add(candidate);}
         });
-        List<Pair<String,Float>> result=new ArrayList<>(heap);result.sort(best);return List.copyOf(result);
+        List<Pair<String,Float>> result=new ArrayList<>(heap);result.sort(best);return result;
     }
     public void forEach(BiConsumer<String,Vec384f> consumer) { snapshot().forEach(consumer); }
 }
