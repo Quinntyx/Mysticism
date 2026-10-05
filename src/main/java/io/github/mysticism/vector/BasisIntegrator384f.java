@@ -17,8 +17,18 @@ package io.github.mysticism.vector;
 public final class BasisIntegrator384f {
     private BasisIntegrator384f() {}
 
-    /** @return true if the basis changed. */
+    /** Target-position API: turn toward target minus current, not the absolute target. */
+    public static boolean step(Basis384f basis, Vec384f current, Vec384f target, double dx, double dy, double dz, float eta) {
+        EmbeddingSpace.requireCurrent(current); EmbeddingSpace.requireCurrent(target);
+        return step(basis, target.clone().sub(current), dx, dy, dz, eta);
+    }
+
+    /** Direction API retained for compatibility. @return true if the basis changed. */
     public static boolean step(Basis384f B, Vec384f attunement, double dx, double dy, double dz, float eta) {
+        EmbeddingSpace.requireCurrent(B.i); EmbeddingSpace.requireCurrent(B.j); EmbeddingSpace.requireCurrent(B.k);
+        EmbeddingSpace.requireCurrent(attunement);
+        if (!Double.isFinite(dx) || !Double.isFinite(dy) || !Double.isFinite(dz) || !Float.isFinite(eta) || eta < 0)
+            throw new IllegalArgumentException("Invalid basis movement/rate");
         // 1) 3D movement magnitude (blocks)
         final double dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
         if (dist < 1e-8) return false; // idle
@@ -40,7 +50,15 @@ public final class BasisIntegrator384f {
 
         Vec384f t = aHat.clone().sub(u.clone().mul(ua)); // orth component
         float tLen = t.length();
-        if (tLen < 1e-8f) return false;
+        if (tLen < 1e-8f) {
+            if (ua >= 0) return false;
+            // Antiparallel vectors have no unique plane. Choose the least-aligned canonical
+            // axis deterministically, then remove its component along u.
+            float[] values = u.data(); int chosen = 0;
+            for (int n = 1; n < values.length; n++) if (Math.abs(values[n]) < Math.abs(values[chosen])) chosen = n;
+            float[] seed = new float[EmbeddingSpace.DIMENSIONS]; seed[chosen] = 1;
+            t = new Vec384f(seed).sub(u.clone().mul(values[chosen])); tLen = t.length();
+        }
         t.mul(1f / tLen); // unit, orth to u
 
         // 4) Fraction of remaining angle this step (eta ≈ percent per block)
@@ -68,9 +86,9 @@ public final class BasisIntegrator384f {
     /* ----------------- internals ----------------- */
 
     private static Vec384f lincomb(Vec384f i, Vec384f j, Vec384f k, float dx, float dy, float dz) {
-        float[] out = new float[384];
-        float[] a = i.data, b = j.data, c = k.data;
-        for (int n = 0; n < 384; n++) out[n] = a[n]*dx + b[n]*dy + c[n]*dz;
+        float[] out = new float[EmbeddingSpace.DIMENSIONS];
+        float[] a = i.data(), b = j.data(), c = k.data();
+        for (int n = 0; n < EmbeddingSpace.DIMENSIONS; n++) out[n] = a[n]*dx + b[n]*dy + c[n]*dz;
         return new Vec384f(out);
     }
 
@@ -91,11 +109,10 @@ public final class BasisIntegrator384f {
         addScaled(v, t, b2 - b);
     }
 
-    /** v := v + s * src (zero-alloc) */
+    /** v := v + s * src, without exposing either vector's arrays. */
     private static void addScaled(Vec384f v, Vec384f src, float s) {
         if (s == 0f) return;
-        float[] a = v.data, b = src.data;
-        for (int n = 0; n < 384; n++) a[n] += b[n] * s;
+        v.add(src.clone().mul(s));
     }
 
     private static void renormIfNeeded(Vec384f v) {

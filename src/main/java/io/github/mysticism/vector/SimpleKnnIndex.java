@@ -1,133 +1,36 @@
 package io.github.mysticism.vector;
 
 import ai.djl.util.Pair;
-
 import java.util.*;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiConsumer;
 
-import static io.github.mysticism.Mysticism.LOGGER;
-
-public class SimpleKnnIndex implements KnnIndex {
-    private final HashMap<String, Vec384f> data;
-    private final ReentrantReadWriteLock rw = new ReentrantReadWriteLock();
-
-
-    public SimpleKnnIndex(HashMap<String, Vec384f> data) {
-        this.data = data;
+/** Exact KNN with copied snapshots and deterministic score-descending/id-ascending order.
+ * Results are independently owned, mutable lists for compatibility with callers that sort them.
+ * EUCLIDEAN scores are negative squared distances, preserving the existing contract.
+ */
+public final class SimpleKnnIndex implements KnnIndex {
+    private final Map<String,Vec384f> data = new HashMap<>();
+    public SimpleKnnIndex() {}
+    public SimpleKnnIndex(HashMap<String,Vec384f> values) { values.forEach(this::upsert); }
+    public synchronized int size() { return data.size(); }
+    public synchronized void upsert(String id, Vec384f vector) { EmbeddingSpace.requireCurrent(vector); data.put(Objects.requireNonNull(id),vector.clone()); }
+    public synchronized Vec384f get(String id) { Vec384f v=data.get(id); return v==null?null:v.clone(); }
+    public synchronized void deltaUpdate(String id,Vec384f delta) { EmbeddingSpace.requireCurrent(delta); data.computeIfAbsent(id,k->Vec384f.ZERO()).add(delta); }
+    public synchronized void converge(List<String> keys,Vec384f target,float factor) { EmbeddingSpace.requireCurrent(target); for(String id:keys)data.computeIfAbsent(id,k->Vec384f.ZERO()).converge(target,factor); }
+    private synchronized Map<String,Vec384f> snapshot() { Map<String,Vec384f> result=new TreeMap<>();data.forEach((id,v)->result.put(id,v.clone()));return result; }
+    public List<Pair<String,Float>> kNN(int k,Vec384f query,Metric metric) {
+        EmbeddingSpace.requireCurrent(query); Objects.requireNonNull(metric);
+        if(k<=0)return new ArrayList<>();
+        Vec384f q=query.clone();
+        Comparator<Pair<String,Float>> best = Comparator.<Pair<String,Float>>comparingDouble(Pair::getValue).reversed().thenComparing(Pair::getKey);
+        PriorityQueue<Pair<String,Float>> heap=new PriorityQueue<>(best.reversed());
+        snapshot().forEach((id,v)->{
+            float score=switch(metric){case COSINE->v.cosine(q);case DOT->v.dot(q);case EUCLIDEAN->-v.squareDistance(q);};
+            if(!Float.isFinite(score))throw new IllegalArgumentException("Nonfinite KNN score");
+            Pair<String,Float> candidate=new Pair<>(id,score);
+            if(heap.size()<k)heap.add(candidate);else if(best.compare(candidate,heap.peek())<0){heap.poll();heap.add(candidate);}
+        });
+        List<Pair<String,Float>> result=new ArrayList<>(heap);result.sort(best);return result;
     }
-
-    public SimpleKnnIndex() {
-        this.data = new HashMap<>();
-    }
-
-    public int size() {
-        rw.readLock().lock();
-        try { return data.size(); }
-        finally { rw.readLock().unlock(); }
-    }
-
-    private static final long WRITE_WARN_MS = 2000;
-
-    public void upsert(String id, Vec384f v) {
-        long start = System.currentTimeMillis();
-        boolean ok = false;
-        try {
-            ok = rw.writeLock().tryLock(WRITE_WARN_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
-            if (!ok) {
-                LOGGER.warn("[KNN] writeLock timeout acquiring for upsert('{}')", id);
-                rw.writeLock().lock(); // block & acquire anyway, but we log a warning
-            }
-            this.data.put(id, v);
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            rw.writeLock().lock(); // fall back to blocking
-            this.data.put(id, v);
-        } finally {
-            rw.writeLock().unlock();
-        }
-    }
-
-
-    public Vec384f get(String id) {
-        rw.readLock().lock();
-        try {
-            Vec384f v = this.data.get(id);
-            return v != null ? v.clone() : null;
-        } finally {
-            rw.readLock().unlock();
-        }
-    }
-
-    public void deltaUpdate(String id, Vec384f delta) {
-        rw.writeLock().lock();
-        try {
-            this.data.computeIfAbsent(id, k -> Vec384f.ZERO()).add(delta);
-        } finally {
-            rw.writeLock().unlock();
-        }
-    }
-
-    public List<Pair<String, Float>> kNN(int k, Vec384f query, Metric metric) {
-        if (k <= 0) return new ArrayList<>();
-
-        List<Map.Entry<String, Vec384f>> snapshot;
-        rw.readLock().lock();
-        try {
-            snapshot = new ArrayList<>(data.entrySet());
-        } finally {
-            rw.readLock().unlock();
-        }
-
-        PriorityQueue<Pair<String, Float>> heap = new PriorityQueue<>(Comparator.comparingDouble(Pair::getValue));
-
-        for (Map.Entry<String, Vec384f> entry : snapshot) {
-            float score = switch (metric) {
-                case COSINE -> entry.getValue().cosine(query);
-                case DOT -> entry.getValue().dot(query);
-                // PriorityQueue is minheap, must flip Euclidean since we want smaller = closer
-                case EUCLIDEAN -> -1.f * entry.getValue().squareDistance(query);
-            };
-
-            if (heap.size() < k)
-                heap.add(new Pair<>(entry.getKey(), score));
-            else {
-                // we already early return if k == 0
-                // so this branch only triggers if heap already has elements
-                assert heap.peek() != null;
-                if (score > heap.peek().getValue()) { // if better than the current worst one
-                    heap.poll();
-                    heap.add(new Pair<>(entry.getKey(), score));
-                }
-            }
-        }
-
-        return new ArrayList<>(heap);
-
-    }
-
-    public void converge(List<String> affectedKeys, Vec384f target, float factor) {
-        rw.writeLock().lock();
-        try {
-            for (String key : affectedKeys)
-                this.data.computeIfAbsent(key, k -> Vec384f.ZERO()).converge(target, factor);
-        } finally { rw.writeLock().unlock(); }
-    }
-
-    public void forEach(BiConsumer<String, Vec384f> consumer) {
-        List<Map.Entry<String, Vec384f>> snapshot;
-        rw.readLock().lock();
-        try {
-            snapshot = new ArrayList<>(data.entrySet());
-        } finally {
-            rw.readLock().unlock();
-        }
-        // Iterate with NO lock held
-        for (var e : snapshot) {
-            Vec384f copy = e.getValue() != null ? e.getValue().clone() : null;
-            consumer.accept(e.getKey(), copy);
-        }
-    }
-
+    public void forEach(BiConsumer<String,Vec384f> consumer) { snapshot().forEach(consumer); }
 }
-

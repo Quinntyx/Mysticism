@@ -235,13 +235,13 @@ public final class LatentCommands {
     }
 
     private static Vec384f canonicalSeed() {
-        float[] a = new float[384];
+        float[] a = new float[EmbeddingSpace.DIMENSIONS];
         a[0] = 1f;
         return new Vec384f(a);
     }
 
     private static Vec384f altSeed() {
-        float[] a = new float[384];
+        float[] a = new float[EmbeddingSpace.DIMENSIONS];
         a[1] = 1f;
         return new Vec384f(a);
     }
@@ -249,8 +249,8 @@ public final class LatentCommands {
     private static Vec384f hashedSeed(Vec384f v) {
         int h = Arrays.hashCode(v.data()); // uses a clone; fine for a seed
         Random r = new Random(h);
-        float[] a = new float[384];
-        for (int i = 0; i < 384; i++) a[i] = (r.nextFloat() - 0.5f);
+        float[] a = new float[EmbeddingSpace.DIMENSIONS];
+        for (int i = 0; i < EmbeddingSpace.DIMENSIONS; i++) a[i] = (r.nextFloat() - 0.5f);
         return new Vec384f(a);
     }
 

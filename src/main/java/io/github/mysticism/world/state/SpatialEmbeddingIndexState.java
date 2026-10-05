@@ -1,162 +1,117 @@
 package io.github.mysticism.world.state;
 
 import com.mojang.serialization.Codec;
-import com.mojang.serialization.Dynamic;
-import com.mojang.serialization.codecs.RecordCodecBuilder;
 import io.github.mysticism.Codecs;
-import io.github.mysticism.vector.KnnIndex;
-import io.github.mysticism.vector.SimpleKnnIndex;
-import io.github.mysticism.vector.Vec384f;
+import io.github.mysticism.embedding.*;
+import io.github.mysticism.vector.*;
+import io.github.mysticism.world.region.*;
 import io.github.mysticism.world.region.impl.BiomeSpiritualRegion;
-import io.github.mysticism.world.region.ISpiritualRegion;
-import net.minecraft.nbt.NbtCompound;
-import net.minecraft.nbt.NbtOps;
+import net.minecraft.nbt.*;
 import net.minecraft.registry.RegistryWrapper;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.world.PersistentState;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
+import org.slf4j.*;
 import java.util.*;
+import java.util.concurrent.*;
 
+/** Retains canonical region geometry across profile changes; vectors are rebuilt, never resized. */
 public class SpatialEmbeddingIndexState extends PersistentState {
-    public static final Logger LOGGER = LoggerFactory.getLogger("Mysticism-SpatialEmbeddingIndexState");
-    private static final String SAVE_KEY = "mysticism.spatial_index";
-
-    /** id -> embedding vector (stable, forward compatible) */
-    private static final Codec<Map<String, Vec384f>> EMBEDDING =
-            Codec.unboundedMap(Codec.STRING, Codecs.VEC384F);
-
-    /** id -> biome-region (vanilla-region bounded, possibly multiple ChunkBoxes) */
-    private static final Codec<Map<String, BiomeSpiritualRegion>> BIOME_MAP =
-            Codec.unboundedMap(Codec.STRING, BiomeSpiritualRegion.CODEC.codec());
-
-    /** In-memory stores */
-    private final KnnIndex index = new SimpleKnnIndex();
-    private final HashMap<String, ISpiritualRegion> regions = new HashMap<>();
-
-    public KnnIndex getIndex() { return index; }
-    public void touch() { this.markDirty(); }
-    public Map<String, ISpiritualRegion> regionsView() { return Collections.unmodifiableMap(regions); }
-
-    /**
-     * Persistent codec:
-     * - "embedding": map of id -> Vec384f (full snapshot of the KNN index)
-     * - "regions":   map of id -> BiomeSpiritualRegion (single type for now; extend later if you add more)
-     */
-    public static final Codec<SpatialEmbeddingIndexState> CODEC =
-            RecordCodecBuilder.create(i -> i.group(
-                    EMBEDDING.fieldOf("embedding").forGetter(SpatialEmbeddingIndexState::snapshotEmbeddings),
-                    BIOME_MAP.optionalFieldOf("regions", Map.of()).forGetter(SpatialEmbeddingIndexState::snapshotBiomeRegions)
-            ).apply(i, SpatialEmbeddingIndexState::fromSnapshot));
-
-    /** Decode path: rebuild KNN index and region map from snapshots. */
-    private static SpatialEmbeddingIndexState fromSnapshot(Map<String, Vec384f> embSnap,
-                                                           Map<String, BiomeSpiritualRegion> regionSnap) {
-        LOGGER.info("Loading SpatialIndex from snapshot");
-        SpatialEmbeddingIndexState s = new SpatialEmbeddingIndexState();
-
-        // restore vectors
-        embSnap.forEach(s.index::upsert);
-
-        // restore regions
-        s.regions.putAll(regionSnap);
-
-        return s;
+    public static final Logger LOGGER=LoggerFactory.getLogger("Mysticism-SpatialEmbeddingIndexState");
+    private static final String SAVE_KEY="mysticism.spatial_index";
+    private static final Codec<Map<String,Vec384f>> EMBEDDINGS=Codec.unboundedMap(Codec.STRING,Codecs.VEC384F);
+    private static final Codec<Map<String,BiomeSpiritualRegion>> BIOMES=Codec.unboundedMap(Codec.STRING,BiomeSpiritualRegion.CODEC.codec());
+    private static final Codec<Map<String,String>> DESCRIPTORS=Codec.unboundedMap(Codec.STRING,Codec.STRING);
+    private KnnIndex index=new SimpleKnnIndex();
+    private final Map<String,ISpiritualRegion> regions=new TreeMap<>();
+    private final Map<String,String> descriptors=new TreeMap<>();
+    private boolean needsRebuild;
+    private NbtCompound archive;
+    private CompletableFuture<Void> rebuilding;
+    public KnnIndex getIndex(){return index;}
+    public void touch(){markDirty();}
+    public Map<String,ISpiritualRegion> regionsView(){return Collections.unmodifiableMap(new TreeMap<>(regions));}
+    public ISpiritualRegion getRegion(String id){return regions.get(id);}
+    public boolean needsRebuild(){return needsRebuild;}
+    public boolean isRebuilding(){return rebuilding!=null&&!rebuilding.isDone();}
+    public static SpatialEmbeddingIndexState fromNbt(NbtCompound nbt,RegistryWrapper.WrapperLookup lookup){
+        var state=new SpatialEmbeddingIndexState();
+        // Decode geometry independently: legacy vector length must not discard canonical regions.
+        var decodedGeometry=BIOMES.parse(NbtOps.INSTANCE,nbt.get("regions"));
+        boolean geometryValid=decodedGeometry.error().isEmpty();
+        if(!geometryValid)LOGGER.warn("Malformed spatial geometry; archiving and retaining only valid regions");
+        var geometry=decodedGeometry.result();
+        geometry.ifPresent(state.regions::putAll);
+        if(!geometryValid && nbt.get("regions") instanceof NbtCompound rawRegions){
+            // Only wholly valid entries survive; partial decoded regions are not canonical geometry.
+            for(String id:rawRegions.getKeys())parseBiomeRegion(rawRegions.get(id)).ifPresent(region->state.regions.put(id,region));
+        }
+        if(EmbeddingNbt.compatible(nbt)){
+            try{
+                var vectors=EMBEDDINGS.parse(NbtOps.INSTANCE,nbt.get("embedding")).getOrThrow();
+                state.descriptors.putAll(DESCRIPTORS.parse(NbtOps.INSTANCE,nbt.get("descriptors")).getOrThrow());
+                state.needsRebuild=nbt.getBoolean("needsRebuild");
+                boolean complete=geometryValid&&geometry.isPresent()&&state.descriptors.keySet().equals(state.regions.keySet())
+                        && (state.needsRebuild ? vectors.isEmpty() : vectors.keySet().equals(state.regions.keySet()));
+                if(!complete)throw new IllegalArgumentException("Incomplete spatial generation");
+                vectors.forEach(state.index::upsert);
+                if(nbt.contains("archive"))state.archive=nbt.getCompound("archive").copy();
+                return state;
+            }catch(RuntimeException error){LOGGER.warn("Invalid spatial generation; archiving and rebuilding",error);}
+        }else LOGGER.warn("Incompatible spatial profile; preserving geometry, rebuilding biome/dimension descriptors");
+        state.archive=nbt.copy();state.index=new SimpleKnnIndex();state.descriptors.clear();state.needsRebuild=true;
+        state.regions.forEach((id,region)->{
+            if(region instanceof BiomeSpiritualRegion biome){String dimension=id.split("\\|",2)[0];state.descriptors.put(id,CanonicalDescriptors.region(dimension,biome.biomeId().toString()));}
+        });
+        state.markDirty();return state;
     }
-
-    /** Encode path: stable snapshot of embeddings. */
-    private Map<String, Vec384f> snapshotEmbeddings() {
-        Map<String, Vec384f> out = new HashMap<>();
-        index.forEach((id, vec) -> out.put(id, vec.clone()));
-        return out;
+    private static Optional<BiomeSpiritualRegion> parseBiomeRegion(NbtElement tag){return BiomeSpiritualRegion.CODEC.codec().parse(NbtOps.INSTANCE,tag).result();}
+    @Override public NbtCompound writeNbt(NbtCompound nbt,RegistryWrapper.WrapperLookup lookup){
+        EmbeddingNbt.stamp(nbt);Map<String,Vec384f> vectors=new TreeMap<>();index.forEach(vectors::put);
+        Map<String,BiomeSpiritualRegion> geometry=new TreeMap<>();regions.forEach((id,r)->{if(r instanceof BiomeSpiritualRegion b)geometry.put(id,b);});
+        nbt.put("embedding",EMBEDDINGS.encodeStart(NbtOps.INSTANCE,vectors).getOrThrow());
+        nbt.put("regions",BIOMES.encodeStart(NbtOps.INSTANCE,geometry).getOrThrow());
+        nbt.put("descriptors",DESCRIPTORS.encodeStart(NbtOps.INSTANCE,descriptors).getOrThrow());
+        nbt.putBoolean("needsRebuild",needsRebuild);
+        if(archive!=null)nbt.put("archive",archive.copy());return nbt;
     }
-
-    /** Encode path: only write biome regions (other region types can be added later). */
-    private Map<String, BiomeSpiritualRegion> snapshotBiomeRegions() {
-        Map<String, BiomeSpiritualRegion> out = new HashMap<>();
-        for (var e : regions.entrySet()) {
-            if (e.getValue() instanceof BiomeSpiritualRegion br) {
-                out.put(e.getKey(), br);
+    public static final PersistentState.Type<SpatialEmbeddingIndexState> TYPE=new PersistentState.Type<>(SpatialEmbeddingIndexState::new,SpatialEmbeddingIndexState::fromNbt,null);
+    public static SpatialEmbeddingIndexState get(MinecraftServer server){return server.getOverworld().getPersistentStateManager().getOrCreate(TYPE,SAVE_KEY);}
+    public CompletableFuture<Void> rebuildAsync(MinecraftServer server){
+        if(isRebuilding())return rebuilding.copy();
+        Map<String,String> canonical=new TreeMap<>();
+        var biomeRegistry=server.getRegistryManager().get(net.minecraft.registry.RegistryKeys.BIOME);
+        regions.forEach((id,region)->{
+            if(region instanceof BiomeSpiritualRegion biome){
+                var tags=biomeRegistry.getEntry(biome.biomeId()).map(entry->entry.streamTags().map(tag->tag.id().toString()).toList()).orElse(List.of());
+                canonical.put(id,CanonicalDescriptors.region(id.split("\\|",2)[0],biome.biomeId().toString(),tags));
             }
+        });
+        if(!needsRebuild&&descriptors.equals(canonical)&&index.size()==canonical.size())return CompletableFuture.completedFuture(null);
+        needsRebuild=true;index=new SimpleKnnIndex();descriptors.clear();descriptors.putAll(canonical);markDirty();
+        rebuilding=IndexGeneration.build(server,canonical).thenAccept(generation->{index=generation.index();descriptors.clear();descriptors.putAll(generation.descriptors());needsRebuild=false;markDirty();});
+        rebuilding.whenComplete((v,error)->{if(error!=null)LOGGER.warn("Spatial embeddings unavailable; preserved geometry remains unindexed",error);});
+        return rebuilding.copy();
+    }
+    public boolean putIfAbsent(String id,ISpiritualRegion region,Vec384f embedding){
+        if(regions.containsKey(id))return false;
+        if(needsRebuild)throw new IllegalStateException("Spatial generation awaiting rebuild");
+        EmbeddingSpace.requireCurrent(embedding);index.upsert(id,embedding);regions.put(id,region);
+        if(region instanceof BiomeSpiritualRegion biome)descriptors.put(id,CanonicalDescriptors.region(id.split("\\|",2)[0],biome.biomeId().toString()));
+        markDirty();return true;
+    }
+    /** Observed chunk boxes only: never expand a bounding box across unseen chunks. */
+    public void observeBiome(String id,BiomeSpiritualRegion region,String descriptor,Vec384f embedding){
+        if(needsRebuild)throw new IllegalStateException("Spatial generation awaiting rebuild");
+        EmbeddingSpace.requireCurrent(embedding);
+        ISpiritualRegion previous=regions.get(id);
+        if(previous instanceof BiomeSpiritualRegion old){
+            List<ChunkBox> boxes=new ArrayList<>(old.boxes());
+            for(var box:region.boxes())if(!boxes.contains(box))boxes.add(box);
+            if(boxes.size()==old.boxes().size())return;
+            region=new BiomeSpiritualRegion(old.regionX(),old.regionZ(),old.biomeId(),boxes);
         }
-        return out;
+        index.upsert(id,embedding);regions.put(id,region);descriptors.put(id,descriptor);markDirty();
     }
-
-    // ======== 1.21.4 Changes Start ========
-
-    /**
-     * Creates a state object from NBT data using the codec.
-     * This is the deserializer function required by PersistentState.Type.
-     */
-    // THIS IS THE LINE THAT WAS FIXED:
-    public static SpatialEmbeddingIndexState fromNbt(NbtCompound nbt, RegistryWrapper.WrapperLookup wrapperLookup) {
-        return CODEC.parse(new Dynamic<>(NbtOps.INSTANCE, nbt))
-                .resultOrPartial(LOGGER::error)
-                .orElseGet(SpatialEmbeddingIndexState::new);
-    }
-
-    /**
-     * Writes the state object to NBT data using the codec.
-     * This overrides the method in PersistentState.
-     */
-    @Override
-    public NbtCompound writeNbt(NbtCompound nbt, RegistryWrapper.WrapperLookup wrapperLookup) {
-        CODEC.encodeStart(NbtOps.INSTANCE, this)
-                .resultOrPartial(LOGGER::error)
-                .ifPresent(encodedNbt -> {
-                    if (encodedNbt instanceof NbtCompound compound) {
-                        compound.getKeys().forEach(key -> nbt.put(key, compound.get(key)));
-                    }
-                });
-        return nbt;
-    }
-
-    /**
-     * The state type for 1.21.4, which takes a supplier and a deserializer.
-     * The third argument (DataFixTypes) can be null if you are not using data fixers.
-     */
-    public static final PersistentState.Type<SpatialEmbeddingIndexState> TYPE =
-            new PersistentState.Type<>(SpatialEmbeddingIndexState::new, SpatialEmbeddingIndexState::fromNbt, null);
-
-    /**
-     * Accessor that creates/loads on world startup.
-     * The save key is now passed as a separate argument to getOrCreate.
-     */
-    public static SpatialEmbeddingIndexState get(MinecraftServer server) {
-        ServerWorld overworld = server.getOverworld();
-        if (overworld == null) {
-            throw new IllegalStateException("Overworld not available yet.");
-        }
-        return overworld.getPersistentStateManager().getOrCreate(TYPE, SAVE_KEY);
-    }
-
-    // ======== 1.21.4 Changes End ========
-
-    /** Insert if absent; also upserts the embedding. */
-    public boolean putIfAbsent(String id, ISpiritualRegion region, Vec384f embedding) {
-        if (regions.containsKey(id)) return false;
-        regions.put(id, region);
-        index.upsert(id, embedding);
-        touch();
-        return true;
-    }
-
-    /**
-     * Optional fast pre-check used by HorizonSeeder:
-     * returns true if ANY region already exists within the given vanilla region (rX,rZ)
-     * for this world's dimension.
-     *
-     * Keys are formatted as:
-     *   <dimId> | "vregion" | rX "," rZ | "|" | <biomeId>
-     */
-    public boolean hasAnyInVanillaRegion(ServerWorld world, int rX, int rZ) {
-        String prefix = world.getRegistryKey().getValue() + "|vregion|" + rX + "," + rZ + "|";
-        // A linear scan over keys is usually fine; optimize with a side-index if needed later.
-        for (String key : regions.keySet()) {
-            if (key.startsWith(prefix)) return true;
-        }
-        return false;
-    }
+    public boolean hasAnyInVanillaRegion(ServerWorld world,int rx,int rz){String prefix=world.getRegistryKey().getValue()+"|vregion|"+rx+","+rz+"|";return regions.keySet().stream().anyMatch(id->id.startsWith(prefix));}
 }
