@@ -13,7 +13,7 @@ import org.lwjgl.glfw.GLFW;
 import java.util.*;
 
 /** Vanilla widgets and original artwork; all progress here is session-local study progress. */
-public final class SpiritGuidebookScreen extends Screen {
+public final class SpiritGuidebookScreen extends GuidebookScreen {
     private record Location(String id, int page) {}
     private sealed interface Row permits Line, Icons { int height(); }
     private record Line(OrderedText text, int color) implements Row { public int height() { return 12; } }
@@ -78,7 +78,7 @@ public final class SpiritGuidebookScreen extends Screen {
         return addDrawableChild(b);
     }
     private void rebuildWidgets() {
-        clearChildren(); icons.clear();
+        clearGuidebookWidgets(); icons.clear();
         int gap = 4, slot = Math.max(20, (right - left - 3 * gap) / 4);
         button(tr("guidebook.mysticism.back"), left, 28, slot, this::back).active = entryId != null || !history.isEmpty();
         button(tr("guidebook.mysticism.center"), left + slot + gap, 28, slot, () -> {
@@ -113,14 +113,21 @@ public final class SpiritGuidebookScreen extends Screen {
             }
             button(tr("guidebook.mysticism.previous"), left, height - 26, 60, () -> turn(-1)).active = page > 0;
             button(tr("guidebook.mysticism.next"), right - 60, height - 26, 60, () -> turn(1)).active = page < sheets.size() - 1;
-            ButtonWidget study = button(tr(studied.contains(entryId) ? "guidebook.mysticism.read" : "guidebook.mysticism.mark_read"),
-                    left + 64, height - 26, Math.max(20, right - left - 128), () -> { studied.add(entryId); rebuildWidgets(); });
+            String studyId = entryId;
+            ButtonWidget study = button(tr(studied.contains(studyId) ? "guidebook.mysticism.read" : "guidebook.mysticism.mark_read"),
+                    left + 64, height - 26, Math.max(20, right - left - 128), () -> markStudied(studyId));
             study.active = !studied.contains(entryId) && book.readyToStudy(entryId, studied) && page == sheets.size() - 1;
             study.setTooltip(Tooltip.of(tr("guidebook.mysticism.study_hint")));
         } else {
             button(tr("guidebook.mysticism.open"), left, height - 26, Math.max(20, right - left),
                     () -> navigate(book.entries().get(focusIndex).id()));
         }
+    }
+    private void markStudied(String id) {
+        // Recheck eligibility; an obsolete callback must never mark null/a different entry.
+        if (id == null || !Objects.equals(entryId, id) || studied.contains(id)
+                || !book.readyToStudy(id, studied) || page != sheets.size() - 1) return;
+        studied.add(id); rebuildWidgets();
     }
     private String related(String item) {
         return book.entries().stream().filter(e -> e.icon().equals(item) && !e.id().equals(entryId))

@@ -164,7 +164,10 @@ public final class GuidebookChecks {
         rejected(() -> decode(source.replaceFirst("paragraph", "executable_command")));
         rejected(() -> decode(source.replaceFirst("\"target\": \"compass\"", "\"target\": \"missing\"")).validate(ITEMS::contains));
         check(lang.get("guidebook.mysticism.crossing.enter.body").getAsString().contains("/execute in mysticism:spirit run tp @s ~ ~ ~"), "Actual dimension command");
-        check(lang.get("guidebook.mysticism.attunement.practice.body").getAsString().contains("/latent set attune item minecraft:amethyst_shard"), "Actual attunement command");
+        String practice = lang.get("guidebook.mysticism.attunement.practice.body").getAsString();
+        check(practice.contains("/latent set attune item minecraft:amethyst_shard"), "Actual attunement command");
+        check(practice.contains("change the logging flag only") && practice.contains("not wired into the server lifecycle")
+                && practice.contains("ON does not promise actionbar output"), "Unwired periodic actionbar documented honestly");
     }
     private static void translated(JsonObject lang, String key) {
         check(lang.has(key) && lang.get(key).isJsonPrimitive() && !lang.get(key).getAsString().isBlank(), "Missing translation: " + key);

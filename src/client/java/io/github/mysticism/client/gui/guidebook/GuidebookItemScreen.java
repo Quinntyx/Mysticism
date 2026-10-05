@@ -10,7 +10,7 @@ import org.lwjgl.glfw.GLFW;
 import java.util.*;
 
 /** Read-only vanilla item details; the supplied mutable stack is defensively copied. */
-final class GuidebookItemScreen extends Screen {
+final class GuidebookItemScreen extends GuidebookScreen {
     private final Screen parent;
     private final ItemStack stack;
     private List<List<OrderedText>> pages = List.of();
@@ -29,7 +29,7 @@ final class GuidebookItemScreen extends Screen {
         buttons();
     }
     private void buttons() {
-        clearChildren();
+        clearGuidebookWidgets();
         addDrawableChild(ButtonWidget.builder(Text.translatable("guidebook.mysticism.back"), ignored -> close())
                 .dimensions(left, height - 28, right - left, 20).build());
         addDrawableChild(ButtonWidget.builder(Text.literal("<"), ignored -> turn(-1))
