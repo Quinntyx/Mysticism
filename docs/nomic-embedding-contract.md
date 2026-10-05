@@ -174,15 +174,51 @@ uses target minus current; convergence clamps its factor to [0,1].
 * `SpiritDeltaPayload.ID` is `mysticism:spirit/visible_delta_v2`. Its packet codec
   writes schema, fingerprint, dimensions, additions and removals in that order.
   Added vectors validate dimension/finiteness and copy arrays on both edges;
-  `Added.of(id, vector)` enforces current provenance. Counts are bounded to 4096.
+  `Added.of(id, vector)` enforces current provenance. Counts are bounded to 4096
+  per addition/removal stream; IDs are nonempty, well-formed UTF-16, at most 256
+  Java characters (at most 768 UTF-8 bytes). `MAX_ENCODED_BYTES = 1_048_000`
+  caps canonical payload bytes below 1 MiB with packet/channel/framing headroom,
+  independently of compression. Constructor and decoder reject oversized deltas.
+  `SpiritDeltaPayload.batches(List<Added>, List<String>)` returns immutable,
+  bounded packets preserving each stream's order; empty input returns no packets.
+  `encodedBytes()` reports exact codec bytes, excluding wrappers. Send all
+  batches in list order before updating the visibility snapshot; additions and
+  removals should have disjoint IDs (as visibility-set differences do).
   Old peers cannot interpret this protocol; update server and clients together.
   The existing visibility selection/rendering policy is not replaced here.
 * HorizonSeeder no longer mutates cached base vectors or adds random semantic
   jitter. The budget is loaded-**chunk lookups per tick**, 2..64 (initially 16),
-  despite the legacy `getRegionsPerTick()` name. `FULL,false` forbids loading or
-  generating chunks. Queue/pending limits are 1024/32; scans resume one lookup
-  at a time and reset on shutdown. Biomes are still chunk-center/sea-level
-  observations, not cave discovery, grounded cave descriptors or clustering.
+  despite the legacy `getRegionsPerTick()` name. `getWorldChunk(x,z)` returns
+  completed chunks without joining generation; null results are skipped.
+  **`getChunk(FULL,false)` is not a nonblocking guarantee**: it can still wait
+  on unfinished ticketed chunks and is not used for observation or spawn
+  discovery. Spawn scans read heightmaps/blocks from completed chunks and do
+  not cross into neighbors. Cached spawns require a completed chunk too.
+  Queue/pending limits are 1024/32; scans resume one lookup at a time and reset
+  on shutdown. Biomes are still chunk-center/sea-level observations, not cave
+  discovery, grounded cave descriptors or clustering. `ChunkBox` construction
+  and codec require ordered local coordinates within [0,31]. Region box lists
+  are bounded to 1024 and deduplicated. The pure
+  `BiomeSpiritualRegion.spawnCandidates(int budget)` returns at most 1024 unique
+  chunks with closest-first/coordinate-tie order and a cap including the center;
+  nonpositive budgets return no candidates. Invalid geometry is archived; only
+  completely valid sibling regions survive for rebuilding.
+
+## Integration needs outside this worktree's ownership
+
+* `command/EmbeddingCommand.executeGetInit` still performs
+  `EmbeddingHelper.getEmbedding(...).get()` and swallows failures. Command edits
+  in this assignment are dimension-only; its async feedback change belongs to
+  the command/contract owner. Replace that blocking code with `whenComplete`,
+  schedule feedback using `server.execute`, and explicitly report exceptional
+  completion, also checking server/player lifetime. Readiness is not permission
+  to block a tick on subsequent HTTP requests. This review finding remains open.
+* `dimension/spiritworld/SpiritVisibilityService` still sends one constructed
+  delta for 1643 items. The transport/visibility owner must use
+  `SpiritDeltaPayload.batches(added, removed)` and send **each** payload before
+  advancing `LAST`. No sender/client-render files were changed here. The byte
+  guard intentionally rejects oversized single deltas instead of silently
+  truncating or sending frames that Minecraft cannot decode.
 
 ## Clustering intent: not a fabricated task prefix
 

@@ -44,7 +44,7 @@ public final class HorizonSeeder {
         for(var player:server.getPlayerManager().getPlayerList()){
             int loaded=0,total=0;var pos=player.getChunkPos();
             for(int z=-2;z<=2&&remaining>0;z++)for(int x=-2;x<=2&&remaining>0;x++){
-                remaining--;total++;if(player.getServerWorld().getChunkManager().isChunkLoaded(pos.x+x,pos.z+z))loaded++;
+                remaining--;total++;if(player.getServerWorld().getChunkManager().getWorldChunk(pos.x+x,pos.z+z)!=null)loaded++;
             }
             if(total>0)worst=Math.min(worst,loaded/(double)total);if(remaining==0)break;
         }
@@ -79,8 +79,8 @@ public final class HorizonSeeder {
         }
         for(int checks=0;checks<chunkBudget&&!QUEUE.isEmpty()&&PENDING.size()<MAX_PENDING;checks++){
             Work work=QUEUE.removeFirst();int local=work.cursor++;int x=(work.rx<<5)+(local&31),z=(work.rz<<5)+(local>>5);
-            // FULL,false explicitly forbids forced generation/loading. Null means skip, later rescan.
-            Chunk chunk=work.world.getChunkManager().getChunk(x,z,ChunkStatus.FULL,false);
+            // Completed chunks only: getChunk(FULL,false) can still join ticketed generation.
+            WorldChunk chunk=work.world.getChunkManager().getWorldChunk(x,z);
             if(chunk!=null)observe(work,chunk,x,z,state);
             if(work.cursor<1024)QUEUE.addLast(work);
             else{ENQUEUED.remove(work.id);LAST_SCAN.put(work.id,server.getTicks());if(LAST_SCAN.size()>4096)LAST_SCAN.remove(LAST_SCAN.keySet().iterator().next());}

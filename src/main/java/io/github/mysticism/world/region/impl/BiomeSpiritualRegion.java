@@ -16,6 +16,8 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
+import java.util.LinkedHashSet;
+import net.minecraft.world.chunk.WorldChunk;
 
 public final class BiomeSpiritualRegion implements ISpiritualRegion {
     /** Vanilla region coordinate (chunk >> 5). */
@@ -29,15 +31,6 @@ public final class BiomeSpiritualRegion implements ISpiritualRegion {
 
     // ---- CODEC ----
 
-    private static final MapCodec<ChunkBox> BOX_CODEC = RecordCodecBuilder.mapCodec(i ->
-            i.group(
-                    Codec.INT.fieldOf("x0").forGetter(ChunkBox::minX),
-                    Codec.INT.fieldOf("z0").forGetter(ChunkBox::minZ),
-                    Codec.INT.fieldOf("x1").forGetter(ChunkBox::maxX),
-                    Codec.INT.fieldOf("z1").forGetter(ChunkBox::maxZ)
-            ).apply(i, ChunkBox::new)
-    );
-
     // BlockPos codec via long for compactness
     private static final Codec<BlockPos> BLOCKPOS_LONG_CODEC =
             Codec.LONG.xmap(BlockPos::fromLong, BlockPos::asLong);
@@ -47,7 +40,7 @@ public final class BiomeSpiritualRegion implements ISpiritualRegion {
                     Codec.INT.fieldOf("rx").forGetter(BiomeSpiritualRegion::regionX),
                     Codec.INT.fieldOf("rz").forGetter(BiomeSpiritualRegion::regionZ),
                     Identifier.CODEC.fieldOf("biome").forGetter(BiomeSpiritualRegion::biomeId),
-                    BOX_CODEC.codec().listOf().fieldOf("boxes").forGetter(BiomeSpiritualRegion::boxes),
+                    ChunkBox.CODEC.listOf(0, ChunkBox.MAX_CHUNKS).fieldOf("boxes").forGetter(BiomeSpiritualRegion::boxes),
                     BLOCKPOS_LONG_CODEC.optionalFieldOf("spawn").forGetter(BiomeSpiritualRegion::cachedSpawn)
             ).apply(i, BiomeSpiritualRegion::new)
     );
@@ -62,7 +55,8 @@ public final class BiomeSpiritualRegion implements ISpiritualRegion {
         this.regionX = rx;
         this.regionZ = rz;
         this.biomeId = biomeId;
-        this.boxes = List.copyOf(boxes);
+        if (boxes.size() > ChunkBox.MAX_CHUNKS) throw new IllegalArgumentException("Too many region boxes");
+        this.boxes = List.copyOf(new LinkedHashSet<>(boxes));
         this.cachedSpawn = spawn;
     }
 
@@ -82,40 +76,21 @@ public final class BiomeSpiritualRegion implements ISpiritualRegion {
      * @param maxChunksToScan safety cap; typical 128..512. Use Integer.MAX_VALUE to allow full scan (<= 1024).
      */
     public Optional<BlockPos> getOrComputeSpawn(ServerWorld world, int maxChunksToScan) {
-        if (cachedSpawn != null && cachedSpawn.isPresent()) return cachedSpawn;
-
-        // Center chunk for ordering (largest box)
-        ChunkBox largest = boxes.stream().max(Comparator.comparingInt(ChunkBox::area))
-                .orElseGet(() -> new ChunkBox(16, 16, 16, 16));
-        ChunkPos centerLocal = largest.centerLocal();
-        ChunkPos centerGlobal = localToGlobal(centerLocal);
-
-        // Build candidate list (all chunks in all boxes), distance-sorted
-        List<ChunkPos> candidates = enumerateAllChunksSorted(centerGlobal);
-
-        // 1) First: try the center chunk itself
-        Optional<BlockPos> center = findSpawnInChunk(world, centerGlobal);
-        if (center.isPresent()) {
-            cachedSpawn = center;
-            return cachedSpawn;
+        if (maxChunksToScan <= 0) return Optional.empty();
+        if (cachedSpawn.isPresent()) {
+            BlockPos p = cachedSpawn.get();
+            if (world.getChunkManager().getWorldChunk(p.getX() >> 4, p.getZ() >> 4) != null)
+                return cachedSpawn;
         }
-
-        // 2) Then: walk other chunks, capped
-        int scanned = 0;
-        for (ChunkPos c : candidates) {
-            if (c.equals(centerGlobal)) continue;
-            if (++scanned > Math.max(1, maxChunksToScan)) break;
-
-            Optional<BlockPos> p = findSpawnInChunk(world, c);
+        for (ChunkPos candidate : spawnCandidates(maxChunksToScan)) {
+            Optional<BlockPos> p = findSpawnInChunk(world, candidate);
             if (p.isPresent()) {
                 cachedSpawn = p;
-                return cachedSpawn;
+                return p;
             }
         }
-
-        // Not found (very rare: fully ocean, frozen oceans at night etc.)
-        cachedSpawn = Optional.empty();
-        return cachedSpawn;
+        // Preserve a temporarily unavailable cached location, but never publish it as ready.
+        return Optional.empty();
     }
 
     /**
@@ -143,19 +118,35 @@ public final class BiomeSpiritualRegion implements ISpiritualRegion {
         return new ChunkPos((regionX << 5) + local.x, (regionZ << 5) + local.z);
     }
 
-    /** Enumerate all chunks covered by boxes, sorted by distance to centerGlobal (Manhattan). */
-    private List<ChunkPos> enumerateAllChunksSorted(ChunkPos centerGlobal) {
+    /** Pure bounded discovery plan: unique chunks, closest-first, stable coordinate ties.
+     * At most 1024 candidates are ever allocated, even for overlapping persisted boxes.
+     * The returned budget includes the preferred center chunk.
+     */
+    public List<ChunkPos> spawnCandidates(int maxChunksToScan) {
+        int limit = Math.min(ChunkBox.MAX_CHUNKS, Math.max(0, maxChunksToScan));
+        if (limit == 0 || boxes.isEmpty()) return List.of();
+        ChunkBox largest = boxes.stream().max(Comparator.comparingInt(ChunkBox::area)
+                .thenComparingInt(ChunkBox::minX).thenComparingInt(ChunkBox::minZ)
+                .thenComparingInt(ChunkBox::maxX).thenComparingInt(ChunkBox::maxZ)).orElseThrow();
+        ChunkPos centerGlobal = localToGlobal(largest.centerLocal());
+        boolean[] seen = new boolean[ChunkBox.MAX_CHUNKS];
         ArrayList<ChunkPos> out = new ArrayList<>();
         for (ChunkBox b : boxes) {
             for (int z = b.minZ(); z <= b.maxZ(); z++) {
                 for (int x = b.minX(); x <= b.maxX(); x++) {
-                    out.add(localToGlobal(new ChunkPos(x, z)));
+                    int index = z * ChunkBox.REGION_SIDE + x;
+                    if (!seen[index]) {
+                        seen[index] = true;
+                        out.add(localToGlobal(new ChunkPos(x, z)));
+                    }
                 }
             }
+            if (out.size() == ChunkBox.MAX_CHUNKS) break;
         }
-        out.sort(Comparator.comparingInt(c ->
-                Math.abs(c.x - centerGlobal.x) + Math.abs(c.z - centerGlobal.z)));
-        return out;
+        out.sort(Comparator.<ChunkPos>comparingInt(c ->
+                Math.abs(c.x - centerGlobal.x) + Math.abs(c.z - centerGlobal.z))
+                .thenComparingInt(c -> c.x).thenComparingInt(c -> c.z));
+        return List.copyOf(out.subList(0, Math.min(limit, out.size())));
     }
 
     /**
@@ -166,8 +157,9 @@ public final class BiomeSpiritualRegion implements ISpiritualRegion {
      * Scans positions in a 16×16 spiral centered at (8,8).
      */
     private static Optional<BlockPos> findSpawnInChunk(ServerWorld world, ChunkPos chunk) {
-        // Resolve only already-loaded chunks. Teleport discovery must not generate terrain.
-        if (!world.getChunkManager().isChunkLoaded(chunk.x, chunk.z)) return Optional.empty();
+        // Ticket eligibility is insufficient: skip unfinished chunks without joining a future.
+        WorldChunk completed = world.getChunkManager().getWorldChunk(chunk.x, chunk.z);
+        if (completed == null) return Optional.empty();
 
         // Spiral over local positions with center bias
         final int cx = (chunk.getStartX()) + 8;
@@ -178,23 +170,23 @@ public final class BiomeSpiritualRegion implements ISpiritualRegion {
             // top & bottom rows
             for (int dx = -r; dx <= r; dx++) {
                 int x1 = cx + dx, z1 = cz - r;
-                Optional<BlockPos> p1 = tryColumn(world, x1, z1);
+                Optional<BlockPos> p1 = tryColumn(world, completed, x1, z1);
                 if (p1.isPresent()) return p1;
 
                 int z2 = cz + r;
                 if (r != 0) { // avoid duplicate when r==0
-                    Optional<BlockPos> p2 = tryColumn(world, x1, z2);
+                    Optional<BlockPos> p2 = tryColumn(world, completed, x1, z2);
                     if (p2.isPresent()) return p2;
                 }
             }
             // left & right cols (without corners)
             for (int dz = -r + 1; dz <= r - 1; dz++) {
                 int z1 = cz + dz, xL = cx - r;
-                Optional<BlockPos> pL = tryColumn(world, xL, z1);
+                Optional<BlockPos> pL = tryColumn(world, completed, xL, z1);
                 if (pL.isPresent()) return pL;
 
                 int xR = cx + r;
-                Optional<BlockPos> pR = tryColumn(world, xR, z1);
+                Optional<BlockPos> pR = tryColumn(world, completed, xR, z1);
                 if (pR.isPresent()) return pR;
             }
         }
@@ -202,17 +194,18 @@ public final class BiomeSpiritualRegion implements ISpiritualRegion {
     }
 
     /** Column test at (x,z): SKY, no water, walkable below, air at pos. */
-    private static Optional<BlockPos> tryColumn(ServerWorld world, int x, int z) {
-        if (!world.getChunkManager().isChunkLoaded(x >> 4, z >> 4)) return Optional.empty();
-        int y = world.getTopY(Heightmap.Type.WORLD_SURFACE, x, z); // topmost ground-ish
+    private static Optional<BlockPos> tryColumn(ServerWorld world, WorldChunk completed, int x, int z) {
+        // Radius 8 reaches a neighbor at local coordinate 16: do not read/scan that chunk.
+        if ((x >> 4) != completed.getPos().x || (z >> 4) != completed.getPos().z) return Optional.empty();
+        int y = completed.sampleHeightmap(Heightmap.Type.WORLD_SURFACE, x & 15, z & 15) + 1;
         BlockPos pos = new BlockPos(x, y, z);
 
         // Require sky and dry
         if (!world.isSkyVisible(pos)) return Optional.empty();
-        if (!world.getFluidState(pos).isEmpty()) return Optional.empty();
+        if (!completed.getFluidState(pos).isEmpty()) return Optional.empty();
 
-        var here = world.getBlockState(pos);
-        var below = world.getBlockState(pos.down());
+        var here = completed.getBlockState(pos);
+        var below = completed.getBlockState(pos.down());
 
         if (!here.isAir()) return Optional.empty();
         if (!below.isOpaque()) return Optional.empty(); // simple walkable check

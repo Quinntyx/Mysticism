@@ -37,14 +37,21 @@ public class SpatialEmbeddingIndexState extends PersistentState {
     public static SpatialEmbeddingIndexState fromNbt(NbtCompound nbt,RegistryWrapper.WrapperLookup lookup){
         var state=new SpatialEmbeddingIndexState();
         // Decode geometry independently: legacy vector length must not discard canonical regions.
-        var geometry=BIOMES.parse(NbtOps.INSTANCE,nbt.get("regions")).result();
+        var decodedGeometry=BIOMES.parse(NbtOps.INSTANCE,nbt.get("regions"));
+        boolean geometryValid=decodedGeometry.error().isEmpty();
+        if(!geometryValid)LOGGER.warn("Malformed spatial geometry; archiving and retaining only valid regions");
+        var geometry=decodedGeometry.result();
         geometry.ifPresent(state.regions::putAll);
+        if(!geometryValid && nbt.get("regions") instanceof NbtCompound rawRegions){
+            // Only wholly valid entries survive; partial decoded regions are not canonical geometry.
+            for(String id:rawRegions.getKeys())parseBiomeRegion(rawRegions.get(id)).ifPresent(region->state.regions.put(id,region));
+        }
         if(EmbeddingNbt.compatible(nbt)){
             try{
                 var vectors=EMBEDDINGS.parse(NbtOps.INSTANCE,nbt.get("embedding")).getOrThrow();
                 state.descriptors.putAll(DESCRIPTORS.parse(NbtOps.INSTANCE,nbt.get("descriptors")).getOrThrow());
                 state.needsRebuild=nbt.getBoolean("needsRebuild");
-                boolean complete=geometry.isPresent()&&state.descriptors.keySet().equals(state.regions.keySet())
+                boolean complete=geometryValid&&geometry.isPresent()&&state.descriptors.keySet().equals(state.regions.keySet())
                         && (state.needsRebuild ? vectors.isEmpty() : vectors.keySet().equals(state.regions.keySet()));
                 if(!complete)throw new IllegalArgumentException("Incomplete spatial generation");
                 vectors.forEach(state.index::upsert);
@@ -58,6 +65,7 @@ public class SpatialEmbeddingIndexState extends PersistentState {
         });
         state.markDirty();return state;
     }
+    private static Optional<BiomeSpiritualRegion> parseBiomeRegion(NbtElement tag){return BiomeSpiritualRegion.CODEC.codec().parse(NbtOps.INSTANCE,tag).result();}
     @Override public NbtCompound writeNbt(NbtCompound nbt,RegistryWrapper.WrapperLookup lookup){
         EmbeddingNbt.stamp(nbt);Map<String,Vec384f> vectors=new TreeMap<>();index.forEach(vectors::put);
         Map<String,BiomeSpiritualRegion> geometry=new TreeMap<>();regions.forEach((id,r)->{if(r instanceof BiomeSpiritualRegion b)geometry.put(id,b);});
