@@ -33,6 +33,7 @@ public class MysticismClient implements ClientModInitializer {
             clientInitialized = false;
         });
 
+        io.github.mysticism.client.gui.guidebook.GuidebookClient.init();
         SpiritNetworkingClient.init();
         ClientLatentPredictor.init();
         SpiritWorldRenderer.init();

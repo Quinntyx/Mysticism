@@ -1,0 +1,201 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "crossing",
+      "title": "guidebook.mysticism.entry.crossing",
+      "category": "guidebook.mysticism.category.basics",
+      "x": -120,
+      "y": -60,
+      "icon": "minecraft:compass",
+      "status": "OPERATIONAL",
+      "parents": [],
+      "pages": [
+        {
+          "title": "guidebook.mysticism.crossing.controls",
+          "blocks": [
+            {
+              "type": "paragraph",
+              "text": "guidebook.mysticism.crossing.controls.body"
+            },
+            {
+              "type": "paragraph",
+              "text": "guidebook.mysticism.crossing.study"
+            }
+          ]
+        },
+        {
+          "title": "guidebook.mysticism.crossing.enter",
+          "blocks": [
+            {
+              "type": "paragraph",
+              "text": "guidebook.mysticism.crossing.enter.body"
+            },
+            {
+              "type": "paragraph",
+              "text": "guidebook.mysticism.crossing.return"
+            },
+            {
+              "type": "item",
+              "text": "guidebook.mysticism.crossing.compass",
+              "item": "minecraft:compass",
+              "target": "compass"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "attunement",
+      "title": "guidebook.mysticism.entry.attunement",
+      "category": "guidebook.mysticism.category.practice",
+      "x": 0,
+      "y": -60,
+      "icon": "minecraft:lodestone",
+      "status": "MIXED",
+      "parents": [
+        "crossing"
+      ],
+      "pages": [
+        {
+          "title": "guidebook.mysticism.attunement.observe",
+          "blocks": [
+            {
+              "type": "paragraph",
+              "text": "guidebook.mysticism.attunement.observe.body"
+            },
+            {
+              "type": "paragraph",
+              "text": "guidebook.mysticism.attunement.zero"
+            }
+          ]
+        },
+        {
+          "title": "guidebook.mysticism.attunement.practice",
+          "blocks": [
+            {
+              "type": "paragraph",
+              "text": "guidebook.mysticism.attunement.practice.body"
+            },
+            {
+              "type": "paragraph",
+              "text": "guidebook.mysticism.attunement.future"
+            },
+            {
+              "type": "item",
+              "text": "guidebook.mysticism.attunement.amethyst",
+              "item": "minecraft:amethyst_shard",
+              "target": "echoes"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "echoes",
+      "title": "guidebook.mysticism.entry.echoes",
+      "category": "guidebook.mysticism.category.future",
+      "x": 120,
+      "y": -60,
+      "icon": "minecraft:amethyst_shard",
+      "status": "PLANNED",
+      "parents": [
+        "attunement"
+      ],
+      "pages": [
+        {
+          "title": "guidebook.mysticism.echoes.plan",
+          "blocks": [
+            {
+              "type": "paragraph",
+              "text": "guidebook.mysticism.echoes.body"
+            },
+            {
+              "type": "paragraph",
+              "text": "guidebook.mysticism.echoes.inspect"
+            },
+            {
+              "type": "item",
+              "text": "guidebook.mysticism.echoes.stone",
+              "item": "minecraft:stone",
+              "target": ""
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "growing",
+      "title": "guidebook.mysticism.entry.growing",
+      "category": "guidebook.mysticism.category.future",
+      "x": 120,
+      "y": 60,
+      "icon": "minecraft:oak_sapling",
+      "status": "PLANNED",
+      "parents": [
+        "attunement"
+      ],
+      "pages": [
+        {
+          "title": "guidebook.mysticism.growing.plan",
+          "blocks": [
+            {
+              "type": "paragraph",
+              "text": "guidebook.mysticism.growing.body"
+            },
+            {
+              "type": "paragraph",
+              "text": "guidebook.mysticism.growing.safety"
+            },
+            {
+              "type": "item",
+              "text": "guidebook.mysticism.growing.sapling",
+              "item": "minecraft:oak_sapling",
+              "target": ""
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "compass",
+      "title": "guidebook.mysticism.entry.compass",
+      "category": "guidebook.mysticism.category.vanilla",
+      "x": -120,
+      "y": 60,
+      "icon": "minecraft:iron_ingot",
+      "status": "OPERATIONAL",
+      "parents": [
+        "crossing"
+      ],
+      "pages": [
+        {
+          "title": "guidebook.mysticism.compass.page",
+          "blocks": [
+            {
+              "type": "paragraph",
+              "text": "guidebook.mysticism.compass.body"
+            },
+            {
+              "type": "recipe",
+              "text": "guidebook.mysticism.compass.recipe",
+              "ingredients": [
+                "",
+                "minecraft:iron_ingot",
+                "",
+                "minecraft:iron_ingot",
+                "minecraft:redstone",
+                "minecraft:iron_ingot",
+                "",
+                "minecraft:iron_ingot",
+                ""
+              ],
+              "output": "minecraft:compass",
+              "target": "crossing"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
