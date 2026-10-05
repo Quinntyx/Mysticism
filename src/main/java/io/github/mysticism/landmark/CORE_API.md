@@ -282,8 +282,11 @@ PendingMutation stageMerge(VerifiedConnectivity proof,long tick,ImportancePolicy
 PendingMutation stageMerge(VerifiedConnectivity proof,long tick,ImportancePolicy policy,
     SourceGeometry reconciled)
 PendingMutation stageSplit(RevisionRef parent,List<Landmark> children)
+PendingMutation stageSplitMetadata(RevisionRef parent,List<LandmarkMetadata> children)
 PendingMutation stageDelete(RevisionRef ref)
 int PendingMutation.advance(int maxPages)
+int PendingMutation.advance(int maxPages,int maxLeaves)
+long PendingMutation.validatedLeaves() // old known leaves checked during reconciliation
 int PendingMutation.remainingPages(); boolean PendingMutation.complete();
 void PendingMutation.cancel()
 ```
@@ -312,19 +315,49 @@ bounded by `DECODED_PAGE_LIMIT=8` and `DECODED_LEAF_LIMIT=65536`; original page 
 are immutable and repeated resident reads reuse them. `find()` never performs cold geometry
 reads: warm all required pages first, or stream larger landmarks page-by-page via the cursor.
 `find()` throws if the full geometry exceeds these residency limits or has missing resident
-pages. Geometry-dependent merge/split convenience APIs likewise require resident geometry;
-large extraction/topology integrations must explicitly stream/reconcile within their budgets.
+pages. **Merge/split never call find and do not require resident parent geometry.**
+Both merge overloads validate metadata/CAS/domains first, then publish aliases and records
+atomically after budgeted validation. Without reconciliation, merge reuses opaque immutable
+page references: duplicate identical keys coalesce, conflicting versions of an observation
+ID fail, and distinct page AABBs must be disjoint (touching half-open faces are allowed).
+Overlapping AABBs, even disjoint sparse masks, conservatively require supplied reconciled
+`SourceGeometry`. Its pages may be accumulated from `GeometryRead.drain()` by the extractor;
+they need not remain in the decoded LRU. Old known material preservation is validated
+incrementally, at most one partial old page retained, without populating that LRU.
+
+`stageSplit` accepts extractor-recomputed child geometry and validates the parent through
+metadata/CAS only. It does not claim to infer the split or verify physical connectivity.
+`stageSplitMetadata` partitions existing immutable parent pages without hydration: every
+parent key must occur exactly once, no foreign keys, children must satisfy source/revision/
+identity rules, and referenced page identities/bounds are checked during advancement. Use
+`stageSplit` for cuts inside pages, masks changed by observations, or removed geometry.
+Both split APIs atomically publish children, parent removal/tombstone and deterministic
+lineage. Never publish topology with a sequence of independent `stagePut` calls.
 `stageActivity()` retains opaque references and CAS-updates activity/claims without leaf
 reconstruction; each retained reference still consumes one bounded advance operation.
 
 Save key is `mysticism.landmarks.v1`. Geometry versions and landmark metadata versions are
 independent immutable PersistentStates, keyed `mysticism.landmark.geometry.<id>.<revision>`
-and `mysticism.landmark.record.<id>.<revision>`. Metadata refs are limited to 4096 geometry
+and `mysticism.landmark.record.<id>.<CAS revision>.<canonical-NBT SHA-256>`. The digest
+recursively sorts compound keys, preserves list order, and includes typed primitive bytes.
+Cancelled attempts at the same committed CAS revision therefore never reserve or overwrite
+another metadata version, including after save/restart. Legacy revision-only record keys
+remain readable; new writes always use content addressing and verify the referenced digest.
+Geometry versions remain extractor-assigned and immutable: changed masks need new versions.
+Metadata refs are limited to 4096 geometry
 pages, 4096 frontiers, and 256 claims; excessive metadata must be partitioned upstream and
-is rejected, never silently truncated. Pages are only encoded when advanced; unchanged
-versions consume bounded work without being dirtied. Advance dirties at most maxPages
-states, counting final manifest publication. Catalog/aliases become visible only after
-all pages are staged. Cancellation leaves old topology and unreferenced pages.
+is rejected, never silently truncated. Metadata is encoded to derive its key during staging;
+geometry is encoded only when advanced. Unchanged versions consume bounded work without
+being dirtied. `advance(maxPages,maxLeaves)` shares the page-operation budget among topology
+validation visits, immutable page writes/reference checks and final manifest publication;
+old-leaf preservation checks additionally consume at most maxLeaves (1..32768) per call.
+`advance(maxPages)` uses 32768 for that leaf budget. `validatedLeaves()` counts checked old
+leaves; `remainingPages()` is a lower bound on remaining page/reference/publication
+operations (a validation page may take multiple leaf-budgeted visits). A validation visit checks
+at most 4096 prior AABBs or scans at most 4096 replacement page bounds per known leaf; these
+are operation/count budgets, not wall-clock or compressed-IO deadlines. Failures must be
+cancelled, never published. Catalog/aliases become visible only after all validation and
+pages are staged. Cancellation leaves old topology and unreferenced immutable pages.
 
 Vanilla `PersistentStateManager.save()` performs disk writes; staging does not force IO.
 States use `DataFixTypes.SAVED_DATA_COMMAND_STORAGE` (required non-null in Yarn 1.21.1),
@@ -378,8 +411,13 @@ files (expected vanilla error logs), byte-for-byte preservation after failed upd
 metadata-only lookup/ranges/activity CAS, incremental 32768-leaf checkerboards, decoded LRU
 limits, cancelled/stale cursors, adversarial radius-invalid replacements/retention/pins,
 weighted-moment agreement with a quadratic reference, and deterministic operation caps for
-4096-candidate single-cluster selection. Timings are printed for diagnostics, never flaky
-pass/fail thresholds. Latest executed run: 802 core checks and 909 disk/NBT checks.
+4096-candidate single-cluster selection. Additional real compressed-NBT regressions cancel
+activity after the revision-1 metadata write (before and after restart), preserve abandoned
+files byte-for-byte, check legacy metadata-key compatibility, and publish merge/split topology
+for nine-page and 98304-leaf parents through both supplied-geometry and opaque-reference
+paths. Stale/lost/foreign/duplicate/out-of-bounds split references and discarded reconciliation
+materials are rejected without publication. Timings are diagnostic, never flaky pass/fail
+thresholds. Latest executed run: 802 core checks and 2388 disk/NBT checks.
 
 Full Gradle `compileJava compileTestJava` was attempted with the supplied Gradle 8.13;
 it fails during existing build configuration because Loom 1.11-SNAPSHOT requires >=8.14.

@@ -7,6 +7,8 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.util.WorldSavePath;
 import net.minecraft.world.PersistentState;
 import net.minecraft.world.PersistentStateManager;
+import java.io.*;
+import java.security.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
@@ -80,7 +82,10 @@ public final class LandmarkStore extends PersistentState {
         checkThread(); id=resolve(id); Ref ref=records.get(id); if(ref==null) return Optional.empty();
         LandmarkMetadata value=metadataCache.get(ref.key);
         if(value==null) {
-            value=LandmarkNbt.decodeMetadata(load(ref.key)); metadataCache.put(ref.key,value);
+            value=LandmarkNbt.decodeMetadata(load(ref.key));
+            String legacy="mysticism.landmark.record."+value.id()+"."+value.revision();
+            if(!ref.key.equals(legacy) && !ref.key.equals(recordKey(value))) throw new IllegalStateException("metadata content/reference mismatch");
+            metadataCache.put(ref.key,value);
             while(metadataCache.size()>128) metadataCache.remove(metadataCache.keySet().iterator().next());
         }
         if(!value.id().equals(id) || value.revision()!=ref.revision) throw new IllegalStateException("record/reference mismatch");
@@ -171,10 +176,28 @@ public final class LandmarkStore extends PersistentState {
         }
     }
     private static void checkKey(String key) {
-        if(!key.matches("mysticism[.]landmark[.](geometry|record)[.]lm-[0-9a-f]{64}[.][0-9]+")) throw new IllegalArgumentException("invalid landmark page key");
+        if(!key.matches("mysticism[.]landmark[.](geometry[.]lm-[0-9a-f]{64}[.][0-9]+|record[.]lm-[0-9a-f]{64}[.][0-9]+([.][0-9a-f]{64})?)")) throw new IllegalArgumentException("invalid landmark page key");
     }
     private static String geometryKey(GeometryPage p) { return "mysticism.landmark.geometry."+p.id()+"."+p.revision(); }
-    private static String recordKey(Landmark l) { return "mysticism.landmark.record."+l.id()+"."+l.revision(); }
+    // CAS revisions name committed identities, not staging attempts. Content addressing makes
+    // cancelled/restarted attempts independent without overwriting any immutable metadata.
+    private static String recordKey(LandmarkMetadata value) {
+        try {
+            MessageDigest hash=MessageDigest.getInstance("SHA-256");
+            var output=new DataOutputStream(new DigestOutputStream(OutputStream.nullOutputStream(),hash));
+            hashNbt(output,LandmarkNbt.encodeMetadata(value));
+            return "mysticism.landmark.record."+value.id()+"."+value.revision()+"."+HexFormat.of().formatHex(hash.digest());
+        } catch(IOException | NoSuchAlgorithmException e) { throw new IllegalStateException("metadata digest",e); }
+    }
+    private static void hashNbt(DataOutput out,NbtElement value) throws IOException {
+        out.writeByte(value.getType());
+        if(value instanceof NbtCompound compound) {
+            var keys=new TreeSet<>(compound.getKeys()); out.writeInt(keys.size());
+            for(String key:keys) { out.writeUTF(key); hashNbt(out,compound.get(key)); }
+        } else if(value instanceof NbtList list) {
+            out.writeInt(list.size()); for(NbtElement element:list) hashNbt(out,element);
+        } else value.write(out);
+    }
     private void unlocked() { checkThread(); if(pending!=null) throw new IllegalStateException("another landmark mutation is pending"); }
     /** expectedRevision=-1 creates a seed; otherwise compare-and-set a canonical live ID. */
     public PendingMutation stagePut(Landmark value,long expectedRevision) {
@@ -193,27 +216,63 @@ public final class LandmarkStore extends PersistentState {
         LandmarkMetadata next=new LandmarkMetadata(old.header().withActivity(activity,ownership),old.geometryKeys());
         List<PageWrite> writes=new ArrayList<>();
         for(String key:old.geometryKeys()) writes.add(new PageWrite(key,null)); // required immutable references; never recreated
-        writes.add(new PageWrite(recordKey(next.header()),()->LandmarkNbt.encodeMetadata(next)));
+        writes.add(new PageWrite(recordKey(next),()->LandmarkNbt.encodeMetadata(next)));
         pending=new PendingMutation(List.copyOf(writes),List.of(next),Set.of(),Map.of(),Map.of(),Map.of(),profile); return pending;
     }
+    /** Metadata/CAS merge with opaque references. Distinct page AABBs must be disjoint;
+     * overlapping masks require the reconciled overload. Validation is budgeted by advance. */
     public PendingMutation stageMerge(LandmarkRepository.VerifiedConnectivity proof,long tick,ImportancePolicy policy) {
         return stageMerge(proof,tick,policy,null);
     }
     public PendingMutation stageMerge(LandmarkRepository.VerifiedConnectivity proof,long tick,ImportancePolicy policy,SourceGeometry reconciled) {
-        unlocked(); Set<String> touched=new TreeSet<>(); List<Landmark> fragments=new ArrayList<>();
-        for(var ref:proof.fragments()) { Landmark l=find(ref.id()).orElseThrow(()->new IllegalStateException("missing fragment")); if(touched.add(l.id())) fragments.add(l); }
+        unlocked(); Set<String> touched=new TreeSet<>(); List<LandmarkMetadata> fragments=new ArrayList<>();
+        for(var ref:proof.fragments()) {
+            LandmarkMetadata m=metadata(ref.id()).orElseThrow(()->new IllegalStateException("missing fragment"));
+            if(m.revision()!=ref.revision()) throw new IllegalStateException("stale landmark revision");
+            if(touched.add(m.id())) fragments.add(m);
+        }
         Map<String,String> localAliases=new TreeMap<>(); aliases.forEach((id,target)->{ if(touched.contains(target)) localAliases.put(id,target); });
-        LandmarkRepository repo=LandmarkRepository.restore(new LandmarkRepository.Snapshot(fragments,localAliases,Map.of(),Map.of()));
-        Landmark merged=repo.mergeVerified(proof,tick,policy,reconciled); var snapshot=repo.snapshot();
+        LandmarkRepository repo=LandmarkRepository.restore(new LandmarkRepository.Snapshot(fragments.stream().map(LandmarkMetadata::header).toList(),localAliases,Map.of(),Map.of()));
+        Landmark merged=repo.mergeVerified(proof,tick,policy); var snapshot=repo.snapshot();
         touched.remove(merged.id());
-        return stage(List.of(merged),touched,snapshot.aliases(),Map.of(),Map.of());
+        List<String> keys=fragments.stream().flatMap(m->m.geometryKeys().stream()).distinct().sorted().toList();
+        if(reconciled==null) {
+            // Same observation ID at different versions requires explicit extractor reconciliation.
+            LandmarkMetadata next=new LandmarkMetadata(merged,keys);
+            PendingMutation mutation=stageMetadata(List.of(next),touched,snapshot.aliases(),Map.of(),Map.of());
+            mutation.validations=keys.stream().map(k->new Validation(k,merged.bounds(),null,true)).toList();
+            return mutation;
+        }
+        Landmark value=new Landmark(merged.id(),merged.dimension(),merged.algorithmVersion(),merged.kind(),merged.biome(),merged.anchor(),merged.bounds(),merged.baseEmbedding(),merged.baseImportance(),merged.activity(),merged.ownership(),reconciled,merged.revision(),merged.provenance());
+        PendingMutation mutation=stage(List.of(value),touched,snapshot.aliases(),Map.of(),Map.of());
+        mutation.validations=keys.stream().map(k->new Validation(k,merged.bounds(),reconciled,false)).toList();
+        return mutation;
     }
+    /** Extractor-recomputed children; parent validation is metadata-only, never find/hydration. */
     public PendingMutation stageSplit(LandmarkRepository.RevisionRef parent,List<Landmark> children) {
-        unlocked(); Landmark old=find(parent.id()).orElseThrow(()->new IllegalStateException("missing parent"));
-        LandmarkRepository repo=new LandmarkRepository(); repo.put(old,-1); repo.split(new LandmarkRepository.RevisionRef(old.id(),parent.revision()),children);
+        unlocked(); LandmarkMetadata old=metadata(parent.id()).orElseThrow(()->new IllegalStateException("missing parent"));
+        var snapshot=splitSnapshot(parent,old,children);
+        return stage(snapshot.landmarks(),Set.of(old.id()),Map.of(),snapshot.tombstones(),snapshot.lineage());
+    }
+    /** Split reusing immutable parent page references; no geometry hydration. New masks use stageSplit. */
+    public PendingMutation stageSplitMetadata(LandmarkRepository.RevisionRef parent,List<LandmarkMetadata> children) {
+        unlocked(); LandmarkMetadata old=metadata(parent.id()).orElseThrow(()->new IllegalStateException("missing parent"));
+        var snapshot=splitSnapshot(parent,old,children.stream().map(LandmarkMetadata::header).toList());
+        Set<String> allowed=new HashSet<>(old.geometryKeys()),used=new HashSet<>(); List<Validation> validations=new ArrayList<>();
+        for(LandmarkMetadata child:children) for(String key:child.geometryKeys()) {
+            if(!allowed.contains(key) || !used.add(key)) throw new IllegalArgumentException("split references must uniquely partition parent pages");
+            validations.add(new Validation(key,child.header().bounds(),null,false));
+        }
+        if(!used.equals(allowed)) throw new IllegalArgumentException("split references must preserve every parent page; recomputed masks use stageSplit");
+        PendingMutation mutation=stageMetadata(children,Set.of(old.id()),Map.of(),snapshot.tombstones(),snapshot.lineage());
+        mutation.validations=List.copyOf(validations); return mutation;
+    }
+    private LandmarkRepository.Snapshot splitSnapshot(LandmarkRepository.RevisionRef parent,LandmarkMetadata old,List<Landmark> children) {
+        LandmarkRepository repo=new LandmarkRepository(); repo.put(old.header(),-1);
+        repo.split(new LandmarkRepository.RevisionRef(old.id(),parent.revision()),children);
         for(Landmark child:children) if((records.containsKey(child.id()) && !child.id().equals(old.id())) || aliases.containsKey(child.id()) || tombstones.containsKey(child.id()))
             throw new IllegalArgumentException("split seed conflicts with catalog");
-        var snapshot=repo.snapshot(); return stage(snapshot.landmarks(),Set.of(old.id()),Map.of(),snapshot.tombstones(),snapshot.lineage());
+        return repo.snapshot();
     }
     public PendingMutation stageDelete(LandmarkRepository.RevisionRef ref) {
         unlocked(); Landmark l=metadata(ref.id()).orElseThrow(()->new IllegalStateException("missing record")).header();
@@ -233,10 +292,20 @@ public final class LandmarkStore extends PersistentState {
             }
         }
         unique.forEach((key,page)->writes.add(new PageWrite(key,()->LandmarkNbt.encodeGeometry(page))));
-        for(Landmark l:values) { String key=recordKey(l); checkKey(key); List<String> geometryKeys=l.geometry().pages().stream().map(LandmarkStore::geometryKey).toList(); writes.add(new PageWrite(key,()->LandmarkNbt.encodeLandmark(l,geometryKeys))); }
         List<LandmarkMetadata> metadata=values.stream().map(l->LandmarkNbt.decodeMetadata(LandmarkNbt.encodeLandmark(l,l.geometry().pages().stream().map(LandmarkStore::geometryKey).toList()))).toList();
+        appendMetadataWrites(writes,metadata);
         pending=new PendingMutation(List.copyOf(writes),metadata,Set.copyOf(removals),Map.copyOf(newAliases),Map.copyOf(retired),Map.copyOf(history),nextProfile); return pending;
     }
+    private static void appendMetadataWrites(List<PageWrite> writes,List<LandmarkMetadata> values) {
+        for(LandmarkMetadata value:values) writes.add(new PageWrite(recordKey(value),()->LandmarkNbt.encodeMetadata(value)));
+    }
+    private PendingMutation stageMetadata(List<LandmarkMetadata> values,Set<String> removals,Map<String,String> newAliases,Map<String,Long> retired,Map<String,List<String>> history) {
+        List<PageWrite> writes=new ArrayList<>(); Set<String> keys=new TreeSet<>();
+        for(LandmarkMetadata value:values) { profile.requireCompatible(value.header().baseEmbedding().profile()); keys.addAll(value.geometryKeys()); }
+        keys.forEach(key->writes.add(new PageWrite(key,null))); appendMetadataWrites(writes,values);
+        pending=new PendingMutation(List.copyOf(writes),List.copyOf(values),Set.copyOf(removals),Map.copyOf(newAliases),Map.copyOf(retired),Map.copyOf(history),profile); return pending;
+    }
+    private record Validation(String key,Bounds bounds,SourceGeometry replacement,boolean disjoint) {}
     public final class PendingMutation {
         private final List<PageWrite> writes;
         private final List<LandmarkMetadata> values;
@@ -245,20 +314,47 @@ public final class LandmarkStore extends PersistentState {
         private final Map<String,Long> retired;
         private final Map<String,List<String>> history;
         private final EmbeddingProfile nextProfile;
-        private int cursor;
+        private int cursor,validationCursor;
+        private List<Validation> validations=List.of();
+        private LandmarkNbt.GeometryDecoder validationDecoder;
+        private final List<Bounds> validatedBounds=new ArrayList<>();
+        private long validatedLeaves;
+        public long validatedLeaves() { checkThread(); return validatedLeaves; }
         private boolean complete,cancelled;
         private PendingMutation(List<PageWrite> writes,List<LandmarkMetadata> values,Set<String> removals,Map<String,String> newAliases,Map<String,Long> retired,Map<String,List<String>> history,EmbeddingProfile nextProfile) {
             this.writes=writes; this.values=values; this.removals=removals; this.newAliases=newAliases; this.retired=retired; this.history=history; this.nextProfile=nextProfile;
         }
         public boolean complete() { checkThread(); return complete; }
-        public int remainingPages() { checkThread(); return complete?0:writes.size()-cursor+1; }
+        public int remainingPages() { checkThread(); return complete?0:validations.size()-validationCursor+writes.size()-cursor+1; }
         /** At most maxPages newly dirtied states, including the final manifest publication.
          * Unchanged immutable versions consume work but are not marked dirty. No automatic disk IO.
          */
-        public int advance(int maxPages) {
+        public int advance(int maxPages) { return advance(maxPages,GeometryPage.MAX_LEAVES); }
+        /** Validation visits, writes and manifest publication share maxPages; old-leaf
+         * reconciliation uses at most maxLeaves. One partially reconstructed old page, never cached. */
+        public int advance(int maxPages,int maxLeaves) {
             checkThread(); if(cancelled) throw new IllegalStateException("cancelled mutation");
-            if(maxPages<=0) throw new IllegalArgumentException("page budget"); if(complete) return 0;
-            int worked=0;
+            if(maxPages<=0 || maxLeaves<1 || maxLeaves>GeometryPage.MAX_LEAVES) throw new IllegalArgumentException("mutation budget"); if(complete) return 0;
+            int worked=0,leaves=0;
+            while(validationCursor<validations.size() && worked<maxPages && leaves<maxLeaves) {
+                Validation v=validations.get(validationCursor);
+                if(validationDecoder==null) {
+                    validationDecoder=new LandmarkNbt.GeometryDecoder(load(v.key));
+                    if(!validationDecoder.key().equals(v.key) || !v.bounds.contains(validationDecoder.bounds())) throw new IllegalArgumentException("topology page identity/bounds mismatch");
+                }
+                worked++;
+                if(v.replacement!=null) {
+                    var decoder=validationDecoder;
+                    int count=decoder.advance(maxLeaves-leaves,cell->LandmarkRepository.validatePreservedCell(cell,decoder.palette(),v.replacement));
+                    leaves+=count; validatedLeaves+=count;
+                    if(!decoder.complete()) return worked;
+                } else if(v.disjoint) {
+                    for(Bounds prior:validatedBounds) if(prior.intersects(validationDecoder.bounds())) throw new IllegalArgumentException("overlapping observation bounds: supply reconciled geometry");
+                    validatedBounds.add(validationDecoder.bounds());
+                }
+                validationDecoder=null; validationCursor++;
+            }
+            if(validationCursor<validations.size()) return worked;
             while(cursor<writes.size() && worked<maxPages) {
                 PageWrite write=writes.get(cursor); BlobState old=blob(write.key);
                 if(write.encode==null) {
@@ -271,7 +367,7 @@ public final class LandmarkStore extends PersistentState {
                 cursor++; worked++;
             }
             if(cursor==writes.size() && worked<maxPages) {
-                removals.forEach(records::remove); for(LandmarkMetadata l:values) records.put(l.id(),new Ref(recordKey(l.header()),l.revision()));
+                removals.forEach(records::remove); for(LandmarkMetadata l:values) records.put(l.id(),new Ref(recordKey(l),l.revision()));
                 aliases.putAll(newAliases); tombstones.putAll(retired); lineage.putAll(history); profile=nextProfile;
                 for(String id:List.copyOf(aliases.keySet())) aliases.put(id,resolve(id));
                 markDirty(); complete=true; pending=null; worked++;
@@ -279,7 +375,7 @@ public final class LandmarkStore extends PersistentState {
             return worked;
         }
         /** Cancel leaves only unreferenced immutable pages, never partially published topology. */
-        public void cancel() { checkThread(); if(complete) throw new IllegalStateException("already published"); cancelled=true; if(pending==this) pending=null; }
+        public void cancel() { checkThread(); if(complete) throw new IllegalStateException("already published"); cancelled=true; validationDecoder=null; if(pending==this) pending=null; }
     }
     private static final class BlobState extends PersistentState {
         private NbtCompound payload;
@@ -302,7 +398,7 @@ public final class LandmarkStore extends PersistentState {
             NbtCompound ref=records.getCompound(id);
             if(!ref.contains("key",NbtElement.STRING_TYPE) || !ref.contains("revision",NbtElement.LONG_TYPE) || ref.getLong("revision")<0) throw new IllegalArgumentException("invalid record revision");
             String key=ref.getString("key"); checkKey(key);
-            if(!key.equals("mysticism.landmark.record."+id+"."+ref.getLong("revision"))) throw new IllegalArgumentException("record key identity mismatch");
+            if(!key.equals("mysticism.landmark.record."+id+"."+ref.getLong("revision")) && !key.matches("mysticism[.]landmark[.]record[.]"+id+"[.]"+ref.getLong("revision")+"[.][0-9a-f]{64}")) throw new IllegalArgumentException("record key identity mismatch");
             store.records.put(id,new Ref(key,ref.getLong("revision")));
         }
         NbtCompound aliases=n.getCompound("aliases"),tombstones=n.getCompound("tombstones"),lineage=n.getCompound("lineage");

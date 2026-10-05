@@ -94,7 +94,7 @@ public final class LandmarkPersistenceSelfTest {
         LandmarkStore loaded=LandmarkStore.open(reloadedManager,dir);
         check(loaded.ids().size()==2 && hydrated(loaded,a.id()).orElseThrow().baseEmbedding().equals(a.baseEmbedding()),"real compressed PersistentState disk reload");
         LandmarkRepository.VerifiedConnectivity proof=new LandmarkRepository.VerifiedConnectivity(List.of(new LandmarkRepository.RevisionRef(a.id(),0),new LandmarkRepository.RevisionRef(b.id(),0)),"loaded-six-neighbour-proof");
-        hydrated(loaded,b.id()); // topology mutation consumes only explicitly resident geometry
+        hydrated(loaded,b.id()); // optional compatibility read; topology does not require residency
         var merge=loaded.stageMerge(proof,1,new ImportancePolicy(0.8,20,0.01,1));
         check(merge.advance(1)==1 && loaded.ids().size()==2,"merge aliases unpublished while paging");
         while(!merge.complete()) check(merge.advance(1)==1,"bounded merge dirty pages");
@@ -137,7 +137,8 @@ public final class LandmarkPersistenceSelfTest {
             var originalManager=manager(dir,lookup); var initial=LandmarkStore.open(originalManager,dir);
             Landmark value=withGeometry(-4); initial.stagePut(value,-1).advance(8); originalManager.save();
             String id=kind.equals("geometry")?value.geometry().pages().getFirst().id():value.id();
-            Path file=dir.resolve("mysticism.landmark."+kind+"."+id+".0.dat");
+            String savedKey=kind.equals("geometry")?"mysticism.landmark.geometry."+id+".0":initial.writeNbt(new NbtCompound(),lookup).getCompound("records").getCompound(id).getString("key");
+            Path file=dir.resolve(savedKey+".dat");
             if(compressed) {
                 NbtCompound malformed=new NbtCompound(); malformed.put("data",new NbtCompound());
                 malformed.putInt("DataVersion",SharedConstants.getGameVersion().getSaveVersion().getId());
@@ -159,7 +160,7 @@ public final class LandmarkPersistenceSelfTest {
             check(store.writeNbt(new NbtCompound(),lookup).equals(before),"failed corruption read leaves catalog clean");
             reloadedManager.save();
             check(Arrays.equals(corrupt,Files.readAllBytes(file)),"corrupt page not dirtied or overwritten on save");
-            check(!Files.exists(dir.resolve("mysticism.landmark.record."+value.id()+".1.dat")),"no replacement record published after corruption");
+            check(store.writeNbt(new NbtCompound(),lookup).getCompound("records").getCompound(value.id()).getLong("revision")==0,"no replacement record published after corruption");
         }
     }
     private static Landmark checkerboard(long x) {
@@ -216,8 +217,114 @@ public final class LandmarkPersistenceSelfTest {
         check(!stale.isCurrent(),"geometry cursor exposes metadata revision guard"); stale.cancel();
         System.out.println("Budgeted PersistentState scratch directory: "+dir);
     }
+    private static void cancellationDoesNotReserveCasRevision() throws Exception {
+        var lookup=RegistryWrapper.WrapperLookup.of(Stream.empty());
+        for(boolean restart:List.of(false,true)) {
+            Path dir=Files.createTempDirectory("landmark-cancel-metadata-");
+            var manager=manager(dir,lookup); var store=LandmarkStore.open(manager,dir); Landmark initial=withGeometry(0);
+            store.stagePut(initial,-1).advance(8); manager.save();
+            var a=store.stageActivity(new LandmarkRepository.RevisionRef(initial.id(),0),new ActivityMetadata(0.3,1),initial.ownership());
+            check(a.advance(2)==2 && !a.complete(),"activity A metadata written, catalog not published");
+            a.cancel(); manager.save();
+            check(store.metadata(initial.id()).orElseThrow().revision()==0,"cancel after metadata write keeps committed CAS revision");
+            Map<Path,byte[]> previous=new HashMap<>();
+            try(var files=Files.list(dir)) { for(Path file:files.toList()) previous.put(file,Files.readAllBytes(file)); }
+            if(restart) { manager=manager(dir,lookup); store=LandmarkStore.open(manager,dir); }
+            var b=store.stageActivity(new LandmarkRepository.RevisionRef(initial.id(),0),new ActivityMetadata(0.8,2),initial.ownership());
+            check(b.advance(2)==2 && !b.complete(),"different activity B can stage same CAS revision after cancellation/restart");
+            manager.save();
+            for(var entry:previous.entrySet()) check(Arrays.equals(entry.getValue(),Files.readAllBytes(entry.getKey())),"no committed or abandoned immutable page overwritten");
+            try(var files=Files.list(dir)) { check(files.filter(p->p.getFileName().toString().startsWith("mysticism.landmark.record.")).count()==3,"distinct immutable content versions for two revision-1 attempts"); }
+            check(b.advance(1)==1 && b.complete(),"B publishes independently of cancelled A"); manager.save();
+            var reopened=LandmarkStore.open(manager(dir,lookup),dir);
+            check(reopened.metadata(initial.id()).orElseThrow().header().activity().equals(new ActivityMetadata(0.8,2)),"B activity survives real disk restart");
+            check(reopened.metadata(initial.id()).orElseThrow().geometryKeys().equals(store.metadata(initial.id()).orElseThrow().geometryKeys()),"cancelled metadata attempts never change geometry versions");
+            // Schema 1 manifests with legacy revision-only storage keys remain readable.
+            NbtCompound legacy=store.writeNbt(new NbtCompound(),lookup);
+            NbtCompound ref=legacy.getCompound("records").getCompound(initial.id()); String hashed=ref.getString("key");
+            String key="mysticism.landmark.record."+initial.id()+".1"; Files.copy(dir.resolve(hashed+".dat"),dir.resolve(key+".dat")); ref.putString("key",key);
+            var legacyManager=manager(dir,lookup); legacyManager.set(LandmarkStore.SAVE_KEY,LandmarkStore.fromNbt(legacy,lookup));
+            check(LandmarkStore.open(legacyManager,dir).metadata(initial.id()).orElseThrow().revision()==1,"legacy metadata key is backward compatible");
+        }
+    }
+    private static Landmark packed(List<GeometryPage> pages,long revision,long anchorX) {
+        Bounds bounds=pages.getFirst().bounds(); for(GeometryPage page:pages) bounds=bounds.union(page.bounds());
+        return LandmarkCoreSelfTest.landmark(new BlockPoint(anchorX,0,0),bounds,LandmarkCoreSelfTest.embedding(0.25,0,0,0),0.5,new SourceGeometry(pages,List.of()),revision,new Ownership(List.of()));
+    }
+    private static LandmarkMetadata metadataOf(Landmark l) {
+        return LandmarkNbt.decodeMetadata(LandmarkNbt.encodeLandmark(l,l.geometry().pages().stream().map(p->"mysticism.landmark.geometry."+p.id()+"."+p.revision()).toList()));
+    }
+    private static void largeTopologyWithoutResidency() throws Exception {
+        var lookup=RegistryWrapper.WrapperLookup.of(Stream.empty());
+        List<GeometryPage> sparse=new ArrayList<>(),dense=new ArrayList<>();
+        for(int i=0;i<9;i++) sparse.add(withGeometry(i*4).geometry().pages().getFirst());
+        for(int i=0;i<3;i++) dense.add(checkerboard(i*32).geometry().pages().getFirst());
+        for(boolean leafLimit:List.of(false,true)) for(boolean reconciliation:List.of(false,true)) {
+            List<GeometryPage> pages=leafLimit?dense:sparse;
+            Landmark big=packed(pages,0,1),small=withGeometry(leafLimit?96:36);
+            Path dir=Files.createTempDirectory("landmark-large-topology-"); var manager=manager(dir,lookup); var initial=LandmarkStore.open(manager,dir);
+            initial.stagePut(big,-1).advance(32); initial.stagePut(small,-1).advance(8); manager.save();
+            var reloadManager=manager(dir,lookup); var store=LandmarkStore.open(reloadManager,dir);
+            var read=store.beginGeometryRead(big.id()); int streamed=0;
+            while(!read.complete()) { read.advance(1,1024); streamed+=read.drain().size(); }
+            check(streamed==pages.size(),"large landmark fully streamed without truncation");
+            fails(IllegalStateException.class,()->store.find(big.id()),"large geometry cannot be forced into bounded resident cache");
+            var proof=new LandmarkRepository.VerifiedConnectivity(List.of(new LandmarkRepository.RevisionRef(big.id(),0),new LandmarkRepository.RevisionRef(small.id(),0)),"loaded-face-proof");
+            List<GeometryPage> combined=new ArrayList<>(pages); combined.addAll(small.geometry().pages()); SourceGeometry geometry=new SourceGeometry(combined,List.of());
+            if(reconciliation) {
+                var invalid=store.stageMerge(proof,1,new ImportancePolicy(0.8,20,0.01,1),new SourceGeometry(List.of(),List.of()));
+                fails(IllegalArgumentException.class,()->invalid.advance(1,1),"streamed reconciliation rejects discarded prior known material"); invalid.cancel();
+                check(store.ids().size()==2 && store.aliases().isEmpty(),"failed reconciliation cannot partially publish aliases");
+            }
+            long cacheLeaves=store.cacheStats().reconstructedLeaves();
+            var merge=reconciliation?store.stageMerge(proof,1,new ImportancePolicy(0.8,20,0.01,1),geometry):store.stageMerge(proof,1,new ImportancePolicy(0.8,20,0.01,1));
+            while(!merge.complete()) {
+                long before=merge.validatedLeaves(); check(merge.advance(1,257)<=1,"large merge shares bounded page work across validation/write/publication");
+                check(merge.validatedLeaves()-before<=257,"reconciliation respects old-leaf validation budget");
+                check(store.cacheStats().pages()<=8 && store.cacheStats().leaves()<=65536,"topology never expands decoded cache");
+            }
+            check(store.cacheStats().reconstructedLeaves()==cacheLeaves,"merge does not reconstruct old geometry into resident cache");
+            String canonical=List.of(big.id(),small.id()).stream().min(String::compareTo).orElseThrow();
+            String alias=canonical.equals(big.id())?small.id():big.id();
+            check(store.ids().equals(List.of(canonical)) && store.resolve(alias).equals(canonical),"large merge publishes records and aliases atomically");
+            check(store.metadata(canonical).orElseThrow().geometryKeys().size()==combined.size(),"large merge preserves all immutable geometry refs");
+            if(reconciliation) check(merge.validatedLeaves()==pages.stream().mapToLong(p->p.knownCells().size()).sum()+2,"all old known leaves validated, none truncated");
+            else check(merge.validatedLeaves()==0,"opaque nonoverlapping merge needs no leaf reconstruction");
+            reloadManager.save(); var restartManager=manager(dir,lookup); var restarted=LandmarkStore.open(restartManager,dir);
+            check(restarted.resolve(alias).equals(canonical),"large merge aliases survive restart");
+            List<GeometryPage> ordered=combined.stream().sorted(Comparator.comparingLong(p->p.bounds().minX())).toList(); int middle=ordered.size()/2;
+            Landmark left=packed(ordered.subList(0,middle),2,ordered.getFirst().bounds().minX()+2);
+            Landmark right=packed(ordered.subList(middle,ordered.size()),2,ordered.get(middle).bounds().minX()+2);
+            if(!reconciliation) {
+                fails(IllegalStateException.class,()->restarted.stageSplitMetadata(new LandmarkRepository.RevisionRef(alias,0),List.of(metadataOf(right),metadataOf(left))),"metadata-only split retains stale CAS protection");
+                LandmarkMetadata leftMetadata=metadataOf(left),rightMetadata=metadataOf(right);
+                LandmarkMetadata incomplete=new LandmarkMetadata(rightMetadata.header(),List.of());
+                fails(IllegalArgumentException.class,()->restarted.stageSplitMetadata(new LandmarkRepository.RevisionRef(alias,1),List.of(leftMetadata,incomplete)),"opaque split cannot discard parent geometry pages");
+                LandmarkMetadata foreign=new LandmarkMetadata(rightMetadata.header(),List.of("mysticism.landmark.geometry."+withGeometry(4096).geometry().pages().getFirst().id()+".0"));
+                fails(IllegalArgumentException.class,()->restarted.stageSplitMetadata(new LandmarkRepository.RevisionRef(alias,1),List.of(leftMetadata,foreign)),"opaque split rejects references not owned by parent");
+                LandmarkMetadata duplicate=new LandmarkMetadata(rightMetadata.header(),leftMetadata.geometryKeys());
+                fails(IllegalArgumentException.class,()->restarted.stageSplitMetadata(new LandmarkRepository.RevisionRef(alias,1),List.of(leftMetadata,duplicate)),"opaque split cannot duplicate geometry into two children");
+                // Swapping partitions covers every parent page but violates child bounds.
+                var misplaced=restarted.stageSplitMetadata(new LandmarkRepository.RevisionRef(alias,1),List.of(new LandmarkMetadata(leftMetadata.header(),rightMetadata.geometryKeys()),new LandmarkMetadata(rightMetadata.header(),leftMetadata.geometryKeys())));
+                fails(IllegalArgumentException.class,()->misplaced.advance(1,1),"budgeted split validates referenced page bounds before publication"); misplaced.cancel();
+                check(restarted.ids().equals(List.of(canonical)) && restarted.lineage().isEmpty(),"invalid opaque split never partially publishes topology");
+            }
+            // Both the existing geometry-supplied interface and opaque partition interface work cold.
+            var split=reconciliation?restarted.stageSplit(new LandmarkRepository.RevisionRef(alias,1),List.of(right,left)):
+                restarted.stageSplitMetadata(new LandmarkRepository.RevisionRef(alias,1),List.of(metadataOf(right),metadataOf(left)));
+            while(!split.complete()) check(split.advance(1,257)<=1,"large split validation/publication remains page budgeted");
+            check(restarted.metadata(alias).isEmpty() && restarted.tombstones().containsKey(canonical),"large split tombstones parent/alias instead of arbitrary child");
+            check(restarted.lineage().get(canonical).equals(List.of(left.id(),right.id()).stream().sorted().toList()),"large split publishes deterministic lineage with children");
+            check(restarted.cacheStats().pages()==0 && restarted.cacheStats().reconstructedLeaves()==0,"cold split never hydrates complete parent");
+            restartManager.save(); var finalStore=LandmarkStore.open(manager(dir,lookup),dir);
+            check(finalStore.ids().size()==2 && finalStore.lineage().equals(restarted.lineage()),"large split children and lineage survive disk restart");
+            int references=finalStore.ids().stream().map(finalStore::metadata).mapToInt(m->m.orElseThrow().geometryKeys().size()).sum();
+            check(references==combined.size(),"split never loses or silently truncates pages");
+        }
+    }
     public static void main(String[] args) throws Exception {
         roundtripAndMalformed(); pagingAliasesRestart(); corruptPagesNeverReplaced(); metadataAndBudgetedReads();
+        cancellationDoesNotReserveCasRevision(); largeTopologyWithoutResidency();
         System.out.println("LandmarkPersistenceSelfTest PASS ("+checks+" explicit checks)");
     }
 }

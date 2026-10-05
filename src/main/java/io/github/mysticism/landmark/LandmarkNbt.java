@@ -81,7 +81,11 @@ public final class LandmarkNbt {
             tree=SparseOctree.empty(getBounds(n,"root"),n.getInt("resolution"),number(n,"maxSide"));
             leaves=list(n,"leaves",NbtElement.COMPOUND_TYPE,GeometryPage.MAX_LEAVES);
         }
-        public int advance(int maxLeaves) {
+        String key() { return "mysticism.landmark.geometry."+id+"."+revision; }
+        Bounds bounds() { return bounds; }
+        BlockPalette palette() { return palette; }
+        public int advance(int maxLeaves) { return advance(maxLeaves,null); }
+        int advance(int maxLeaves,java.util.function.Consumer<SparseOctree.Cell<BlockSample>> observer) {
             if(maxLeaves<1) throw new IllegalArgumentException("leaf budget");
             int worked=0;
             while(cursor<leaves.size() && worked<maxLeaves) {
@@ -94,6 +98,7 @@ public final class LandmarkNbt {
                         || !tree.query(b,1).isEmpty()) throw new IllegalArgumentException("unaligned/overlapping/outside geometry leaf");
                 BlockSample sample=new BlockSample(BlockSample.Occupancy.valueOf(string(entry,"occupancy")),entry.getInt("palette"));
                 GeometryPage.validateLeaf(bounds,palette,b,sample);
+                if(observer!=null) observer.accept(new SparseOctree.Cell<>(b,sample));
                 tree=tree.with(b,sample,8192);
                 cursor++; worked++;
             }

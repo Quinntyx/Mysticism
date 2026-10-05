@@ -112,18 +112,19 @@ public final class LandmarkRepository {
         records.put(seed.id(),merged); flattenAliases(); return merged;
     }
     private static void validatePreservedMaterials(List<Landmark> group,SourceGeometry reconciled) {
-        for(Landmark l:group) for(GeometryPage page:l.geometry().pages()) for(var old:page.knownCells()) {
-            Bounds b=old.bounds(); long covered=0;
-            for(var material:reconciled.queryMaterials(b,GeometryPage.MAX_SIDE*GeometryPage.MAX_SIDE*GeometryPage.MAX_SIDE)) {
-                if(!material.material().equals(page.palette().state(old.value().paletteIndex())) || material.sample().occupancy()!=old.value().occupancy())
-                    throw new IllegalArgumentException("reconciliation changed known material; revise observations first");
-                Bounds c=material.bounds();
-                covered+=(Math.min(b.maxX(),c.maxX())-Math.max(b.minX(),c.minX()))
-                        *(Math.min(b.maxY(),c.maxY())-Math.max(b.minY(),c.minY()))*(Math.min(b.maxZ(),c.maxZ())-Math.max(b.minZ(),c.minZ()));
-            }
-            long volume=(b.maxX()-b.minX())*(b.maxY()-b.minY())*(b.maxZ()-b.minZ());
-            if(covered!=volume) throw new IllegalArgumentException("reconciliation discarded known geometry");
+        for(Landmark l:group) for(GeometryPage page:l.geometry().pages()) for(var old:page.knownCells()) validatePreservedCell(old,page.palette(),reconciled);
+    }
+    static void validatePreservedCell(SparseOctree.Cell<BlockSample> old,BlockPalette palette,SourceGeometry reconciled) {
+        Bounds b=old.bounds(); long covered=0;
+        for(var material:reconciled.queryMaterials(b,GeometryPage.MAX_SIDE*GeometryPage.MAX_SIDE*GeometryPage.MAX_SIDE)) {
+            if(!material.material().equals(palette.state(old.value().paletteIndex())) || material.sample().occupancy()!=old.value().occupancy())
+                throw new IllegalArgumentException("reconciliation changed known material; revise observations first");
+            Bounds c=material.bounds();
+            covered+=(Math.min(b.maxX(),c.maxX())-Math.max(b.minX(),c.minX()))
+                    *(Math.min(b.maxY(),c.maxY())-Math.max(b.minY(),c.minY()))*(Math.min(b.maxZ(),c.maxZ())-Math.max(b.minZ(),c.minZ()));
         }
+        long volume=(b.maxX()-b.minX())*(b.maxY()-b.minY())*(b.maxZ()-b.minZ());
+        if(covered!=volume) throw new IllegalArgumentException("reconciliation discarded known geometry");
     }
     /** Split results must be recomputed by the extractor. A child containing the original seed
      * can retain its ID; otherwise parent and its aliases tombstone, with explicit one-to-many lineage.
