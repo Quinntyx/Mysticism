@@ -1,0 +1,105 @@
+// No JUnit or other test dependency. Feature tests are public static main methods
+// under src/test/java; the runner discovers *Test / *SelfTest classes in that output.
+sourceSets {
+    buildTest {
+        java.srcDirs = ['scripts/selftest']
+        resources.srcDirs = []
+        compileClasspath = files()
+        runtimeClasspath = output
+    }
+}
+
+// Client-only pure helpers can also be tested from src/test/java.
+sourceSets.test.compileClasspath += sourceSets.client.output
+sourceSets.test.runtimeClasspath += sourceSets.client.output
+
+// Loom may serialize comparison operators as JSON Unicode escapes. Always check
+// the decoded value, never the raw fabric.mod.json text.
+def requireJava21 = { metadata ->
+    if (metadata.depends?.java != '>=21') {
+        throw new GradleException('Missing Java 21 requirement in production artifact')
+    }
+}
+
+tasks.register('buildSelfTest', JavaExec) {
+    group = 'verification'
+    description = 'Run dependency-free deterministic build/packaging contract tests.'
+    classpath = sourceSets.buildTest.runtimeClasspath
+    mainClass = 'io.github.mysticism.build.PackagingSelfTest'
+    enableAssertions = true
+    doFirst {
+        def parser = new groovy.json.JsonSlurper()
+        ['{"depends":{"java":">=21"}}', '{"depends":{"java":"\\u003e\\u003d21"}}'].each { json ->
+            requireJava21(parser.parseText(json))
+        }
+        ['{"depends":{"java":">=17"}}', '{"depends":{}}'].each { json ->
+            boolean rejected = false
+            try {
+                requireJava21(parser.parseText(json))
+            } catch (GradleException expected) {
+                rejected = true
+            }
+            if (!rejected) throw new GradleException('Invalid Java requirement was accepted')
+        }
+        logger.lifecycle('Decoded metadata checks passed (literal/Unicode escaped Java 21, invalid/missing rejection)')
+    }
+}
+
+tasks.register('selfTest', JavaExec) {
+    group = 'verification'
+    description = 'Run all public main-based *Test / *SelfTest classes with assertions enabled.'
+    dependsOn tasks.named('testClasses'), tasks.named('buildSelfTest')
+    classpath = sourceSets.test.runtimeClasspath + sourceSets.buildTest.output
+    mainClass = 'io.github.mysticism.build.SelfTestRunner'
+    enableAssertions = true
+    args sourceSets.test.output.classesDirs.files.collect { it.absolutePath }
+    workingDir = rootProject.projectDir
+}
+
+// These are main-based checks, not a silently skipped JUnit suite.
+tasks.named('test') {
+    enabled = false
+    dependsOn tasks.named('selfTest')
+}
+
+tasks.register('verifyProductionJar', JavaExec) {
+    group = 'verification'
+    description = 'Validate the remapped production jar, resources and nested libraries.'
+    dependsOn tasks.named('remapJar')
+    classpath = sourceSets.buildTest.runtimeClasspath
+    mainClass = 'io.github.mysticism.build.ProductionJarVerifier'
+    enableAssertions = true
+    doFirst {
+        def artifact = tasks.named('remapJar').get().archiveFile.get().asFile
+        new java.util.zip.ZipFile(artifact).withCloseable { zip ->
+            def metadata = zip.getInputStream(zip.getEntry('fabric.mod.json')).withCloseable { stream ->
+                new groovy.json.JsonSlurper().parse(stream, 'UTF-8')
+            }
+            if (metadata.schemaVersion != 1 || metadata.depends.minecraft != project.minecraft_version) {
+                throw new GradleException('Incorrect Fabric schema/Minecraft requirement in production artifact')
+            }
+            requireJava21(metadata)
+            def nested = (metadata.jars ?: []).collect { it.file }
+            ['cardinal-components-base', 'cardinal-components-entity', 'satin'].each { library ->
+                if (!nested.any { it.startsWith("META-INF/jars/${library}-") && zip.getEntry(it) != null }) {
+                    throw new GradleException("Missing nested runtime library: ${library}")
+                }
+            }
+            zip.entries().each { entry ->
+                if (entry.name.matches('assets/[^/]+/lang/[^/]+\\.json')) {
+                    zip.getInputStream(entry).withCloseable { stream ->
+                        new groovy.json.JsonSlurper().parse(stream, 'UTF-8')
+                    }
+                }
+            }
+        }
+        setArgs([artifact.absolutePath, project.version.toString()])
+    }
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('selfTest')
+}
+tasks.named('build') {
+    dependsOn tasks.named('verifyProductionJar')
+}
