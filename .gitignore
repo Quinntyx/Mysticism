@@ -1,9 +1,6 @@
 .gradle/
 .idea/
 build/
-gradle/
-gradlew
-gradlew.bat
 run/
-src/.DS_Store
+.DS_Store
 

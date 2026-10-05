@@ -7,7 +7,6 @@
   "authors": ["Quinntyx"],
   "contact": {},
   "license": "MIT",
-  "icon": "assets/mysticism/icon.png",
   "environment": "*",
   "entrypoints": {
     "fabric-datagen": [
@@ -32,9 +31,9 @@
   ],
   "depends": {
     "fabricloader": ">=${loader_version}",
-    "fabric": "*",
     "fabric-api": "*",
-    "minecraft": "${minecraft_version}"
+    "minecraft": "${minecraft_version}",
+    "java": ">=21"
   },
   "custom": {
     "cardinal-components": [
