@@ -1,6 +1,6 @@
 package io.github.mysticism.command;
 
-import ai.djl.util.Pair;
+import io.github.mysticism.vector.IndexPair;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
@@ -122,12 +122,12 @@ public class EmbeddingCommand {
         if (itemVec.isEmpty()) return 0;
 
         KnnIndex spatial = SpatialEmbeddingIndexState.get(player.getServer()).getIndex();
-        List<Pair<String, Float>> res = spatial.kNN(1, itemVec.get(), Metric.COSINE);
+        List<IndexPair<String, Float>> res = spatial.kNN(1, itemVec.get(), Metric.COSINE);
         if (res.isEmpty()) {
             ctx.getSource().sendFeedback(() -> Text.literal("No spatial regions indexed yet.").formatted(Formatting.YELLOW), false);
             return 1;
         }
-        Pair<String, Float> top = res.get(0);
+        IndexPair<String, Float> top = res.get(0);
         ctx.getSource().sendFeedback(() -> Text.literal(String.format("Best region: %s (dot=%.4f)", top.getKey(), top.getValue()))
                 .formatted(Formatting.AQUA), false);
         return 1;
@@ -142,7 +142,7 @@ public class EmbeddingCommand {
         if (itemVec.isEmpty()) return 0;
 
         KnnIndex spatial = SpatialEmbeddingIndexState.get(player.getServer()).getIndex();
-        List<Pair<String, Float>> results = spatial.kNN(k, itemVec.get(), Metric.COSINE);
+        List<IndexPair<String, Float>> results = spatial.kNN(k, itemVec.get(), Metric.COSINE);
         results.sort((a, b) -> Float.compare(b.getValue(), a.getValue()));
 
         if (results.isEmpty()) {
@@ -152,7 +152,7 @@ public class EmbeddingCommand {
 
         ctx.getSource().sendFeedback(() -> Text.literal("Top " + results.size() + " regions (DOT):").formatted(Formatting.AQUA), false);
         int i = 1;
-        for (Pair<String, Float> p : results) {
+        for (IndexPair<String, Float> p : results) {
             String line = String.format("#%d  %.4f  %s", i++, p.getValue(), p.getKey());
             ctx.getSource().sendFeedback(() -> Text.literal(line), false);
         }
@@ -167,7 +167,7 @@ public class EmbeddingCommand {
         if (itemVec.isEmpty()) return 0;
 
         SpatialEmbeddingIndexState spatialState = SpatialEmbeddingIndexState.get(player.getServer());
-        List<Pair<String, Float>> res = spatialState.getIndex().kNN(1, itemVec.get(), Metric.COSINE);
+        List<IndexPair<String, Float>> res = spatialState.getIndex().kNN(1, itemVec.get(), Metric.COSINE);
         if (res.isEmpty()) {
             ctx.getSource().sendFeedback(() -> Text.literal("No spatial regions indexed yet.").formatted(Formatting.YELLOW), false);
             return 1;
@@ -199,7 +199,7 @@ public class EmbeddingCommand {
             return 0;
         }
 
-        List<Pair<String, Float>> results = spatial.getIndex().kNN(k + 1, regionVec.get(), Metric.COSINE);
+        List<IndexPair<String, Float>> results = spatial.getIndex().kNN(k + 1, regionVec.get(), Metric.COSINE);
         // drop self if present
         results = results.stream()
                 .filter(p -> !p.getKey().equals(currentRegionId))
@@ -214,7 +214,7 @@ public class EmbeddingCommand {
 
         ctx.getSource().sendFeedback(() -> Text.literal("Nearest regions to current chunk:").formatted(Formatting.AQUA), false);
         int i = 1;
-        for (Pair<String, Float> p : results) {
+        for (IndexPair<String, Float> p : results) {
             String line = String.format("#%d  %.4f  %s", i++, p.getValue(), p.getKey());
             ctx.getSource().sendFeedback(() -> Text.literal(line), false);
         }
@@ -234,7 +234,7 @@ public class EmbeddingCommand {
         }
 
         ItemEmbeddingIndexState itemState = ItemEmbeddingIndexState.get(player.getServer());
-        List<Pair<String, Float>> results = itemState.getIndex().kNN(k, regionVec.get(), Metric.COSINE);
+        List<IndexPair<String, Float>> results = itemState.getIndex().kNN(k, regionVec.get(), Metric.COSINE);
         results.sort((a, b) -> Float.compare(b.getValue(), a.getValue()));
 
         if (results.isEmpty()) {
@@ -244,7 +244,7 @@ public class EmbeddingCommand {
 
         ctx.getSource().sendFeedback(() -> Text.literal("Top " + results.size() + " items related to this chunk:").formatted(Formatting.AQUA), false);
         int i = 1;
-        for (Pair<String, Float> p : results) {
+        for (IndexPair<String, Float> p : results) {
             String id = p.getKey();
             String pretty = id;
             try {
@@ -352,7 +352,7 @@ public class EmbeddingCommand {
             return 0;
         }
 
-        List<Pair<String, Float>> results = index.kNN(k, query, Metric.COSINE);
+        List<IndexPair<String, Float>> results = index.kNN(k, query, Metric.COSINE);
         if (results.isEmpty()) {
             src.sendFeedback(() -> Text.literal("No neighbors found (index empty?)").formatted(Formatting.YELLOW), false);
             return 1;
@@ -363,7 +363,7 @@ public class EmbeddingCommand {
                 .formatted(Formatting.AQUA), false);
 
         int rank = 1;
-        for (Pair<String, Float> p : results) {
+        for (IndexPair<String, Float> p : results) {
             String id = p.getKey();
             float score = p.getValue();
 

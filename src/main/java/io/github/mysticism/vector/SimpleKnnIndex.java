@@ -1,6 +1,6 @@
 package io.github.mysticism.vector;
 
-import ai.djl.util.Pair;
+import io.github.mysticism.vector.IndexPair;
 import java.util.*;
 import java.util.function.BiConsumer;
 
@@ -18,19 +18,19 @@ public final class SimpleKnnIndex implements KnnIndex {
     public synchronized void deltaUpdate(String id,Vec384f delta) { EmbeddingSpace.requireCurrent(delta); data.computeIfAbsent(id,k->Vec384f.ZERO()).add(delta); }
     public synchronized void converge(List<String> keys,Vec384f target,float factor) { EmbeddingSpace.requireCurrent(target); for(String id:keys)data.computeIfAbsent(id,k->Vec384f.ZERO()).converge(target,factor); }
     private synchronized Map<String,Vec384f> snapshot() { Map<String,Vec384f> result=new TreeMap<>();data.forEach((id,v)->result.put(id,v.clone()));return result; }
-    public List<Pair<String,Float>> kNN(int k,Vec384f query,Metric metric) {
+    public List<IndexPair<String,Float>> kNN(int k,Vec384f query,Metric metric) {
         EmbeddingSpace.requireCurrent(query); Objects.requireNonNull(metric);
         if(k<=0)return new ArrayList<>();
         Vec384f q=query.clone();
-        Comparator<Pair<String,Float>> best = Comparator.<Pair<String,Float>>comparingDouble(Pair::getValue).reversed().thenComparing(Pair::getKey);
-        PriorityQueue<Pair<String,Float>> heap=new PriorityQueue<>(best.reversed());
+        Comparator<IndexPair<String,Float>> best = Comparator.<IndexPair<String,Float>>comparingDouble(IndexPair::getValue).reversed().thenComparing(IndexPair::getKey);
+        PriorityQueue<IndexPair<String,Float>> heap=new PriorityQueue<>(best.reversed());
         snapshot().forEach((id,v)->{
             float score=switch(metric){case COSINE->v.cosine(q);case DOT->v.dot(q);case EUCLIDEAN->-v.squareDistance(q);};
             if(!Float.isFinite(score))throw new IllegalArgumentException("Nonfinite KNN score");
-            Pair<String,Float> candidate=new Pair<>(id,score);
+            IndexPair<String,Float> candidate=new IndexPair<>(id,score);
             if(heap.size()<k)heap.add(candidate);else if(best.compare(candidate,heap.peek())<0){heap.poll();heap.add(candidate);}
         });
-        List<Pair<String,Float>> result=new ArrayList<>(heap);result.sort(best);return result;
+        List<IndexPair<String,Float>> result=new ArrayList<>(heap);result.sort(best);return result;
     }
     public void forEach(BiConsumer<String,Vec384f> consumer) { snapshot().forEach(consumer); }
 }
