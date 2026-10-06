@@ -41,8 +41,11 @@ Quality choice: JVM `-Dmysticism.spirit.quality=low|medium|high`, default medium
 `ShaderManager.setQuality(SpiritRenderSettings.Quality)` is also public. Low/medium/high
 use **24/40/64** bounded ray samples and **9/25/49 unique neighborhood taps**, respectively.
 Each painterly tap has at most one color/depth fetch, plus center samples; four quadrant
-moments share the neighborhood, no randomized rotated kernels or 81-tap arrays. Sky/depth
-edge rejection avoids obvious silhouette bleed. Saturation is a separate final program:
+moments share the neighborhood, no randomized rotated kernels or 81-tap arrays. Explicit integer `texelFetch` reads make depth filtering independent of GL sampler state.
+Foreground-only gathering rejects any neighbor deeper than the center, so background
+terrain/glyph color cannot spread onto a nearer wall through the old symmetric window-depth
+threshold. This conservative guard can reduce taps on sloping surfaces; visual quality
+still needs GPU smoke testing. Saturation is a separate final program:
 monotonic-time smoothstep from grayscale to full saturation over **2.5 seconds** after
 entry; independent of tick rate, distance fog, frame count and painterly quality.
 
@@ -64,7 +67,7 @@ occlusion and linear fog, and retry after re-entry or resource reload (F3+T).
 
 ## Actual 1.21.1 ordering / attachment investigation
 
-Inspected the cached **Fabric rendering-v1 5.0.5+df16efd019 / Satin 2.0.0 source JARs** and
+Inspected the cached **Fabric rendering-v1 5.1.0+ab4c25a019 / Satin 2.0.0 source JARs** and
 mapped Yarn **1.21.1+build.1** Minecraft bytecode (`javap -c -p`). Relevant source paths:
 
 * Fabric `net/fabricmc/fabric/mixin/client/rendering/WorldRendererMixin.java`:
@@ -159,3 +162,69 @@ or every Fabulous auxiliary entity surface. Arbitrary mod model atlas assumption
 external shader/renderer compatibility need smoke testing. No actual terrain loading is
 implemented by this client patch. No persisted authoritative glyph placement is available in
 current payload, so local frozen glyph session positions are not a save/reload world contract.
+
+## Independent review fixes and actual re-verification (2026-10-06)
+
+Reviewed the implementation against fixed baseline `1619e58000b40fd42f837d8d061318d0e5eae367`,
+not a moving integration branch. Fixed the first-entry frame bug: predictor mirrors only
+refresh after movement, so they can be default/stale when the first glyph is rendered.
+The renderer now captures the player's **actual CCA LATENT_BASIS/LATENT_POS** on first
+nonempty visibility, with immutable copies held by production `SpiritGlyphFrame`.
+World/player replacement resets that local frame and releases the native glyph buffer.
+Renderer/resource invalidation clears icons for fresh built-in-model safety checks but
+preserves retained frame positions and the saturation timer. Disconnect clears local placement/icons
+and the connection's visible/vector cache; no networking payload or common service changed.
+This does not establish ordering between CCA sync and the first server visibility packet.
+
+Production placement has an explicit 128-entry cap, rejects incompatible profiles even
+for retained IDs, releases nonvisible entries when the next bounded set is processed,
+and retains cached positions despite later basis/origin/embedding mutation. Tests now call
+that actual helper. Each position and icon cache is <=128; the existing payload vector
+map can still accumulate invisible entries within one connection (parent networking
+followup below). Icon stacks suppress enchantment glint: glint has a different texture
+and vertex format and must not be routed into the single depth-writing atlas layer.
+Negative near-zero camera coordinates can round to exactly 4096 in float; periodic wrapping
+now maps that boundary to zero and rejects nonfinite coordinates.
+
+Latest checks, not a live Minecraft/GPU claim:
+
+* `MYSTICISM_MINECRAFT_CLASSPATH="$(< /tmp/mysticism-volumetrics.cp)" bash
+  src/test/java/io/github/mysticism/client/spiritworld/run-render-tests.sh`: **PASS**,
+  **99 static contracts**, **1870 CPU math/production-placement checks**, **3 GLSL150
+  fragment validations** with installed `glslangValidator`. No software was installed.
+* Visible tmux pane **%466**, Java21: `JAVA_HOME=/usr/lib/jvm/java-21-openjdk bash
+  ./gradlew --offline --no-daemon --max-workers=2 -I /tmp/mysticism-render-review.gradle
+  compileJava compileClientJava selfTest`: **PASS**, final exit 0, 12 seconds. To bypass the
+  worktree's unrelated remaining DJL Pair imports, a temporary copy of main sources at
+  `/tmp/mysticism-render-review-main.lnmoyu22` substitutes exactly the four parent
+  `2577922` sources: IndexPair, KnnIndex, SimpleKnnIndex, EmbeddingCommand. All client
+  sources, tests and resources are this worktree's actual files. This is a qualified
+  standalone compile, not proof that the unmodified baseline common sources build.
+  Five test mains passed: render **1870**, embedding persistence/network **93**,
+  pipeline **133**, landmark core **802**, disk/NBT **2388**. Corrupt-save diagnostics
+  are expected test output. Build self-test metadata/runner checks also passed.
+* Same visible command with `verifyProductionJar`: **FAILED** at `jar`, duplicate
+  `assets/mysticism/lang/en_us.json` from main/client resource roots. Remap/production-jar
+  verification was **NOT RUN**. This pre-existing parent/build integration issue was
+  not patched or hidden with duplicate exclusions. All **7** processed shader JSON/GLSL
+  files byte-match reviewed source. `git diff --check`: **PASS**.
+* GPU/live client, shader execution on a driver, wall occlusion screenshots, Fabulous,
+  resize/reload/hardware-failure smoke, visual saturation and performance: **NOT RUN**.
+  Source-level nearest-depth/foreground gather and correct game callback ordering are
+  verified, not visually proven.
+
+Precise parent networking followup: transmit an authoritative projection epoch and realm
+position/placement (or a persisted server projection frame) for each stable glyph ID,
+with the pinned embedding profile and a connection/dimension session identifier. Apply
+packets only to the matching live session; coordinate the first placement set with CCA
+sync, clear/prune removed vector entries, and resend placement/epoch on re-entry/respawn.
+Then test world save/reload against terrain's persisted placements. The current local
+frame is only session-stable; reconnect/re-entry can legitimately choose another anchor,
+and disconnected queued payload work still needs an epoch guard in parent-owned networking.
+Do not describe these glyphs as save-stable or terrain-authoritatively aligned.
+
+Parent integration remains unchanged: register the supplied SpiritBackgroundRendererMixin,
+retain idempotent client init, reconcile duplicate language resources/common Pair migration,
+and ensure terrain generation/loading beyond the **64-block opaque / >=80-block loading**
+contract. No manifest, mixin JSON, initializer, build/dependency, terrain or payload files
+were edited in this review.

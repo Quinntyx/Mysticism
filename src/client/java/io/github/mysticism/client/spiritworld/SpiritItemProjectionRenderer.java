@@ -1,14 +1,17 @@
 package io.github.mysticism.client.spiritworld;
 
 import com.mojang.blaze3d.systems.RenderSystem;
-import io.github.mysticism.vector.Basis384f;
+import io.github.mysticism.component.MysticismEntityComponents;
 import io.github.mysticism.vector.EmbeddingSpace;
-import io.github.mysticism.vector.Projection384f;
 import io.github.mysticism.vector.Vec384f;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+import net.fabricmc.fabric.api.client.rendering.v1.InvalidateRenderStateCallback;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.component.DataComponentTypes;
 import net.minecraft.client.render.LightmapTextureManager;
 import net.minecraft.client.render.OverlayTexture;
 import net.minecraft.client.render.RenderLayer;
@@ -40,9 +43,8 @@ public final class SpiritItemProjectionRenderer {
     private static final Map<String, Glyph> glyphs = new LinkedHashMap<>();
     private static final RenderLayer GLYPH_LAYER = RenderLayer.getEntityCutoutNoCull(SpriteAtlasTexture.BLOCK_ATLAS_TEXTURE);
     private static ClientWorld world;
-    private static Basis384f frozenBasis;
-    private static Vec384f frozenOrigin;
-    private static Vec3d realmAnchor;
+    private static ClientPlayerEntity player;
+    private static SpiritGlyphFrame frame;
     private static BufferAllocator allocator;
     private static VertexConsumerProvider.Immediate immediate;
     private static boolean initialized, warned;
@@ -53,20 +55,26 @@ public final class SpiritItemProjectionRenderer {
         if (initialized) return;
         initialized = true;
         WorldRenderEvents.AFTER_ENTITIES.register(SpiritItemProjectionRenderer::render);
-        ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
-            if (allocator != null) allocator.close();
-            allocator = null;
-            immediate = null;
+        // Resource/world renderer reload can change an item's model into a built-in renderer.
+        // Re-resolve icon safety without changing retained frame positions or the saturation timer.
+        InvalidateRenderStateCallback.EVENT.register(glyphs::clear);
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
             resetSession();
+            // Payload cache is connection-scoped. Never show a previous server's IDs on reconnect.
+            ClientSpiritCache.VISIBLE.clear();
+            ClientSpiritCache.VEC.clear();
         });
+        ClientLifecycleEvents.CLIENT_STOPPING.register(client -> resetSession());
     }
 
     public static void resetSession() {
+        if (allocator != null) allocator.close();
+        allocator = null;
+        immediate = null;
         glyphs.clear();
         world = null;
-        frozenBasis = null;
-        frozenOrigin = null;
-        realmAnchor = null;
+        player = null;
+        frame = null;
         warned = false;
     }
 
@@ -78,19 +86,29 @@ public final class SpiritItemProjectionRenderer {
         }
         var matrices = context.matrixStack();
         if (matrices == null || context.frustum() == null) return;
-        if (world != client.world) {
+        if (world != client.world || player != client.player) {
             resetSession();
             world = client.world;
-            // The current payload carries vectors, not authoritative realm placements. Freeze a local
-            // session frame rather than re-anchoring to the camera each render (the old orbit/ring bug).
-            frozenBasis = ClientSpiritCache.playerLatentBasis.clone();
-            frozenOrigin = ClientSpiritCache.playerLatentPos.clone();
-            realmAnchor = client.player.getPos();
+            player = client.player;
         }
         if (ClientSpiritCache.VISIBLE.size() > SpiritRenderSettings.MAX_GLYPHS) {
             warn("Server glyph set exceeds 128; refusing unbounded render enumeration", null);
             return;
         }
+        if (ClientSpiritCache.VISIBLE.isEmpty()) return;
+        if (frame == null) {
+            try {
+                // Predictor mirrors only refresh after motion: on entry they can be default or from
+                // the previous world. Read current synced CCA components, freeze on first glyph.
+                // Payload still lacks authoritative realm placements; this is a LOCAL session frame.
+                frame = new SpiritGlyphFrame(MysticismEntityComponents.LATENT_BASIS.get(player).get(),
+                        MysticismEntityComponents.LATENT_POS.get(player).get(), player.getPos());
+            } catch (RuntimeException exception) {
+                warn("Cannot capture compatible player glyph frame", exception);
+                return;
+            }
+        }
+        frame.retain(ClientSpiritCache.VISIBLE);
         if (immediate == null) {
             allocator = new BufferAllocator(262144);
             immediate = VertexConsumerProvider.immediate(allocator);
@@ -113,12 +131,7 @@ public final class SpiritItemProjectionRenderer {
                 EmbeddingSpace.requireCurrent(vector);
                 glyph = glyphs.get(id);
                 if (glyph == null) {
-                    Vec3d position = Projection384f.projectToWorld(vector, frozenOrigin, frozenBasis, realmAnchor, 30.0f);
-                    if (!Double.isFinite(position.x) || !Double.isFinite(position.y) || !Double.isFinite(position.z))
-                        throw new IllegalArgumentException("Nonfinite projected position");
-                    float scale = (float) Math.max(0.25, Math.min(1.5,
-                            1.0 / Math.sqrt(Math.max(0.01, vector.squareDistance(frozenOrigin)))));
-                    glyph = new Glyph(position, resolveIcon(id), scale);
+                    glyph = new Glyph(frame.position(id, vector), resolveIcon(id), frame.scale(vector));
                     glyphs.put(id, glyph);
                 }
             } catch (IllegalArgumentException exception) {
@@ -151,6 +164,9 @@ public final class SpiritItemProjectionRenderer {
         Identifier identifier = Identifier.tryParse(id);
         Item item = identifier == null ? Items.AMETHYST_SHARD : Registries.ITEM.get(identifier);
         ItemStack stack = new ItemStack(item == Items.AIR ? Items.AMETHYST_SHARD : item);
+        // Glint uses a DIFFERENT texture/vertex format; routing it into our single atlas cutout
+        // buffer corrupts both color and depth (e.g. enchanted golden apples). Glyphs omit glint.
+        stack.set(DataComponentTypes.ENCHANTMENT_GLINT_OVERRIDE, false);
         // Built-in renderers may use non-atlas textures/special targets. Keep a predictable depth glyph.
         if (MinecraftClient.getInstance().getItemRenderer().getModel(stack, world, null, 0).isBuiltin())
             return new ItemStack(Items.AMETHYST_SHARD);

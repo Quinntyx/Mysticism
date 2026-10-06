@@ -16,6 +16,7 @@ javac --release 21 -proc:none -cp "$MYSTICISM_MINECRAFT_CLASSPATH" -d "$classes"
     "$root/src/main/java/io/github/mysticism/vector/Basis384f.java" \
     "$root/src/main/java/io/github/mysticism/vector/Projection384f.java" \
     "$root/src/client/java/io/github/mysticism/client/spiritworld/SpiritRenderSettings.java" \
+    "$root/src/client/java/io/github/mysticism/client/spiritworld/SpiritGlyphFrame.java" \
     "$root/src/test/java/io/github/mysticism/client/spiritworld/SpiritRenderMathSelfTest.java"
 java -cp "$classes:$MYSTICISM_MINECRAFT_CLASSPATH" io.github.mysticism.client.spiritworld.SpiritRenderMathSelfTest
 printf 'Self-test class output retained at %s\n' "$classes"

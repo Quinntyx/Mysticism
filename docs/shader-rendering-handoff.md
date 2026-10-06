@@ -46,7 +46,47 @@ model IO/inference, large world scans or blocking waits on tick/render. One snap
 FBO plus three Satin targets, no per-frame FBO allocation; dimensions/sampler IDs follow
 framebuffer resize. Owned resources release on exit/disconnect/re-entry/shutdown.
 
-## Actual validation
+## Independent review (2026-10-06)
+
+Fixed first glyph entry freezing stale movement-only predictor mirrors: production
+`SpiritGlyphFrame` now snapshots actual CCA basis/position on first visibility. Retained
+positions/profile rejection and its hard 128-entry budget are exercised directly by tests.
+World/player replacement resets the local frame and releases its native buffer; disconnect
+clears connection caches. Renderer/resource invalidation re-resolves model safety while
+preserving the frozen placement frame.
+Suppressed glyph glint to avoid routing its incompatible texture/vertex format through the
+atlas cutout buffer. Fixed float wrapping of tiny negative coordinates to keep [0,4096).
+Kuwahara now uses integer nearest depth/color fetches and foreground-only gathering,
+preventing deeper glyph samples bleeding onto a nearer wall; still <=49 neighborhood taps.
+Fog radius, chain ordering and independent 2.5-second saturation layer remain unchanged.
+
+Latest actual checks:
+
+* **PASS**: 99 static resource/order contracts, 1870 CPU/production-placement checks,
+  3 GLSL150 fragments (`glslangValidator`); seven processed shader resources byte-match
+  reviewed source; `git diff --check`.
+* **PASS, qualified**: visible tmux **%466**, Java21 Gradle offline `compileJava
+  compileClientJava selfTest`, exit 0. Temporary main-source copy substitutes exactly
+  parent `2577922`'s four Pair migration files (IndexPair/KnnIndex/SimpleKnnIndex/command),
+  with no worktree common/config changes. Actual client sources and all five test mains
+  passed: render 1870, persistence/network 93, pipeline 133, core 802, disk/NBT 2388.
+  Command/init-script details are in `docs/spirit-volumetrics-integration.md`.
+* **FAILED**: `verifyProductionJar` attempt stops at `jar` because main/client resources
+  duplicate `assets/mysticism/lang/en_us.json`. Remap/production-jar verification not run;
+  parent owns the fix. Unmodified baseline common source still needs its Pair migration.
+* **NOT RUN**: GPU/live Minecraft, visual wall occlusion, Fabulous, resize/reload/failure
+  recovery, actual saturation visuals or performance. No driver/runtime success claimed.
+
+Parent networking followup is required for authoritative save-stable glyph placement:
+include projection epoch and realm placement/persisted frame per stable ID with pinned
+profile and connection/dimension session identity; guard queued packets by live session,
+coordinate initial CCA sync, prune removed vector entries, and resend on re-entry/respawn.
+The existing vector cache can grow within a connection; disconnect cleanup is not a
+per-connection memory cap. Current positions are **local session-stable only**, not
+terrain-authoritatively aligned or save/reload-stable. No placeholder packet/API invented.
+Parent still registers the supplied mixin and ensures terrain loading >=80 for opaque64.
+
+## Original implementation validation (before independent review)
 
 * `MYSTICISM_MINECRAFT_CLASSPATH="<existing mapped/runtime jars>" bash
   src/test/java/io/github/mysticism/client/spiritworld/run-render-tests.sh` passed:

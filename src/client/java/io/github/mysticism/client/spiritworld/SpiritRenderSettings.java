@@ -33,6 +33,10 @@ public final class SpiritRenderSettings {
 
     /** Periodic coordinates preserve density at negative positions and wrap boundaries. */
     public static float wrap(double coordinate) {
-        return (float) (coordinate - Math.floor(coordinate / DENSITY_PERIOD) * DENSITY_PERIOD);
+        if (!Double.isFinite(coordinate)) throw new IllegalArgumentException("Nonfinite camera coordinate");
+        float wrapped = (float) (coordinate - Math.floor(coordinate / DENSITY_PERIOD) * DENSITY_PERIOD);
+        // Float rounding just below the boundary (especially tiny negative coordinates) can
+        // produce PERIOD. Zero is the same periodic point, and keeps uniforms in [0, PERIOD).
+        return wrapped >= DENSITY_PERIOD ? 0.0f : wrapped;
     }
 }

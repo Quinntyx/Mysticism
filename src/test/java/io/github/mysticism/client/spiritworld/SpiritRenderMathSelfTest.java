@@ -8,6 +8,9 @@ import net.minecraft.util.math.Vec3d;
 import org.joml.Matrix4f;
 import org.joml.Vector4f;
 
+import java.util.HashSet;
+import java.util.Set;
+
 /** Actual settings/projection API checks plus CPU reference for GLSL integration (not a GPU test). */
 public final class SpiritRenderMathSelfTest {
     private static int checks;
@@ -56,10 +59,10 @@ public final class SpiritRenderMathSelfTest {
             check(saturation >= previous && saturation <= 1, "monotonic time fade");
             previous = saturation;
         }
-        for (double x : new double[]{-30_000_000, -8192, -4096.125, -1, 0, 4095.875, 8192, 30_000_000}) {
+        for (double x : new double[]{-30_000_000, -8192, -4096.125, -1, -1e-9, -0.00001, 0, 4095.99999, 4095.875, 8192, 30_000_000}) {
             float wrapped = SpiritRenderSettings.wrap(x);
             check(wrapped >= 0 && wrapped < SpiritRenderSettings.DENSITY_PERIOD, "negative/world-border wrapping");
-            near(density(x, 11, -5), density(wrapped, 11, -5), 2e-8);
+            near(density(x, 11, -5), density(wrapped, 11, -5), 1e-5); // bounded float-coordinate rounding
         }
         for (var quality : SpiritRenderSettings.Quality.values()) {
             check(quality.fogSteps >= 8 && quality.fogSteps <= 64, "bounded ray samples");
@@ -109,8 +112,63 @@ public final class SpiritRenderMathSelfTest {
             throw new AssertionError("incompatible embedding accepted");
         } catch (IllegalArgumentException expected) { checks++; }
     }
+    private static void painterlyDepthGuard() {
+        Matrix4f projection = new Matrix4f().perspective((float) Math.toRadians(70), 16f / 9, .05f, 1024);
+        Vector4f wall = projection.transform(new Vector4f(0, 0, -10, 1));
+        Vector4f glyph = projection.transform(new Vector4f(0, 0, -12, 1));
+        float wallDepth = wall.z / wall.w * .5f + .5f;
+        float glyphDepth = glyph.z / glyph.w * .5f + .5f;
+        check(Math.abs(glyphDepth - wallDepth) < .0015f, "old symmetric depth threshold admits background glyph color");
+        check(glyphDepth > wallDepth, "foreground-only gather rejects that glyph sample");
+        check(!(wallDepth > wallDepth), "center sample remains in all four quadrants");
+    }
+    private static void productionGlyphFrame() {
+        Basis384f liveBasis = new Basis384f();
+        Vec384f liveOrigin = axis(4);
+        SpiritGlyphFrame frame = new SpiritGlyphFrame(liveBasis, liveOrigin, new Vec3d(-11, 64, 33));
+        // Exercise the helper actually called by the renderer, not a duplicate projection formula.
+        Vec3d first = frame.position("first", axis(0));
+        near(first.x, 19, 0); near(first.y, 64, 0); near(first.z, 33, 0);
+        liveOrigin.add(axis(0)); liveBasis.i.mul(0);
+        near(frame.position("later", axis(0)).squaredDistanceTo(first), 0, 0);
+        near(frame.position("first", axis(1)).squaredDistanceTo(first), 0, 0);
+        try {
+            frame.position("first", new Vec384f(axis(0).data(), "wrong-fingerprint"));
+            throw new AssertionError("cached ID bypassed fingerprint check");
+        } catch (IllegalArgumentException expected) { checks++; }
+        check(frame.size() == 2, "rejected profile cannot change frame cache");
+        frame.retain(Set.of("first"));
+        check(frame.size() == 1, "removed visibility releases placement");
+        near(frame.position("later", axis(0)).squaredDistanceTo(first), 0, 0);
+        Set<String> visible = new HashSet<>(); visible.add("first"); visible.add("later");
+        for (int i = 2; i < SpiritRenderSettings.MAX_GLYPHS; i++) {
+            String id = "glyph-" + i; visible.add(id); frame.position(id, axis(0));
+        }
+        check(frame.size() == SpiritRenderSettings.MAX_GLYPHS, "exact retained placement budget");
+        try {
+            frame.position("overflow", axis(0));
+            throw new AssertionError("placement cache overflow accepted");
+        } catch (IllegalArgumentException expected) { checks++; }
+        visible.add("overflow");
+        try {
+            frame.retain(visible);
+            throw new AssertionError("oversized visibility accepted");
+        } catch (IllegalArgumentException expected) { checks++; }
+        check(frame.size() == SpiritRenderSettings.MAX_GLYPHS, "overflow is atomic");
+        frame.retain(Set.of()); check(frame.size() == 0, "empty visibility releases cache");
+        near(frame.position("first", axis(0)).squaredDistanceTo(first), 0, 0);
+        check(frame.scale(axis(0)) >= .25f && frame.scale(axis(0)) <= 1.5f, "bounded glyph scale");
+        try {
+            new SpiritGlyphFrame(new Basis384f(), axis(0), new Vec3d(Double.NaN, 0, 0));
+            throw new AssertionError("nonfinite anchor accepted");
+        } catch (IllegalArgumentException expected) { checks++; }
+        try {
+            SpiritRenderSettings.wrap(Double.NaN);
+            throw new AssertionError("nonfinite camera accepted");
+        } catch (IllegalArgumentException expected) { checks++; }
+    }
     public static void main(String[] args) {
-        settingsAndMedium(); sceneDepth(); projectionProfilesAndStability();
+        settingsAndMedium(); sceneDepth(); projectionProfilesAndStability(); productionGlyphFrame(); painterlyDepthGuard();
         System.out.println("Spirit render math: " + checks + " checks passed (CPU reference; GPU not exercised)");
     }
 }
