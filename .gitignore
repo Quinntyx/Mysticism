@@ -4,3 +4,6 @@ build/
 run/
 .DS_Store
 
+# Local orchestration notebooks and runtime diagnostics; never production sources.
+.pi/
+logs/

@@ -123,6 +123,13 @@ public final class LandmarkPersistenceSelfTest {
         while(!split.complete()) split.advance(1);
         check(hydrated(loaded,alias).isEmpty() && hydrated(loaded,canonical).isEmpty() && loaded.tombstones().containsKey(canonical),"split aliases resolve tombstone, not arbitrary child");
         check(loaded.lineage().get(canonical).equals(List.of(left.id(),right.id()).stream().sorted().toList()),"persisted deterministic one-to-many split lineage");
+        check(loaded.tombstoneRevision(canonical).orElseThrow()==2,"bounded retired-parent revision");
+        check(loaded.tombstoneRevision(left.id()).isEmpty(),"live child is not tombstoned");
+        check(loaded.lineageChildren(canonical,2).equals(loaded.lineage().get(canonical)),"bounded deterministic split lineage");
+        check(loaded.lineageChildren(left.id(),0).isEmpty(),"missing lineage requires no global copy");
+        fails(IllegalArgumentException.class,()->loaded.lineageChildren(canonical,1),"reject undersized lineage budget");
+        fails(IllegalArgumentException.class,()->loaded.lineageChildren(canonical,513),"reject unbounded lineage read");
+
         reloadedManager.save(); LandmarkStore splitRestart=LandmarkStore.open(manager(dir,lookup),dir);
         check(hydrated(splitRestart,alias).isEmpty() && splitRestart.ids().size()==2 && splitRestart.lineage().equals(loaded.lineage()),"split tombstones and children actual disk restart");
         fails(IllegalStateException.class,()->loaded.stageDelete(new LandmarkRepository.RevisionRef(left.id(),1)),"stale store revision rejected");

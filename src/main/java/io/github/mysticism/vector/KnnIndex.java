@@ -1,6 +1,6 @@
 package io.github.mysticism.vector;
 
-import ai.djl.util.Pair;
+import io.github.mysticism.vector.IndexPair;
 
 import java.util.List;
 import java.util.function.BiConsumer;
@@ -51,7 +51,7 @@ public interface KnnIndex {
      * @return A list of pairs containing up to the K nearest
      * keys with their associated scores according to the provided metric.
      */
-    List<Pair<String, Float>> kNN(int k, Vec384f query, Metric metric);
+    List<IndexPair<String, Float>> kNN(int k, Vec384f query, Metric metric);
 
     /**
      * Converge a list of vectors on a specific target, with a percentage-based factor.
