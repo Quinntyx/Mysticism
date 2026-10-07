@@ -19,6 +19,7 @@ public final class GuidebookClient {
     private GuidebookClient() {}
     public static void init() {
         if (key != null) return;
+        GuidebookShimmerShader.init();
         GuidebookLoader.loadBundled();
         ResourceManagerHelper.get(ResourceType.CLIENT_RESOURCES).registerReloadListener(new GuidebookLoader());
         key = KeyBindingHelper.registerKeyBinding(new KeyBinding("key.mysticism.guidebook", InputUtil.Type.KEYSYM,

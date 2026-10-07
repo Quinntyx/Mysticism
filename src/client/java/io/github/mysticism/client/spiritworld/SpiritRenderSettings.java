@@ -7,7 +7,8 @@ public final class SpiritRenderSettings {
     public static final double OPAQUE_RADIUS = 64.0;
     public static final double MIN_LOADING_RADIUS = 80.0;
     public static final double MAX_TRANSMITTANCE = 0.001;
-    public static final double MIN_EXTINCTION = -Math.log(MAX_TRANSMITTANCE) / OPAQUE_RADIUS;
+    public static final double NEAR_BUBBLE = 5.0;
+    public static final double MIN_EXTINCTION = -Math.log(MAX_TRANSMITTANCE) / (OPAQUE_RADIUS - NEAR_BUBBLE);
     public static final FogHorizons HORIZONS = new FogHorizons(40, OPAQUE_RADIUS, MIN_LOADING_RADIUS);
     public static final double SATURATION_FADE_SECONDS = 2.5;
     public static final double DENSITY_PERIOD = 4096.0;
