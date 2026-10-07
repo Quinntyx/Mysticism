@@ -18,6 +18,15 @@ public final class ActivityMath {
         // Opposing vectors may cancel exactly: retain continuity instead of emitting NaN.
         return mixed.length() < 1e-6 ? from.clone() : new Vec384f(mixed.norm());
     }
+    /** Apply only the already inertia-limited source change; retain the activity residual.
+     * Repeated unchanged source vectors are a no-op, not repeated blending away of history. */
+    public static Vec384f reconcileSource(Vec384f effective,Vec384f previousSource,Vec384f nextSource){
+        EmbeddingSpace.requireCurrent(effective);EmbeddingSpace.requireCurrent(previousSource);EmbeddingSpace.requireCurrent(nextSource);
+        float[] current=effective.data(),before=previousSource.data(),after=nextSource.data();double normSquared=0;boolean changed=false;
+        for(int i=0;i<current.length;i++){double delta=(double)after[i]-before[i];changed|=delta!=0;current[i]=(float)(current[i]+delta);normSquared+=(double)current[i]*current[i];}
+        if(!changed||normSquared<1e-12)return effective.clone();
+        return new Vec384f(new Vec384f(current).norm());
+    }
     public static double relevance(double distanceSquared, double radius) {
         if (!Double.isFinite(distanceSquared) || distanceSquared < 0 || !Double.isFinite(radius) || radius <= 0)
             throw new IllegalArgumentException("distance/radius");

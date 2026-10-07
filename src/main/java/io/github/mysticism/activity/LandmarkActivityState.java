@@ -14,7 +14,10 @@ import java.util.*;
 
 /** Separate influence persistence. The landmark catalog/geometry remains authoritative in LandmarkStore. */
 public final class LandmarkActivityState extends PersistentState {
-    public static final int LIMIT=512, CELL_LIMIT=256;
+    public static final int CELL_LIMIT=256;
+    /** Four in-game years: importance survives ordinary visits/time gaps, then fades slowly. */
+    static final double HALF_LIFE_TICKS=24000.0*365*4;
+    static double decay(long elapsed){return Math.pow(.5,Math.max(0,elapsed)/HALF_LIFE_TICKS);}
     static final double MAX_IMPORTANCE_MASS=4096;
     public static final Type<LandmarkActivityState> TYPE=new Type<>(LandmarkActivityState::new,LandmarkActivityState::read,DataFixTypes.SAVED_DATA_COMMAND_STORAGE);
     static final class Influence {
@@ -23,14 +26,13 @@ public final class LandmarkActivityState extends PersistentState {
         // of source bases; rendering caps are separate and never erase conserved mass.
         double mergedBase=-1;
         double base(double sourceBase){return mergedBase<0?sourceBase:mergedBase;}
-        double importance(double sourceBase,long now){return Math.clamp(base(sourceBase)+level(now),0,1);}
+        double importance(double sourceBase,long now){return Math.clamp(base(sourceBase)*decay(now-tick)+level(now),0,1);}
         SparseOctree<String> claims;
         final Set<String> owners=new TreeSet<>();
         Influence(Vec384f v,double l,long t){vector=v.clone();level=l;tick=t;}
-        double level(long now){return level*Math.pow(0.5,Math.max(0,now-tick)/24000.0);}
+        double level(long now){return level*decay(now-tick);}
     }
     final Map<String,Influence> entries=new TreeMap<>();
-    private NbtCompound archive;
     private final Map<String,Integer> claimCounts=new HashMap<>();
     int claimedBy(UUID player){return claimCounts.getOrDefault(player.toString(),0);}
     void remove(String id){Influence old=entries.remove(id);if(old!=null){old.owners.forEach(owner->claimCounts.computeIfPresent(owner,(k,v)->v<=1?null:v-1));markDirty();}}
@@ -41,7 +43,7 @@ public final class LandmarkActivityState extends PersistentState {
     }
     public static LandmarkActivityState get(MinecraftServer server){
         if(!server.isOnThread())throw new IllegalStateException("activity server thread");
-        var manager=server.getOverworld().getPersistentStateManager();String key="mysticism.landmark_activity.v1";
+        var manager=server.getOverworld().getPersistentStateManager();String key="mysticism.landmark_activity.source-v2";
         LandmarkActivityState state=manager.get(TYPE,key);
         if(state==null&&!Files.notExists(server.getSavePath(WorldSavePath.ROOT).resolve("data").resolve(key+".dat")))
             throw new IllegalStateException("unreadable activity state; refusing replacement");
@@ -49,12 +51,10 @@ public final class LandmarkActivityState extends PersistentState {
     }
     static LandmarkActivityState read(NbtCompound tag,RegistryWrapper.WrapperLookup lookup){
         LandmarkActivityState state=new LandmarkActivityState();
-        if(tag.contains("embeddingArchive",NbtElement.COMPOUND_TYPE))state.archive=tag.getCompound("embeddingArchive").copy();
-        if(!EmbeddingNbt.compatible(tag)||tag.getInt("schema")!=1){state.archive=tag.copy();return state;}
+        if(!EmbeddingNbt.compatible(tag)||tag.getInt("schema")!=2)return state; // disposable generated profile, no migration/archive
         if(!tag.contains("entries",NbtElement.LIST_TYPE))throw new IllegalArgumentException("missing activity entries");
         NbtList list=tag.getList("entries",NbtElement.COMPOUND_TYPE);
         if(list.size()!=((NbtList)tag.get("entries")).size())throw new IllegalArgumentException("activity entry type");
-        if(list.size()>LIMIT)throw new IllegalArgumentException("activity entry budget");
         for(int i=0;i<list.size();i++){
             NbtCompound n=list.getCompound(i);String id=n.getString("id");
             if(!id.matches("lm-[0-9a-f]{64}")||state.entries.containsKey(id))throw new IllegalArgumentException("activity identity");
@@ -72,7 +72,7 @@ public final class LandmarkActivityState extends PersistentState {
             if(n.contains("claims")&&!n.contains("root"))throw new IllegalArgumentException("claims without root");
             if(n.contains("root")&&!n.contains("root",NbtElement.LONG_ARRAY_TYPE))throw new IllegalArgumentException("claim root type");
             if(n.contains("root",NbtElement.LONG_ARRAY_TYPE)){
-                Bounds root=LandmarkNbt.getBounds(n,"root");v.claims=SparseOctree.empty(root,1,512);
+                Bounds root=LandmarkNbt.getBounds(n,"root");v.claims=SparseOctree.empty(root,1,1L<<32);
                 NbtList cells=strictList(n,"claims",NbtElement.COMPOUND_TYPE);if(cells.size()>CELL_LIMIT)throw new IllegalArgumentException("claim budget");
                 for(int j=0;j<cells.size();j++){NbtCompound c=cells.getCompound(j);String owner=UUID.fromString(c.getString("owner")).toString();
                     Bounds bounds=LandmarkNbt.getBounds(c,"bounds");
@@ -99,7 +99,7 @@ public final class LandmarkActivityState extends PersistentState {
         return list;
     }
     @Override public NbtCompound writeNbt(NbtCompound tag,RegistryWrapper.WrapperLookup lookup){
-        EmbeddingNbt.stamp(tag);tag.putInt("schema",1);NbtList list=new NbtList();
+        EmbeddingNbt.stamp(tag);tag.putInt("schema",2);NbtList list=new NbtList();
         for(var e:entries.entrySet()){
             Influence v=e.getValue();NbtCompound n=new NbtCompound();n.putString("id",e.getKey());n.putIntArray("vector",v.vector.toBits());n.putDouble("level",v.level);n.putLong("tick",v.tick);
             if(v.mergedBase>=0)n.putDouble("mergedBase",v.mergedBase);
@@ -108,6 +108,6 @@ public final class LandmarkActivityState extends PersistentState {
             NbtList owners=new NbtList();v.owners.forEach(owner->owners.add(NbtString.of(owner)));n.put("owners",owners);
             list.add(n);
         }
-        tag.put("entries",list);if(archive!=null)tag.put("embeddingArchive",archive.copy());return tag;
+        tag.put("entries",list);tag.remove("embeddingArchive");return tag;
     }
 }

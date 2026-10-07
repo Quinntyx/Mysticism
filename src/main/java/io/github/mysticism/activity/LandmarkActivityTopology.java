@@ -47,7 +47,7 @@ public final class LandmarkActivityTopology {
     private record SplitInput(LandmarkMetadata parent,List<Landmark> children){}
     private static SplitInput splitInput(LandmarkStore store,LandmarkActivityState state,LandmarkRepository.RevisionRef ref,List<Landmark> supplied,long now){
         var source=parent(store,ref);var h=source.header();
-        if(now<0||supplied.size()<2||supplied.size()>MAX_CHILDREN||state.entries.size()>LandmarkActivityState.LIMIT)throw new IllegalArgumentException("split child/time/overlay budget");
+        if(now<0||supplied.size()<2||supplied.size()>MAX_CHILDREN)throw new IllegalArgumentException("split child/time/overlay budget");
         List<Landmark> children=supplied.stream().sorted(Comparator.comparing(Landmark::id)).toList();
         Set<String> ids=new HashSet<>();int pages=0,frontiers=0;
         for(var child:children){
@@ -76,7 +76,7 @@ public final class LandmarkActivityTopology {
         return new Prepared(store,state,List.of(ref),captured,outputs,children);
     }
     static Plan prepareRemove(LandmarkStore store,LandmarkActivityState state,List<LandmarkRepository.RevisionRef> supplied){
-        if(supplied.isEmpty()||supplied.size()>MAX_PARENTS||state.entries.size()>LandmarkActivityState.LIMIT)throw new IllegalArgumentException("remove budget");
+        if(supplied.isEmpty()||supplied.size()>MAX_PARENTS)throw new IllegalArgumentException("remove budget");
         List<LandmarkRepository.RevisionRef> refs=supplied.stream().sorted(Comparator.comparing(LandmarkRepository.RevisionRef::id)).toList();
         Set<String> ids=new HashSet<>();for(var ref:refs){parent(store,ref);if(!ids.add(ref.id()))throw new IllegalArgumentException("duplicate remove parent");}
         TreeMap<String,Snapshot> captured=new TreeMap<>();for(String id:ids)captured.put(id,Snapshot.of(state.entries.get(id)));
@@ -143,7 +143,7 @@ public final class LandmarkActivityTopology {
     }
     private static void validateBudget(LandmarkActivityState state,Map<String,Snapshot> captured,Map<String,LandmarkActivityState.Influence> outputs){
         long removed=captured.values().stream().filter(v->v.original!=null).count();
-        if(state.entries.size()>LandmarkActivityState.LIMIT||state.entries.size()-removed+outputs.size()>LandmarkActivityState.LIMIT)throw new IllegalArgumentException("topology overlay capacity");
+        // No global overlay/catalog cardinality cutoff; children and claims per operation remain bounded.
         Map<String,Integer> delta=new TreeMap<>();captured.values().forEach(s->s.owners.forEach(o->delta.merge(o,-1,Integer::sum)));
         for(var next:outputs.values()){
             if(next.owners.size()>16)throw new IllegalArgumentException("child owner capacity");
