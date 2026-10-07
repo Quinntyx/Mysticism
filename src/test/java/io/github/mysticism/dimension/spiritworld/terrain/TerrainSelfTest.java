@@ -91,19 +91,109 @@ public final class TerrainSelfTest {
         repository.put(near,-1);repository.put(distant,-1);repository.put(outside,-1);
         var all=repository.semanticRange(embedding(0,0),config.semanticRadius(),256);
         check(all.size()==2 && all.stream().anyMatch(l->l.id().equals(distant.id())),"ALL in-range landmarks, not nearest K");
-        var selector=config.selector();var importance=new ImportancePolicy(1,1200,0,0);
-        var selected=selector.select(all,embedding(0,0),1,frame(),new Point3(0,128,0),config.fog(),importance,1,1,null,Set.of());
+        var selector=new FrozenTerrainSelector(config);
+        var physical=new TerrainState();physical.initialize(frame());var importance=new ImportancePolicy(1,1200,0,0);
+        var selected=selector.select(all,embedding(0,0),1,frame(),new Point3(0,128,0),config.fog(),importance,1,1,null,Set.of(),l->physical.placement(metadata(l)));
         check(selected.representatives().size()==2,"separate semantic clusters retain far in-range feature");
         var dense=new ArrayList<>(all);
         for(int i=1;i<=100;i++)dense.add(landmark(256+i*8,.02,0,.1,STONE,true));
-        var crowded=selector.select(dense,embedding(0,0),2,frame(),new Point3(0,128,0),config.fog(),importance,2,1,selected,Set.of());
+        var crowded=selector.select(dense,embedding(0,0),2,frame(),new Point3(0,128,0),config.fog(),importance,2,1,selected,Set.of(),l->physical.placement(metadata(l)));
         check(crowded.representatives().size()==selected.representatives().size(),"source/chunk density does not add physical slots");
         check(crowded.representatives().stream().anyMatch(r->r.landmarkId().equals(distant.id())),"dense near duplicates cannot evict far semantic cluster");
-        var moved=selector.select(dense,embedding(0,0),3,frame(),new Point3(4,128,0),config.fog(),importance,3,1,crowded,Set.of());
+        var moved=selector.select(dense,embedding(0,0),3,frame(),new Point3(4,128,0),config.fog(),importance,3,1,crowded,Set.of(),l->physical.placement(metadata(l)));
         check(moved.representatives().stream().map(RepresentativeSelector.Representative::seedId).toList().equals(crowded.representatives().stream().map(RepresentativeSelector.Representative::seedId).toList()),"representative slot IDs stable across camera movement");
         check(selector.lastStats().medoidComponentOperations()<=256L*8*PROFILE.dimensions()*8,"bounded production selector work");
         fails(()->repository.semanticRange(embedding(0,0),1.25,1),"range overflow rejects instead of truncating topology");
         fails(()->new TerrainConfig(1.25,.18,config.fog(),257,8,2,65536,128,16,1,100),"catalog scan budget");
+    }
+    private static Landmark withEmbedding(Landmark l,LandmarkEmbedding embedding) {
+        return new Landmark(l.id(),l.dimension(),l.algorithmVersion(),l.kind(),l.biome(),l.anchor(),l.bounds(),embedding,
+                l.baseImportance(),l.activity(),l.ownership(),l.geometry(),l.revision()+1,l.provenance());
+    }
+    private static void selectorParity() {
+        var random=new Random(5817);var config=TerrainConfig.DEFAULT;var f=frame();var policy=new ImportancePolicy(1,1200,0,0);
+        for(int trial=0;trial<40;trial++) {
+            var input=new ArrayList<Landmark>();
+            for(int i=0;i<30;i++)input.add(landmark(i*8,(random.nextDouble()-.5)*1.5,random.nextDouble()*.2,random.nextDouble(),STONE,true));
+            Collections.shuffle(input,random);
+            var core=config.selector();var frozen=new FrozenTerrainSelector(config);var state=new TerrainState();state.initialize(f);
+            var expected=core.select(input,embedding(0,0),trial,f,new Point3(0,128,0),config.fog(),policy,trial,1,null,Set.of());
+            var actual=frozen.select(input,embedding(0,0),trial,f,new Point3(0,128,0),config.fog(),policy,trial,1,null,Set.of(),l->state.placement(metadata(l)));
+            check(actual.equals(expected),"frozen-selector algorithm matches wave1 when physical and semantic placements coincide");
+            check(core.lastStats().semanticDistanceEvaluations()==frozen.lastStats().semanticDistanceEvaluations()
+                    && core.lastStats().medoidComponentOperations()==frozen.lastStats().medoidComponentOperations(),"wave1 deterministic operation-budget parity");
+        }
+    }
+    private static void frozenSelection() throws Exception {
+        var original=landmark(0,0,0,1,STONE,true);
+        var unit=new EmbeddingProfile(PROFILE.model(),PROFILE.revision(),PROFILE.tokenizer(),PROFILE.prefixPolicy(),
+                PROFILE.dimensions(),EmbeddingProfile.Normalization.UNIT,PROFILE.descriptorSchema());
+        var before=withEmbedding(original,new LandmarkEmbedding(unit,vector(1,0,0,0)));
+        var f=new ProjectionFrame(1,123,before.baseEmbedding(),new Point3(0,128,0),vector(1,0,0,0),vector(0,1,0,0),vector(0,0,1,0),96);
+        var state=new TerrainState();state.initialize(f);var frozen=state.placement(metadata(before));
+        var after=withEmbedding(before,new LandmarkEmbedding(unit,vector(-1,0,0,0)));
+        var config=TerrainConfig.DEFAULT;var player=frozen.realmAnchor();var policy=new ImportancePolicy(1,1200,0,0);
+        check(frozen.projectedBounds(after.bounds()).distanceSquared(player)==0,"actual frozen terrain remains at player");
+        check(f.place(after,1).projectedBounds(after.bounds()).distanceSquared(player)==33856,"reproduce reviewed UNIT drift distance");
+        check(config.selector().select(List.of(after),after.baseEmbedding(),1,f,player,config.fog(),policy,1,1,null,Set.of()).representatives().isEmpty(),"control reproduces foundation recalculation mismatch");
+        var selector=new FrozenTerrainSelector(config);
+        var selected=selector.select(List.of(after),after.baseEmbedding(),1,f,player,config.fog(),policy,1,1,null,Set.of(),l->state.placement(metadata(l)));
+        check(selected.representatives().size()==1 && selected.representatives().getFirst().landmarkId().equals(after.id()),"production selection uses persisted placement after compatible drift");
+        var active=Map.of(after.id(),new TerrainField.Layer(metadata(after),frozen,after.geometry(),after.baseEmbedding(),1));
+        check(TerrainEntryEligibility.owners(selected,after.baseEmbedding(),player,active,config).equals(Set.of(after.id())),"entry uses physical placement and current compatible semantics");
+        check(TerrainEntryEligibility.owners(selected,before.baseEmbedding(),player,active,config).isEmpty(),"stale selection cannot bypass current personal semantic radius");
+        var lookup=RegistryWrapper.WrapperLookup.of(Stream.empty());
+        Path file=Files.createTempFile("terrain-drift-",".dat");NbtIo.writeCompressed(state.writeNbt(new NbtCompound(),lookup),file);
+        var reload=TerrainState.fromNbt(NbtIo.readCompressed(file,NbtSizeTracker.ofUnlimitedBytes()),lookup);
+        var again=selector.select(List.of(after),after.baseEmbedding(),2,reload.frame(),player,config.fog(),policy,2,1,selected,Set.of(),l->reload.placement(metadata(l)));
+        check(again.representatives().equals(selected.representatives()) && reload.placement(metadata(after)).equals(frozen),"compressed reload preserves drift-safe representative and physical transform");
+        check(selector.select(List.of(after),before.baseEmbedding(),3,f,player,config.fog(),policy,3,1,selected,Set.of(after.id()),l->state.placement(metadata(l))).representatives().isEmpty(),"physical proximity/pins cannot bypass semantic gate");
+    }
+    private static void personalLanding() {
+        var a=landmark(0,0,0,1,STONE,true);var b=landmark(64,.65,0,1,DIRT,true);
+        var pa=frame().place(a,1);var pb=frame().place(b,1);var la=layer(a,pa);var lb=layer(b,pb);
+        var layers=Map.of(a.id(),la,b.id(),lb);var field=new TerrainField(1,List.of(la,lb));
+        var sa=new RepresentativeSelector.RepresentativeSet(1,1,1,PROFILE,List.of(new RepresentativeSelector.Representative(a.id(),a.id(),1,0)));
+        var sb=new RepresentativeSelector.RepresentativeSet(1,1,1,PROFILE,List.of(new RepresentativeSelector.Representative(b.id(),b.id(),1,0)));
+        var config=TerrainConfig.DEFAULT;
+        var selectedA=TerrainEntryEligibility.owners(sa,a.baseEmbedding(),pa.realmAnchor(),layers,config);
+        var selectedB=TerrainEntryEligibility.owners(sb,b.baseEmbedding(),pb.realmAnchor(),layers,config);
+        check(selectedA.equals(Set.of(a.id())) && selectedB.equals(Set.of(b.id())),"two players have distinct personal selected owners despite global union");
+        check(TerrainEntryEligibility.owners(null,a.baseEmbedding(),pa.realmAnchor(),layers,config).isEmpty(),"entry before own selection cannot borrow global landing");
+        var empty=new RepresentativeSelector.RepresentativeSet(1,1,1,PROFILE,List.of());
+        check(TerrainEntryEligibility.owners(empty,a.baseEmbedding(),pa.realmAnchor(),layers,config).isEmpty(),"empty personal selection stays empty");
+        check(TerrainEntryEligibility.owners(sa,a.baseEmbedding(),new Point3(1000,128,0),layers,config).isEmpty(),"selected owner must remain physically local");
+        var ledger=new OverlayLedger<BlockPalette.State>(1024);var w=new World();
+        var ra=new OverlayLedger.Region(0,16,0);var rb=new OverlayLedger.Region(7,16,0);
+        check(ledger.reconcile(ra,w,sampler(field)) && ledger.reconcile(rb,w,sampler(field)),"real field generates distinct owned landing regions");
+        java.util.function.Predicate<TerrainLandingSearch.Landing> safe=c->{
+            var p=c.floor();var entry=ledger.entry(p);
+            return entry!=null && w.get(p).equals(entry.generated())
+                && w.get(new OverlayLedger.Pos(p.x(),p.y()+1,p.z())).equals(AIR)
+                && w.get(new OverlayLedger.Pos(p.x(),p.y()+2,p.z())).equals(AIR)
+                && field.knownAir(c.owner(),p.x(),p.y()+1,p.z()) && field.knownAir(c.owner(),p.x(),p.y()+2,p.z());
+        };
+        var first=new TerrainLandingSearch();var second=new TerrainLandingSearch();
+        var floorA=first.find(ledger,selectedA,safe).orElseThrow();
+        var floorB=second.find(ledger,selectedB,safe).orElseThrow();
+        check(floorA.owner().equals(a.id()) && floorB.owner().equals(b.id()),"production cursors never assign another player's cached floor");
+        check(first.find(ledger,Set.of(),safe).isEmpty(),"cached candidate is invalid without own current selection");
+        floorA=first.find(ledger,selectedA,safe).orElseThrow();
+        w.blocks.put(floorA.floor(),AIR);ledger.protect(floorA.floor());
+        var blocked=new OverlayLedger.Pos(floorA.floor().x()+1,129,floorA.floor().z());w.blocks.put(blocked,DIRT);
+        w.allowed=false;int writes=w.writes;
+        check(!ledger.reconcile(ra,w,sampler(field)),"near-player mutation gate rejects restamping");
+        var recovered=first.find(ledger,selectedA,safe).orElseThrow();
+        check(!recovered.floor().equals(floorA.floor()) && recovered.floor().x()!=blocked.x(),"broken cached floor and blocked air rediscover another existing safe floor");
+        check(w.writes==writes && w.blocks.get(blocked).equals(DIRT),"landing rediscovery performs no mutation and preserves protected region edits");
+        check(first.lastProbes()<=TerrainLandingSearch.PROBES_PER_PLAYER,"landing cell budget independent of stamps");
+        check(ledger.ownedRegions(selectedB).equals(Set.of(rb)),"indexed scan skips unrelated player regions");
+        ledger.protect(recovered.floor());
+        check(first.find(ledger,selectedA,safe).orElseThrow().floor().x()!=recovered.floor().x(),"same-state protected floor cannot remain cached landing");
+        check(second.find(ledger,selectedA,safe).orElseThrow().owner().equals(a.id()),"changed personal selection invalidates old owner cache");
+        check(new TerrainLandingSearch().find(ledger,selectedA,c->false).isEmpty(),"no safe floor returns empty, never synthesizes entry terrain");
+        var missing=new TerrainLandingSearch();missing.find(ledger,selectedA,c->false);
+        check(missing.lastProbes()==TerrainLandingSearch.PROBES_PER_PLAYER,"failed search consumes exact fixed budget");
     }
     private static void ledger() {
         var a=landmark(0,0,0,1,STONE,true);var f=new TerrainField(1,List.of(layer(a,frame().place(a,1))));
@@ -155,9 +245,11 @@ public final class TerrainSelfTest {
         check(loaded.frame().project(embedding(.2,0)).equals(state.frame().project(embedding(.2,0))),"saved axes/origin/profile projection exact");
         check(loaded.ledger.entry(edited).protectedEdit(),"save/reload preserves same-state edit protection");
         check(loaded.ledger.ownedCount(a.id())==63,"saved ownership counters reconstructed");
+        check(loaded.ledger.ownedRegions(Set.of(a.id())).equals(Set.of(r)),"saved per-owner landing-region index reconstructed without entry scans");
         int before=w.writes;loaded.ledger.reconcile(r,w,sampler(new TerrainField(1,List.of(layer(a,placement)))));
         check(w.writes==before,"save/reload maintains actual stable collision");
         loaded.ledger.reconcile(r,w,p->null);check(w.blocks.get(edited).equals(STONE),"reloaded cleanup preserves edited cell");
+        check(loaded.ledger.ownedRegions(Set.of(a.id())).isEmpty(),"protected-only saved regions do not enter landing index");
         var bad=n.copy();bad.putString("entries","corrupt");fails(()->TerrainState.fromNbt(bad,lookup),"wrong list type must fail closed");
         var duplicate=n.copy();duplicate.getList("entries",NbtElement.COMPOUND_TYPE).add(duplicate.getList("entries",NbtElement.COMPOUND_TYPE).getCompound(0).copy());
         fails(()->TerrainState.fromNbt(duplicate,lookup),"duplicate owned cell rejected");
@@ -168,6 +260,6 @@ public final class TerrainSelfTest {
         System.out.println("Compressed save fixture retained: "+directory);
     }
     public static void main(String[] args) throws Exception {
-        fieldAndProjection();selection();ledger();collisionContact();persistence();System.out.println("TerrainSelfTest: "+checks+" checks passed");
+        SharedConstants.createGameVersion();fieldAndProjection();selection();selectorParity();frozenSelection();personalLanding();ledger();collisionContact();persistence();System.out.println("TerrainSelfTest: "+checks+" checks passed");
     }
 }

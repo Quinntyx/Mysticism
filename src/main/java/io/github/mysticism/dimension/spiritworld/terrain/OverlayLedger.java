@@ -28,9 +28,21 @@ public final class OverlayLedger<S> {
     private final Map<Pos,Entry<S>> entries=new HashMap<>();
     private final NavigableSet<Region> regions=new TreeSet<>();
     private final Map<String,Integer> ownerCounts=new HashMap<>();
+    private final Map<String,NavigableMap<Region,Integer>> ownerRegions=new HashMap<>();
+    Set<Region> ownedRegions(Set<String> selected) {
+        Set<Region> result=new TreeSet<>();
+        for(String owner:selected) {
+            var indexed=ownerRegions.get(owner); if(indexed!=null)result.addAll(indexed.keySet());
+        }
+        return result;
+    }
     public int ownedCount(String owner) { return ownerCounts.getOrDefault(owner,0); }
-    private void count(Entry<S> e,int delta) {
-        if(e!=null && !e.protectedEdit)ownerCounts.compute(e.owner,(k,v)->{ int n=(v==null?0:v)+delta; return n==0?null:n; });
+    private void count(Pos p,Entry<S> e,int delta) {
+        if(e==null || e.protectedEdit)return;
+        ownerCounts.compute(e.owner,(k,v)->{ int n=(v==null?0:v)+delta; return n==0?null:n; });
+        var indexed=ownerRegions.computeIfAbsent(e.owner,id->new TreeMap<>());
+        indexed.compute(p.region(),(k,v)->{ int n=(v==null?0:v)+delta; return n==0?null:n; });
+        if(indexed.isEmpty())ownerRegions.remove(e.owner);
     }
     public OverlayLedger(int limit) { if(limit<512 || limit>65536)throw new IllegalArgumentException("ledger budget"); this.limit=limit; }
     public Map<Pos,Entry<S>> entries() { return Collections.unmodifiableMap(entries); }
@@ -39,10 +51,10 @@ public final class OverlayLedger<S> {
     public void restore(Map<Pos,Entry<S>> saved, Collection<Region> savedRegions) {
         if(!entries.isEmpty() || !regions.isEmpty() || saved.size()>limit || savedRegions.size()>limit/512)
             throw new IllegalArgumentException("saved ledger bounds");
-        entries.putAll(saved); regions.addAll(savedRegions); saved.values().forEach(e->count(e,1));
+        entries.putAll(saved); regions.addAll(savedRegions); saved.forEach((p,e)->count(p,e,1));
     }
     public void protect(Pos p) {
-        var e=entries.get(p); if(e!=null) { count(e,-1); entries.put(p,new Entry<>(e.original,e.generated,e.owner,true)); }
+        var e=entries.get(p); if(e!=null) { count(p,e,-1); entries.put(p,new Entry<>(e.original,e.generated,e.owner,true)); }
     }
     /** Preflight the entire 8^3 region before any writes. World must not dispatch neighbors
      * during set; production uses FORCE_STATE + NOTIFY_LISTENERS, on the server thread.
@@ -76,9 +88,9 @@ public final class OverlayLedger<S> {
             throw failure;
         }
         for(int y=0;y<8;y++)for(int z=0;z<8;z++)for(int x=0;x<8;x++) {
-            Pos p=new Pos(o.x+x,o.y+y,o.z+z); count(entries.remove(p),-1);
+            Pos p=new Pos(o.x+x,o.y+y,o.z+z); count(p,entries.remove(p),-1);
         }
-        entries.putAll(next); next.values().forEach(e->count(e,1)); regions.add(region); return true;
+        entries.putAll(next); next.forEach((p,e)->count(p,e,1)); regions.add(region); return true;
     }
     public boolean forgetEmpty(Region region) {
         Pos o=region.origin();

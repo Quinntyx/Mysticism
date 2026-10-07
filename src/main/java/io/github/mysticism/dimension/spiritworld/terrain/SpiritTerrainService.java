@@ -135,7 +135,8 @@ public final class SpiritTerrainService {
     private static final class PlayerState {
         boolean entering; long revision,entryDeadline; String status;
         RepresentativeSelector.RepresentativeSet selection;
-        final RepresentativeSelector selector=CONFIG.selector();
+        final FrozenTerrainSelector selector=new FrozenTerrainSelector(CONFIG);
+        final TerrainLandingSearch landingSearch=new TerrainLandingSearch();
     }
     private static final class Context {
         final MinecraftServer server; final ServerWorld world; final TerrainState state;
@@ -151,8 +152,6 @@ public final class SpiritTerrainService {
         final Map<OverlayLedger.Region,Stamp> stamped=new HashMap<>();
         final LinkedHashMap<BlockPalette.State,BlockState> palette=new LinkedHashMap<>(16,.75f,true);
         Stage stage; long tick,epoch=1; OverlayLedger.Region lastRegion; String error;
-        Landing landing;
-        record Landing(BlockPos floor,String owner) {}
         Context(MinecraftServer server,ServerWorld world) {
             this.server=server; this.world=world;
             var manager=world.getPersistentStateManager();
@@ -168,6 +167,7 @@ public final class SpiritTerrainService {
         void enter(ServerPlayerEntity player) {
             if(players.size()>=8 && !players.containsKey(player.getUuid())) { player.sendMessage(Text.literal("[Spirit terrain] player budget reached"),false); return; }
             var p=players.computeIfAbsent(player.getUuid(),id->new PlayerState()); p.entering=true; p.entryDeadline=tick+400;
+            p.selection=null; // A prior login/entry or another player never authorizes this entry.
             if(returns.containsKey(player.getUuid())) { player.setNoGravity(true); player.setVelocity(Vec3d.ZERO); }
             else player.sendMessage(Text.literal("[Spirit terrain] Entry not prepared: asynchronous landing cannot suspend gravity safely"),false);
         }
@@ -257,7 +257,6 @@ public final class SpiritTerrainService {
                     resolve(sample.material()); return new OverlayLedger.Desired<>(sample.material(),sample.landmarkId());
                 })) {
                     state.markDirty(); stamped.put(r,target);
-                    offerLanding(r,field,observers);
                     if(state.ledger.forgetEmpty(r) && layerRegions.values().stream().noneMatch(rs->rs.contains(lastRegion))) { frontier.remove(r); stamped.remove(r); }
                     // <=512 ordinary block writes/tick; a rejected batch may additionally roll back <=512.
                 } else status("Overlay capacity reached; existing terrain and player edits retained");
@@ -272,8 +271,10 @@ public final class SpiritTerrainService {
             var query=LandmarkProfiles.wrap(player.getComponent(MysticismEntityComponents.LATENT_POS).get());
             var metadata=LandmarkStore.get(server).semanticRange(query,CONFIG.semanticRadius(),CONFIG.catalogLimit(),CONFIG.catalogLimit());
             List<Landmark> effective=new ArrayList<>();
+            Map<String,Placement> physical=new HashMap<>();
             for(var m:metadata) {
-                var h=m.header(); var embedding=SpiritActivityService.effectiveEmbedding(server,m);
+                var h=m.header(); physical.put(h.id(),state.placement(m));
+                var embedding=SpiritActivityService.effectiveEmbedding(server,m);
                 h.baseEmbedding().profile().requireCompatible(embedding.profile());
                 double importance=SpiritActivityService.importance(server,m);
                 if(!Double.isFinite(importance))throw new IllegalArgumentException("nonfinite activity importance"); importance=Math.clamp(importance,0,1);
@@ -287,7 +288,7 @@ public final class SpiritTerrainService {
                 }
             }
             actor.selection=actor.selector.select(effective,query,tick,state.frame(),new Point3(player.getX(),player.getY(),player.getZ()),CONFIG.fog(),
-                    new ImportancePolicy(1,1200,0,0),tick,1,actor.selection,Set.of());
+                    new ImportancePolicy(1,1200,0,0),tick,1,actor.selection,Set.of(),l->physical.get(l.id()));
             actor.revision=tick;
         }
         BlockState resolve(BlockPalette.State material) {
@@ -339,37 +340,32 @@ public final class SpiritTerrainService {
                 return world.getBlockState(pos).equals(next) || world.setBlockState(pos,next,Block.NOTIFY_LISTENERS|Block.FORCE_STATE|Block.SKIP_DROPS);
             }
         }
-        void offerLanding(OverlayLedger.Region region,TerrainField field,List<ServerPlayerEntity> observers) {
-            if(landing!=null || observers.stream().noneMatch(p->players.get(p.getUuid()).entering))return;
-            var o=region.origin();
-            for(int y=0;y<8;y++)for(int z=0;z<8;z++)for(int x=0;x<8;x++) {
-                var floor=new BlockPos(o.x()+x,o.y()+y,o.z()+z); var e=state.ledger.entry(position(floor));
-                if(e==null || e.protectedEdit() || !field.knownAir(e.owner(),floor.getX(),floor.getY()+1,floor.getZ())
-                        || !field.knownAir(e.owner(),floor.getX(),floor.getY()+2,floor.getZ()))continue;
-                if(!world.getBlockState(floor).isSideSolidFullSquare(world,floor,Direction.UP)
-                        || !world.getBlockState(floor.up()).isAir() || !world.getBlockState(floor.up(2)).isAir())continue;
-                landing=new Landing(floor,e.owner()); return;
-            }
-        }
         void tryLanding(TerrainField field,List<ServerPlayerEntity> observers) {
-            if(landing==null)return; BlockPos floor=landing.floor;
-            if(!desired.contains(landing.owner)) { landing=null; return; }
-            var center=position(floor).region();
-            // Prepare a 24-block halo before entry. Unknown/outside geometry stays base-world terrain.
-            for(int dy=-1;dy<=1;dy++)for(int dz=-1;dz<=1;dz++)for(int dx=-1;dx<=1;dx++) {
-                var r=new OverlayLedger.Region(center.x()+dx,center.y()+dy,center.z()+dz);
-                if(frontier.contains(r) && !new Stamp(epoch,true).equals(stamped.get(r)))return;
-            }
-            if(!world.isChunkLoaded(floor) || !world.getBlockState(floor).isSideSolidFullSquare(world,floor,Direction.UP)
-                    || !world.getBlockState(floor.up()).isAir() || !world.getBlockState(floor.up(2)).isAir()
-                    || !field.knownAir(landing.owner,floor.getX(),floor.getY()+1,floor.getZ())) { landing=null; return; }
             for(var p:observers) {
-                var actor=players.get(p.getUuid()); if(!actor.entering)continue;
+                var actor=players.get(p.getUuid()); if(!actor.entering || actor.selection==null)continue;
+                var query=LandmarkProfiles.wrap(p.getComponent(MysticismEntityComponents.LATENT_POS).get());
+                Point3 current=new Point3(p.getX(),p.getY(),p.getZ());
+                Set<String> selected=TerrainEntryEligibility.owners(actor.selection,query,current,layers,CONFIG);
+                var found=actor.landingSearch.find(state.ledger,selected,candidate->{
+                    BlockPos floor=block(candidate.floor());
+                    if(!world.isChunkLoaded(floor) || floor.getY()<world.getBottomY() || floor.getY()+3>=world.getTopY()
+                            || !world.getWorldBorder().contains(floor)
+                            || floor.toCenterPos().squaredDistanceTo(p.getPos())>=CONFIG.fog().prefetch()*CONFIG.fog().prefetch())return false;
+                    var entry=state.ledger.entry(candidate.floor());
+                    if(entry==null || !material(world.getBlockState(floor)).equals(entry.generated()))return false;
+                    if(!world.getBlockState(floor).isSideSolidFullSquare(world,floor,Direction.UP)
+                            || !world.getBlockState(floor.up()).isAir() || !world.getBlockState(floor.up(2)).isAir()
+                            || !field.knownAir(candidate.owner(),floor.getX(),floor.getY()+1,floor.getZ())
+                            || !field.knownAir(candidate.owner(),floor.getX(),floor.getY()+2,floor.getZ()))return false;
+                    Vec3d target=new Vec3d(floor.getX()+.5,floor.getY()+1,floor.getZ()+.5);
+                    return world.isSpaceEmpty(p,p.getBoundingBox().offset(target.subtract(p.getPos())));
+                });
+                if(found.isEmpty())continue;
+                BlockPos floor=block(found.get().floor());
                 Vec3d target=new Vec3d(floor.getX()+.5,floor.getY()+1,floor.getZ()+.5);
-                if(!world.getWorldBorder().contains(floor) || !world.isSpaceEmpty(p,p.getBoundingBox().offset(target.subtract(p.getPos()))))continue;
                 p.teleport(world,target.x,target.y,target.z,p.getYaw(),p.getPitch()); p.setVelocity(Vec3d.ZERO); p.fallDistance=0; actor.entering=false;
                 var pose=returns.remove(p.getUuid()); if(pose!=null)p.setNoGravity(pose.noGravity);
-                p.sendMessage(Text.literal("[Spirit terrain] Entered observed landmark air"),true);
+                p.sendMessage(Text.literal("[Spirit terrain] Entered personally selected landmark air"),true);
             }
         }
         final class Stage {
