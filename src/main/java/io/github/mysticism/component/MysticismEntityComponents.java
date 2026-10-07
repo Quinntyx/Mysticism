@@ -20,12 +20,16 @@ public final class MysticismEntityComponents implements EntityComponentInitializ
             ComponentRegistry.getOrCreate(Identifier.of(MOD_ID, "latent_attunement"), LatentAttunement.class);
 
 
+    public static final ComponentKey<SpiritNavigation> SPIRIT_NAVIGATION =
+            ComponentRegistry.getOrCreate(Identifier.of(MOD_ID, "spirit_navigation"), SpiritNavigation.class);
+
     @Override
     public void registerEntityComponentFactories(EntityComponentFactoryRegistry registry) {
         // Players: persist + copy on respawn
         registry.registerForPlayers(LATENT_POS,   p -> new LatentPos(),   RespawnCopyStrategy.ALWAYS_COPY);
         registry.registerForPlayers(LATENT_BASIS, p -> new LatentBasis(), RespawnCopyStrategy.ALWAYS_COPY);
         registry.registerForPlayers(LATENT_ATTUNEMENT, p -> new LatentAttunement(), RespawnCopyStrategy.ALWAYS_COPY);
+        registry.registerForPlayers(SPIRIT_NAVIGATION, p -> new SpiritNavigation(), RespawnCopyStrategy.ALWAYS_COPY);
 
         // Your custom glyph/entity can carry a latent vector too (no respawn semantics needed)
 //        registry.registerFor(LatentGlyphEntity.class, LATENT_POS, e -> new LatentPos());

@@ -17,7 +17,6 @@ import org.ladysnake.cca.api.v3.component.sync.AutoSyncedComponent;
  * remember to call MysticismEntityComponents.LATENT_BASIS.sync(player) after edits.
  */
 public final class LatentBasis implements ComponentV3, AutoSyncedComponent {
-    private NbtCompound archive;
 
     // Requires Basis384f to have public constructors.
     private Basis384f basis = new Basis384f();
@@ -59,12 +58,10 @@ public final class LatentBasis implements ComponentV3, AutoSyncedComponent {
 
     @Override
     public void readFromNbt(NbtCompound tag, RegistryWrapper.WrapperLookup wrapperLookup) {
-        archive = tag.contains("embeddingArchive") ? tag.getCompound("embeddingArchive").copy() : null;
         if (EmbeddingNbt.compatible(tag) && tag.contains("b", NbtElement.INT_ARRAY_TYPE)) {
             try { this.basis = Basis384f.fromBits(tag.getIntArray("b")); return; }
-            catch (IllegalArgumentException incompatible) { /* Preserve corrupt payload below. */ }
+            catch (IllegalArgumentException incompatible) { /* Discard obsolete/corrupt semantic data. */ }
         }
-        archive = tag.copy();
         this.basis = new Basis384f();
     }
 
@@ -72,6 +69,6 @@ public final class LatentBasis implements ComponentV3, AutoSyncedComponent {
     public void writeToNbt(NbtCompound tag, RegistryWrapper.WrapperLookup wrapperLookup) {
         EmbeddingNbt.stamp(tag);
         tag.putIntArray("b", this.basis.toBits());
-        if (archive != null) tag.put("embeddingArchive", archive.copy());
+        tag.remove("embeddingArchive");
     }
 }
