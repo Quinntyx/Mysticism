@@ -21,7 +21,7 @@ import java.util.function.Supplier;
  * Unreferenced old/staged versions are deliberately not deleted (future explicit compaction).
  */
 public final class LandmarkStore extends PersistentState {
-    public static final String SAVE_KEY="mysticism.landmarks.v1";
+    public static final String SAVE_KEY="mysticism.landmarks.source-v2";
     public static final Type<LandmarkStore> TYPE=new Type<>(LandmarkStore::new,LandmarkStore::fromNbt,DataFixTypes.SAVED_DATA_COMMAND_STORAGE);
     private record Ref(String key,long revision) {}
     private record PageWrite(String key,Supplier<NbtCompound> encode) {}
@@ -143,6 +143,23 @@ public final class LandmarkStore extends PersistentState {
         }
         return new SourceRangePage(result,last,scanned,id==null);
     }
+    /** Discard disposable generated catalogue/profile, never source chunks or player data. */
+    private int sourceGeneration;
+    public boolean usesNativeSourceProfile(EmbeddingProfile current){checkThread();return sourceGeneration==2&&(profile==null||profile.equals(current));}
+    public void clearGeneratedIfIncompatible(EmbeddingProfile current) {
+        checkThread();if(sourceGeneration!=2 || profile!=null && !profile.equals(current)){unlocked();records.clear();aliases.clear();tombstones.clear();lineage.clear();decoded.clear();metadataCache.clear();residentLeaves=0;profile=current;sourceGeneration=2;markDirty();}
+    }
+    /** Resumable semantic admission; no total-catalogue cap or hydration. */
+    public SourceRangePage semanticRangePage(LandmarkEmbedding current,double radius,String afterId,int maxResults,int maxScanned) {
+        return semanticRangePage(current,radius,afterId,maxResults,maxScanned,m->m.header().baseEmbedding());
+    }
+    public SourceRangePage semanticRangePage(LandmarkEmbedding current,double radius,String afterId,int maxResults,int maxScanned,java.util.function.Function<LandmarkMetadata,LandmarkEmbedding> effective) {
+        checkThread();if(!Double.isFinite(radius)||radius<=0||!Double.isFinite(radius*radius)||radius*radius==0||maxResults<1||maxResults>128||maxScanned<1||maxScanned>128)throw new IllegalArgumentException("semantic page budget");
+        if(profile!=null)profile.requireCompatible(current.profile());
+        String id=afterId==null?(records.isEmpty()?null:records.firstKey()):records.higherKey(afterId),last=afterId;int scanned=0;List<LandmarkMetadata> found=new ArrayList<>();
+        while(id!=null && scanned<maxScanned && found.size()<maxResults){var m=metadata(id).orElseThrow();last=id;scanned++;if(effective.apply(m).distanceSquared(current)<radius*radius)found.add(m);id=records.higherKey(id);}
+        return new SourceRangePage(found,last,scanned,id==null);
+    }
     public List<LandmarkMetadata> semanticRange(LandmarkEmbedding current,double radius,int maxResults,int maxScanned) {
         checkThread();
         if(!Double.isFinite(radius) || radius<=0 || !Double.isFinite(radius*radius) || radius*radius==0) throw new IllegalArgumentException("radius");
@@ -167,19 +184,23 @@ public final class LandmarkStore extends PersistentState {
         if(state==null || state.payload==null) throw new IllegalStateException("missing/corrupt landmark page: "+key);
         return state.payload; // private read-only codecs; never exposed to callers
     }
-    public GeometryRead beginGeometryRead(String id) {
+    public boolean geometryReadAvailable(){checkThread();return activeRead==null;}
+    public GeometryRead beginGeometryRead(String id) {return beginGeometryRead(id,null);}
+    /** Bounds-gated cold geometry traversal: skip unrelated page leaves, one header per operation. */
+    public GeometryRead beginGeometryRead(String id,Bounds range) {
         checkThread(); if(activeRead!=null) throw new IllegalStateException("another geometry read is active");
-        activeRead=new GeometryRead(metadata(id).orElseThrow(()->new IllegalStateException("missing landmark"))); return activeRead;
+        activeRead=new GeometryRead(metadata(id).orElseThrow(()->new IllegalStateException("missing landmark")),range); return activeRead;
     }
     /** One active read; batches hold <=8 pages. Drain before advancing. Budgets count cache hits too. */
     public final class GeometryRead {
         private final LandmarkMetadata metadata;
+        private final Bounds range;
         private final List<GeometryPage> ready=new ArrayList<>();
         private int cursor;
         private LandmarkNbt.GeometryDecoder decoder;
         private boolean cancelled;
         public boolean isCurrent() { checkThread(); Ref ref=records.get(metadata.id()); return ref!=null && ref.revision==metadata.revision(); }
-        private GeometryRead(LandmarkMetadata metadata) { this.metadata=metadata; }
+        private GeometryRead(LandmarkMetadata metadata,Bounds range) { this.metadata=metadata;this.range=range; }
         public LandmarkMetadata metadata() { checkThread(); return metadata; }
         public boolean complete() { checkThread(); return cursor==metadata.geometryKeys().size(); }
         public int advance(int maxPages,int maxLeaves) {
@@ -190,12 +211,14 @@ public final class LandmarkStore extends PersistentState {
                 String key=metadata.geometryKeys().get(cursor); CachedPage cached=decoded.get(key); GeometryPage page=cached==null?null:cached.page;
                 if(page==null) {
                     if(decoder==null) decoder=new LandmarkNbt.GeometryDecoder(load(key));
+                    if(range!=null && !range.intersects(decoder.bounds())){decoder=null;cursor++;pages++;continue;}
                     int worked=decoder.advance(maxLeaves-leaves); leaves+=worked; decodedLeavesTotal+=worked;
                     if(!decoder.complete()) break;
                     page=decoder.result(); int leafCount=decoder.leafCount(); decoder=null;
                     if(!geometryKey(page).equals(key)) throw new IllegalStateException("geometry/reference mismatch");
                     cache(key,page,leafCount);
                 }
+                if(range!=null && !range.intersects(page.bounds())){cursor++;pages++;continue;}
                 if(!metadata.header().bounds().contains(page.bounds())) throw new IllegalStateException("page outside landmark");
                 ready.add(page); cursor++; pages++;
             }
@@ -260,7 +283,10 @@ public final class LandmarkStore extends PersistentState {
     public PendingMutation stageMerge(LandmarkRepository.VerifiedConnectivity proof,long tick,ImportancePolicy policy) {
         return stageMerge(proof,tick,policy,null);
     }
-    public PendingMutation stageMerge(LandmarkRepository.VerifiedConnectivity proof,long tick,ImportancePolicy policy,SourceGeometry reconciled) {
+    public PendingMutation stageMerge(LandmarkRepository.VerifiedConnectivity proof,long tick,ImportancePolicy policy,SourceGeometry reconciled) {return stageMerge(proof,tick,policy,reconciled,false);}
+    /** Activity convergence may override initial cave biome/kind classification, never physical proof. */
+    public PendingMutation stageSemanticMerge(LandmarkRepository.VerifiedConnectivity proof,long tick,ImportancePolicy policy,SourceGeometry reconciled) {return stageMerge(proof,tick,policy,reconciled,true);}
+    private PendingMutation stageMerge(LandmarkRepository.VerifiedConnectivity proof,long tick,ImportancePolicy policy,SourceGeometry reconciled,boolean converged) {
         unlocked(); Set<String> touched=new TreeSet<>(); List<LandmarkMetadata> fragments=new ArrayList<>();
         for(var ref:proof.fragments()) {
             LandmarkMetadata m=metadata(ref.id()).orElseThrow(()->new IllegalStateException("missing fragment"));
@@ -269,7 +295,7 @@ public final class LandmarkStore extends PersistentState {
         }
         Map<String,String> localAliases=new TreeMap<>(); aliases.forEach((id,target)->{ if(touched.contains(target)) localAliases.put(id,target); });
         LandmarkRepository repo=LandmarkRepository.restore(new LandmarkRepository.Snapshot(fragments.stream().map(LandmarkMetadata::header).toList(),localAliases,Map.of(),Map.of()));
-        Landmark merged=repo.mergeVerified(proof,tick,policy); var snapshot=repo.snapshot();
+        Landmark merged=converged?repo.mergeConverged(proof,tick,policy):repo.mergeVerified(proof,tick,policy); var snapshot=repo.snapshot();
         touched.remove(merged.id());
         List<String> keys=fragments.stream().flatMap(m->m.geometryKeys().stream()).distinct().sorted().toList();
         if(reconciled==null) {
@@ -283,6 +309,18 @@ public final class LandmarkStore extends PersistentState {
         PendingMutation mutation=stage(List.of(value),touched,snapshot.aliases(),Map.of(),Map.of());
         mutation.validations=keys.stream().map(k->new Validation(k,merged.bounds(),reconciled,false)).toList();
         return mutation;
+    }
+    /** Atomic exclusive cell transfer. Caller certifies source contiguity; prior materials are
+     * incrementally conserved against the disjoint replacement union before publication. */
+    public PendingMutation stageTransfer(List<LandmarkRepository.RevisionRef> parents,List<Landmark> replacements,SourceGeometry conserved) {
+        unlocked();if(parents.size()!=2 || replacements.size()!=2)throw new IllegalArgumentException("transfer participants");
+        Set<String> ids=new HashSet<>();List<LandmarkMetadata> previous=new ArrayList<>();
+        for(var ref:parents){var old=metadata(ref.id()).orElseThrow();if(!old.id().equals(ref.id())||old.revision()!=ref.revision()||!ids.add(ref.id()))throw new IllegalStateException("stale transfer");previous.add(old);}
+        if(!previous.getFirst().header().dimension().equals(previous.getLast().header().dimension()))throw new IllegalArgumentException("transfer dimension");
+        for(var value:replacements){var old=previous.stream().filter(m->m.id().equals(value.id())).findFirst().orElseThrow();if(value.revision()!=old.revision()+1 || !value.dimension().equals(old.header().dimension()))throw new IllegalArgumentException("transfer identity");}
+        if(replacements.stream().map(Landmark::id).distinct().count()!=2)throw new IllegalArgumentException("transfer replacements");
+        var mutation=stage(replacements,Set.of(),Map.of(),Map.of(),Map.of());Bounds union=replacements.getFirst().bounds().union(replacements.getLast().bounds());
+        mutation.validations=previous.stream().flatMap(m->m.geometryKeys().stream()).distinct().map(k->new Validation(k,union,conserved,false)).toList();return mutation;
     }
     /** Extractor-recomputed children; parent validation is metadata-only, never find/hydration. */
     public PendingMutation stageSplit(LandmarkRepository.RevisionRef parent,List<Landmark> children) {
@@ -425,7 +463,7 @@ public final class LandmarkStore extends PersistentState {
     }
     public static LandmarkStore fromNbt(NbtCompound n,RegistryWrapper.WrapperLookup r) {
         if(!n.contains("schema",NbtElement.INT_TYPE) || n.getInt("schema")!=LandmarkNbt.SCHEMA) throw new IllegalArgumentException("unsupported landmark manifest");
-        LandmarkStore store=new LandmarkStore();
+        LandmarkStore store=new LandmarkStore();store.sourceGeneration=n.getInt("sourceGeneration");
         if(n.contains("profile",NbtElement.COMPOUND_TYPE)) store.profile=LandmarkNbt.decodeProfile(n.getCompound("profile"));
         for(String field:List.of("records","aliases","tombstones","lineage")) if(!n.contains(field,NbtElement.COMPOUND_TYPE)) throw new IllegalArgumentException("missing manifest field: "+field);
         NbtCompound records=n.getCompound("records");
@@ -458,7 +496,7 @@ public final class LandmarkStore extends PersistentState {
         return store;
     }
     @Override public NbtCompound writeNbt(NbtCompound n,RegistryWrapper.WrapperLookup r) {
-        n.putInt("schema",LandmarkNbt.SCHEMA); if(profile!=null) n.put("profile",LandmarkNbt.encodeProfile(profile));
+        n.putInt("schema",LandmarkNbt.SCHEMA);n.putInt("sourceGeneration",sourceGeneration); if(profile!=null) n.put("profile",LandmarkNbt.encodeProfile(profile));
         NbtCompound refs=new NbtCompound(); records.forEach((id,ref)->{ NbtCompound e=new NbtCompound(); e.putString("key",ref.key); e.putLong("revision",ref.revision); refs.put(id,e); }); n.put("records",refs);
         NbtCompound alias=new NbtCompound(); aliases.forEach(alias::putString); n.put("aliases",alias);
         NbtCompound retired=new NbtCompound(); tombstones.forEach(retired::putLong); n.put("tombstones",retired);

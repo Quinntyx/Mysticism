@@ -87,14 +87,17 @@ public final class LandmarkRepository {
     /** Optional extractor reconciliation resolves duplicate observation masks/frontier closure.
      * Every prior known material must survive; unknown cells may become known, never the reverse.
      */
-    public Landmark mergeVerified(VerifiedConnectivity proof,long tick,ImportancePolicy policy,SourceGeometry reconciled) {
+    public Landmark mergeVerified(VerifiedConnectivity proof,long tick,ImportancePolicy policy,SourceGeometry reconciled) {return merge(proof,tick,policy,reconciled,false);}
+    public Landmark mergeConverged(VerifiedConnectivity proof,long tick,ImportancePolicy policy) {return merge(proof,tick,policy,null,true);}
+    private Landmark merge(VerifiedConnectivity proof,long tick,ImportancePolicy policy,SourceGeometry reconciled,boolean converged) {
         List<Landmark> group=proof.fragments.stream().map(this::require).distinct().sorted(Comparator.comparing(Landmark::id)).toList();
         if(group.size()<2) throw new IllegalArgumentException("already merged fragments");
         Landmark seed=group.getFirst(); Bounds bounds=seed.bounds(); Ownership claims=new Ownership(List.of());
         TreeMap<String,GeometryPage> pages=new TreeMap<>(); List<FrontierFace> frontiers=new ArrayList<>();
         double importance=0,activity=0; long revision=0;
         for(Landmark l:group) {
-            sameSource(seed,l); bounds=bounds.union(l.bounds()); claims=claims.merge(l.ownership());
+            if(converged){seed.baseEmbedding().profile().requireCompatible(l.baseEmbedding().profile());if(!seed.dimension().equals(l.dimension())||!seed.algorithmVersion().equals(l.algorithmVersion()))throw new IllegalArgumentException("different physical source");}
+            else sameSource(seed,l); bounds=bounds.union(l.bounds()); claims=claims.merge(l.ownership());
             importance=Math.max(importance,l.baseImportance()); activity=Math.max(activity,l.activity().decayed(tick,policy)); revision=Math.max(revision,l.revision());
             frontiers.addAll(l.geometry().frontiers());
             if(reconciled==null) for(GeometryPage p:l.geometry().pages()) {

@@ -28,7 +28,7 @@ public final class RepresentativeSelector {
                     || representatives.stream().map(Representative::landmarkId).distinct().count()!=representatives.size()) throw new IllegalArgumentException("duplicate representative");
         }
     }
-    private record Candidate(Landmark landmark,Point3 projected,double score,boolean pinned,float[] semantic) { String id() { return landmark.id(); } }
+    private record Candidate(Landmark landmark,Point3 projected,double score,double importance,double proximity,boolean pinned,float[] semantic) { String id() { return landmark.id(); } }
     private record Cost(double value,double distortion) {}
     private record SpatialCell(long x,long y,long z) {}
     public record SelectionStats(long semanticDistanceEvaluations,long medoidComponentOperations) {}
@@ -52,8 +52,15 @@ public final class RepresentativeSelector {
             if(distance>=config.semanticRadius*config.semanticRadius) continue;
             Placement placement=frame.place(l,config.blocksPerSourceBlock);
             if(!horizons.shouldPrefetch(placement.projectedBounds(l.bounds()).distanceSquared(player))) continue;
-            double score=importance.score(distance,config.semanticRadius,l.baseImportance(),l.activity(),tick);
-            eligible.put(l.id(),new Candidate(l,placement.realmAnchor(),score,pinnedIds.contains(l.id()),l.baseEmbedding().data()));
+            double bounded=importance.score(distance,config.semanticRadius,l.baseImportance(),l.activity(),tick);
+            double score=proximityPriority(distance,config.semanticRadius,bounded);
+            eligible.put(l.id(),new Candidate(l,placement.realmAnchor(),score,bounded,distance,pinnedIds.contains(l.id()),l.baseEmbedding().data()));
+        }
+        // The nearest inner-five-percent target supersedes stale cluster locks (even at zero).
+        Candidate nearestTarget=eligible.values().stream().min(Comparator.comparingDouble(Candidate::proximity).thenComparing(Candidate::id)).orElse(null);
+        if(nearestTarget!=null&&nearestTarget.proximity<=.0025*config.semanticRadius*config.semanticRadius){
+            var keepPins=eligible.values().stream().filter(Candidate::pinned).filter(c->!c.id().equals(nearestTarget.id())).sorted(Comparator.comparingDouble(Candidate::proximity).thenComparing(Candidate::id)).limit(config.maxRepresentatives-1L).map(Candidate::id).collect(java.util.stream.Collectors.toSet());
+            keepPins.add(nearestTarget.id());for(var entry:new ArrayList<>(eligible.entrySet())){Candidate c=entry.getValue();eligible.put(entry.getKey(),new Candidate(c.landmark,c.projected,c.score,c.importance,c.proximity,keepPins.contains(c.id()),c.semantic));}
         }
         if(eligible.values().stream().filter(Candidate::pinned).count()>config.maxRepresentatives)
             throw new IllegalArgumentException("pin budget exceeded");
@@ -97,7 +104,7 @@ public final class RepresentativeSelector {
             if(best==null) break; seeds.add(best);
             for(Candidate c:candidates) nearestById.put(c.id(),Math.min(nearestById.get(c.id()),distance(c,best)));
         }
-        seeds.sort(Comparator.<Candidate,Boolean>comparing(c->pinnedBySeed.containsKey(c.id())).reversed().thenComparing(Candidate::id));
+        seeds.sort(Comparator.<Candidate,Boolean>comparing(c->pinnedBySeed.containsKey(c.id())).reversed().thenComparingDouble(Candidate::proximity).thenComparing(Candidate::id));
         Map<String,List<Candidate>> groups=new TreeMap<>(); for(Candidate s:seeds) groups.put(s.id(),new ArrayList<>());
         for(Candidate c:candidates) {
             String forcedSeed=null;
@@ -136,10 +143,17 @@ public final class RepresentativeSelector {
             }
             if(best==null) { if(pin!=null) throw new IllegalArgumentException("pin spatial quota exceeded"); continue; }
             counts.merge(cell(best),1,Integer::sum); chosen.add(best);
-            selected.add(new Representative(seed.id(),best.id(),best.score,bestCost.distortion));
+            selected.add(new Representative(seed.id(),best.id(),best.importance,bestCost.distortion));
         }
         selected.sort(Comparator.comparing(Representative::seedId));
         return new RepresentativeSet(currentRevision,frame.epoch(),clusterEpoch,current.profile(),selected);
+    }
+    /** Finite inverse-square priority; importance stays bounded, outside radius contributes zero.
+     * At five percent radius the proximity term is 2; exact coincidence is deterministic and finite. */
+    public static double proximityPriority(double distanceSquared,double radius,double importance){
+        if(!Double.isFinite(radius)||radius<=0||!Double.isFinite(radius*radius)||radius*radius==0||!Double.isFinite(distanceSquared)||distanceSquared<0||!Double.isFinite(importance)||importance<0||importance>1)throw new IllegalArgumentException("selection priority");
+        double radiusSquared=radius*radius;if(distanceSquared>=radiusSquared)return 0;
+        return .025+importance+Math.min(1e6,.005*radiusSquared/Math.max(distanceSquared,1e-12*radiusSquared));
     }
     private SpatialCell cell(Candidate c) {
         return new SpatialCell((long)Math.floor(c.projected.x()/config.spatialCellBlocks),(long)Math.floor(c.projected.y()/config.spatialCellBlocks),(long)Math.floor(c.projected.z()/config.spatialCellBlocks));

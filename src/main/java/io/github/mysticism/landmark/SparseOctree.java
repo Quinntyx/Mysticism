@@ -90,6 +90,24 @@ public final class SparseOctree<T> {
         long h=(b.maxX()-b.minX())/2;
         return Bounds.cube(b.minX()+((i&1)!=0?h:0),b.minY()+((i&2)!=0?h:0),b.minZ()+((i&4)!=0?h:0),h);
     }
+    /** Resumable 3D descent. Branches outside the requested source volume are skipped before
+     * children/values are visited. Both node visits and output cells are per-call bounded. */
+    public Cursor cursor(Bounds range) { return new Cursor(range); }
+    private record Visit<U>(Node<U> node,Bounds bounds) {}
+    public final class Cursor {
+        private final Bounds range;private final java.util.ArrayDeque<Visit<T>> pending=new java.util.ArrayDeque<>();private int lastVisited;
+        private Cursor(Bounds range){this.range=range;if(node!=null&&root.intersects(range))pending.add(new Visit<>(node,root));}
+        public boolean complete(){return pending.isEmpty();}
+        public int lastVisited(){return lastVisited;}
+        public List<Cell<T>> advance(int maxNodes,int maxCells){
+            if(maxNodes<1||maxCells<1)throw new IllegalArgumentException("octree cursor budget");
+            List<Cell<T>> out=new ArrayList<>();lastVisited=0;
+            while(!pending.isEmpty()&&lastVisited<maxNodes&&out.size()<maxCells){var visit=pending.removeLast();lastVisited++;var n=visit.node();var b=visit.bounds();
+                if(n.leaf())out.add(new Cell<>(b,n.value));else for(int i=7;i>=0;i--){var c=n.children.get(i);var cb=child(b,i);if(c!=null&&cb.intersects(range))pending.add(new Visit<>(c,cb));}
+            }
+            return List.copyOf(out);
+        }
+    }
     /** Returns known leaves intersecting the source bounds; rejects over-budget queries, never truncates geometry. */
     public List<Cell<T>> query(Bounds range,int maxCells) {
         if (maxCells<0) throw new IllegalArgumentException("cell budget");

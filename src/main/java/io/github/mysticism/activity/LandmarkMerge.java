@@ -13,7 +13,7 @@ public final class LandmarkMerge {
     /** Rendering score only. Conserved local source/activity mass lives in the persisted overlay. */
     public static double importance(MinecraftServer server,LandmarkMetadata landmark){
         var influence=LandmarkActivityState.get(server).entries.get(landmark.id());
-        return influence==null?landmark.header().baseImportance():influence.importance(landmark.header().baseImportance(),server.getOverworld().getTime());
+        long now=server.getOverworld().getTime();return influence==null?landmark.header().baseImportance()*LandmarkActivityState.decay(now-landmark.header().activity().evaluatedTick()):influence.importance(landmark.header().baseImportance(),now);
     }
     /** Extractor calls BEFORE staging its real core proof/reconciled geometry, then commit()
      * immediately AFTER that core mutation completes. Cancellation never publishes history. */
@@ -38,8 +38,6 @@ public final class LandmarkMerge {
     }
     private static void validateBudget(LandmarkActivityState state,List<LandmarkActivityState.Influence> history,
                                        LandmarkActivityState.Influence combined){
-        long removedEntries=history.stream().filter(Objects::nonNull).count();
-        if(state.entries.size()-removedEntries+1>LandmarkActivityState.LIMIT)throw new IllegalArgumentException("overlay budget");
         for(String owner:combined.owners){
             long removed=history.stream().filter(Objects::nonNull).filter(h->h.owners.contains(owner)).count();
             if(state.claimedBy(UUID.fromString(owner))-removed+1>8)throw new IllegalArgumentException("player claim quota");
@@ -86,16 +84,13 @@ public final class LandmarkMerge {
         for(int i:order){
             var h=fragments.get(i).header();var influence=history.get(i);
             LandmarkProfiles.current().requireCompatible(h.baseEmbedding().profile());
-            if(!ids.add(h.id())||!h.dimension().equals(seed.dimension())||!h.algorithmVersion().equals(seed.algorithmVersion())
-                    ||!h.biome().equals(seed.biome())||h.kind()!=seed.kind())throw new IllegalArgumentException("merge domain");
+            if(!ids.add(h.id())||!h.dimension().equals(seed.dimension())||!h.algorithmVersion().equals(seed.algorithmVersion()))throw new IllegalArgumentException("merge domain");
             union=union.union(h.bounds());
-            if(union.maxX()-union.minX()>128||union.maxY()-union.minY()>128||union.maxZ()-union.minZ()>128)
-                throw new IllegalArgumentException("merge source locality");
             Vec384f vector=influence==null?h.baseEmbedding().vector():influence.vector;
             for(Vec384f other:vectors)if(vector.squareDistance(other)>=SEMANTIC_RADIUS*SEMANTIC_RADIUS)
                 throw new IllegalArgumentException("merge semantic radius");
             vectors.add(vector);
-            double base=influence==null?h.baseImportance():influence.base(h.baseImportance());
+            double base=(influence==null?h.baseImportance():influence.base(h.baseImportance()))*LandmarkActivityState.decay(now-(influence==null?h.activity().evaluatedTick():influence.tick));
             double level=influence==null?0:influence.level(now);
             weights.add(Math.max(0.01,base+level));bases+=base;levels+=level;
             if(bases+levels>LandmarkActivityState.MAX_IMPORTANCE_MASS)throw new IllegalArgumentException("merge mass budget");
@@ -106,7 +101,7 @@ public final class LandmarkMerge {
                     var leaves=influence.claims.cells(LandmarkActivityState.CELL_LIMIT);
                     cells+=leaves.size();if(cells>LandmarkActivityState.CELL_LIMIT)throw new IllegalArgumentException("combined claim budget");
                     for(var cell:leaves){
-                        if(combined.claims==null)combined.claims=SparseOctree.empty(influence.claims.rootBounds(),1,512);
+                        if(combined.claims==null)combined.claims=SparseOctree.empty(influence.claims.rootBounds(),1,1L<<32);
                         // Full spatial union; sorted source IDs pick the deterministic overlapping
                         // cell winner, while owners/core Ownership retain ALL player histories.
                         combined.claims=combined.claims.with(cell.bounds(),cell.value(),256);
