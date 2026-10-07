@@ -10,15 +10,14 @@ import org.ladysnake.cca.api.v3.entity.RespawnCopyStrategy;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.util.Identifier;
 
-import io.github.mysticism.Mysticism;
-
 public final class MysticismEntityComponents implements EntityComponentInitializer {
+    private static final String MOD_ID = "mysticism";
     public static final ComponentKey<LatentPos>   LATENT_POS   =
-            ComponentRegistry.getOrCreate(Identifier.of(Mysticism.MOD_ID, "latent_pos"), LatentPos.class);
+            ComponentRegistry.getOrCreate(Identifier.of(MOD_ID, "latent_pos"), LatentPos.class);
     public static final ComponentKey<LatentBasis> LATENT_BASIS =
-            ComponentRegistry.getOrCreate(Identifier.of(Mysticism.MOD_ID, "latent_basis"), LatentBasis.class);
+            ComponentRegistry.getOrCreate(Identifier.of(MOD_ID, "latent_basis"), LatentBasis.class);
     public static final ComponentKey<LatentAttunement> LATENT_ATTUNEMENT =
-            ComponentRegistry.getOrCreate(Identifier.of(Mysticism.MOD_ID, "latent_attunement"), LatentAttunement.class);
+            ComponentRegistry.getOrCreate(Identifier.of(MOD_ID, "latent_attunement"), LatentAttunement.class);
 
 
     @Override
