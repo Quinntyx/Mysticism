@@ -26,7 +26,6 @@ import java.util.concurrent.CompletableFuture;
 
 /** Bounded server-thread event adapter. No model invocation, waits, geometry hydration or chunk loads on tick. */
 public final class SpiritActivityService {
-    private static final ImportancePolicy POLICY=LandmarkInfluence.POLICY;
     private static final int MAX_PLAYERS=64, MAX_EVENTS=64, MAX_JOBS=8;
     private static boolean initialized;
     private static final Map<MinecraftServer,Session> SESSIONS=new IdentityHashMap<>();
@@ -42,14 +41,46 @@ public final class SpiritActivityService {
         final Map<UUID,Personal> players=new LinkedHashMap<>();
         final ArrayDeque<Pulse> events=new ArrayDeque<>();
         final ArrayDeque<Job> jobs=new ArrayDeque<>();
-        LandmarkStore.PendingMutation mutation; Runnable committed;
-        long skipped; int cursor,landmarkCursor;
+        LandmarkStore.PendingMutation mutation; Runnable committed; String mutationDimension;
+        long skipped; int cursor;
+        final LinkedHashMap<Region,String> nearbyCursors=new LinkedHashMap<>(16,0.75f,true);
+        Pulse discovering; NearbyDiscovery discovery;
+    }
+    private record Region(String dimension,int x,int y,int z) {
+        static Region of(Pulse pulse){return new Region(pulse.dimension,Math.floorDiv(pulse.pos.getX(),24),Math.floorDiv(pulse.pos.getY(),24),Math.floorDiv(pulse.pos.getZ(),24));}
+    }
+    /** The production incremental probe. One retained pulse, <=4 metadata reads per tick,
+     * no catalogue list, one full circular pass at most, strict source radius after AABB gate. */
+    static final class NearbyDiscovery {
+        final String dimension,start; final Point3 point; final Bounds range;
+        String cursor; boolean wrapped,done; int lastScanned;
+        NearbyDiscovery(String dimension,BlockPos pos,String cursor){
+            this.dimension=dimension;this.start=cursor;this.cursor=cursor;
+            point=new Point3(pos.getX(),pos.getY(),pos.getZ());
+            range=new Bounds(pos.getX()-24L,pos.getY()-24L,pos.getZ()-24L,pos.getX()+25L,pos.getY()+25L,pos.getZ()+25L);
+        }
+        Optional<LandmarkMetadata> advance(LandmarkStore store){
+            lastScanned=0;if(done)return Optional.empty();
+            var page=store.sourceRangePage(dimension,range,cursor,1,4);lastScanned=page.scanned();cursor=page.nextId();
+            for(var metadata:page.landmarks()){
+                if(wrapped&&start!=null&&metadata.id().compareTo(start)>0)break;
+                if(ActivityMath.relevance(metadata.header().bounds().distanceSquared(point),24)>0){done=true;return Optional.of(metadata);}
+            }
+            if(wrapped&&start!=null&&cursor!=null&&cursor.compareTo(start)>=0)done=true;
+            else if(page.end()){
+                if(!wrapped&&start!=null){wrapped=true;cursor=null;}else done=true;
+            }
+            return Optional.empty();
+        }
     }
     private SpiritActivityService(){}
     public static void init(){
         if(initialized)return;initialized=true;
+        // Load overlays before terrain/activity ticks; no first-use overlay file load on tick.
+        ServerLifecycleEvents.SERVER_STARTED.register(server->{LandmarkStore.get(server);LandmarkActivityState.get(server);SESSIONS.computeIfAbsent(server,k->new Session());});
         ServerTickEvents.END_SERVER_TICK.register(SpiritActivityService::tick);
-        ServerLifecycleEvents.SERVER_STOPPING.register(server->{Session s=SESSIONS.remove(server);if(s!=null){if(s.mutation!=null)s.mutation.cancel();s.jobs.forEach(j->j.future.cancel(false));s.players.values().forEach(p->{if(p.pending!=null)p.pending.cancel(false);});}});
+        ServerWorldEvents.UNLOAD.register((server,world)->clearDimension(server,dimension(world)));
+        ServerLifecycleEvents.SERVER_STOPPING.register(server->{Session s=SESSIONS.remove(server);if(s!=null){cancelMutation(s);s.jobs.forEach(j->j.future.cancel(false));s.players.values().forEach(p->{if(p.pending!=null)p.pending.cancel(false);});}});
         ServerPlayConnectionEvents.DISCONNECT.register((handler,server)->clearPlayer(server,handler.player.getUuid()));
         ServerEntityWorldChangeEvents.AFTER_PLAYER_CHANGE_WORLD.register((player,origin,destination)->clearPlayer(destination.getServer(),player.getUuid()));
         ServerPlayerEvents.AFTER_RESPAWN.register((oldPlayer,newPlayer,alive)->clearPlayer(newPlayer.getServer(),newPlayer.getUuid()));
@@ -72,7 +103,20 @@ public final class SpiritActivityService {
         if(a==null&&s.players.size()<MAX_PLAYERS){a=new Personal(dim);s.players.put(p.getUuid(),a);}
         return Optional.ofNullable(a);
     }
-    public static void clearPlayer(MinecraftServer server,UUID id){Session s=SESSIONS.get(server);if(s!=null){Personal a=s.players.remove(id);if(a!=null&&a.pending!=null)a.pending.cancel(false);s.events.removeIf(e->id.equals(e.owner));s.jobs.removeIf(j->{if(id.equals(j.pulse.owner)){j.future.cancel(false);return true;}return false;});}}
+    public static void clearPlayer(MinecraftServer server,UUID id){Session s=SESSIONS.get(server);if(s!=null){Personal a=s.players.remove(id);if(a!=null&&a.pending!=null)a.pending.cancel(false);s.events.removeIf(e->id.equals(e.owner));s.jobs.removeIf(j->{if(id.equals(j.pulse.owner)){j.future.cancel(false);return true;}return false;});if(s.discovering!=null&&id.equals(s.discovering.owner)){s.discovering=null;s.discovery=null;}}}
+    private static void clearDimension(MinecraftServer server,String dimension){
+        Session s=SESSIONS.get(server);if(s==null)return;
+        for(var id:List.copyOf(s.players.keySet()))if(s.players.get(id).dimension.equals(dimension))clearPlayer(server,id);
+        s.events.removeIf(e->e.dimension.equals(dimension));
+        s.jobs.removeIf(j->{if(j.pulse.dimension.equals(dimension)){j.future.cancel(false);return true;}return false;});
+        s.nearbyCursors.keySet().removeIf(k->k.dimension.equals(dimension));
+        if(s.discovering!=null&&s.discovering.dimension.equals(dimension)){s.discovering=null;s.discovery=null;}
+        if(dimension.equals(s.mutationDimension))cancelMutation(s);
+    }
+    private static void cancelMutation(Session s){
+        if(s.mutation!=null&&!s.mutation.complete())s.mutation.cancel();
+        s.mutation=null;s.committed=null;s.mutationDimension=null;
+    }
     private static void enqueue(ServerWorld world,Pulse pulse){
         if(!world.getServer().isOnThread()||pulse.dimension.equals("mysticism:spirit"))return;
         Session s=SESSIONS.computeIfAbsent(world.getServer(),k->new Session());
@@ -108,47 +152,18 @@ public final class SpiritActivityService {
         return LandmarkProfiles.wrap(influence.vector);
     }
     public static double importance(MinecraftServer server,LandmarkMetadata landmark){
-        var influence=LandmarkActivityState.get(server).entries.get(landmark.id());
-        double now=influence==null?0:influence.level(server.getOverworld().getTime());
-        return Math.min(1,Math.max(0,landmark.header().baseImportance()+now));
+        return LandmarkMerge.importance(server,landmark);
     }
-    /** Extractor-supplied physical proof only. Semantic affinity is an extra gate, never connectivity evidence.
-     * Returns whether the bounded transaction was staged, not whether it is already committed.
-     */
-    public static boolean tryVerifiedLocalMerge(MinecraftServer server,LandmarkRepository.VerifiedConnectivity proof){
-        if(!server.isOnThread())throw new IllegalStateException("activity server thread");
-        if(proof.fragments().size()<2||proof.fragments().size()>8)return false;
-        Session s=SESSIONS.computeIfAbsent(server,k->new Session());if(s.mutation!=null)return false;
-        LandmarkStore store=LandmarkStore.get(server);LandmarkActivityState state=LandmarkActivityState.get(server);
-        try{
-            List<LandmarkMetadata> fragments=new ArrayList<>();
-            for(var ref:proof.fragments()){var m=store.metadata(ref.id()).orElseThrow();if(m.revision()!=ref.revision())return false;fragments.add(m);}
-            fragments.sort(Comparator.comparing(LandmarkMetadata::id));var seed=fragments.getFirst();
-            for(var m:fragments)if(!m.header().dimension().equals(seed.header().dimension())||!m.header().biome().equals(seed.header().biome())
-                    ||m.header().kind()!=seed.header().kind()||m.header().bounds().distanceSquared(seed.header().bounds().center())>64*64
-                    ||effectiveEmbedding(server,m).distanceSquared(effectiveEmbedding(server,seed))>0.04)return false;
-            List<Vec384f> vectors=new ArrayList<>();List<Double> weights=new ArrayList<>();double level=0;long now=server.getOverworld().getTime();
-            var combined=new LandmarkActivityState.Influence(seed.header().baseEmbedding().vector(),0,now);
-            for(var m:fragments){var v=state.entries.get(m.id());vectors.add(effectiveEmbedding(server,m).vector());weights.add(Math.max(0.01,importance(server,m)));
-                if(v!=null){level=Math.max(level,v.level(now));combined.owners.addAll(v.owners);
-                    if(v.claims!=null)for(var cell:v.claims.cells(LandmarkActivityState.CELL_LIMIT)){
-                        if(combined.claims==null)combined.claims=SparseOctree.empty(v.claims.rootBounds(),1,512);
-                        combined.claims=combined.claims.with(cell.bounds(),cell.value(),256);combined.claims.cells(LandmarkActivityState.CELL_LIMIT);
-                    }
-                }
-            }
-            if(combined.owners.size()>16||state.entries.size()>=LandmarkActivityState.LIMIT&&!state.entries.containsKey(seed.id()))return false;
-            combined.vector=ActivityMath.weighted(vectors,weights);combined.level=Math.min(0.35,level);
-            s.mutation=store.stageMerge(proof,now,POLICY);
-            s.committed=()->{fragments.forEach(m->state.remove(m.id()));state.publish(seed.id(),combined);};return true;
-        }catch(IllegalArgumentException|IllegalStateException invalidOrBusy){s.skipped++;return false;}
-    }
+    // Merges are extractor-owned: LandmarkMerge.prepare(server, realProof), then core
+    // stageMerge with reconciled observed geometry, Plan.commit only after core completion.
+    // No independent convenience merge can bypass transactional history conservation.
     public static long skipped(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.skipped;}
     private static void tick(MinecraftServer server){
         Session s=SESSIONS.computeIfAbsent(server,k->new Session());
         // Dimension exits and disconnects invalidate in-flight observations even between sample cadences.
         for(var id:List.copyOf(s.players.keySet())){var p=server.getPlayerManager().getPlayer(id);if(p==null||!dimension(p.getServerWorld()).equals(s.players.get(id).dimension))clearPlayer(server,id);}
-        if(s.mutation!=null){try{s.mutation.advance(1,256);if(s.mutation.complete()){s.committed.run();s.mutation=null;s.committed=null;}}catch(RuntimeException stale){s.mutation.cancel();s.mutation=null;s.committed=null;s.skipped++;}}
+        if(s.mutation!=null){try{s.mutation.advance(1,256);if(s.mutation.complete()){s.committed.run();s.mutation=null;s.committed=null;s.mutationDimension=null;}}catch(RuntimeException stale){cancelMutation(s);s.skipped++;}}
+        if(s.mutation==null&&s.discovery!=null)advanceDiscovery(server,s);
         if(server.getTicks()%20!=0)return;
         List<ServerPlayerEntity> online=server.getPlayerManager().getPlayerList();
         // At most four inventory samples per second, independent of player count.
@@ -161,10 +176,10 @@ public final class SpiritActivityService {
             if(j.future.isCompletedExceptionally()||j.future.isCancelled()){s.skipped++;continue;}
             Vec384f v=j.future.getNow(null);if(v!=null)enqueueVector(s,j.pulse,v);
         }
-        if(s.mutation==null&&!s.events.isEmpty()){
+        if(s.mutation==null&&s.discovery==null&&!s.events.isEmpty()){
             Pulse e=s.events.remove();
             if(e.vector==null){if(EmbeddingHelper.isReady()&&s.jobs.size()<MAX_JOBS)s.jobs.add(new Job(e,EmbeddingHelper.getEmbedding(e.descriptor)));else s.skipped++;}
-            else apply(server,s,e);
+            else {s.discovering=e;s.discovery=new NearbyDiscovery(e.dimension,e.pos,s.nearbyCursors.get(Region.of(e)));}
         }
     }
     private static void enqueueVector(Session s,Pulse e,Vec384f v){if(s.events.size()<MAX_EVENTS)s.events.addFirst(new Pulse(e.dimension,e.pos,e.owner,v.clone(),null,e.strength,e.claim));else s.skipped++;}
@@ -195,26 +210,24 @@ public final class SpiritActivityService {
         }
         MysticismEntityComponents.LATENT_ATTUNEMENT.sync(p);
     }
-    private static void apply(MinecraftServer server,Session s,Pulse e){
-        LandmarkStore store=LandmarkStore.get(server);LandmarkActivityState state=LandmarkActivityState.get(server);
-        Bounds range=new Bounds(e.pos.getX()-24L,e.pos.getY()-24L,e.pos.getZ()-24L,e.pos.getX()+25L,e.pos.getY()+25L,e.pos.getZ()+25L);
+    private static void advanceDiscovery(MinecraftServer server,Session s){
+        LandmarkStore store=LandmarkStore.get(server);
         try {
-            // Core rejects catalogs >128 BEFORE enumeration. Never an unbounded catalog scan.
-            var nearby=store.sourceRange(e.dimension,range,8,128);
-            for(int offset=0;offset<nearby.size();offset++){
-                var metadata=nearby.get(Math.floorMod(s.landmarkCursor+offset,nearby.size()));
-                var h=metadata.header();LandmarkProfiles.current().requireCompatible(h.baseEmbedding().profile());double relevance=ActivityMath.relevance(h.bounds().distanceSquared(new Point3(e.pos.getX(),e.pos.getY(),e.pos.getZ())),24);
-                if(relevance==0)continue;
-                var old=state.entries.get(h.id());if(old==null&&state.entries.size()>=LandmarkActivityState.LIMIT){s.skipped++;continue;}
-                long now=server.getOverworld().getTime();
-                var reduced=LandmarkInfluence.reduce(h,old,e.vector,new BlockPoint(e.pos.getX(),e.pos.getY(),e.pos.getZ()),e.owner,e.strength,e.claim,
-                        e.owner==null?0:state.claimedBy(e.owner),now);
-                s.mutation=store.stageActivity(new LandmarkRepository.RevisionRef(h.id(),h.revision()),reduced.activity(),reduced.ownership());
-                s.committed=()->state.publish(h.id(),reduced.influence());
-                // Rotate the bounded nearby set: repeat dwell reaches overlapping cave/biome regions,
-                // never a catalog-global shop district. Each pulse consumes at most one transaction.
-                s.landmarkCursor++;break;
-            }
-        }catch(IllegalArgumentException|IllegalStateException budgetOrBusy){s.skipped++;}
+            var found=s.discovery.advance(store);
+            if(found.isEmpty()){if(s.discovery.done){s.discovery=null;s.discovering=null;}return;}
+            Pulse e=s.discovering;var h=found.orElseThrow().header();
+            // Remember a source-local ID seek, not a list of every overlap. Repeat pulses
+            // traverse all eligible overlaps even when local/world catalogues exceed old caps.
+            s.nearbyCursors.put(Region.of(e),h.id());
+            while(s.nearbyCursors.size()>64)s.nearbyCursors.remove(s.nearbyCursors.keySet().iterator().next());
+            s.discovery=null;s.discovering=null;
+            LandmarkProfiles.current().requireCompatible(h.baseEmbedding().profile());
+            LandmarkActivityState state=LandmarkActivityState.get(server);
+            var old=state.entries.get(h.id());if(old==null&&state.entries.size()>=LandmarkActivityState.LIMIT){s.skipped++;return;}
+            var reduced=LandmarkInfluence.reduce(h,old,e.vector,new BlockPoint(e.pos.getX(),e.pos.getY(),e.pos.getZ()),e.owner,e.strength,e.claim,
+                    e.owner==null?0:state.claimedBy(e.owner),server.getOverworld().getTime());
+            s.mutation=store.stageActivity(new LandmarkRepository.RevisionRef(h.id(),h.revision()),reduced.activity(),reduced.ownership());
+            s.mutationDimension=e.dimension;s.committed=()->state.publish(h.id(),reduced.influence());
+        }catch(IllegalArgumentException|IllegalStateException budgetOrBusy){s.discovery=null;s.discovering=null;s.skipped++;}
     }
 }

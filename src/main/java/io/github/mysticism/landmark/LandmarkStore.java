@@ -107,6 +107,27 @@ public final class LandmarkStore extends PersistentState {
     public List<LandmarkMetadata> sourceRange(String dimension,Bounds range,int maxResults,int maxScanned) {
         return metadataRange(maxResults,maxScanned,m->m.header().dimension().equals(dimension) && m.header().bounds().intersects(range));
     }
+    /** One resumable ID-ordered source page, not a catalogue-size/result overflow gate.
+     * Resume exclusively after nextId; end means the current suffix is exhausted. This is
+     * a live view (not a topology snapshot); deleted cursor IDs remain valid seek positions.
+     * At most 128 metadata reads, including cache hits; no geometry or ID-list materialization.
+     * Cold metadata reads still use vanilla synchronous bounded-record IO.
+     */
+    public record SourceRangePage(List<LandmarkMetadata> landmarks,String nextId,int scanned,boolean end) {
+        public SourceRangePage { landmarks=List.copyOf(landmarks); }
+    }
+    public SourceRangePage sourceRangePage(String dimension,Bounds range,String afterId,int maxResults,int maxScanned) {
+        checkThread(); Objects.requireNonNull(dimension); Objects.requireNonNull(range);
+        if(maxResults<1 || maxResults>128 || maxScanned<1 || maxScanned>128) throw new IllegalArgumentException("source page budget");
+        String id=afterId==null?(records.isEmpty()?null:records.firstKey()):records.higherKey(afterId);
+        String last=afterId; int scanned=0; List<LandmarkMetadata> result=new ArrayList<>();
+        while(id!=null && scanned<maxScanned && result.size()<maxResults) {
+            LandmarkMetadata m=metadata(id).orElseThrow(); last=id; scanned++;
+            if(m.header().dimension().equals(dimension) && m.header().bounds().intersects(range)) result.add(m);
+            id=records.higherKey(id);
+        }
+        return new SourceRangePage(result,last,scanned,id==null);
+    }
     public List<LandmarkMetadata> semanticRange(LandmarkEmbedding current,double radius,int maxResults,int maxScanned) {
         checkThread();
         if(!Double.isFinite(radius) || radius<=0 || !Double.isFinite(radius*radius) || radius*radius==0) throw new IllegalArgumentException("radius");

@@ -17,10 +17,12 @@ if [[ -n "${MYSTICISM_MINECRAFT_CLASSPATH:-}" ]]; then
   else
     echo 'Terrain-linked evolver compile NOT RUN: provide the real terrain service source directory.'
   fi
-  javac --release 21 -proc:none -sourcepath '' -cp "$classes:$MYSTICISM_MINECRAFT_CLASSPATH" -d "$classes" "${sources[@]}" "$root/src/test/java/io/github/mysticism/activity/ActivityPersistenceTest.java" "$root/src/test/java/io/github/mysticism/activity/ActivityAdapterTest.java" "$root/src/test/java/io/github/mysticism/activity/ActivityMergeTest.java"
+  javac --release 21 -proc:none -sourcepath '' -cp "$classes:$MYSTICISM_MINECRAFT_CLASSPATH" -d "$classes" "${sources[@]}" "$root/src/test/java/io/github/mysticism/activity/ActivityPersistenceTest.java" "$root/src/test/java/io/github/mysticism/activity/ActivityAdapterTest.java" "$root/src/test/java/io/github/mysticism/activity/ActivityMergeTest.java" "$root/src/test/java/io/github/mysticism/activity/ActivityDiscoveryTest.java" "$root/src/test/java/io/github/mysticism/landmark/LandmarkSourceRangePageTest.java"
   java -cp "$classes:$MYSTICISM_MINECRAFT_CLASSPATH" io.github.mysticism.activity.ActivityPersistenceTest
   java -cp "$classes:$MYSTICISM_MINECRAFT_CLASSPATH" io.github.mysticism.activity.ActivityAdapterTest
   java -cp "$classes:$MYSTICISM_MINECRAFT_CLASSPATH" io.github.mysticism.activity.ActivityMergeTest
+  java -cp "$classes:$MYSTICISM_MINECRAFT_CLASSPATH" io.github.mysticism.activity.ActivityDiscoveryTest
+  java -cp "$classes:$MYSTICISM_MINECRAFT_CLASSPATH" io.github.mysticism.landmark.LandmarkSourceRangePageTest
 else
   echo 'Production adapters/persistence NOT RUN: set MYSTICISM_MINECRAFT_CLASSPATH to existing mapped Minecraft, Fabric, CCA and runtime jars.'
 fi
