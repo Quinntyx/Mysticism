@@ -125,7 +125,14 @@ public final class SpiritRenderMathSelfTest {
     private static void productionGlyphFrame() {
         Basis384f liveBasis = new Basis384f();
         Vec384f liveOrigin = axis(4);
-        SpiritGlyphFrame frame = new SpiritGlyphFrame(liveBasis, liveOrigin, new Vec3d(-11, 64, 33));
+        var profile = new io.github.mysticism.landmark.EmbeddingProfile(EmbeddingSpace.MODEL, EmbeddingSpace.REVISION,
+                "pinned-tokenizer", "search_document", EmbeddingSpace.DIMENSIONS,
+                io.github.mysticism.landmark.EmbeddingProfile.Normalization.NONE, "test-schema");
+        SpiritGlyphFrame frame = new SpiritGlyphFrame(new io.github.mysticism.landmark.ProjectionFrame(1, 42,
+                new io.github.mysticism.landmark.LandmarkEmbedding(profile, liveOrigin),
+                new io.github.mysticism.landmark.Point3(-11, 64, 33), axis(0), axis(1), axis(2), 30));
+        frame.place("first", new io.github.mysticism.landmark.Point3(19, 64, 33));
+        frame.place("later", new io.github.mysticism.landmark.Point3(19, 64, 33));
         // Exercise the helper actually called by the renderer, not a duplicate projection formula.
         Vec3d first = frame.position("first", axis(0));
         near(first.x, 19, 0); near(first.y, 64, 0); near(first.z, 33, 0);
@@ -139,14 +146,16 @@ public final class SpiritRenderMathSelfTest {
         check(frame.size() == 2, "rejected profile cannot change frame cache");
         frame.retain(Set.of("first"));
         check(frame.size() == 1, "removed visibility releases placement");
+        frame.place("later", new io.github.mysticism.landmark.Point3(19, 64, 33));
         near(frame.position("later", axis(0)).squaredDistanceTo(first), 0, 0);
         Set<String> visible = new HashSet<>(); visible.add("first"); visible.add("later");
         for (int i = 2; i < SpiritRenderSettings.MAX_GLYPHS; i++) {
-            String id = "glyph-" + i; visible.add(id); frame.position(id, axis(0));
+            String id = "glyph-" + i; visible.add(id);
+            frame.place(id, new io.github.mysticism.landmark.Point3(19, 64, 33)); frame.position(id, axis(0));
         }
         check(frame.size() == SpiritRenderSettings.MAX_GLYPHS, "exact retained placement budget");
         try {
-            frame.position("overflow", axis(0));
+            frame.place("overflow", new io.github.mysticism.landmark.Point3(19, 64, 33));
             throw new AssertionError("placement cache overflow accepted");
         } catch (IllegalArgumentException expected) { checks++; }
         visible.add("overflow");
@@ -156,6 +165,7 @@ public final class SpiritRenderMathSelfTest {
         } catch (IllegalArgumentException expected) { checks++; }
         check(frame.size() == SpiritRenderSettings.MAX_GLYPHS, "overflow is atomic");
         frame.retain(Set.of()); check(frame.size() == 0, "empty visibility releases cache");
+        frame.place("first", new io.github.mysticism.landmark.Point3(19, 64, 33));
         near(frame.position("first", axis(0)).squaredDistanceTo(first), 0, 0);
         check(frame.scale(axis(0)) >= .25f && frame.scale(axis(0)) <= 1.5f, "bounded glyph scale");
         try {
