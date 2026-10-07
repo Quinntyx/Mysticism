@@ -81,7 +81,7 @@ public final class SpiritProjectionService {
     }
     public static void sendTerrain(ServerPlayerEntity p,TerrainMeshFrame frame){thread(p);if(!spirit(p))return;try{activate(p);connections.get(p.networkHandler).pendingTerrain=frame;}catch(RuntimeException unavailable){var c=connections.get(p.networkHandler);String error=String.valueOf(unavailable.getMessage());if(c!=null&&!error.equals(c.error)){c.error=error;p.sendMessage(net.minecraft.text.Text.literal("[Spirit transport] "+error),true);}}}
     public static boolean clearRay(ServerPlayerEntity p,Vec3d from,Vec3d to){return meshes.clearRay(p,from,to);}
-    private static Vec3d projected(ServerPlayerEntity viewer,Vec384f semantic){return Projection384f.projectToWorld(semantic,q(viewer),basis(viewer),viewer.getEyePos(),SCALE);}
+    private static Vec3d projected(ServerPlayerEntity viewer,Vec384f semantic){return Projection384f.projectToWorld(semantic,q(viewer),basis(viewer),viewer.getEyePos(),(float)SCALE);}
     private static List<SpiritScenePayload.Peer> peers(ServerPlayerEntity viewer){
         var result=new ArrayList<SpiritScenePayload.Peer>();var current=q(viewer);int inspected=0;
         for(var p:viewer.getServer().getPlayerManager().getPlayerList()){
