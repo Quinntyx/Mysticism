@@ -70,6 +70,20 @@ public class Mysticism implements ModInitializer, DedicatedServerModInitializer 
                 }, io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService::clearRay);
         io.github.mysticism.net.SpiritProjectionService.init();
         io.github.mysticism.net.DroppedItemSemanticService.init();
+        io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService.onSourceAnchor(
+                io.github.mysticism.navigation.SpiritNavigationService::anchorSource);
+        io.github.mysticism.navigation.SpiritNavigationService.installLandingSafety(
+                new io.github.mysticism.navigation.SpiritNavigationService.LandingSafety() {
+                    public boolean canAlign(net.minecraft.server.network.ServerPlayerEntity player,
+                            io.github.mysticism.vector.Basis384f proposed) {
+                        return io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService.canAlign(player, proposed);
+                    }
+                    public boolean ready(net.minecraft.server.network.ServerPlayerEntity player,
+                            String dimension, String landmarkId, net.minecraft.util.math.BlockPos block) {
+                        return io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService.landingReady(
+                                player, dimension, landmarkId, block);
+                    }
+                });
         SpiritBasisEvolver.init();
 
         Registry.register(Registries.CHUNK_GENERATOR, Identifier.of("mysticism","spirit_generator"),

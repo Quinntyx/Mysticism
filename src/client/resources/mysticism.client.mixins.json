@@ -8,7 +8,9 @@
     "mixin.SpiritNativeSceneMixin",
     "spiritworld.mixin.SpiritLayerPhasesAccess",
     "spiritworld.mixin.SpiritTextureAccess",
-    "spiritworld.mixin.SpiritLayerAccess"
+    "spiritworld.mixin.SpiritLayerAccess",
+    "client.spiritworld.mixin.SpiritTrackerEntriesAccess",
+    "client.spiritworld.mixin.SpiritTrackerInitialValueAccess"
   ],
   "injectors": {
     "defaultRequire": 1

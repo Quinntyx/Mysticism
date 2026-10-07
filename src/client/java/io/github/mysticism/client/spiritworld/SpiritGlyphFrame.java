@@ -21,7 +21,7 @@ public final class SpiritGlyphFrame {
                 player.getLerpedPos(tickDelta).add(0,player.getStandingEyeHeight(),0));
     }
     public Vec3d project(Vec384f semanticPosition) {
-        return Projection384f.projectToWorld(semanticPosition,q,basis,head,SCALE);
+        return Projection384f.projectToWorld(semanticPosition,q,basis,head,(float)SCALE);
     }
     public Vec3d head() { return head; }
     public Vec384f position() { return q.clone(); }
