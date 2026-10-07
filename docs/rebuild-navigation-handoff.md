@@ -1,17 +1,25 @@
 # Approved rebuild — navigation handoff
 
-Authority: `docs/spirit-world-approved-design.md`, read completely; reviewed current sibling `docs/rebuild-{source,terrain,network,render}-handoff.md` directly. This is the approved per-observer custom-mesh rebuild, NOT the previous traversal/activity handoff. Scope: components, navigation service/mixins, evolver, predictor, traversal math and debug commands. Source owner now owns general activity/landmarks. No initializers, networking, terrain/render, JSON/resources/build files, dependencies, agents or Gradle runs changed/used.
+Authority: `docs/spirit-world-approved-design.md` and parent’s bounded follow-up review of initial commit `75d578d`. Scope remains navigation/components/evolver/predictor/debug controls. No initializer, terrain, networking, rendering, resource/build configuration, foundation, dependency or agent changes. Parent’s existing `SpiritInteractionGuard` remains unchanged.
+
+## Follow-up fixes (this commit)
+
+1. **Immediate freeflight is independent of embeddings.** `enterDeep` always activates deep mode, flight permissions and flying, even while source discovery is pending/failed. Only semantic integration, landing and touch require a real anchor. Unanchored client prediction is also disabled. Leaving a floor while walking immediately enters freeflight; an ascending vanilla jump retains up to 14 unsupported ticks of shallow grace.
+2. **Actual floor identity matters.** Navigation compares `support.landmarkId()` with the shallow binding, not just the retained terrain window. Blank matches blank only. An unrelated floor immediately enters deep, without rebinding. Exit performs the same identity check when support exists. The established source mapping still bounds ordinary jump grace.
+3. **Physical pose survives model reset.** Valid source dimension/XYZ, active/deep mode and original flight permissions load independently of the embedding stamp. Incompatible generated landmark bindings/target/basis metadata are discarded. A corrupt generated target does not erase valid physical coordinates. Existing vector/basis components discard incompatible generated values as before; no archives/reindexing or world/stat/inventory migration.
+4. **Landing is a deep approach, not a snap.** Within `.035` semantic units (3.36 blocks), basis alignment proceeds over 40 accepted steps, subject to the terrain guard described below. Singular/antipodal interpolation jumps over `.1` axis-vector distance are refused visibly. Physical movement continues to advance q; q is never replaced with the captured target, and there is no final basis replacement. Acquisition requires <=`.0005` semantic residual (4.8 cm), matching actual target support, near-horizontal support normal, aligned basis and the terrain guard’s readiness approval. Without a registered guard, acquisition is disabled with visible status, not silently permitted.
+5. **Prediction baseline:** synced/persisted `motionEpoch`, deep-mode comparison and semantic-readiness gating prevent sub-four-block mode/anchor corrections from being interpreted as movement. During approach, client prediction advances q without ordinary deep basis steering. Server acquisition also resets the evolver baseline.
+6. **Native entity allowlist:** both `ServerWorld.spawnEntity` filtering and Fabric entity-load filtering allow `PlayerEntity` and `ItemEntity` only in `mysticism:spirit`. Native projectiles/vehicles/orbs/falling blocks and living mobs are rejected/discarded. Source worlds and client-only source ghosts are untouched. Vanilla item load/pickup/magnet paths are not intercepted; held-item interaction remains owned by parent’s existing guard.
 
 ## Actual APIs
 
-`MysticismEntityComponents.SPIRIT_NAVIGATION` is registered for players (`ALWAYS_COPY`), `SpiritNavigation` implements CCA auto-sync:
+`MysticismEntityComponents.SPIRIT_NAVIGATION` remains the registered `ALWAYS_COPY`, auto-synced player CCA component. Existing API:
 
 ```java
 boolean active(); boolean deep();
 String sourceDimension(); String landmarkId(); Vec3d sourcePosition();
-boolean hasShallowTarget();
-String targetDimension(); String targetLandmarkId(); BlockPos targetBlock();
-Basis384f targetBasis(); // defensive snapshot; persisted with captured source pose
+boolean hasShallowTarget(); String targetDimension(); String targetLandmarkId();
+BlockPos targetBlock(); Basis384f targetBasis(); // defensive snapshot
 void enterDeep(); void shallow(String dimension, String id, Vec3d pos);
 void setActive(boolean active);
 void target(String dimension, String id, BlockPos pos);
@@ -19,48 +27,34 @@ void target(String dimension, String id, BlockPos pos, Basis384f sourceBasis);
 void clearTarget();
 ```
 
-**UNOWNED initial shallow source is valid:** `landmarkId=""`, actual dimension/coordinates, no fabricated ID. A shallow TARGET requires a real ID and an orthonormal captured source basis. The target embedding is an independent snapshot in `LatentAttunement.target()`. Component persistence accepts only current cheap model/profile stamps; incompatible semantic vectors are discarded, not archived/migrated. Normal blocks/stats/inventory are untouched. Original flight/no-gravity permissions are saved across logout/restart and restored on exit/dimension change/normal respawn.
+Additional state: `boolean semanticReady()`, `boolean modelCompatible()`, `boolean landingApproach()`, `long motionEpoch()`; controlled readiness/approach setters. The cheap current model stamp applies to semantic state, not physical coordinates. Blank unowned shallow bindings are valid; shallow targets require a real ID and an orthonormal captured source basis.
 
-`io.github.mysticism.navigation.SpiritNavigationService`:
+`SpiritNavigationService` retains `init`, `enter`, `exit`, `enterDeep`, `deep`, `binding`, `update`, `captureHere`, `captureSource`, `cancelCapture`, both `captureTarget` overloads, `touch`, and `anchorFromConcept`. Terrain’s actual `prepareEnter`, `sourcePosition`, `support`, `setShallow`, `prefetchTarget`, `tryLandTarget`, `exit` and direct `LandmarkStore.metadata` are consumed; no duplicate initial source extraction or invented semantic fallback. Commands use ready index data / real async source discovery, never model joins on tick. Ordinary deep travel still uses original movement-dependent `BasisIntegrator384f` toward target minus q, at 96 blocks/semantic unit; q is a location, not a normalized text embedding.
+
+### Parent/terrain coordination REQUIRED for landing and late discovery
+
+New real common hook:
 
 ```java
-public static void init();
-public static boolean enter(ServerPlayerEntity player);
-public static boolean exit(ServerPlayerEntity player);
-public static void enterDeep(ServerPlayerEntity player);
-public static boolean deep(ServerPlayerEntity player);
-public static Optional<SpiritScenePayload.Binding> binding(ServerPlayerEntity player);
-public static boolean update(ServerPlayerEntity player, Vec3d physicalDelta); // evolver only, once/tick
-public static boolean captureHere(ServerPlayerEntity player);
-public static boolean captureSource(ServerPlayerEntity player, String dimension, BlockPos block, String requiredId);
-public static void cancelCapture(ServerPlayerEntity player);
-public static void captureTarget(ServerPlayerEntity player, String dimension, String landmarkId, BlockPos block, Vec384f embedding);
-public static void captureTarget(ServerPlayerEntity player, String dimension, String landmarkId, BlockPos block, Vec384f embedding, Basis384f sourceBasis);
-public static void touch(ServerPlayerEntity actor, ServerPlayerEntity target);
-public static void anchorFromConcept(ServerPlayerEntity player); // ready-item position command only
+public interface SpiritNavigationService.LandingSafety {
+    boolean canAlign(ServerPlayerEntity player, Basis384f proposedBasis);
+    boolean ready(ServerPlayerEntity player, String dimension, String landmarkId, BlockPos block);
+}
+public static void installLandingSafety(LandingSafety safety);
+public static void anchorSource(ServerPlayerEntity player,
+        SpiritTerrainService.SourcePosition source, Basis384f sourceBasis);
 ```
 
-Parent installs network `Navigation` by delegating `deep/binding/touch` to these actual methods. **Network authenticates mutual reach/alignment and BOTH `SpiritTerrainService.clearRay` views before calling touch.** Touch additionally rejects shallow/different-server/different-world/self, interpolates recipient basis over 20 ticks, preserves q/attunement, and cancels interpolation when actual movement resumes. Stationary authoritative basis sync still reaches predictor/render cache.
+- Parent installs a terrain-owned `LandingSafety` adapter **only after terrain supplies real implementations**. `canAlign` must validate the proposed next frame against the current player body and the same render/collision geometry, preventing local clipping before navigation applies that basis. `ready` must require the exact captured source window, observed/current clearance and ownership, and a coherent already-visible collision/render transition. Do not return unconditional true or call a mutating landing method as a readiness query. False retains deep freeflight and physical movement.
+- Terrain’s currently inspected `tryLandTarget` calls `setPosition(projected)` and publishes shallow immediately. **Parent/terrain must remove that correction before installing this hook.** Acquisition must preserve CURRENT physical carrier pose and bind its current pose to the validated source coordinates; preserve the visible/collision geometry rather than jumping to a root or inserting a safety floor. Navigation never changes q or sets the final basis to disguise that jump.
+- `sourcePosition` is shallow-only. Terrain must call `anchorSource` after real async ownership discovery, including when the player already switched to unanchored deep flight, using the actual retained source pose and captured source-grid basis. Invoke in the same server-thread publication transaction as terrain’s semantic-frame update to avoid a frame/q mismatch. This method validates real metadata and source ownership, marks semantic readiness and preserves deep mode/flight; it does not launch another extraction request. Until wired, unanchored deep freeflight works but semantic travel remains unavailable. Parent/terrain must account for physical movement during pending discovery when choosing the corresponding source pose/frame; no fabricated embedding is permitted.
+- Current sibling terrain has JOIN restoration from `nav.active/sourceDimension/sourcePosition` and reuses `nav.targetBasis` for target prewarm. Model reset now retains the physical inputs it requires. These remain terrain-owned paths, not independently runtime-verified here.
 
-## Implemented integration
+## Existing integration/config glue (unchanged)
 
-- Entry calls terrain `prepareEnter`, preserves exact source XYZ and yaw/pitch and uses those same carrier coordinates. Calls `setShallow(true)` after teleport. No `(0,128,0)`, entry floor stamping, safe-air substitution or shared projection frame.
-- Terrain already owns asynchronous initial `SourceLandmarks.ensureSourceLocation`; navigation consumes its real resolved `sourcePosition` ID and direct `LandmarkStore.metadata(id)` once to establish q. **No duplicate entry extraction service/request.** Before resolution, binding has blank ID and an explicitly unavailable ZERO embedding; this is NOT used to evolve deep position. Ordinary unowned source geometry remains shallow and walkable. Double-jump/off-support deep transition is refused until a real source semantic anchor exists, with visible message. Explicit ready-item position is a valid debug concept anchor, not synthetic fallback.
-- Shallow preserves basis/source-grid alignment and actual support. Vanilla jump retains shallow for up to 14 unsupported ticks; flight toggle or loss/change of confirmed supporting region enters automatic deep flight. No sneak/drop special controls, no motion freeze and no orbit/target mutation under the floor.
-- Deep uses original `BasisIntegrator384f` movement-dependent rotation toward **target minus q**, fraction 0.30/block; chosen physical delta advances q at **96 blocks/semantic unit**. Stationary and >4-block teleport displacement do not inject travel. Server and client use `TraversalSteering` math; q is a LOCATION and must NOT be passed through unit-only `LandmarkProfiles.wrap`.
-- Target capture uses actual async `SourceLandmarks.ensureSourceLocation`, rejects a mismatched requested owner, snapshots source-grid basis and embedding plus exact source-block offset; no tick model calls/joins. Generation guards prevent a cancelled/already-queued capture callback from overwriting a newer explicit item/personal/source target. Calls actual `prefetchTarget(..., captured, sourceBasis)`. Captured source basis is persisted and re-used on reconnect, not silently replaced with global/default axes.
-- At q distance <.035, invokes actual `tryLandTarget` at that exact captured block. Failure stays deep nearby, with message and retry hysteresis; no alternative landing. Success rebinds shallow and restores captured basis/q, resets motion baseline. `/spirit leave` delegates exact current shallow `exit`; unavailable/obstructed/deep exits fail visibly.
-- Fabric ALLOW_DAMAGE rejects damage to a deep player AND damage initiated by a deep player, preserving normal-world behavior. No duplicate Fabric attack/use guard was added: parent owns `SpiritInteractionGuard.init()`; held-item use, native item pickup/magnets and authenticated custom touch are untouched by this scope. Native living non-player spirit entities are rejected on spawn and discarded on load; source ghosts are not native entities. Normal source entities/ItemEntities are not touched.
-- Disconnect, respawn, dimension change and shutdown clear transient motion/touch/pending-capture state. Source dimension unload cancels matching requests. Saved compatible q/basis/target/source pose remain component data.
-- Predictor always refreshes `ClientSpiritCache.updateNavigation/updateObserver`, including at rest; no competing scene packet cache/renderer. World/player/disconnect changes reset predictor baseline. Initially unowned source does not predict fabricated semantic travel.
-
-Debug controls: `/spirit [enter|leave|deep|capture]`; `/latent target here`; `/latent target at <dimension> <landmarkId> <x> <y> <z>`; `/latent target item <item>`; `/latent target personal`; `/latent show`; legacy `/latent set {basis,pos,attune} item <item>`. Item commands consume only ready current-model index values, never join/embed. Basis/position re-key commands reject shallow mode. Personal target is explicitly snapshotted, not live-followed.
-
-## Parent-owned glue
-
-1. Initialize source and terrain services before `SpiritBasisEvolver.init()` (which idempotently calls navigation init); retain `ClientLatentPredictor.init()` after client terrain initialization. Existing CCA entrypoint is sufficient.
-2. Network currently already calls nav `touch` in its default adapter. To use the nav binding's explicit unavailable vector until real ownership is ready, use actual `SpiritProjectionService.install(new SpiritProjectionService.Navigation() { ... }, SpiritTerrainService::clearRay)`, delegating `deep/binding/touch` to the three methods above. Retain actual per-player terrain transport and both touch participants' `clearRay`. Binding/Ghost must permit blank unowned ID (network code now visibly does for Binding). Initialize parent-owned `SpiritInteractionGuard`; do not add a second guard here.
-3. Add common mixin resource, for example `mysticism.navigation.mixins.json`, and reference it from Fabric manifest (NOT edited here):
+1. Initialize source and terrain before `SpiritBasisEvolver.init()` (idempotently initializes navigation); retain `ClientLatentPredictor.init()` after client terrain setup. CCA registration already exists.
+2. Network delegates `deep/binding/touch` through actual `SpiritProjectionService.Navigation`. Network authenticates mutual reach/alignment and both `SpiritTerrainService.clearRay` views before touch. Touch preserves q/attunement and interpolates recipient basis over 20 ticks; movement cancels it. Parent initializes its existing `SpiritInteractionGuard` once.
+3. Common mixin resource/manifest registration is parent-owned, not edited here:
 
 ```json
 {
@@ -73,19 +67,15 @@ Debug controls: `/spirit [enter|leave|deep|capture]`; `/latent target here`; `/l
 }
 ```
 
-Flight hook targets Yarn `ServerPlayNetworkHandler.onUpdatePlayerAbilities` TAIL, after vanilla server-thread guard. Native mob hook targets `ServerWorld.spawnEntity` HEAD. Terrain owns movement/collision mixin; no nav collision adapter or block overlay exists.
-4. Parent owns native dimension/profile bump: current branch still has foundation `DIMENSIONS=256`, `NATIVE_DIMENSIONS=768`; network has requested native Nomic v2 document profile. Vector code is outside this scope; all nav storage/math use actual `EmbeddingSpace` constants.
+`SpiritFlightToggleMixin`: Yarn `ServerPlayNetworkHandler.onUpdatePlayerAbilities` TAIL, after vanilla thread guard. `SpiritNativeMobMixin`: `ServerWorld.spawnEntity` HEAD, now the explicit native allowlist despite its historical class name. Terrain owns collision/movement mixins.
+4. Model/native-dimension/profile configuration remains parent-owned. All navigation storage/math use actual `EmbeddingSpace` constants; this worktree still has foundation `DIMENSIONS=256`, `NATIVE_DIMENSIONS=768` until parent’s configuration integration.
 
-## Concrete remaining integration/runtime limits
+## Lifecycle/resource bounds
 
-- Independent contract review: nav component and binding explicitly support initial UNOWNED blank IDs, and deep transition now waits for an actual source semantic anchor. Affine/local-box transport and matching 64-property materials are terrain/network-owned; real ghost pose/equipment/variant/player-profile transport and create-failure fallback are network/render-owned. Their latest sibling code visibly includes those appearance hooks; no out-of-scope edits or independent runtime-success claim here.
-- **Terrain owner coordination:** current source lacks JOIN/session reconstruction for already-spirit saved players. Navigation persists source pose/basis and can resume movement, but cannot manufacture terrain sessions. Terrain must reconstruct its actual window/collision asynchronously from CCA on JOIN. Without that, shallow relog becomes deep/unavailable and meshes cannot reappear. No fake resume adapter was invented here.
-- **Terrain owner coordination:** its fallback prewarm in tick currently passes `new Basis384f()`; use actual `nav.targetBasis()` now published. Navigation explicitly prewarms captured basis immediately at entry/capture and after session recreation, but parent must not rely on default-basis fallback winning event order. Terrain must also preserve requested captured basis when an existing same-ID/point prewarm is refreshed.
-- Exact landing/source clearance, observed/generated-only cells, ownership validation, deformation and visible floor continuity are terrain-owned real hooks, not claimed independently verified. Native mob/deep damage/flight Mixin boot, simultaneous touch, CCA reconnect and live collision/jump behavior have NOT been exercised.
-- Pending source discovery can fail/unavailable: no semantic fallback/deep travel is invented; player can remain on available shallow geometry and attempt exact exit. Recent pending capture is transient and may be lost on logout/shutdown. Callback publication verifies same live player/session.
-- Vector work is bounded by native dimension and connected players; one pending debug capture/player, fixed 20-tick blend, no catalog enumeration/geometry hydration/model calls on movement tick. CCA q/basis and shallow pose reconcile every four ticks; these are not a measured wall-clock/packet-size guarantee. Terrain/network own their population/mesh/packet caps.
-- Existing old prototype tests were left untouched; old orbit/archive assertions are not validation of this approved rebuild. No new test battery/migration machinery was added.
+Disconnect/respawn/dimension exit/shutdown clear transient motion/touch/capture state; pending callbacks verify the live session/player/generation. Source unload cancels matching captures and moves affected shallow players into flight. Original ability permissions persist across relog and restore on exit/dimension change/normal respawn. One pending debug capture/player; fixed-size per-player state, 20-step touch / 40-step landing basis work, dimension-bounded vector operations. No catalog scans, geometry hydration, model IO, inference or joins in navigation’s movement tick. Terrain guard implementations must preserve that budget. Four-tick CCA reconciliation remains, not a measured packet/CPU guarantee.
 
-## Actual validation
+## Exact validation and remaining limitations
 
-`git diff --check` passed. Reviewed real sibling source/API and Yarn signatures with mapped `javap`. **No Gradle, compile, smoke, new tests, live Fabric/client/server/GPU or integrated model execution run** during concurrent implementation, per parent instruction. Parent owns serial merged compile/basic smoke; this document does not claim those passed.
+Initial commit and this bounded pass: **no builds, Gradle, smoke tests, new test suite, existing test execution, live Fabric/GPU/server/model execution or agents**, as requested. Static inspection and `git diff --check` only; no claim of runtime success. Existing old orbit/archive tests were left unchanged and are not evidence for this design.
+
+Follow-up closes unconditional flight refusal, unrelated-floor retention, physical-coordinate erasure and navigation’s q/basis landing snap. **Landing intentionally remains fail-closed until parent/terrain wires the real guard and no-position-correction acquisition.** Late deep source anchoring also requires the actual terrain ownership callback above. Singular landing alignments may fail visibly rather than force a discontinuity. Coherent render/collision streaming, reconnect model reset, jump/edge behavior, mixin boot, item pickup/magnets and multiplayer touch still need parent’s integrated runtime validation. Parent owns serial merged compile/basic smoke and follow-up merge.

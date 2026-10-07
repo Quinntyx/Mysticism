@@ -11,7 +11,7 @@ import net.fabricmc.fabric.api.entity.event.v1.*;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerWorldEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
-import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
@@ -24,12 +24,19 @@ import java.util.concurrent.CompletableFuture;
 public final class SpiritNavigationService {
     private static final Map<MinecraftServer, Map<UUID, Session>> SERVERS = new IdentityHashMap<>();
     private static boolean initialized;
+    /** Terrain-owned validation; install only with no-snap acquisition and coherent visible/collision frames. */
+    public interface LandingSafety {
+        boolean canAlign(ServerPlayerEntity player, Basis384f proposedBasis);
+        boolean ready(ServerPlayerEntity player, String dimension, String landmarkId, BlockPos block);
+    }
+    private static LandingSafety landingSafety;
+    public static void installLandingSafety(LandingSafety safety) { landingSafety = Objects.requireNonNull(safety); }
     private SpiritNavigationService() {}
     private static final class Session {
-        int unsupported, blendTick;
-        boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned;
+        int unsupported, blendTick, landingTick;
+        boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, jumping;
         Vec384f targetSnapshot;
-        Basis384f blendFrom, blendTo;
+        Basis384f blendFrom, blendTo, landingFrom;
         CompletableFuture<?> capture;
         String captureDimension = "";
         long captureNonce;
@@ -68,10 +75,10 @@ public final class SpiritNavigationService {
         ServerLivingEntityEvents.ALLOW_DAMAGE.register((entity, source, damage) ->
                 !(entity instanceof ServerPlayerEntity victim && deep(victim))
                         && !(source.getAttacker() instanceof ServerPlayerEntity attacker && deep(attacker)));
-        // No native spirit mobs. Source ghosts are network/render snapshots, not spawned entities.
+        // Explicit native allowlist. Source ghosts are client snapshots, not server spawned entities.
         ServerEntityEvents.ENTITY_LOAD.register((entity, world) -> {
             if (world.getRegistryKey().equals(SpiritTerrainService.WORLD)
-                    && entity instanceof LivingEntity && !(entity instanceof PlayerEntity)) entity.discard();
+                    && !(entity instanceof PlayerEntity) && !(entity instanceof ItemEntity)) entity.discard();
         });
     }
     private static void clear(ServerPlayerEntity p) {
@@ -108,6 +115,7 @@ public final class SpiritNavigationService {
         var mapped = SpiritTerrainService.sourcePosition(p);
         nav.shallow(dimension, mapped.map(SpiritTerrainService.SourcePosition::landmarkId).orElse(""), source);
         Session s = session(p); s.semanticReady = false; s.checkedRestore = true;
+        nav.setSemanticReady(false); nav.setLandingApproach(false);
         s.confirmedOwned = false; s.warnedAnchor = false; s.prefetched = false;
         try {
             // Source-identical carrier pose: no shared origin, entry search or replacement floor.
@@ -126,16 +134,27 @@ public final class SpiritNavigationService {
         }
     }
     private static void anchorSource(ServerPlayerEntity p, Session s, SpiritTerrainService.SourcePosition source) {
-        // Terrain owns initial async SourceLandmarks discovery. Consume its actual resolved ownership,
-        // not a second extraction request or a fabricated vector. Metadata lookup is direct, no scan/geometry.
+        anchorSource(p, source, p.getComponent(MysticismEntityComponents.LATENT_BASIS).get());
+    }
+    /** Terrain calls this after actual async ownership publication, including while already flying deep.
+     * source is the retained physical source pose; sourceBasis is its captured grid, NOT a later camera basis. */
+    public static void anchorSource(ServerPlayerEntity p, SpiritTerrainService.SourcePosition source, Basis384f sourceBasis) {
+        var nav = state(p); Session s = session(p);
+        if (!spirit(p) || !nav.active() || s.semanticReady || source.landmarkId().isEmpty()
+                || !source.dimension().equals(nav.sourceDimension())
+                || (!nav.landmarkId().isEmpty() && !nav.landmarkId().equals(source.landmarkId()))) return;
         var found = LandmarkStore.get(p.getServer()).metadata(source.landmarkId());
         if (found.isEmpty()) return;
         var metadata = found.get();
-        s.semanticReady = true;
-        var nav = state(p); nav.shallow(source.dimension(), metadata.id(), source.position());
+        if (!metadata.header().dimension().equals(source.dimension()) || !metadata.header().bounds().contains(
+                MathHelper.floor(source.position().x), MathHelper.floor(source.position().y), MathHelper.floor(source.position().z))) return;
+        boolean wasDeep = nav.deep();
+        nav.shallow(source.dimension(), source.landmarkId(), source.position());
+        if (wasDeep) nav.enterDeep(); // Async discovery must not take flight away or silently land.
+        s.semanticReady = true; nav.setSemanticReady(true);
         Vec384f q = metadata.header().baseEmbedding().vector();
         Vec3d offset = source.position().subtract(metadata.header().anchor().x(), metadata.header().anchor().y(), metadata.header().anchor().z());
-        TraversalSteering.advance(q, p.getComponent(MysticismEntityComponents.LATENT_BASIS).get(), offset.x, offset.y, offset.z);
+        TraversalSteering.advance(q, sourceBasis, offset.x, offset.y, offset.z);
         p.getComponent(MysticismEntityComponents.LATENT_POS).set(q);
         var att = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT);
         att.set(att.target().length() < 1e-6 ? q : att.target()); // freeze any default personal target at entry
@@ -150,6 +169,10 @@ public final class SpiritNavigationService {
         if (!spirit(p) || !state(p).active() || state(p).deep()) {
             p.sendMessage(Text.literal("Exit requires a valid current shallow source location."), false); return false;
         }
+        var support = SpiritTerrainService.support(p);
+        if (support.isPresent() && !support.get().landmarkId().equals(state(p).landmarkId())) {
+            enterDeep(p); p.sendMessage(Text.literal("The actual supporting region changed; cannot exit through the previous source binding."), false); return false;
+        }
         if (!SpiritTerrainService.exit(p)) {
             p.sendMessage(Text.literal("Current shallow source location is unavailable or obstructed; no substitute exit."), false); return false;
         }
@@ -160,15 +183,14 @@ public final class SpiritNavigationService {
         var permissions = state(p);
         if (!permissions.hasSavedAbilities()) permissions.rememberAbilities(p.getAbilities().allowFlying, p.getAbilities().flying, p.hasNoGravity());
         Session s = session(p); restoreAnchor(p, s);
-        if (!s.semanticReady) {
-            flight(p, false);
-            if (!s.warnedAnchor) { p.sendMessage(Text.literal("Deep flight awaits a real source semantic anchor; unowned shallow terrain remains usable."), false); s.warnedAnchor = true; }
-            return;
-        }
         var nav = state(p); boolean changed = !nav.active() || !nav.deep();
+        // Flight safety never waits for a model. Only semantic travel/landing/touch require a real anchor.
         nav.enterDeep(); SpiritTerrainService.setShallow(p, false); flight(p, true);
-        s.unsupported = 0;
+        s.unsupported = 0; s.jumping = false;
         if (changed) sync(p);
+        if (!s.semanticReady && !s.warnedAnchor) {
+            p.sendMessage(Text.literal("Free flight active; semantic travel awaits real source discovery."), false); s.warnedAnchor = true;
+        }
     }
 
     /** Called once by the evolver. True permits ordinary deep movement integration. */
@@ -179,25 +201,33 @@ public final class SpiritNavigationService {
             SpiritTerrainService.prefetchTarget(p, nav.targetDimension(), nav.targetLandmarkId(), nav.targetBlock(),
                     p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target(), nav.targetBasis()); s.prefetched = true;
         }
-        if (!nav.active()) { enterDeep(p); if (!nav.active()) return false; } // never invent a semantic anchor for external entry
+        if (!nav.active()) enterDeep(p); // Safe freeflight even without an anchor; never invent a semantic vector.
         if (!nav.deep()) {
-            if (p.getAbilities().flying) { enterDeep(p); return nav.deep(); }
+            if (p.getAbilities().flying) { enterDeep(p); return nav.deep() && s.semanticReady; }
             var mapping = SpiritTerrainService.sourcePosition(p);
             var support = SpiritTerrainService.support(p);
-            if (mapping.isEmpty()) { enterDeep(p); return nav.deep(); }
+            if (mapping.isEmpty()) { enterDeep(p); return nav.deep() && s.semanticReady; }
             var source = mapping.get(); boolean anchoredNow = false;
-            if (!s.semanticReady && !source.landmarkId().isEmpty()) { anchorSource(p, s, source); anchoredNow = s.semanticReady; }
             String id = source.landmarkId();
             // Permit the initial unowned frame to catch up with asynchronous ownership publication.
             // Once geometry actually confirms ownership, leaving it enters deep, never switches regions.
             if (!nav.landmarkId().isEmpty() && !id.equals(nav.landmarkId()) && (!id.isEmpty() || s.confirmedOwned)) {
-                enterDeep(p); return nav.deep();
+                enterDeep(p); return nav.deep() && s.semanticReady;
             }
             if (!id.isEmpty()) s.confirmedOwned = true;
             if (id.isEmpty() && !s.confirmedOwned) id = nav.landmarkId();
+            // A retained local window is NOT proof that the floor belongs to it. Blank matches blank only.
+            if (support.isPresent() && !support.get().landmarkId().equals(id)) {
+                enterDeep(p); return nav.deep() && s.semanticReady;
+            }
+            // Ownership checks precede initial anchoring; discovery cannot overwrite an established binding.
+            if (!s.semanticReady && !source.landmarkId().isEmpty()) { anchorSource(p, s, source); anchoredNow = s.semanticReady; }
             nav.shallow(source.dimension(), id, source.position());
-            if (support.isPresent()) s.unsupported = 0;
-            else if (++s.unsupported > 14) { enterDeep(p); return nav.deep(); } // ordinary vanilla jump ~12 ticks
+            if (support.isPresent()) { s.unsupported = 0; s.jumping = false; }
+            else {
+                if (s.unsupported == 0) s.jumping = delta.y > .01;
+                if (++s.unsupported > 14 || !s.jumping) { enterDeep(p); return nav.deep() && s.semanticReady; }
+            } // Ascending takeoff gets ordinary jump grace; walking over an edge gets immediate freeflight.
             flight(p, false);
             if (s.semanticReady && !anchoredNow) TraversalSteering.advance(p.getComponent(MysticismEntityComponents.LATENT_POS).get(),
                     p.getComponent(MysticismEntityComponents.LATENT_BASIS).get(), delta.x, delta.y, delta.z);
@@ -215,46 +245,89 @@ public final class SpiritNavigationService {
                 return false;
             }
         }
-        attemptLanding(p, s);
+        if (attemptLanding(p, s, delta)) return false; // Approach advanced q once, without ordinary basis steering.
         return nav.deep();
     }
     private static void restoreAnchor(ServerPlayerEntity p, Session s) {
         if (s.checkedRestore) return; s.checkedRestore = true;
         var nav = state(p); Vec384f q = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
-        // Persisted q is accepted only in an already-active current-profile navigation session.
-        if (nav.active() && nav.deep() && q.length() > 1e-6) s.semanticReady = true;
-        if (nav.active() && !nav.landmarkId().isEmpty() && LandmarkStore.get(p.getServer()).metadata(nav.landmarkId()).isPresent())
-            s.semanticReady = true;
+        // Physical pose survives model reset, but discarded q/IDs cannot authorize semantic travel.
+        s.semanticReady = nav.active() && nav.semanticReady();
+        if (nav.modelCompatible() && nav.active() && nav.deep() && q.length() > 1e-6) s.semanticReady = true;
+        if (nav.modelCompatible() && nav.active() && !nav.landmarkId().isEmpty()
+                && LandmarkStore.get(p.getServer()).metadata(nav.landmarkId()).isPresent()) s.semanticReady = true;
+        if (nav.semanticReady() != s.semanticReady) { nav.setSemanticReady(s.semanticReady); sync(p); }
         // Terrain restores its source window and runs initial discovery; no duplicate entry extraction here.
     }
     /** Called only when a debug command supplies a ready real item location, not a fabricated fallback. */
     public static void anchorFromConcept(ServerPlayerEntity p) {
         if (p.getComponent(MysticismEntityComponents.LATENT_POS).get().length() > 1e-6) {
             Session s = session(p); s.semanticReady = true; s.checkedRestore = true;
+            state(p).setSemanticReady(true); sync(p);
         }
     }
-    private static void attemptLanding(ServerPlayerEntity p, Session s) {
-        var nav = state(p); if (!nav.hasShallowTarget()) return;
-        var att = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT);
-        Vec384f target = att.target();
+    private static void endApproach(ServerPlayerEntity p, Session s) {
+        s.landingFrom = null; s.landingTick = 0;
+        if (state(p).landingApproach()) { state(p).setLandingApproach(false); sync(p); }
+    }
+    /** True means this controller already integrated physical movement for this tick. Never snaps q/pose/basis. */
+    private static boolean attemptLanding(ServerPlayerEntity p, Session s, Vec3d delta) {
+        var nav = state(p);
+        if (!nav.hasShallowTarget()) { endApproach(p, s); return false; }
+        Vec384f target = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target();
         if (s.targetSnapshot == null || s.targetSnapshot.squareDistance(target) > 0) {
-            s.targetSnapshot = target; s.attemptedLanding = false;
+            s.targetSnapshot = target; s.attemptedLanding = false; s.warnedLanding = false; endApproach(p, s);
         }
-        float distance = p.getComponent(MysticismEntityComponents.LATENT_POS).get().squareDistance(target);
-        if (distance > .15f * .15f) s.attemptedLanding = false;
-        if (distance > .035f * .035f || s.attemptedLanding) return;
+        var q = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
+        float distance = q.squareDistance(target);
+        if (distance > .15f * .15f) { s.attemptedLanding = false; s.warnedLanding = false; }
+        if (distance > .035f * .035f || s.attemptedLanding) { endApproach(p, s); return false; }
+        LandingSafety safety = landingSafety;
+        if (safety == null) {
+            endApproach(p, s);
+            if (!s.warnedLanding) { p.sendMessage(Text.literal("Landing remains deep: continuous terrain-transition guard is not installed."), false); s.warnedLanding = true; }
+            return false;
+        }
+        var component = p.getComponent(MysticismEntityComponents.LATENT_BASIS);
+        Basis384f destination = nav.targetBasis();
+        if (s.landingFrom == null) { s.landingFrom = component.get().clone(); s.landingTick = 0; }
+        if (!nav.landingApproach()) { nav.setLandingApproach(true); sync(p); }
+        if (s.landingTick < 40) {
+            Basis384f proposed = TraversalSteering.blend(s.landingFrom, destination, (s.landingTick + 1) / 40f);
+            // Reject a singular/antipodal interpolation jump rather than forcing the final basis.
+            Basis384f before = component.get();
+            if (before.i.squareDistance(proposed.i) > .01f || before.j.squareDistance(proposed.j) > .01f
+                    || before.k.squareDistance(proposed.k) > .01f) {
+                s.attemptedLanding = true; endApproach(p, s);
+                p.sendMessage(Text.literal("Captured source-grid alignment cannot transition continuously; remaining deep nearby."), false);
+                return false;
+            }
+            // Terrain must validate candidate geometry/body clearance before any basis change is applied.
+            if (safety.canAlign(p, proposed)) { component.set(proposed); ++s.landingTick; }
+        }
+        TraversalSteering.advance(q, component.get(), delta.x, delta.y, delta.z);
+        distance = q.squareDistance(target);
+        if (distance > .035f * .035f) { endApproach(p, s); return true; }
+        // 3.36 blocks is APPROACH radius, not permission to replace q or jump onto another floor.
+        // Acquisition requires <=4.8 cm semantic residual and an already-aligned, visible real target floor.
+        Basis384f current = component.get();
+        if (s.landingTick < 40 || distance > .0005f * .0005f
+                || current.i.squareDistance(destination.i) > 1e-8f || current.j.squareDistance(destination.j) > 1e-8f
+                || current.k.squareDistance(destination.k) > 1e-8f) return true;
+        var support = SpiritTerrainService.support(p);
+        if (support.isEmpty() || !support.get().landmarkId().equals(nav.targetLandmarkId())
+                || support.get().normal().y < .99 || !safety.ready(p, nav.targetDimension(), nav.targetLandmarkId(), nav.targetBlock())) return true;
         s.attemptedLanding = true;
-        // The terrain owner validates exact ownership, observed air and body clearance. No safeAir fallback.
+        // Parent's terrain acquisition must preserve CURRENT carrier pose and commit only its ready source mapping.
         if (SpiritTerrainService.tryLandTarget(p, nav.targetDimension(), nav.targetLandmarkId(), nav.targetBlock())) {
             var source = SpiritTerrainService.sourcePosition(p);
             if (source.isPresent()) {
-                var at = source.get(); nav.shallow(at.dimension(), at.landmarkId(), at.position());
-                s.unsupported = 0;
-                p.getComponent(MysticismEntityComponents.LATENT_POS).set(att.target());
-                p.getComponent(MysticismEntityComponents.LATENT_BASIS).set(nav.targetBasis());
-                SpiritBasisEvolver.resetMotion(p); flight(p, false); sync(p);
+                var at = source.get(); nav.shallow(at.dimension(), at.landmarkId(), at.position()); s.unsupported = 0;
+                endApproach(p, s); SpiritBasisEvolver.resetMotion(p); flight(p, false);
+                MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p); sync(p);
             }
-        } else p.sendMessage(Text.literal("Captured shallow destination changed, blocked or unavailable. Remaining deep nearby."), false);
+        } else { endApproach(p, s); p.sendMessage(Text.literal("Captured destination changed or blocked. Remaining deep nearby."), false); }
+        return true;
     }
     public static Optional<SpiritScenePayload.Binding> binding(ServerPlayerEntity p) {
         var nav = state(p); if (!spirit(p) || !nav.active() || nav.deep()) return Optional.empty();
@@ -275,7 +348,8 @@ public final class SpiritNavigationService {
         state(p).target(dimension, id, block, basis);
         p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).set(embedding.clone());
         sync(p); MysticismEntityComponents.LATENT_ATTUNEMENT.sync(p);
-        Session s = session(p); s.attemptedLanding = false; s.prefetched = true;
+        Session s = session(p); s.attemptedLanding = false; s.prefetched = true; s.warnedLanding = false;
+        endApproach(p, s);
         if (spirit(p)) SpiritTerrainService.prefetchTarget(p, dimension, id, block, embedding, basis);
         else s.prefetched = false;
     }
@@ -319,9 +393,10 @@ public final class SpiritNavigationService {
     }
     /** Caller validates BOTH projected reach/alignment/collision rays before invoking. */
     public static void touch(ServerPlayerEntity actor, ServerPlayerEntity target) {
-        if (actor == target || !deep(actor) || !deep(target) || actor.getServer() != target.getServer()
+        if (actor == target || !deep(actor) || !deep(target) || !state(actor).semanticReady() || !state(target).semanticReady()
+                || actor.getServer() != target.getServer()
                 || actor.getWorld() != target.getWorld()) return;
-        Session s = session(target);
+        Session s = session(target); endApproach(target, s);
         s.blendFrom = target.getComponent(MysticismEntityComponents.LATENT_BASIS).get().clone();
         s.blendTo = actor.getComponent(MysticismEntityComponents.LATENT_BASIS).get().clone(); s.blendTick = 0;
         // Target vector and semantic q deliberately unchanged. Network authenticates/validates the touch.
