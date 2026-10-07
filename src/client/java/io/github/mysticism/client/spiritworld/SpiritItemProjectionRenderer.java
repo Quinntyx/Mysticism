@@ -1,7 +1,7 @@
 package io.github.mysticism.client.spiritworld;
 
 import com.mojang.blaze3d.systems.RenderSystem;
-import io.github.mysticism.component.MysticismEntityComponents;
+import io.github.mysticism.client.net.SpiritNetworkingClient;
 import io.github.mysticism.vector.EmbeddingSpace;
 import io.github.mysticism.vector.Vec384f;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
@@ -36,7 +36,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-/** Bounded, frozen-session glyph placement; opaque/cutout depth goes into the main scene. */
+/** Bounded server-authoritative glyph placement; opaque/cutout depth goes into the main scene. */
 public final class SpiritItemProjectionRenderer {
     private static final Logger LOGGER = LoggerFactory.getLogger("Mysticism/SpiritGlyphs");
     private record Glyph(Vec3d position, ItemStack icon, float scale) {}
@@ -80,6 +80,7 @@ public final class SpiritItemProjectionRenderer {
 
     private static void render(WorldRenderContext context) {
         MinecraftClient client = MinecraftClient.getInstance();
+        SpiritNetworkingClient.observe(client);
         if (!ShaderManager.inSpiritWorld() || client.player == null) {
             resetSession();
             return;
@@ -96,18 +97,12 @@ public final class SpiritItemProjectionRenderer {
             return;
         }
         if (ClientSpiritCache.VISIBLE.isEmpty()) return;
-        if (frame == null) {
-            try {
-                // Predictor mirrors only refresh after motion: on entry they can be default or from
-                // the previous world. Read current synced CCA components, freeze on first glyph.
-                // Payload still lacks authoritative realm placements; this is a LOCAL session frame.
-                frame = new SpiritGlyphFrame(MysticismEntityComponents.LATENT_BASIS.get(player).get(),
-                        MysticismEntityComponents.LATENT_POS.get(player).get(), player.getPos());
-            } catch (RuntimeException exception) {
-                warn("Cannot capture compatible player glyph frame", exception);
-                return;
-            }
+        if (frame != ClientSpiritCache.frame()) {
+            glyphs.clear();
+            frame = ClientSpiritCache.frame();
         }
+        // Do not guess placement from unsynced CCA, player position or camera on entry.
+        if (frame == null) return;
         frame.retain(ClientSpiritCache.VISIBLE);
         if (immediate == null) {
             allocator = new BufferAllocator(262144);

@@ -1,61 +1,28 @@
 package io.github.mysticism.client.spiritworld;
 
-import io.github.mysticism.vector.Basis384f;
-import io.github.mysticism.vector.EmbeddingSpace;
-import io.github.mysticism.vector.Projection384f;
-import io.github.mysticism.vector.Vec384f;
+import io.github.mysticism.landmark.*;
+import io.github.mysticism.net.SpiritProjectionState;
+import io.github.mysticism.vector.*;
 import net.minecraft.util.math.Vec3d;
+import java.util.*;
 
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Set;
-
-/** Render-thread session placement, independent of camera motion and later CCA/predictor updates. */
+/** Only server-authoritative absolute positions; never reads camera, predictor or initial CCA sync. */
 final class SpiritGlyphFrame {
-    private final Basis384f basis;
-    private final Vec384f origin;
-    private final Vec3d anchor;
-    private final Map<String, Vec3d> positions = new HashMap<>();
-
-    SpiritGlyphFrame(Basis384f liveBasis, Vec384f liveOrigin, Vec3d realmAnchor) {
-        EmbeddingSpace.requireCurrent(liveOrigin);
-        EmbeddingSpace.requireCurrent(liveBasis.i);
-        EmbeddingSpace.requireCurrent(liveBasis.j);
-        EmbeddingSpace.requireCurrent(liveBasis.k);
-        requireFinite(realmAnchor);
-        basis = liveBasis.clone();
-        origin = liveOrigin.clone();
-        anchor = realmAnchor;
+    private final ProjectionFrame frame;
+    private final Map<String,Vec3d> positions=new HashMap<>();
+    SpiritGlyphFrame(ProjectionFrame frame) { SpiritProjectionState.encodeFrame(frame);this.frame=frame; }
+    /** Old source callers compile, but cannot manufacture an authenticated placement. */
+    @Deprecated SpiritGlyphFrame(Basis384f basis,Vec384f origin,Vec3d anchor) { throw new IllegalArgumentException("Legacy local glyph frame is unauthenticated"); }
+    void place(String id,Point3 position) {
+        SpiritProjectionState.validatePosition(position);
+        if(!positions.containsKey(id) && positions.size()>=128)throw new IllegalArgumentException("Glyph placement budget");
+        positions.put(id,new Vec3d(position.x(),position.y(),position.z()));
     }
-
-    Vec3d position(String id, Vec384f embedding) {
-        // Validate even a retained ID: a new incompatible payload must never inherit cached placement.
-        EmbeddingSpace.requireCurrent(embedding);
-        Vec3d retained = positions.get(id);
-        if (retained != null) return retained;
-        if (positions.size() >= SpiritRenderSettings.MAX_GLYPHS)
-            throw new IllegalArgumentException("Glyph placement budget exceeded");
-        Vec3d projected = Projection384f.projectToWorld(embedding, origin, basis, anchor, 30.0f);
-        requireFinite(projected);
-        positions.put(id, projected);
-        return projected;
+    Vec3d position(String id,Vec384f embedding) {
+        EmbeddingSpace.requireCurrent(embedding); var position=positions.get(id);
+        if(position==null)throw new IllegalArgumentException("Missing authoritative glyph placement");return position;
     }
-
-    float scale(Vec384f embedding) {
-        return (float) Math.max(0.25, Math.min(1.5,
-                1.0 / Math.sqrt(Math.max(0.01, embedding.squareDistance(origin)))));
-    }
-
-    void retain(Set<String> visible) {
-        if (visible.size() > SpiritRenderSettings.MAX_GLYPHS)
-            throw new IllegalArgumentException("Glyph visibility budget exceeded");
-        positions.keySet().removeIf(id -> !visible.contains(id)); // scans <=128 retained IDs, never a world/catalog
-    }
-
+    float scale(Vec384f embedding) { EmbeddingSpace.requireCurrent(embedding);return (float)Math.max(.25,Math.min(1.5,1/Math.sqrt(Math.max(.01,embedding.squareDistance(frame.semanticOrigin().vector()))))); }
+    void retain(Set<String> ids) { if(ids.size()>128)throw new IllegalArgumentException("Glyph visibility budget");positions.keySet().removeIf(id->!ids.contains(id)); }
     int size() { return positions.size(); }
-
-    private static void requireFinite(Vec3d position) {
-        if (!Double.isFinite(position.x) || !Double.isFinite(position.y) || !Double.isFinite(position.z))
-            throw new IllegalArgumentException("Nonfinite glyph placement");
-    }
 }

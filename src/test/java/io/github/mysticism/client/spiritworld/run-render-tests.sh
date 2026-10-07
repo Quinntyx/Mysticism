@@ -8,7 +8,7 @@ if [[ -z "${MYSTICISM_MINECRAFT_CLASSPATH:-}" ]]; then
     exit 0
 fi
 classes="$(mktemp -d "${TMPDIR:-/tmp}/mysticism-render-tests.XXXXXXXX")"
-javac --release 21 -proc:none -cp "$MYSTICISM_MINECRAFT_CLASSPATH" -d "$classes" \
+javac --release 21 -proc:none -sourcepath "$root/src/main/java:$root/src/client/java" -cp "$MYSTICISM_MINECRAFT_CLASSPATH" -d "$classes" \
     "$root/src/main/java/io/github/mysticism/landmark/BorderDither.java" \
     "$root/src/main/java/io/github/mysticism/landmark/FogHorizons.java" \
     "$root/src/main/java/io/github/mysticism/vector/EmbeddingSpace.java" \
@@ -17,6 +17,8 @@ javac --release 21 -proc:none -cp "$MYSTICISM_MINECRAFT_CLASSPATH" -d "$classes"
     "$root/src/main/java/io/github/mysticism/vector/Projection384f.java" \
     "$root/src/client/java/io/github/mysticism/client/spiritworld/SpiritRenderSettings.java" \
     "$root/src/client/java/io/github/mysticism/client/spiritworld/SpiritGlyphFrame.java" \
-    "$root/src/test/java/io/github/mysticism/client/spiritworld/SpiritRenderMathSelfTest.java"
+    "$root/src/test/java/io/github/mysticism/client/spiritworld/SpiritRenderMathSelfTest.java" \
+    "$root/src/test/java/io/github/mysticism/client/spiritworld/SpiritProjectionSelfTest.java"
 java -cp "$classes:$MYSTICISM_MINECRAFT_CLASSPATH" io.github.mysticism.client.spiritworld.SpiritRenderMathSelfTest
+java -cp "$classes:$MYSTICISM_MINECRAFT_CLASSPATH" io.github.mysticism.client.spiritworld.SpiritProjectionSelfTest
 printf 'Self-test class output retained at %s\n' "$classes"

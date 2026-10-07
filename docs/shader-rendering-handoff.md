@@ -1,127 +1,108 @@
-# Shader/rendering handoff — wave 2
+# Shader/rendering handoff — authoritative glyph follow-up
 
-Implementation commit: `fc30ce436955d0d0eab661263a7332dcf61d6330` on
-`feat-spirit-volumetrics`. Only client render/mixin source, shader resources, scoped tests
-and documentation were changed. No initializer, build/config, common visibility,
-network payload, terrain, activity or landmark-core edits; no new dependencies.
+Original renderer commits: `fc30ce4`, `885a8de`; reviewer base: `ac3d0a4`.
+Original shader implementation/source ordering/manual smoke details remain in
+`docs/spirit-volumetrics-integration.md`. This follow-up supersedes its local glyph
+placement limitation, **only after parent wires the APIs below**. GPU limitations remain.
 
-## Parent integration
+## Exact parent integration
 
-* Add `SpiritBackgroundRendererMixin` to the existing `client` list in
-  `src/client/resources/mysticism.client.mixins.json`; retain its package
-  `io.github.mysticism.client.mixin`. Parent should use `compatibilityLevel: JAVA_21`.
-* Existing registrations remain valid/idempotent: `SpiritWorldRenderer.init()` now
-  delegates to `SpiritItemProjectionRenderer.init()`; `SpiritFogVoxels.init()` delegates
-  to `ShaderManager.init()` and no longer draws analytic fog boxes.
-  Optional consolidated registration: `SpiritWorldClient.init()` (shader, glyphs, sky).
-* Missing fog mixin: visible HUD/log diagnostic; volumetric chain refuses to double-fog
-  vanilla rendering. With the hook installed, hardware/shader failure uses 40..64-block
-  linear fallback. F3+T or dimension re-entry retries.
-* Terrain contract: **opaque radius 64 blocks; loading/generation at least 80 blocks**.
-  Actual client constants are `SpiritRenderSettings.OPAQUE_RADIUS=64`,
-  `MIN_LOADING_RADIUS=80`, `FogHorizons(40,64,80)`; client does not load terrain itself.
+1. Common initializer: after existing `SpiritNetworking.init()`, call
+   **`io.github.mysticism.net.SpiritProjectionService.init()`** once. Registers disconnect,
+   dimension-change, respawn and server-stop invalidation. Existing client
+   `SpiritNetworkingClient.init()` now registers frame receiver and lifecycle guards.
+   Existing `SpiritNetworking.init()` additionally registers the new frame payload.
+2. **`SpiritVisibilityService`**: before computing/sending a spirit player's delta, obtain
+   the **real frozen terrain `ProjectionFrame`**. Inspected immutable terrain commit
+   **`46264f824acdacca0f59f41953951595d2e9f2ef`**: `TerrainState.frame()` is public;
+   spirit-world `PersistentStateManager.get(TerrainState.TYPE, TerrainState.KEY)` gives
+   its real saved state. Do not `getOrCreate` or construct a second terrain frame.
+   Missing state/frame: skip publication and retry after terrain initialization.
+   Terrain service has no public frame accessor; parent may instead bridge a public
+   `Optional<ProjectionFrame> projectionFrame(MinecraftServer)` from its real controller.
+   This is a **requested parent bridge, not an implemented/placeholder API**.
+3. Call **`boolean bootstrap = SpiritProjectionService.activate(player, terrainFrame)`**.
+   On true: discard that player's old visibility snapshot and send the **full currently
+   selected set**, even if its IDs are unchanged. On false: normal delta calculation.
+   Handle unsupported-client/state-error diagnostics without advancing snapshots or
+   repeated tick log spam. New clients intentionally render nothing before bootstrap.
+4. Replace visibility's direct `ServerPlayNetworking.send(...new SpiritDeltaPayload(...))`
+   (original file line 55) / legacy batch sends with
+   **`SpiritProjectionService.send(player, added, removed)`**. Advance the visibility
+   snapshot **only after this returns**. Existing `Added.of(id, vector)`, `Added(id,bits)`
+   and `SpiritDeltaPayload(add,remove)` remain source compatible, but legacy/direct
+   unauthenticated placement is rejected client-side, not claimed save-stable.
+5. For glyphs intended to match landmark collision, first publish **immutable base source
+   embeddings**, not transient activity/ring-motion substitutes. Terrain freezes placement
+   from landmark base embeddings. Same base vector/shared frame gives the same anchor.
+   No terrain geometry, collision, dynamic projection re-keying or teleport was changed.
 
-## Production implementation and ordering
+## Actual contracts and bounds
 
-World-space participating medium uses nonlinear depth unprojection with inverse actual
-world view-projection, periodic continuous density, bounded Beer–Lambert integration
-and in-scattering. Extinction floor `-ln(0.001)/64` ensures near-opacity by 64 blocks;
-clear sky depth gets a full-length ray, not a no-fog shortcut.
+Per-player overworld **real PersistentState** key:
+`mysticism.spirit_projection.v1.<uuid>`. Schema 1 saves full landmark profile, current
+vector fingerprint, coordinate-semantics version, epoch/seed, absolute realm origin,
+orthonormal axes, scale and up to **4096 first-ID positions**. Complete frame must match
+terrain on subsequent activation. Changed frame/profile fails closed: explicit migration
+required. Existing unreadable save file is not silently replaced. No position eviction
+or reprojection on removal/re-entry/save reload; capacity exhaustion raises a diagnostic.
+Only new IDs do bounded projection; no model IO/inference/world/catalog scan. Vanilla
+owns disk saves. Per-player catalog is bounded; total storage grows with distinct players.
 
-Actual cached Fabric/Satin source and mapped Yarn1.21.1 bytecode were inspected.
-**Satin's effect event is after the hand render/depth clear**, not a usable scene-depth
-hook. Fabulous's transparency postprocessor also clears main depth. Consequently:
+Terrain's actual frame: epoch 1, world seed, absolute `(0,128,0)`, first observer's
+orthonormalized axes, **96 blocks/semantic unit**. Saved glyph frame copies it, not old
+local player/camera placement at scale 30. Fog/loading constants stay **64 / >=80 blocks**.
 
-1. `START`: matrices/uniforms/FBO preparation.
-2. `AFTER_ENTITIES`: glyphs flush directly into main with depth testing/writes.
-3. `AFTER_TRANSLUCENT`: snapshot main terrain+glyph depth before Fabulous compositing.
-4. `END`: managed fog -> Kuwahara -> saturation -> blit; restore main scene depth.
-5. Vanilla clears depth for hand; hand/HUD are outside volumetric processing.
+Channels: `spirit/frame_v1`, `spirit/visible_delta_v3`. Bootstrap includes full pinned
+frame, random per-play-connection nonce, player UUID, `mysticism:spirit` identity,
+monotonic entry/respawn generation and saved frame epoch. Deltas repeat session identity,
+strict sequence and explicit absolute positions. Authentication means the active trusted
+Minecraft play connection, **not an added cryptographic signature**. Ordered reliable
+transport is required; a sequence gap clears cache and requires fresh bootstrap.
 
-Quality JVM property `mysticism.spirit.quality=low|medium|high` selects 24/40/64 ray
-samples and 9/25/49 unique coherent painterly taps (default medium). Independent final
-saturation pass fades grayscale to full color over 2.5 monotonic-time seconds.
-At most 128 cached/sorted glyphs; incompatible profile fingerprints rejected. No new
-model IO/inference, large world scans or blocking waits on tick/render. One snapshot
-FBO plus three Satin targets, no per-frame FBO allocation; dimensions/sampler IDs follow
-framebuffer resize. Owned resources release on exit/disconnect/re-entry/shutdown.
+Queued work compares actual handler/world/player identities. Bootstrap generation
+watermark survives dimension/respawn clears; only connection replacement resets it.
+No initial CCA or predictor state is read for placement. Removals release vector and
+position entries; dimension/respawn/connection transitions clear active cache. Active
+client cache and deltas are **<=128 glyphs**, encoded packets bounded below 1 MiB.
 
-## Independent review (2026-10-06)
+Scope: owned net/client-net/cache/frame, minimum renderer consumption, matching tests/docs
+only. No initializer/visibility/terrain/shader/config/build/profile/dependency edits.
+Original feature worktree retained; no dev/main edits or new dependencies; no agents.
 
-Fixed first glyph entry freezing stale movement-only predictor mirrors: production
-`SpiritGlyphFrame` now snapshots actual CCA basis/position on first visibility. Retained
-positions/profile rejection and its hard 128-entry budget are exercised directly by tests.
-World/player replacement resets the local frame and releases its native buffer; disconnect
-clears connection caches. Renderer/resource invalidation re-resolves model safety while
-preserving the frozen placement frame.
-Suppressed glyph glint to avoid routing its incompatible texture/vertex format through the
-atlas cutout buffer. Fixed float wrapping of tiny negative coordinates to keep [0,4096).
-Kuwahara now uses integer nearest depth/color fetches and foreground-only gathering,
-preventing deeper glyph samples bleeding onto a nearer wall; still <=49 neighborhood taps.
-Fog radius, chain ordering and independent 2.5-second saturation layer remain unchanged.
+## Actual validation
 
-Latest actual checks:
-
-* **PASS**: 99 static resource/order contracts, 1870 CPU/production-placement checks,
-  3 GLSL150 fragments (`glslangValidator`); seven processed shader resources byte-match
-  reviewed source; `git diff --check`.
-* **PASS, qualified**: visible tmux **%466**, Java21 Gradle offline `compileJava
-  compileClientJava selfTest`, exit 0. Temporary main-source copy substitutes exactly
-  parent `2577922`'s four Pair migration files (IndexPair/KnnIndex/SimpleKnnIndex/command),
-  with no worktree common/config changes. Actual client sources and all five test mains
-  passed: render 1870, persistence/network 93, pipeline 133, core 802, disk/NBT 2388.
-  Command/init-script details are in `docs/spirit-volumetrics-integration.md`.
-* **FAILED**: `verifyProductionJar` attempt stops at `jar` because main/client resources
-  duplicate `assets/mysticism/lang/en_us.json`. Remap/production-jar verification not run;
-  parent owns the fix. Unmodified baseline common source still needs its Pair migration.
-* **NOT RUN**: GPU/live Minecraft, visual wall occlusion, Fabulous, resize/reload/failure
-  recovery, actual saturation visuals or performance. No driver/runtime success claimed.
-
-Parent networking followup is required for authoritative save-stable glyph placement:
-include projection epoch and realm placement/persisted frame per stable ID with pinned
-profile and connection/dimension session identity; guard queued packets by live session,
-coordinate initial CCA sync, prune removed vector entries, and resend on re-entry/respawn.
-The existing vector cache can grow within a connection; disconnect cleanup is not a
-per-connection memory cap. Current positions are **local session-stable only**, not
-terrain-authoritatively aligned or save/reload-stable. No placeholder packet/API invented.
-Parent still registers the supplied mixin and ensures terrain loading >=80 for opaque64.
-
-## Original implementation validation (before independent review)
-
-* `MYSTICISM_MINECRAFT_CLASSPATH="<existing mapped/runtime jars>" bash
+* Scoped Java21 `javac -proc:none --release 21`: all owned net files, client receiver,
+  cache/frame and renderer consumption compiled against real existing cached mapped
+  Yarn/Fabric dependencies. Outputs: `/tmp/mysticism-glyph-scoped.krfjsBKi`.
+* `MYSTICISM_MINECRAFT_CLASSPATH="/tmp/mysticism-volumetrics-classes:<cached jar CP>" bash
   src/test/java/io/github/mysticism/client/spiritworld/run-render-tests.sh` passed:
-  **90 static resource/order checks**, **1843 math checks**, **3 GLSL150 fragments**
-  validated with installed `glslangValidator -S frag`.
-* Owned client/mixin sources compiled with Java21 `javac -proc:none --release 21`
-  against actual cached Yarn/Fabric/Satin APIs. This is not Loom mixin remapping validation.
-* Recompiled this worktree's actual test dependencies and ran the existing main-based
-  runner: embedding persistence/network **93**, embedding pipeline **133**, landmark
-  core **802**, disk/NBT persistence **2388** checks passed, plus render math (5 suites).
-  Corrupt-save tests logged expected errors. No real model/client/server was booted.
-* Visible interactive tmux pane **%466**, explicit bash, Java21:
-  `bash ./gradlew --offline --no-daemon --max-workers=2 compileJava compileClientJava test`
-  **failed** at existing common `ai.djl.util.Pair` imports in KnnIndex,
-  SimpleKnnIndex and EmbeddingCommand. Client Gradle compile/tests were not reached.
-  Parent/safety integration must resolve that baseline issue, not this shader patch.
-* `git diff --check` passed. No logs/classes/caches committed.
+  **99 static contracts**, **1870 CPU render-math checks**, **34 production projection
+  checks**, **3 GLSL fragment validations**. Output retained at
+  `/tmp/mysticism-render-tests.iOGLmFCh`.
+* Projection checks execute **actual compressed PersistentStateManager disk save/reload**,
+  saved ID retention after changed input, epoch/profile rejection, 4096 catalog cap,
+  frame/delta wire roundtrip and exact byte budget, legacy/pre-bootstrap rejection,
+  removal cleanup, re-entry/respawn/connection guards, replay rejection and aggregate
+  128-glyph cache cap. No live client/server or model was booted.
+* Recompiled matching `EmbeddingPersistenceTest` against owned codec: **93 assertions
+  passed**. Old exact transport reproduction initially failed after intentional format
+  change; updated v3 header/placement tags reproduce **2,107,472 bytes**, correctly
+  rejected by frame encoder. Expected corrupt-save warnings/errors remain.
+* Scoped script initially pulled CCA injected APIs through an unused import; removed
+  that import and reran successfully. New test initially used WrapperLookup rather than
+  DynamicRegistryManager for RegistryByteBuf; corrected and passed.
+* No parent-owned Gradle build run; no dependency installs, output redirection or long
+  build. Cached project classes/artifacts read-only. `git diff --check` passed.
 
-## Limitations / independent review
+## Remaining limitations / independent review
 
-No GPU, visual FPS, Fabulous, driver failure/recovery or mixin runtime smoke was executed.
-Depth describes opaque terrain/glyphs, not all translucent layers/weather/clouds/Fabulous
-auxiliary entity surfaces. Atlas glyphs use depth-writing cutout rendering; built-in
-non-atlas renderers get an amethyst fallback. Modded model buffer growth is not hard-byte
-capped (starts at 256 KiB). Four full-size color/depth FBOs cost nominally ~63.3 MiB at
-1080p, excluding main/Fabulous/driver overhead; Satin may initialize its managed targets
-on resource reload outside the spirit world.
-
-Current payload has no authoritative realm placement/epoch. Glyph positions are frozen
-within a world/connection session, but re-entry/reload rebuilds a local frame from player
-state; save-stable glyph-to-terrain alignment cannot be guaranteed without parent-owned
-placement networking. No placeholder payload/API was invented.
-
-Manual review: wall occlusion; sky/glyph/terrain at 8/32/64/80 blocks; camera motion/FOV;
-Fast/Fancy/Fabulous; resize/fullscreen/F3+T; quality frame times; timed fade; dimension
-exit/re-entry/disconnect; invalid-shader resource-pack fallback/recovery; save/reload
-placement comparison. Detailed source references and smoke steps are in
-`docs/spirit-volumetrics-integration.md`.
+Parent initializer/visibility/terrain-frame bridge is **not wired in this leaf**. Without
+it glyphs fail closed. Full merged Gradle and live lifecycle/network/GPU/Fabulous smoke
+not run here. Original translucent-layer depth/driver limitations remain unchanged.
+No terrain/loading alignment claim for item catalog IDs or transient non-base landmark
+vectors. No automatic migration of changed projection/profile semantics, no custom crash
+transaction beyond vanilla PersistentState save behavior. Saturation/fog/shader unchanged.
+Manual smoke: save/reload exact ID positions; camera/FOV stability; disconnect/reconnect;
+dimension exit/re-entry; death/respawn before CCA sync; delayed old frame/delta; wall
+occlusion; cache growth while cycling visibility; catalog-cap diagnostic.
