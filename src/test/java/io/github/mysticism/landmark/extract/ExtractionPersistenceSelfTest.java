@@ -50,6 +50,28 @@ public final class ExtractionPersistenceSelfTest {
         while(!r.complete()){check(r.advance(1,8)<=8,"cold geometry leaf streaming budget");var drained=r.drain();check(drained.size()<=1,"cold geometry page streaming budget");pages.addAll(drained);check(++steps<20000,"cold read convergence");}
         return LandmarkNbt.hydrate(r.metadata(),pages);
     }
+    private static void globalBoundaryPersistence(Path dir,RegistryWrapper.WrapperLookup lookup)throws Exception{
+        Files.createDirectories(dir);var states=manager(dir,lookup);var store=open(states,dir);
+        var sources=BoundaryCavesSelfTest.domains();for(var source:sources)commit(store.stagePut(source,-1));states.save();
+        // Unload every resident page/state and reopen the real compressed repository.
+        states=manager(dir,lookup);store=open(states,dir);final LandmarkStore cold=store;
+        var union=BoundaryCaves.stitch(sources.stream().map(l->read(cold,l.id())).toList()).orElseThrow();
+        var aborted=store.stageMerge(union.proof(),20,new ImportancePolicy(1,12000,.001,.5),union.geometry());aborted.advance(1,8);aborted.cancel();states.save();
+        states=manager(dir,lookup);store=open(states,dir);check(store.ids().size()==3,"cancelled global union preserves three source headers");
+        final LandmarkStore retry=store;union=BoundaryCaves.stitch(sources.stream().map(l->read(retry,l.id())).toList()).orElseThrow();
+        commit(store.stageMerge(union.proof(),20,new ImportancePolicy(1,12000,.001,.5),union.geometry()));states.save();
+        states=manager(dir,lookup);store=open(states,dir);String canonical=sources.stream().map(Landmark::id).min(String::compareTo).orElseThrow();Landmark merged=read(store,canonical);
+        check(store.ids().size()==1,"global out-of-core union saves/reloads as ONE feature");for(var source:sources)check(store.resolve(source.id()).equals(canonical),"global merge alias survives unload/reload");
+        for(int x=8;x<104;x++)check(merged.geometry().sample(x,-22,18).occupancy()==BlockSample.Occupancy.AIR,"three-domain connected air survives cold reload");
+        var observed=BoundaryCavesSelfTest.cells();observed[ExtractionGraph.index(16,10,10)]=rock();var seeds=BoundaryCavesSelfTest.seeds(merged);Set<String> retired=new HashSet<>();for(var source:sources)retired.add(source.id());
+        var local=BoundaryCavesSelfTest.graph(1,observed,seeds,2,retired);var split=BoundaryCaves.revise(DIM,BoundaryCavesSelfTest.root(1),observed,local,seeds,2,retired);
+        var children=split.stream().map(f->BoundaryCavesSelfTest.value(f,merged.revision()+1)).toList();commit(store.stageSplit(new LandmarkRepository.RevisionRef(merged.id(),merged.revision()),children));states.save();
+        states=manager(dir,lookup);store=open(states,dir);check(store.lineage().get(canonical).size()==2,"global bridge cut persists split lineage");
+        for(var child:children){var restored=read(store,child.id());check(restored.anchor().equals(child.anchor()),"global split anchor cold reload");var sample=restored.geometry().sample(56,-22,18);check(sample==null||sample.occupancy()!=BlockSample.Occupancy.AIR,"removed global bridge remains absent");}
+        var removed=store.metadata(children.getFirst().id()).orElseThrow();commit(store.stageDelete(new LandmarkRepository.RevisionRef(removed.id(),removed.revision())));states.save();
+        var last=open(manager(dir,lookup),dir);check(last.metadata(removed.id()).isEmpty(),"global child removal/tombstone survives reload");
+    }
+    private static ExtractionGraph.Observation rock(){return new ExtractionGraph.Observation(new BlockPalette.State("minecraft:stone",Map.of()),BIOME,"minecraft:stone",false,false,100,63);}
     public static void main(String[] args)throws Exception{
         SharedConstants.createGameVersion();var lookup=RegistryWrapper.WrapperLookup.of(Stream.empty());Path dir=Files.createTempDirectory("mysticism-extraction-");
         var states=manager(dir,lookup);var store=open(states,dir);
@@ -93,6 +115,7 @@ public final class ExtractionPersistenceSelfTest {
         ExtractionJournal bounded=new ExtractionJournal();for(int i=0;i<ExtractionJournal.MAX_REGIONS;i++)check(bounded.entry(new ExtractionJournal.Region(DIM,8+i*32,-32,8))!=null,"bounded region acceptance");
         check(bounded.entry(new ExtractionJournal.Region(DIM,-24,-32,8))==null,"explicit persistence cap, no unbounded scheduler growth");
         NbtCompound encoded=loadedJournal.writeNbt(new NbtCompound(),lookup);check(ExtractionJournal.fromNbt(encoded,lookup).writeNbt(new NbtCompound(),lookup).equals(encoded),"journal deterministic NBT roundtrip");
+        globalBoundaryPersistence(dir.resolve("global-boundaries"),lookup);
         System.out.println("ExtractionPersistenceSelfTest: "+checks+" checks passed; scratch "+dir);
     }
 }

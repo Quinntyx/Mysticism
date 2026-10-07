@@ -41,7 +41,51 @@ Per server: one worker, at most one queued worker task (including canceled work)
 
 Descriptor embeddings use actual block-palette frequencies, exact biome/dimension descriptors and structural classification through asynchronous `EmbeddingHelper.composeDescriptors`. At most 12 material descriptors plus two structural/region descriptors per feature are submitted; weighted compatible item-index vectors are the non-random fallback. Failed/unready embeddings defer publication. Pending edits remain bounded. Failed/unready jobs requeue without losing pre-readiness edits; loaded-chunk polling also retries frontiers. Deferred warning logs are rate-limited to one per 200 ticks. Vanished parents are deleted before new births, and merge reductions precede splits/births so temporary publication does not exceed regional identity caps. Completed observation fingerprints prevent unchanged retries from generating repeated immutable geometry versions. Shutdown cancels reads/mutations/futures, clears queues/references and interrupts the worker; unloaded dimensions discard in-flight work and queued references.
 
-## Activity/ownership integration: parent follow-up required
+## Global boundary stitching continuation (2026-10-07)
+
+`BoundaryCaves` is now a production worker helper, called automatically by `StitchJob` after completed source observations. It streams canonical cave masks from the current domain and its six adjacent **persisted** domains, then proves actual six-neighbour AIR contact. Dimension, biome, algorithm and embedding profile must match exactly. Biome boundaries never disappear because vectors are similar. Connected groups are merged through real `LandmarkStore.stageMerge(proof, tick, policy, reconciledGeometry)` transactions; there is no permanent spatial cutoff at 32-cube boundaries. Repeated unions grow a feature across arbitrary adjacent domains subject to explicit resource bounds: <=256 candidates, <=512 streamed pages, <=131072 expanded observed cells, and <=8 fragments per atomic union. Exceeding a bound defers the union; it does not invent a connecting corridor or average disconnected caves.
+
+For edits to a previously stitched cave, `BoundaryCaves.revise` recomputes its **whole observed** air graph using new observations inside the edited domain and persisted masks outside it. Remote geometry is never truncated to that domain. A changed bridge can therefore produce a real global split/removal via the existing repository split/delete plans. Missing observations of a previously known bridge defer revision until reload, rather than manufacturing a split or closed cave. Unknown frontiers are conservatively retained; this continuation does **not** claim global frontier closure/finalization. Geometry hydration, expanded-air scanning and reconciliation stay on the worker. Reads/mutations still advance one page/256 leaves per tick; no whole geometry scan or inference is added to tick.
+
+Discovery order produces the same final minimum source seed ID when the same domain fragments are observed: the real core records aliases when a newly discovered lower canonical seed wins. This is an explicit merge identity change, not a projection re-key or teleport. Different partial/unknown observations and subsequently retired seeds can still yield different fragment histories. Catalog aliases/lineage survive reload. The controller caches bounded lineage at startup and follows split children incrementally while reading stale journal aliases; a retained parent ID does not hide its other children. <=8192 cached retired IDs/lineage entries; exhaustion defers extraction. Foundation startup catalog-map copies and vanilla multi-file save caveats remain.
+
+## Activity/ownership integration: exact prepare/commit/cancel API
+
+Reviewed the real sibling `LandmarkMerge` and handoff at activity continuation `eadce4d`; no sibling/core/dev edits or dependency added. **After-only COMMITTED_TOPOLOGY is no longer the history adapter.** Install this adapter before gameplay:
+
+```java
+LandmarkExtractionService.topologyAdapter((server, change) -> {
+    if (change.kind() == LandmarkExtractionService.TopologyKind.MERGE) {
+        var plan = io.github.mysticism.activity.LandmarkMerge.prepare(server, change.proof());
+        return new LandmarkExtractionService.TopologyPlan() {
+            public void commit() { plan.commit(); }
+            public void cancel() { plan.cancel(); }
+        };
+    }
+    // Parent-owned real SPLIT/REMOVE preparation: snapshot overlay before core staging,
+    // validate quotas and capture change.parents() / immutable change.children().
+    // Return guarded commit()/cancel(); never publish history in prepare().
+    throw new IllegalStateException("split/remove activity adapter not installed");
+});
+```
+
+The owned public types are `TopologyKind { MERGE, SPLIT, REMOVE }`,
+`TopologyChange(kind, List<RevisionRef> parents, List<Landmark> children, VerifiedConnectivity proof)`,
+`TopologyAdapter.prepare(MinecraftServer, TopologyChange) -> TopologyPlan`, and
+`TopologyPlan.commit()/cancel()`. Proof is non-null for MERGE. SPLIT carries exact newly recomputed children, including profile, seed, geometry, revision and metadata; REMOVE carries the guarded parent ref. Preparation occurs immediately **before** the corresponding real core staging; a rejection is not swallowed and vetoes that mutation. Commit occurs immediately **after** successful core completion, before topology notifications and descriptor-refresh publication. Cancellation/stale work/dimension unload/shutdown cancels prepared history without publication. Both local topology and global boundary unions use these hooks. An adapter commit failure after core publication is logged/deferred, not falsely described as an atomic rollback of vanilla files.
+
+The default adapter publishes no overlay history, because activity-owned split/removal copying does not exist here. Parent MUST install the real adapter; no fake activity implementation or reflective placeholder was added. The sibling merge plan has additional radius, effective-vector, importance/owner and **128-block union extent** limits. Those can veto otherwise physically valid global unions: parent must deliberately review/widen that activity policy if large caves should merge, not discard histories or silently bypass preparation. Coordinate overlay edits while a prepared mutation is pending, preload activity state, and delegate bounded importance as documented in the sibling handoff. Avoid double-summing histories in COMMITTED_TOPOLOGY.
+
+### Exact continuation validation
+
+No whole Gradle task was run in this continuation; parent serializes those. Visible tmux `%463`, explicit bash, Java 21, existing cached mapped Minecraft/Fabric jars, no downloads, outputs exclusively retained `/tmp/mysticism-boundary-service.*` and `/tmp/mysticism-extraction-tests.*`:
+
+- Owned `extract/*.java` production compilation: passed using `javac --release 21 -proc:none`, actual existing baseline common classes and cached runtime classpath.
+- `run-self-tests.sh` with actual Minecraft classpath: ExtractionSelfTest **104063**, BoundaryCavesSelfTest **6416**, ExtractionPersistenceSelfTest **3212** checks passed.
+- New tests exercise three adjacent domains, alternate discovery order/canonical aliases, exact cave-biome/dimension cutoffs, disconnected masks, no remote truncation, global bridge split/removal, unknown-bridge deferral/reload, explicit bounds, actual canceled/completed streaming store merges, compressed disk cold reload, split lineage and deletion tombstones.
+- Initial new test attempts failed on compound `var` declaration and incorrectly dimensioned fixture frontiers; corrected, rerun passed. No live source-world/player tick, real runtime inference, activity adapter lifecycle, integrated Gradle artifact or GPU validation was exercised.
+
+## Earlier wave-2 integration notes (superseded where stated above)
 
 Automatic physical merge is **already wired** to real `LandmarkStore.stageMerge(proof, time, policy, reconciledGeometry)`. Source-mask revisions precede the atomic ownership/alias merge so changed material is explicitly reconciled. Current source descriptors are refreshed after merge. Splits use `stageSplit`, preserve common activity/ownership metadata and record lineage.
 
@@ -57,7 +101,7 @@ LandmarkExtractionService.COMMITTED_TOPOLOGY.register((server, previousIds, repl
 });
 ```
 
-This is a real emitted event, not a substitute activity implementation. A new activity-state absorption/split-copy listener is still required in the activity-owned scope and must be registered before gameplay. Explicit original IDs remain available even after aliases resolve. Without it, common repository ownership survives, but activity's separate influence-history map is not absorbed/copied. Listener exceptions are logged without pretending to undo an already committed topology mutation. Similarity alone is never accepted as connectivity, and different biome keys never merge.
+This is a real emitted notification, not an activity implementation. **Use the new prepare/commit/cancel adapter above for histories**, not an after-only absorption listener. Explicit original IDs remain available even after aliases resolve. Without it, common repository ownership survives, but activity's separate influence-history map is not absorbed/copied. Listener exceptions are logged without pretending to undo an already committed topology mutation. Similarity alone is never accepted as connectivity, and different biome keys never merge.
 
 ## Validation
 
@@ -84,7 +128,7 @@ Earlier diagnostic iterations **failed**, then were fixed: cold-read leaf budget
 
 ## Remaining limitations (not aspirational completion)
 
-- Flood-fill is bounded to one 32-cube observation domain. Components cross source chunks/pages inside it; components crossing the **extraction-domain boundary** remain provisional frontier fragments and are not yet globally stitched/merged. Boundary frontiers are conservative, so they never falsely claim closure. This is not an unlimited whole-world cave extractor.
+- Sampling remains in 32-cube observation domains, but global air-face stitching is implemented as described above. Unresolved frontiers remain provisional. Global page/cell/candidate caps and activity-policy vetoes can still defer very large unions; this is not an unlimited whole-world resident flood-fill.
 - Seed selection is deterministic within each observed snapshot and persistent lineage. Different initial unknown-frontier/chunk-discovery histories are not guaranteed to converge to identical final IDs in independently created worlds; existing committed anchors are intentionally not dynamically re-keyed.
 - Many-to-many topology edits (simultaneous split and merge sharing parents) defer rather than publishing an invalid partial topology. Catalog/seed-history exhaustion and excessive local fragmentation also explicitly defer; there is no unbounded eviction/scan workaround.
 - Initial chunk discovery covers chunk events plus loaded spawn/player chunks, not an enumeration of all already-loaded remote forced chunks. Poll retries are bounded and can have substantial latency in a busy world. No new chunks are loaded to reduce that latency.

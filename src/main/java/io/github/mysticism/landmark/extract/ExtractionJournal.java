@@ -28,6 +28,7 @@ public final class ExtractionJournal extends PersistentState {
     private final LinkedHashMap<String,Entry> entries=new LinkedHashMap<>();
     private int idCount,seenCount;
     public Collection<Entry> entries(){return Collections.unmodifiableCollection(entries.values());}
+    public Entry existing(Region region){return entries.get(region.key());}
     public Entry entry(Region region){
         Entry e=entries.get(region.key());if(e!=null)return e;
         if(entries.size()==MAX_REGIONS)return null;

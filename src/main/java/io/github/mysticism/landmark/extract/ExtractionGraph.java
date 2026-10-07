@@ -225,7 +225,7 @@ public final class ExtractionGraph {
             for(var cell:source.knownCells()){
                 Bounds b=cell.bounds();
                 for(long x=b.minX();x<b.maxX();x++)for(long y=b.minY();y<b.maxY();y++)for(long z=b.minZ();z<b.maxZ();z++){
-                    if(++observed>MAX_CELLS)throw new IllegalArgumentException("Merge observation budget");
+                    if(++observed>BoundaryCaves.MAX_CELLS)throw new IllegalArgumentException("Merge observation budget");
                     String owner=sorted.getFirst().id();
                     for(var seed:sorted)if(seed.geometry().sample(x,y,z)!=null){owner=seed.id();break;}
                     SparseOctree<BlockSample> tree=masks.computeIfAbsent(owner,k->SparseOctree.empty(source.bounds(),1,16));
