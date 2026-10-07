@@ -1,28 +1,34 @@
 package io.github.mysticism.client.spiritworld;
 
-import io.github.mysticism.landmark.*;
-import io.github.mysticism.net.SpiritProjectionState;
 import io.github.mysticism.vector.*;
+import net.minecraft.client.MinecraftClient;
 import net.minecraft.util.math.Vec3d;
-import java.util.*;
 
-/** Only server-authoritative absolute positions; never reads camera, predictor or initial CCA sync. */
-final class SpiritGlyphFrame {
-    private final ProjectionFrame frame;
-    private final Map<String,Vec3d> positions=new HashMap<>();
-    SpiritGlyphFrame(ProjectionFrame frame) { SpiritProjectionState.encodeFrame(frame);this.frame=frame; }
-    /** Old source callers compile, but cannot manufacture an authenticated placement. */
-    @Deprecated SpiritGlyphFrame(Basis384f basis,Vec384f origin,Vec3d anchor) { throw new IllegalArgumentException("Legacy local glyph frame is unauthenticated"); }
-    void place(String id,Point3 position) {
-        SpiritProjectionState.validatePosition(position);
-        if(!positions.containsKey(id) && positions.size()>=128)throw new IllegalArgumentException("Glyph placement budget");
-        positions.put(id,new Vec3d(position.x(),position.y(),position.z()));
+/** A short-lived current observer view, not a persistent/frozen world frame. */
+public final class SpiritGlyphFrame {
+    public static final double SCALE = 96;
+    private final Vec384f q;
+    private final Basis384f basis;
+    private final Vec3d head;
+    public SpiritGlyphFrame(Vec384f q, Basis384f basis, Vec3d head) {
+        EmbeddingSpace.requireCurrent(q);
+        this.q=q.clone(); this.basis=basis.clone(); this.head=head;
     }
-    Vec3d position(String id,Vec384f embedding) {
-        EmbeddingSpace.requireCurrent(embedding); var position=positions.get(id);
-        if(position==null)throw new IllegalArgumentException("Missing authoritative glyph placement");return position;
+    public static SpiritGlyphFrame current(float tickDelta) {
+        var player=MinecraftClient.getInstance().player;
+        if (player==null || !ClientSpiritCache.observerReady()) return null;
+        return new SpiritGlyphFrame(ClientSpiritCache.playerLatentPos,ClientSpiritCache.playerLatentBasis,
+                player.getLerpedPos(tickDelta).add(0,player.getStandingEyeHeight(),0));
     }
-    float scale(Vec384f embedding) { EmbeddingSpace.requireCurrent(embedding);return (float)Math.max(.25,Math.min(1.5,1/Math.sqrt(Math.max(.01,embedding.squareDistance(frame.semanticOrigin().vector()))))); }
-    void retain(Set<String> ids) { if(ids.size()>128)throw new IllegalArgumentException("Glyph visibility budget");positions.keySet().removeIf(id->!ids.contains(id)); }
-    int size() { return positions.size(); }
+    public Vec3d project(Vec384f semanticPosition) {
+        return Projection384f.projectToWorld(semanticPosition,q,basis,head,SCALE);
+    }
+    public Vec3d head() { return head; }
+    public Vec384f position() { return q.clone(); }
+    public Basis384f basis() { return basis.clone(); }
+    /** Same directions = normal size; mismatch shrinks smoothly, no unrelated rotation. */
+    public float alignment(Basis384f other) {
+        double dot=(basis.i.dot(other.i)+basis.j.dot(other.j)+basis.k.dot(other.k))/3.0;
+        return (float)Math.max(0,Math.min(1,(dot+1)/2));
+    }
 }

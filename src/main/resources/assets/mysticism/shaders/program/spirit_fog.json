@@ -2,14 +2,17 @@
   "vertex": "blit",
   "fragment": "mysticism:spirit_fog",
   "attributes": ["Position"],
-  "samplers": [{"name": "DiffuseSampler"}, {"name": "DepthSampler"}],
+  "samplers": [{"name": "DiffuseSampler"}, {"name": "DepthSampler"}, {"name": "OccupancySampler"}],
   "uniforms": [
     {"name": "ProjMat", "type": "matrix4x4", "count": 16, "values": [1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]},
     {"name": "OutSize", "type": "float", "count": 2, "values": [1,1]},
     {"name": "InverseViewProjection", "type": "matrix4x4", "count": 16, "values": [1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]},
     {"name": "CameraModulo", "type": "float", "count": 3, "values": [0,0,0]},
     {"name": "OpaqueRadius", "type": "float", "count": 1, "values": [64]},
-    {"name": "MinExtinction", "type": "float", "count": 1, "values": [0.107933675]},
+    {"name": "NearBubble", "type": "float", "count": 1, "values": [5]},
+    {"name": "HasOccupancy", "type": "int", "count": 1, "values": [0]},
+    {"name": "OccupancyCameraOffset", "type": "float", "count": 3, "values": [0,0,0]},
+    {"name": "MinExtinction", "type": "float", "count": 1, "values": [0.11708060]},
     {"name": "FogSteps", "type": "int", "count": 1, "values": [40]}
   ]
 }

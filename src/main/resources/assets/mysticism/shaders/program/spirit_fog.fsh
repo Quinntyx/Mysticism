@@ -1,6 +1,10 @@
 #version 150
 uniform sampler2D DiffuseSampler;
 uniform sampler2D DepthSampler;
+uniform sampler2D OccupancySampler;
+uniform int HasOccupancy;
+uniform vec3 OccupancyCameraOffset;
+uniform float NearBubble;
 uniform mat4 InverseViewProjection;
 uniform vec3 CameraModulo;
 uniform float OpaqueRadius;
@@ -27,6 +31,15 @@ float density(vec3 p) {
                                     * sin(phase.z * 61.0 - phase.y * 17.0));
 }
 
+// Terrain-published occupied voxels, not generated on render/tick. Nearest packed atlas.
+float occupancy(vec3 offset) {
+    if (HasOccupancy == 0) return 0.0;
+    ivec3 cell = ivec3(floor((offset + OccupancyCameraOffset + vec3(64.0)) / 8.0));
+    if (any(lessThan(cell, ivec3(0))) || any(greaterThanEqual(cell, ivec3(16)))) return 0.0;
+    ivec2 pixel = ivec2((cell.z % 4) * 16 + cell.x, (cell.z / 4) * 16 + cell.y);
+    return texelFetch(OccupancySampler, pixel, 0).r;
+}
+
 void main() {
     vec4 scene = texture(DiffuseSampler, texCoord);
     // texelFetch avoids interpolation of unrelated near/far surfaces at silhouettes.
@@ -37,15 +50,18 @@ void main() {
     float distanceToScene = length(endpoint);
     vec3 direction = endpoint / max(distanceToScene, 0.00001);
     // Clear depth is SKY, not empty/no-fog. March it to the shared opaque horizon.
-    float lengthToMarch = depth >= 0.9999999 ? OpaqueRadius : min(distanceToScene, OpaqueRadius);
+    float endDistance = depth >= 0.9999999 ? OpaqueRadius : min(distanceToScene, OpaqueRadius);
+    float lengthToMarch = max(0.0, endDistance - NearBubble);
     int count = clamp(FogSteps, 8, 64);
     float stepLength = lengthToMarch / float(count);
     float transmittance = 1.0;
     vec3 scattering = vec3(0.0);
     for (int i = 0; i < 64; ++i) {
         if (i >= count || transmittance <= 0.001) break;
-        vec3 worldSample = CameraModulo + direction * ((float(i) + 0.5) * stepLength);
-        float sigma = MinExtinction * density(worldSample);
+        vec3 offset = direction * (NearBubble + (float(i) + 0.5) * stepLength);
+        vec3 worldSample = CameraModulo + offset;
+        float occupied = occupancy(offset);
+        float sigma = MinExtinction * (density(worldSample) + 0.7 * occupied);
         float segmentTransmittance = exp(-sigma * stepLength);
         // In-scattering varies throughout the world-space participating medium, not at the endpoint.
         float light = 0.94 + 0.06 * sin(worldSample.y * (TAU * 7.0 / PERIOD));

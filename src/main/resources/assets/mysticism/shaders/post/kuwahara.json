@@ -4,6 +4,6 @@
     {"name": "mysticism:spirit_fog", "intarget": "minecraft:main", "outtarget": "fogged"},
     {"name": "mysticism:kuwahara", "intarget": "fogged", "outtarget": "painted"},
     {"name": "mysticism:spirit_saturation", "intarget": "painted", "outtarget": "saturated"},
-    {"name": "blit", "intarget": "saturated", "outtarget": "minecraft:main"}
+    {"name": "mysticism:spirit_transition", "intarget": "saturated", "outtarget": "minecraft:main"}
   ]
 }
