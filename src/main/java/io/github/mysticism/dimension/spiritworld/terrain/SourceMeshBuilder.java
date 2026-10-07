@@ -1,0 +1,118 @@
+package io.github.mysticism.dimension.spiritworld.terrain;
+
+import io.github.mysticism.landmark.BlockPalette;
+import io.github.mysticism.landmark.Bounds;
+import net.minecraft.block.*;
+import net.minecraft.registry.Registries;
+import net.minecraft.server.world.ServerWorld;
+import net.minecraft.state.property.Property;
+import net.minecraft.util.Identifier;
+import net.minecraft.util.math.*;
+import net.minecraft.world.EmptyBlockView;
+import net.minecraft.world.BlockView;
+import net.minecraft.block.entity.BlockEntity;
+import net.minecraft.fluid.FluidState;
+import net.minecraft.world.LightType;
+import java.util.*;
+
+/** Bounded source-grid adapter and uniform octree compactor. Never writes or generates source blocks. */
+final class SourceMeshBuilder {
+    static final Box UNIT=new Box(0,0,0,1,1,1);
+    record Tile(TerrainMeshFrame.Material material,List<Box> collision,int color,int light,boolean air,boolean cube) {}
+    record Node(BlockPos position,int side,Tile tile) {}
+    record Key(int x,int y,int z,int side) {}
+    static Tile read(ServerWorld world,BlockPos position) {
+        if(!world.isChunkLoaded(position))return null;
+        BlockState state=world.getBlockState(position);
+        int color=0xffffff;
+        var biome=world.getBiome(position).value();
+        if(state.getBlock() instanceof LeavesBlock)color=biome.getFoliageColor();
+        else if(state.getBlock() instanceof GrassBlock || state.getBlock() instanceof FernBlock)color=biome.getGrassColorAt(position.getX(),position.getZ());
+        int light=(world.getLightLevel(LightType.BLOCK,position)<<4)|(world.getLightLevel(LightType.SKY,position)<<20);
+        return tile(state,world,position,color,light);
+    }
+    static Tile stored(BlockPalette.State material,BlockPos position) {
+        return tile(resolve(new TerrainMeshFrame.Material(material.blockId(),material.properties())),EmptyBlockView.INSTANCE,position,0xffffff,0xf000f0);
+    }
+    static Tile stored(BlockPalette.State material,BlockPos position,Map<BlockPos,Tile> neighbors) {
+        BlockState current=resolve(new TerrainMeshFrame.Material(material.blockId(),material.properties()));
+        BlockView context=new BlockView() {
+            public BlockEntity getBlockEntity(BlockPos p){return null;}
+            public BlockState getBlockState(BlockPos p){
+                if(p.equals(position))return current;
+                Tile t=neighbors.get(p);return t==null?Blocks.AIR.getDefaultState():resolve(t.material());
+            }
+            public FluidState getFluidState(BlockPos p){return getBlockState(p).getFluidState();}
+            public int getHeight(){return 1024;}
+            public int getBottomY(){return -512;}
+        };
+        return tile(current,context,position,0xffffff,0xf000f0);
+    }
+    static Tile tile(BlockState state,net.minecraft.world.BlockView world,BlockPos position,int color,int light) {
+        var collision=state.getCollisionShape(world,position).getBoundingBoxes();
+        if(collision.size()>TerrainMeshFrame.MAX_SHAPES)throw new IllegalArgumentException("source shape exceeds eight primitives");
+        Map<String,String> properties=new TreeMap<>();state.getEntries().forEach((p,v)->properties.put(p.getName(),propertyName(p,v)));
+        var material=new TerrainMeshFrame.Material(Registries.BLOCK.getId(state.getBlock()).toString(),properties);
+        boolean cube=collision.size()==1 && collision.getFirst().equals(UNIT) && state.isOpaque();
+        return new Tile(material,List.copyOf(collision),color,light,state.isAir(),cube);
+    }
+    @SuppressWarnings({"rawtypes","unchecked"})
+    private static String propertyName(Property property,Comparable value){return property.name(value);}
+    static BlockState resolve(TerrainMeshFrame.Material material) {
+        Identifier id=Identifier.of(material.blockId());
+        if(!Registries.BLOCK.containsId(id))throw new IllegalArgumentException("unknown source material "+id);
+        BlockState state=Registries.BLOCK.get(id).getDefaultState();
+        for(var e:material.properties().entrySet()) {
+            Property<?> p=state.getBlock().getStateManager().getProperty(e.getKey());
+            if(p==null)throw new IllegalArgumentException("unknown source property "+e.getKey());
+            state=apply(state,p,e.getValue());
+        }
+        return state;
+    }
+    private static <T extends Comparable<T>> BlockState apply(BlockState state,Property<T> property,String value) {
+        return state.with(property,property.parse(value).orElseThrow(()->new IllegalArgumentException("unknown source property value")));
+    }
+    static Bounds range(Vec3d origin,int side) {
+        int x=MathHelper.floor(origin.x)-side/2,y=MathHelper.floor(origin.y)-side/2,z=MathHelper.floor(origin.z)-side/2;
+        return new Bounds(x,y,z,(long)x+side,(long)y+side,(long)z+side);
+    }
+    static List<Node> compact(Map<BlockPos,Tile> source,Vec3d fineCenter) {
+        Map<Key,Tile> nodes=new HashMap<>();
+        source.forEach((p,t)->{if(!t.air)nodes.put(new Key(p.getX(),p.getY(),p.getZ(),1),t);});
+        for(int side=1;side<16;side*=2) {
+            Set<Key> parents=new HashSet<>();
+            for(Key k:nodes.keySet())if(k.side==side)parents.add(new Key(Math.floorDiv(k.x,side*2)*side*2,Math.floorDiv(k.y,side*2)*side*2,Math.floorDiv(k.z,side*2)*side*2,side*2));
+            for(Key p:parents) {
+                Box bounds=new Box(p.x,p.y,p.z,p.x+p.side,p.y+p.side,p.z+p.side);
+                if(distanceSquared(bounds,fineCenter)<49)continue;
+                Tile common=null;boolean equal=true;
+                for(int child=0;child<8;child++) {
+                    Tile t=nodes.get(new Key(p.x+((child&1)==0?0:side),p.y+((child&2)==0?0:side),p.z+((child&4)==0?0:side),side));
+                    if(t==null || !t.cube || common!=null && !t.equals(common)){equal=false;break;}
+                    common=t;
+                }
+                if(!equal)continue;
+                for(int child=0;child<8;child++)nodes.remove(new Key(p.x+((child&1)==0?0:side),p.y+((child&2)==0?0:side),p.z+((child&4)==0?0:side),side));
+                nodes.put(p,common);
+            }
+        }
+        var result=new ArrayList<Node>();
+        nodes.forEach((k,t)->result.add(new Node(new BlockPos(k.x,k.y,k.z),k.side,t)));
+        result.sort(Comparator.comparingDouble((Node n)->distanceSquared(new Box(n.position).expand(n.side-1),fineCenter))
+                .thenComparingLong(n->n.position.asLong()).thenComparingInt(Node::side));
+        return result;
+    }
+    static long key(String owner,Vec3d source,int side) {
+        long h=0xcbf29ce484222325L;
+        for(int i=0;i<owner.length();i++)h=(h^owner.charAt(i))*0x100000001b3L;
+        h=(h^Double.doubleToLongBits(source.x))*0x100000001b3L;
+        h=(h^Double.doubleToLongBits(source.y))*0x100000001b3L;
+        h=(h^Double.doubleToLongBits(source.z))*0x100000001b3L;
+        h=(h^side)*0x100000001b3L;
+        h^=h>>>30;h*=0xbf58476d1ce4e5b9L;h^=h>>>27;h*=0x94d049bb133111ebL;return h^(h>>>31);
+    }
+    static double distanceSquared(Box b,Vec3d p) {
+        double x=Math.max(Math.max(b.minX-p.x,0),p.x-b.maxX),y=Math.max(Math.max(b.minY-p.y,0),p.y-b.maxY),z=Math.max(Math.max(b.minZ-p.z,0),p.z-b.maxZ);
+        return x*x+y*y+z*z;
+    }
+}
