@@ -20,6 +20,16 @@ public final class ActivityPersistenceTest {
         LatentAttunement b=new LatentAttunement();b.readFromNbt(tag,null);
         check(b.get().squareDistance(a.get())==0,"current reload");check(b.target().squareDistance(axis(1))==0,"target reload distinct");
         check(b.personal().squareDistance(axis(0))==0,"personal reload distinct");
+        LatentAttunement traversal=new LatentAttunement(axis(1));
+        Basis384f basis=new Basis384f();
+        for(int i=0;i<2000;i++)traversal.steer(TraversalSteering.supported(axis(4),basis,10,2,0,0,1,0),0.015);
+        check(traversal.get().squareDistance(axis(4))<0.001,"production component grounded bounded tangent orbit");
+        check(traversal.target().squareDistance(axis(1))==0,"grounded orbit retains flight target");
+        Vec384f beforeJump=TraversalSteering.supported(axis(4),basis,0,0,0,0,1,0);
+        check(TraversalSteering.supported(axis(4),basis,0,3,0,0,1,0).squareDistance(beforeJump)==0,"normal jump retains semantic floor");
+        for(int i=0;i<5000;i++)traversal.steer(traversal.target(),0.005);
+        check(traversal.get().squareDistance(traversal.target())<1e-6,"off-support/flight component slowly reattunes target");
+        check(traversal.personal().length()==0,"navigation does not rewrite personal history");
         b.observe(axis(3));check(b.target().squareDistance(axis(1))==0,"supported/personality drift retains explicit target");
         b.get().mul(0);check(b.get().length()>0.9,"CCA snapshots");
         b.followPersonal();b.observe(axis(4));check(b.target().squareDistance(b.personal())==0,"personal target mode");
