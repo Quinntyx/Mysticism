@@ -375,7 +375,7 @@ public final class SpiritTerrainService {
             if(closest!=null && closest!=s.local && closest!=s.target)append(p,s,closest,materials,palette,cells,keys,128,observer);
             for(Window w:s.regions.values())if(w!=closest && w!=s.local && w!=s.target && !w.id.equals(s.local.id))append(p,s,w,materials,palette,cells,keys,128,observer);
         }
-        return new TerrainMeshFrame(revision,s.shallow,s.local.dimension,s.local.origin,s.carrier,materials,MeshStitcher.stitch(cells,s.local.id,s.shallow));
+        return new TerrainMeshFrame(revision,s.shallow,s.local.dimension,s.local.origin,s.carrier,materials,MeshStitcher.stitch(cells,materials,s.local.id,s.shallow,p.getPos()));
     }
     private static void append(ServerPlayerEntity p,Session s,Window w,List<TerrainMeshFrame.Material> materials,Map<TerrainMeshFrame.Material,Integer> palette,List<TerrainMeshFrame.Cell> cells,Set<Long> keys,int limit,Basis384f current) {
         boolean aligned=w==s.local && s.shallow;Vec3d root;
