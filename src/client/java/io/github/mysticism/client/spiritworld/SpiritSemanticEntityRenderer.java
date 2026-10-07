@@ -16,6 +16,9 @@ import net.minecraft.entity.ItemEntity;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.item.ItemStack;
 import net.minecraft.registry.Registries;
+import net.minecraft.entity.data.DataTracker;
+import io.github.mysticism.client.spiritworld.mixin.SpiritTrackerEntriesAccess;
+import io.github.mysticism.client.spiritworld.mixin.SpiritTrackerInitialValueAccess;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.*;
 import java.util.*;
@@ -32,7 +35,14 @@ public final class SpiritSemanticEntityRenderer {
     private static long lastFrame;
     private static final class Visual {
         Entity model; ItemStack stack; Vec3d target,position; int light=LightmapTextureManager.MAX_LIGHT_COORDINATE; float size=1,alpha,yaw,pitch,bodyYaw,headYaw; boolean present;
-        Visual(Entity model,Vec3d position) { this.model=model; this.position=target=position; }
+        final Map<Integer,DataTracker.SerializedEntry<?>> defaults=new LinkedHashMap<>();
+        SpiritScenePayload.Ghost applied;
+        Visual(Entity model,Vec3d position) { this.model=model; this.position=target=position;captureDefaults(); }
+        void captureDefaults() {
+            defaults.clear();applied=null;
+            if(model!=null)for(var entry:((SpiritTrackerEntriesAccess)(Object)model.getDataTracker()).mysticism$entries())
+                defaults.put(entry.getData().id(),defaultEntry(entry));
+        }
     }
     private SpiritSemanticEntityRenderer() {}
     public static void init() {
@@ -113,6 +123,41 @@ public final class SpiritSemanticEntityRenderer {
         // Source-local translation for flying/air ghosts with no sampled cell below them.
         return new GhostProjection(observerFeet.add(p.subtract(scene.binding().sourcePosition())),LightmapTextureManager.MAX_LIGHT_COORDINATE);
     }
+    private static OtherClientPlayerEntity playerModel(MinecraftClient client,GameProfile profile) {
+        if(profile==null)throw new IllegalArgumentException("Authentic player profile missing");
+        var skins=client.getSkinProvider().getSkinTexturesSupplier(profile);
+        return new OtherClientPlayerEntity(client.world,profile) {
+            @Override public net.minecraft.client.util.SkinTextures getSkinTextures(){return skins.get();}
+        };
+    }
+    private static boolean sameProfile(GameProfile a,GameProfile b) {
+        return a!=null && b!=null && a.equals(b) && a.getProperties().equals(b.getProperties());
+    }
+    private static <T> DataTracker.SerializedEntry<T> copyEntry(DataTracker.SerializedEntry<T> entry) {
+        return new DataTracker.SerializedEntry<>(entry.id(),entry.handler(),entry.handler().copy(entry.value()));
+    }
+    @SuppressWarnings("unchecked")
+    private static <T> DataTracker.SerializedEntry<T> defaultEntry(DataTracker.Entry<T> entry) {
+        T initial=(T)((SpiritTrackerInitialValueAccess)(Object)entry).mysticism$initialValue();
+        return DataTracker.SerializedEntry.of(entry.getData(),initial);
+    }
+    /** COMPLETE appearance, not a delta. Only private render models are changed.
+     * Use declared tracker defaults, NOT constructor-mutated values (e.g. a roosting bat).
+     * Copies prevent mutable received/model values from poisoning the retained defaults. */
+    private static void applyAppearance(Visual visual,SpiritScenePayload.Ghost appearance) {
+        if(visual.applied==appearance)return;
+        List<DataTracker.SerializedEntry<?>> reset=new ArrayList<>(visual.defaults.size());
+        for(var entry:visual.defaults.values())reset.add(copyEntry(entry));
+        visual.model.getDataTracker().writeUpdatedEntries(reset);
+        if(visual.model instanceof LivingEntity living)
+            for(var slot:EquipmentSlot.values())if(living.canUseSlot(slot))living.equipStack(slot,ItemStack.EMPTY);
+        visual.model.getDataTracker().writeUpdatedEntries(appearance.tracked());
+        visual.model.setPose(EntityPose.valueOf(appearance.pose()));
+        if(visual.model instanceof LivingEntity living)for(var equipment:appearance.equipment())
+            living.equipStack(equipment.slot(),equipment.stack());
+        visual.yaw=appearance.yaw();visual.pitch=appearance.pitch();
+        visual.bodyYaw=appearance.bodyYaw();visual.headYaw=appearance.headYaw();visual.applied=appearance;
+    }
     private static void render(WorldRenderContext context) {
         var client=MinecraftClient.getInstance();
         if (world!=client.world || player!=client.player) { clear(); world=client.world; player=client.player; }
@@ -126,16 +171,26 @@ public final class SpiritSemanticEntityRenderer {
         for (var peer:scene.peers()) {
             if (peer.id().equals(client.player.getUuid())) continue;
             String key="peer:"+peer.id(); Visual visual=visuals.get(key);
-            if (visual==null && visuals.size()<128) {
+            try {
+                var appearance=peer.appearance();
                 var entry=client.getNetworkHandler().getPlayerListEntry(peer.id());
-                var profile=entry==null?new GameProfile(peer.id(),"Spirit"):entry.getProfile();
-                var model=new OtherClientPlayerEntity(client.world,profile);
-                visual=new Visual(model,view.project(peer.q())); visuals.put(key,visual);
+                var profile=entry==null?appearance.profile():entry.getProfile();
+                if(visual==null && visuals.size()<128) {
+                    visual=new Visual(playerModel(client,profile),view.project(peer.q()));visuals.put(key,visual);
+                }
+                if(visual==null)continue;
+                if(!sameProfile(((OtherClientPlayerEntity)visual.model).getGameProfile(),profile)) {
+                    visual.model=playerModel(client,profile);visual.captureDefaults();
+                }
+                applyAppearance(visual,appearance);
+                visual.size=Math.max(.05f,(float)Math.pow(view.alignment(peer.basis()),2));
+                visual.target=view.project(peer.q()).add(0,-visual.model.getStandingEyeHeight()*visual.size,0);
+                visual.present=true;
+            } catch(RuntimeException failure) {
+                if(failedTypes.size()<64 && failedTypes.add("minecraft:player"))
+                    LOGGER.warn("Peer canonical appearance unavailable; no fabricated profile/model",failure);
+                visuals.remove(key);
             }
-            if (visual==null) continue;
-            visual.size=Math.max(.05f,(float)Math.pow(view.alignment(peer.basis()),2));
-            visual.target=view.project(peer.q()).add(0,-visual.model.getStandingEyeHeight()*visual.size,0);
-            visual.yaw=visual.bodyYaw=visual.headYaw=peer.yaw(); visual.pitch=peer.pitch(); visual.present=true;
         }
         if (!scene.deep() && scene.binding()!=null) for (var ghost:scene.ghosts()) {
             String key="ghost:"+ghost.id()+":"+ghost.type(); Visual visual=visuals.get(key);
@@ -148,22 +203,18 @@ public final class SpiritSemanticEntityRenderer {
                     if (type==null || !Registries.ENTITY_TYPE.containsId(type)) throw new IllegalArgumentException("Unavailable registry type");
                     Entity model;
                     if (type.equals(Identifier.ofVanilla("player"))) {
-                        if (ghost.profile()==null) throw new IllegalArgumentException("Source player profile missing");
-                        var profile=ghost.profile(); var skins=client.getSkinProvider().getSkinTexturesSupplier(profile);
-                        model=new OtherClientPlayerEntity(client.world,profile) {
-                            @Override public net.minecraft.client.util.SkinTextures getSkinTextures() { return skins.get(); }
-                        };
+                        model=playerModel(client,ghost.profile());
                     } else model=Registries.ENTITY_TYPE.get(type).create(client.world);
                     if (model==null) throw new IllegalArgumentException("Registry type cannot create client ghost");
                     model.setUuid(ghost.id()); visual=new Visual(model,point); visuals.put(key,visual);
                 }
                 if (visual==null) continue;
-                visual.model.getDataTracker().writeUpdatedEntries(ghost.tracked());
-                visual.model.setPose(EntityPose.valueOf(ghost.pose()));
-                if (visual.model instanceof LivingEntity living) for (var equipment:ghost.equipment())
-                    living.equipStack(equipment.slot(),equipment.stack());
-                visual.target=point; visual.yaw=ghost.yaw(); visual.pitch=ghost.pitch();
-                visual.bodyYaw=ghost.bodyYaw();visual.headYaw=ghost.headYaw();visual.light=projected.light();visual.present=true;
+                if(visual.model instanceof OtherClientPlayerEntity sourcePlayer
+                        && !sameProfile(sourcePlayer.getGameProfile(),ghost.profile())) {
+                    visual.model=playerModel(client,ghost.profile());visual.captureDefaults();
+                }
+                applyAppearance(visual,ghost);
+                visual.target=point;visual.light=projected.light();visual.present=true;
             } catch (RuntimeException failure) {
                 if (failedTypes.size()<64 && failedTypes.add(ghost.type()))
                     LOGGER.warn("Source ghost type {} unavailable; skip model until session/reload, not a marker",ghost.type(),failure);

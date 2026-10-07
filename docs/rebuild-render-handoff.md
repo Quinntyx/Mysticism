@@ -161,6 +161,24 @@ through entry fade, exit, saturation timing, changed distant selections, respawn
 before CCA sync, semantic touch occlusion and source ghosts/tracker/model appearance. No
 CPU GLSL/math or successful compile alone proves these visual/physics/GPU behaviors.
 
+## Appearance review correction
+
+Complete appearance snapshots now clear every usable equipment slot and reset ALL tracker
+IDs to copied declared `DataTracker.Entry.initialValue` defaults before applying new values.
+Constructor-mutated defaults (e.g. a bat constructor marking it roosting) are not used.
+Defaults are captured once per private model and copied on reset. Same immutable snapshot
+is applied once, not reapplied every draw. Only private render models are modified.
+**Parent register two additional client mixins:**
+`io.github.mysticism.client.spiritworld.mixin.SpiritTrackerEntriesAccess` and
+`io.github.mysticism.client.spiritworld.mixin.SpiritTrackerInitialValueAccess`.
+They expose the existing tracker entries/declared defaults; no config edited here.
+Peers now consume `peer.appearance()` for tracker/equipment/pose/body/head yaw and authenticated
+profile (tab profile when present, signed supplied profile otherwise; no fabricated fallback).
+Profile changes replace only the private model and its defaults, preserving projected position,
+interpolation/alpha and basis-dependent scale. Source players receive the same profile handling.
+No public rendering API changes. No tests/build/live checks run for this precise follow-up;
+parent retains its merged event-order adjustment and owns compile/runtime validation.
+
 ## Parent lang replacements (requested, not applied to shared resources)
 
 * `guidebook.mysticism.crossing.enter.body`: "V1 debug entry: /spirit enter starts shallow
