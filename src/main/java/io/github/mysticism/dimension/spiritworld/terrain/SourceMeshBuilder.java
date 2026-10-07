@@ -27,7 +27,7 @@ final class SourceMeshBuilder {
         int color=0xffffff;
         var biome=world.getBiome(position).value();
         if(state.getBlock() instanceof LeavesBlock)color=biome.getFoliageColor();
-        else if(state.getBlock() instanceof GrassBlock || state.getBlock() instanceof FernBlock)color=biome.getGrassColorAt(position.getX(),position.getZ());
+        else if(state.getBlock() instanceof GrassBlock || state.isOf(Blocks.FERN) || state.isOf(Blocks.LARGE_FERN) || state.isOf(Blocks.SHORT_GRASS) || state.isOf(Blocks.TALL_GRASS))color=biome.getGrassColorAt(position.getX(),position.getZ());
         int light=(world.getLightLevel(LightType.BLOCK,position)<<4)|(world.getLightLevel(LightType.SKY,position)<<20);
         return tile(state,world,position,color,light);
     }
