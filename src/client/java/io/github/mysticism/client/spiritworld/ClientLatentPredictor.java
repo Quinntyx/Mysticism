@@ -1,70 +1,50 @@
 package io.github.mysticism.client.spiritworld;
 
+import io.github.mysticism.activity.TraversalSteering;
 import io.github.mysticism.component.MysticismEntityComponents;
-import io.github.mysticism.vector.Basis384f;
-import io.github.mysticism.vector.BasisIntegrator384f;
-import io.github.mysticism.vector.Vec384f;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.client.world.ClientWorld;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.Vec3d;
 
-/**
- * Client-side prediction for Spirit world:
- *  - evolve basis with a small plane rotation (stable near alignment)
- *  - evolve latent position with your "converge 1% per block" rule
- *
- * This keeps Δ = (obj - you) changing locally each frame, so glyphs no longer "stick to your head"
- * when you set pos == obj and start walking.
- */
+/** Same per-player movement math as server; stationary CCA touch corrections still refresh render state. */
 @Environment(EnvType.CLIENT)
 public final class ClientLatentPredictor {
+    private static boolean initialized;
+    private static Vec3d lastPos;
+    private static ClientPlayerEntity lastPlayer;
+    private static ClientWorld lastWorld;
     private ClientLatentPredictor() {}
-
-    // Tune: percentage of converge toward attunement per block walked
-    private static final float POS_LERP_PER_BLOCK = 0.01f;
-    // Tune: small angle rotation strength per block for basis
-    private static final float BASIS_ROTATION_PER_BLOCK = 0.05f;
-
-    private static Vec3d lastPos; // world movement bookkeeping
-
     public static void init() {
+        if (initialized) return; initialized = true;
         ClientTickEvents.END_CLIENT_TICK.register(ClientLatentPredictor::onEndTick);
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> clear());
     }
-
+    private static void clear() { lastPos = null; lastPlayer = null; lastWorld = null; }
     private static void onEndTick(MinecraftClient mc) {
-        if (mc.world == null || mc.player == null) return;
-        if (!mc.world.getRegistryKey().getValue().equals(Identifier.of("mysticism", "spirit"))) {
-            lastPos = null;
-            return;
-        }
-
-        Vec3d now = mc.player.getPos();
-        if (lastPos == null) { lastPos = now; return; }
-        double dx = now.x - lastPos.x, dy = now.y - lastPos.y, dz = now.z - lastPos.z;
-        lastPos = now;
-
-        double dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
-        if (dist < 1e-8) return;
-
-        // Get the live, mutable component instances
-        Basis384f basis = mc.player.getComponent(MysticismEntityComponents.LATENT_BASIS).get();
-        Vec384f    pos  = mc.player.getComponent(MysticismEntityComponents.LATENT_POS).get();
-        Vec384f    att  = mc.player.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).get();
-
-        // Perform mutation on the live components
-        BasisIntegrator384f.step(basis, att, dx, dy, dz, BASIS_ROTATION_PER_BLOCK);
-        float f = (float)(POS_LERP_PER_BLOCK * dist);
-        if (f > 0f) pos.converge(att, f);
-
-        // --- THE SOLUTION ---
-        // Mirror IMMUTABLE SNAPSHOTS into your client cache for the renderer.
-        // The .clone() method creates a new object with a copy of the data at this exact moment.
-        // The renderer will now have a stable, thread-safe copy to work with for the entire frame.
-        ClientSpiritCache.playerLatentBasis = basis.clone();
-        ClientSpiritCache.playerLatentPos   = pos.clone();
-        ClientSpiritCache.playerLatentAttunement = att.clone();
+        if (mc.world == null || mc.player == null) { clear(); return; }
+        var nav = mc.player.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION);
+        ClientSpiritCache.updateNavigation(nav.active(), nav.deep(), nav.sourceDimension(), nav.sourcePosition());
+        var basis = mc.player.getComponent(MysticismEntityComponents.LATENT_BASIS).get();
+        var q = mc.player.getComponent(MysticismEntityComponents.LATENT_POS).get();
+        var target = mc.player.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target();
+        if (mc.world.getRegistryKey().getValue().equals(Identifier.of("mysticism", "spirit")) && nav.active()) {
+            Vec3d now = mc.player.getPos();
+            if (lastPlayer == mc.player && lastWorld == mc.world && lastPos != null) {
+                Vec3d delta = now.subtract(lastPos);
+                if (delta.lengthSquared() <= 16) {
+                    if (nav.deep()) TraversalSteering.deepStep(q, basis, target, delta.x, delta.y, delta.z);
+                    else if (!nav.landmarkId().isEmpty()) TraversalSteering.advance(q, basis, delta.x, delta.y, delta.z);
+                }
+            }
+            lastPos = now; lastPlayer = mc.player; lastWorld = mc.world;
+        } else clear();
+        // Refresh even at rest: touch blends and authoritative vector/profile updates are not movement.
+        ClientSpiritCache.updateObserver(q, basis);
     }
 }

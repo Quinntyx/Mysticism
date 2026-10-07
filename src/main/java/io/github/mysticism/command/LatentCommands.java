@@ -2,288 +2,146 @@ package io.github.mysticism.command;
 
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.StringArgumentType;
-import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+import io.github.mysticism.component.MysticismEntityComponents;
+import io.github.mysticism.navigation.SpiritNavigationService;
+import io.github.mysticism.vector.*;
+import io.github.mysticism.world.state.ItemEmbeddingIndexState;
 import net.minecraft.command.CommandRegistryAccess;
+import net.minecraft.command.argument.BlockPosArgumentType;
 import net.minecraft.command.argument.ItemStackArgumentType;
 import net.minecraft.item.ItemStack;
+import net.minecraft.registry.Registries;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.command.CommandManager;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
-
-import io.github.mysticism.component.MysticismEntityComponents;
-import io.github.mysticism.dimension.spiritworld.SpiritVisibilityService;
-import io.github.mysticism.vector.*;
-
+import net.minecraft.util.math.BlockPos;
 import java.util.*;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
-
 import static net.minecraft.server.command.CommandManager.literal;
 
-/**
- * /latent commands.
- * NOTE: Latent vectors (pos, attunement) are treated as RAW here (no normalization).
- *       Only basis construction normalizes/orthonormalizes its axes.
- */
+/** Debug target snapshots and state inspection. Never synchronously calls or joins the model. */
 public final class LatentCommands {
-    // simple per-player “actionbar logging” toggle
     private static final Set<UUID> LOG = new HashSet<>();
-
     private LatentCommands() {}
-
     public static void register(CommandDispatcher<ServerCommandSource> d, CommandRegistryAccess reg, CommandManager.RegistrationEnvironment env) {
-        d.register(literal("latent")
-                // /latent show
-                .then(literal("show").executes(ctx -> showAll(ctx.getSource())))
-                // /latent show <basis|pos|attune|items>
-                .then(literal("show")
-                        .then(literal("basis").executes(ctx -> showOne(ctx.getSource(), "basis")))
-                        .then(literal("pos").executes(ctx -> showOne(ctx.getSource(), "pos")))
-                        .then(literal("attune").executes(ctx -> showOne(ctx.getSource(), "attune")))
-                        .then(literal("items").executes(ctx -> showOne(ctx.getSource(), "items")))
-                )
-                // /latent set <basis|pos|attune> item <item>
-                .then(literal("set")
-                        .then(literal("basis")
-                                .then(literal("item")
-                                        .then(CommandManager.argument("item", ItemStackArgumentType.itemStack(reg))
-                                                .executes(ctx -> setFromItem(ctx.getSource(), "basis", ItemStackArgumentType.getItemStackArgument(ctx, "item").createStack(1, false)))
-                                        )
-                                )
-                        )
-                        .then(literal("pos")
-                                .then(literal("item")
-                                        .then(CommandManager.argument("item", ItemStackArgumentType.itemStack(reg))
-                                                .executes(ctx -> setFromItem(ctx.getSource(), "pos", ItemStackArgumentType.getItemStackArgument(ctx, "item").createStack(1, false)))
-                                        )
-                                )
-                        )
-                        .then(literal("attune")
-                                .then(literal("item")
-                                        .then(CommandManager.argument("item", ItemStackArgumentType.itemStack(reg))
-                                                .executes(ctx -> setFromItem(ctx.getSource(), "attune", ItemStackArgumentType.getItemStackArgument(ctx, "item").createStack(1, false)))
-                                        )
-                                )
-                        )
-                        // /latent set <basis|pos|attune> region  (stub)
-                        .then(literal("basis").then(literal("region").executes(ctx -> stubRegion(ctx.getSource(), "basis"))))
-                        .then(literal("pos").then(literal("region").executes(ctx -> stubRegion(ctx.getSource(), "pos"))))
-                        .then(literal("attune").then(literal("region").executes(ctx -> stubRegion(ctx.getSource(), "attune"))))
-                )
-                // /latent set basis <item> (shorthand)
-                .then(literal("set")
-                        .then(literal("basis")
-                                .then(CommandManager.argument("itemId", StringArgumentType.string())
-                                        .executes(ctx -> setBasisByItemId(ctx.getSource(), StringArgumentType.getString(ctx, "itemId")))
-                                )
-                        )
-                )
-                // /latent log <show|hide>
-                .then(literal("log")
-                        .then(literal("show").executes(ctx -> toggleLog(ctx.getSource(), true)))
-                        .then(literal("hide").executes(ctx -> toggleLog(ctx.getSource(), false)))
-                )
-        );
+        var root = literal("latent").executes(ctx -> show(ctx.getSource()));
+        var show = literal("show").executes(ctx -> show(ctx.getSource()));
+        for (String field : List.of("basis", "pos", "attune", "items"))
+            show.then(literal(field).executes(ctx -> show(ctx.getSource())));
+        root.then(show);
+        root.then(literal("target")
+                .then(literal("here").executes(ctx -> capture(ctx.getSource())))
+                .then(literal("personal").executes(ctx -> personal(ctx.getSource())))
+                .then(literal("item").then(CommandManager.argument("item", ItemStackArgumentType.itemStack(reg))
+                        .executes(ctx -> setItem(ctx.getSource(), "attune", ItemStackArgumentType.getItemStackArgument(ctx, "item").createStack(1, false)))))
+                .then(literal("at").then(CommandManager.argument("dimension", StringArgumentType.word())
+                        .then(CommandManager.argument("landmark", StringArgumentType.word())
+                                .then(CommandManager.argument("position", BlockPosArgumentType.blockPos())
+                                        .executes(ctx -> captureAt(ctx.getSource(), StringArgumentType.getString(ctx, "dimension"),
+                                                StringArgumentType.getString(ctx, "landmark"), BlockPosArgumentType.getBlockPos(ctx, "position"))))))));
+        var set = literal("set");
+        for (String field : List.of("basis", "pos", "attune"))
+            set.then(literal(field).then(literal("item")
+                    .then(CommandManager.argument("item", ItemStackArgumentType.itemStack(reg))
+                            .executes(ctx -> setItem(ctx.getSource(), field, ItemStackArgumentType.getItemStackArgument(ctx, "item").createStack(1, false))))));
+        set.then(literal("attune").then(literal("region").executes(ctx -> capture(ctx.getSource()))));
+        set.then(literal("basis").then(CommandManager.argument("itemId", StringArgumentType.word())
+                .executes(ctx -> setById(ctx.getSource(), "basis", StringArgumentType.getString(ctx, "itemId")))));
+        root.then(set);
+        root.then(literal("log").then(literal("show").executes(ctx -> log(ctx.getSource(), true)))
+                .then(literal("hide").executes(ctx -> log(ctx.getSource(), false))));
+        d.register(root);
     }
-
-    // ---- handlers ----
-
-    private static int showAll(ServerCommandSource src) {
-        ServerPlayerEntity p = src.getPlayer();
-        if (p == null) return 0;
-
-        var pos = p.getComponent(MysticismEntityComponents.LATENT_POS).get();                 // RAW
-        var basis = p.getComponent(MysticismEntityComponents.LATENT_BASIS).get();             // Orthonormal
-        var att = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).get();          // RAW
-
-        List<String> items = visibleItems(src.getServer(), p, 15);
-
-        src.sendFeedback(() -> Text.literal(
-                "Latent State\n" +
-                        "  pos   = " + fmt(pos) + "\n" +
-                        "  basis = { i=" + fmt(basis.i) + ", j=" + fmt(basis.j) + ", k=" + fmt(basis.k) + " }\n" +
-                        "  att   = " + fmt(att) + "\n" +
-                        "  items = " + (items.isEmpty() ? "[]" : items.toString())
-        ), false);
-        return 1;
+    private static int capture(ServerCommandSource src) {
+        var p = src.getPlayer(); return p != null && SpiritNavigationService.captureHere(p) ? 1 : 0;
     }
-
-    private static int showOne(ServerCommandSource src, String which) {
-        ServerPlayerEntity p = src.getPlayer(); if (p == null) return 0;
-        switch (which) {
-            case "pos" -> {
-                var v = p.getComponent(MysticismEntityComponents.LATENT_POS).get(); // RAW
-                src.sendFeedback(() -> Text.literal("pos = " + fmt(v)), false);
-            }
-            case "attune" -> {
-                var v = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).get(); // RAW
-                src.sendFeedback(() -> Text.literal("attunement = " + fmt(v)), false);
-            }
-            case "basis" -> {
-                var b = p.getComponent(MysticismEntityComponents.LATENT_BASIS).get();
-                src.sendFeedback(() -> Text.literal("basis = { i=" + fmt(b.i) + ", j=" + fmt(b.j) + ", k=" + fmt(b.k) + " }"), false);
-            }
-            case "items" -> {
-                List<String> items = visibleItems(src.getServer(), p, 30);
-                src.sendFeedback(() -> Text.literal("visible items = " + (items.isEmpty() ? "[]" : items.toString())), false);
-            }
-        }
-        return 1;
-    }
-
-    private static int setFromItem(ServerCommandSource src, String target, ItemStack stack) {
-        ServerPlayerEntity p = src.getPlayer(); if (p == null) return 0;
-
-        var id = Objects.requireNonNull(stack.getItem().getRegistryEntry().registryKey().getValue()).toString();
-        var v = embeddingForItem(src.getServer(), id); // RAW embedding from your index
-        if (v == null) {
-            src.sendError(Text.literal("No embedding for item: " + id));
-            return 0;
-        }
-
-        switch (target) {
-            case "pos" -> {
-                // RAW set (no normalization)
-                p.getComponent(MysticismEntityComponents.LATENT_POS).set(v.clone());
-                MysticismEntityComponents.LATENT_POS.sync(p);
-                src.sendFeedback(() -> Text.literal("Set pos to RAW item embedding of " + id), false);
-            }
-            case "attune" -> {
-                // RAW set (no normalization)
-                p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).set(v.clone());
-                MysticismEntityComponents.LATENT_ATTUNEMENT.sync(p);
-                src.sendFeedback(() -> Text.literal("Set attunement to RAW item embedding of " + id), false);
-            }
-            case "basis" -> {
-                // Basis MUST be orthonormal for projection; use direction of v + Gram–Schmidt.
-                Basis384f B = orthonormalBasisFrom(v, p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).get());
-                p.getComponent(MysticismEntityComponents.LATENT_BASIS).set(B);
-                MysticismEntityComponents.LATENT_BASIS.sync(p);
-                src.sendFeedback(() -> Text.literal("Aligned basis to item " + id + " (i forward; orthonormal)"), false);
-            }
-        }
-        return 1;
-    }
-
-    // /latent set basis <itemId> (string shortcut)
-    private static int setBasisByItemId(ServerCommandSource src, String itemId) {
-        ServerPlayerEntity p = src.getPlayer(); if (p == null) return 0;
-        var v = embeddingForItem(src.getServer(), itemId); // RAW
-        if (v == null) { src.sendError(Text.literal("No embedding for item: " + itemId)); return 0; }
-        Basis384f B = orthonormalBasisFrom(v, p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).get());
-        p.getComponent(MysticismEntityComponents.LATENT_BASIS).set(B);
-        MysticismEntityComponents.LATENT_BASIS.sync(p);
-        src.sendFeedback(() -> Text.literal("Aligned basis to item " + itemId + " (i forward; orthonormal)"), false);
-        return 1;
-    }
-
-    private static int stubRegion(ServerCommandSource src, String which) {
-        src.sendFeedback(() -> Text.literal(
-                        "[todo] `/latent set " + which + " region` not implemented yet (current region-embedding pipeline is disabled)"),
-                false);
-        return 1;
-    }
-
-    private static int toggleLog(ServerCommandSource src, boolean show) {
+    private static int captureAt(ServerCommandSource src, String dimension, String id, BlockPos block) {
         var p = src.getPlayer(); if (p == null) return 0;
-        if (show) { LOG.add(p.getUuid()); src.sendFeedback(() -> Text.literal("latent debug actionbar: ON"), false); }
-        else      { LOG.remove(p.getUuid()); src.sendFeedback(() -> Text.literal("latent debug actionbar: OFF"), false); }
-        return 1;
+        if (net.minecraft.util.Identifier.tryParse(dimension) == null) { src.sendError(Text.literal("Invalid dimension ID.")); return 0; }
+        return SpiritNavigationService.captureSource(p, dimension, block, id) ? 1 : 0;
     }
-
-    // ---- helpers (embedding lookup, basis construction, formatting) ----
-
-    private static Vec384f embeddingForItem(MinecraftServer server, String itemId) {
-        var state = io.github.mysticism.world.state.ItemEmbeddingIndexState.get(server);
-        // your index should be able to return the vector by id (RAW)
-        return state.getIndex().get(itemId);
+    private static int personal(ServerCommandSource src) {
+        var p = src.getPlayer(); if (p == null) return 0;
+        var att = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT);
+        // Explicit snapshot, NOT followPersonal(), which would live-follow subsequent observations.
+        SpiritNavigationService.cancelCapture(p);
+        att.set(att.personal()); p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION).clearTarget();
+        MysticismEntityComponents.LATENT_ATTUNEMENT.sync(p); MysticismEntityComponents.SPIRIT_NAVIGATION.sync(p);
+        src.sendFeedback(() -> Text.literal("Captured personal concept location; no shallow source destination."), false); return 1;
     }
-
-    /**
-     * Build an orthonormal basis with i = direction of vItem (normalized).
-     * j is obtained by Gram–Schmidt using a seed (prefer attunement; else fallback).
-     * k orthogonalized similarly. Only the basis is normalized; pos/attune stay RAW.
-     */
-    private static Basis384f orthonormalBasisFrom(Vec384f vItem, Vec384f attunementRaw) {
-        Vec384f i = vItem.clone(); normalizeInPlace(i);
-
-        // seed not collinear with i
-        Vec384f seed1 = (attunementRaw != null && attunementRaw.length() > 1e-6f) ? attunementRaw.clone() : canonicalSeed();
-
-        // j = normalize(seed1 - <seed1,i> i)
-        Vec384f j = seed1.sub(i.clone().mul(seed1.dot(i)));
-        if (j.length() < 1e-6f) j = canonicalSeed().sub(i.clone().mul(canonicalSeed().dot(i)));
-        normalizeInPlace(j);
-
-        // k from another seed, orthogonalize against i & j
-        Vec384f seed2 = altSeed();
-        Vec384f k = seed2.sub(i.clone().mul(seed2.dot(i))).sub(j.clone().mul(seed2.dot(j)));
-        if (k.length() < 1e-6f) {
-            Vec384f h = hashedSeed(vItem);
-            k = h.sub(i.clone().mul(h.dot(i))).sub(j.clone().mul(h.dot(j)));
+    private static int setItem(ServerCommandSource src, String field, ItemStack stack) {
+        return setById(src, field, Registries.ITEM.getId(stack.getItem()).toString());
+    }
+    private static int setById(ServerCommandSource src, String field, String id) {
+        var p = src.getPlayer(); if (p == null) return 0;
+        var vector = ItemEmbeddingIndexState.get(src.getServer()).getIndex().get(id);
+        if (vector == null) { src.sendError(Text.literal("No ready current-model embedding for " + id + "; use /myst embed separately.")); return 0; }
+        switch (field) {
+            case "pos" -> {
+                if (p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION).active()
+                        && !p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION).deep()) {
+                    src.sendError(Text.literal("Cannot re-key source-grid position while shallow; /spirit deep first.")); return 0;
+                }
+                p.getComponent(MysticismEntityComponents.LATENT_POS).set(vector); SpiritNavigationService.anchorFromConcept(p);
+                MysticismEntityComponents.LATENT_POS.sync(p);
+            }
+            case "attune" -> {
+                SpiritNavigationService.cancelCapture(p);
+                p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).set(vector);
+                p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION).clearTarget();
+                MysticismEntityComponents.LATENT_ATTUNEMENT.sync(p); MysticismEntityComponents.SPIRIT_NAVIGATION.sync(p);
+            }
+            case "basis" -> {
+                if (p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION).active()
+                        && !p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION).deep()) {
+                    src.sendError(Text.literal("Shallow preserves source-grid alignment; /spirit deep first.")); return 0;
+                }
+                p.getComponent(MysticismEntityComponents.LATENT_BASIS).set(basis(vector)); MysticismEntityComponents.LATENT_BASIS.sync(p);
+            }
+            default -> { return 0; }
         }
-        normalizeInPlace(k);
-
-        return new Basis384f(i, j, k);
+        src.sendFeedback(() -> Text.literal("Set " + field + " from captured item location " + id), false); return 1;
     }
-
-    private static void normalizeInPlace(Vec384f v) {
-        float len = v.length();
-        if (len > 1e-6f) v.mul(1f / len).updateNorm();
+    private static Basis384f basis(Vec384f vector) {
+        Vec384f i = vector.clone(); if (i.length() < 1e-6) return new Basis384f(); i.mul(1 / i.length());
+        Vec384f j = orthogonal(i, null); Vec384f k = orthogonal(i, j); return new Basis384f(i, j, k);
     }
-
-    private static Vec384f canonicalSeed() {
-        float[] a = new float[EmbeddingSpace.DIMENSIONS];
-        a[0] = 1f;
-        return new Vec384f(a);
+    private static Vec384f orthogonal(Vec384f i, Vec384f j) {
+        float[] a = i.data(), b = j == null ? new float[a.length] : j.data(); int seed = 0;
+        for (int n = 1; n < a.length; n++) if (a[n]*a[n] + b[n]*b[n] < a[seed]*a[seed] + b[seed]*b[seed]) seed = n;
+        float[] values = new float[a.length]; values[seed] = 1;
+        Vec384f result = new Vec384f(values).sub(i.clone().mul(a[seed]));
+        if (j != null) result.sub(j.clone().mul(b[seed]));
+        return result.mul(1 / result.length());
     }
-
-    private static Vec384f altSeed() {
-        float[] a = new float[EmbeddingSpace.DIMENSIONS];
-        a[1] = 1f;
-        return new Vec384f(a);
+    private static int show(ServerCommandSource src) {
+        var p = src.getPlayer(); if (p == null) return 0;
+        var b = p.getComponent(MysticismEntityComponents.LATENT_BASIS).get();
+        var att = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT);
+        var nav = p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION);
+        src.sendFeedback(() -> Text.literal("q=" + fmt(p.getComponent(MysticismEntityComponents.LATENT_POS).get())
+                + " target(snapshot)=" + fmt(att.target()) + " personal=" + fmt(att.personal())
+                + " basis{i=" + fmt(b.i) + ", j=" + fmt(b.j) + ", k=" + fmt(b.k) + "}"
+                + " mode=" + (!nav.active() ? "source" : nav.deep() ? "deep" : "shallow")
+                + (nav.hasShallowTarget() ? " targetSource=" + nav.targetDimension() + " " + nav.targetLandmarkId()
+                + " " + nav.targetBlock().toShortString() : " targetSource=none")), false); return 1;
     }
-
-    private static Vec384f hashedSeed(Vec384f v) {
-        int h = Arrays.hashCode(v.data()); // uses a clone; fine for a seed
-        Random r = new Random(h);
-        float[] a = new float[EmbeddingSpace.DIMENSIONS];
-        for (int i = 0; i < EmbeddingSpace.DIMENSIONS; i++) a[i] = (r.nextFloat() - 0.5f);
-        return new Vec384f(a);
-    }
-
-    // compact formatting for logs/chat; does not normalize
     private static String fmt(Vec384f v) {
-        float n = v.length();
-        float[] d = v.data(); // RAW snapshot
-        int show = Math.min(6, d.length);
-        String head = IntStream.range(0, show)
-                .mapToObj(i -> String.format("%.3f", d[i]))
-                .collect(Collectors.joining(", "));
-        return "[" + head + (d.length > show ? ", …" : "") + "] |‖v‖=" + String.format("%.3f", n);
+        float[] values = v.data(); return String.format(Locale.ROOT, "[%.3f, %.3f, %.3f, …] |%.3f|", values[0], values[1], values[2], v.length());
     }
-
-    private static List<String> visibleItems(MinecraftServer server, ServerPlayerEntity p, int k) {
-        if (!SpiritVisibilityService.isSpiritWorld(p)) return List.of();
-        var state = io.github.mysticism.world.state.ItemEmbeddingIndexState.get(server);
-        var q = p.getComponent(MysticismEntityComponents.LATENT_POS).get(); // RAW
-        // Adapt to your API; this assumes state exposes a nearestIds(k, q) over RAW vectors.
-        return state.nearestIds(k, q);
+    private static int log(ServerCommandSource src, boolean enable) {
+        var p = src.getPlayer(); if (p == null) return 0;
+        if (enable) LOG.add(p.getUuid()); else LOG.remove(p.getUuid()); return 1;
     }
-
-    // ---- actionbar logger loop ----
-
     public static void tickActionbar(MinecraftServer server) {
+        Set<UUID> online = new HashSet<>();
         for (var p : server.getPlayerManager().getPlayerList()) {
-            if (!LOG.contains(p.getUuid())) continue;
-            var pos = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
-            var b = p.getComponent(MysticismEntityComponents.LATENT_BASIS).get();
-            p.sendMessage(Text.literal("latent pos‖" + String.format("%.2f", pos.length())
-                    + "  i‖" + String.format("%.2f", b.i.length())
-                    + " j‖" + String.format("%.2f", b.j.length())
-                    + " k‖" + String.format("%.2f", b.k.length())), true);
+            online.add(p.getUuid()); if (!LOG.contains(p.getUuid())) continue;
+            var nav = p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION);
+            p.sendMessage(Text.literal("Spirit " + (!nav.active() ? "source" : nav.deep() ? "deep" : "shallow")
+                    + " q=" + fmt(p.getComponent(MysticismEntityComponents.LATENT_POS).get())), true);
         }
+        LOG.retainAll(online);
     }
 }
