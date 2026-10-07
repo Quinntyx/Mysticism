@@ -9,7 +9,7 @@ sources=("$root/src/main/java/io/github/mysticism/vector/Vec384f.java"
          "$root/src/main/java/io/github/mysticism/vector/EmbeddingSpace.java"
          "$root/src/main/java/io/github/mysticism/embedding/EmbeddingProfile.java"
          "$package/extract/ExtractionGraph.java" "$package/extract/BoundaryCaves.java" "$package/extract/LandmarkProfiles.java"
-         "$package/extract/ObservationFingerprints.java"
+         "$package/extract/ObservationFingerprints.java" "$package/extract/SourceDimensions.java"
          "$root/src/test/java/io/github/mysticism/landmark/extract/ExtractionSelfTest.java"
          "$root/src/test/java/io/github/mysticism/landmark/extract/BoundaryCavesSelfTest.java")
 for source in "$package"/*.java; do
@@ -22,8 +22,11 @@ java -cp "$classes" io.github.mysticism.landmark.extract.BoundaryCavesSelfTest
 if [[ -n "${MYSTICISM_MINECRAFT_CLASSPATH:-}" ]]; then
     javac --release 21 -proc:none -Xlint:all,-path -cp "$classes:$MYSTICISM_MINECRAFT_CLASSPATH" -d "$classes" \
         "$package/LandmarkNbt.java" "$package/LandmarkStore.java" "$package/extract/ExtractionJournal.java" \
-        "$root/src/test/java/io/github/mysticism/landmark/extract/ExtractionPersistenceSelfTest.java"
+        "$package/extract/SourceWorkQueue.java" \
+        "$root/src/test/java/io/github/mysticism/landmark/extract/ExtractionPersistenceSelfTest.java" \
+        "$root/src/test/java/io/github/mysticism/landmark/extract/SourceAdmissionSelfTest.java"
     java -cp "$classes:$MYSTICISM_MINECRAFT_CLASSPATH" io.github.mysticism.landmark.extract.ExtractionPersistenceSelfTest
+    java -cp "$classes:$MYSTICISM_MINECRAFT_CLASSPATH" io.github.mysticism.landmark.extract.SourceAdmissionSelfTest
 else
     printf '%s\n' 'Disk checks NOT RUN: set MYSTICISM_MINECRAFT_CLASSPATH to existing mapped Minecraft/runtime jars.'
 fi
