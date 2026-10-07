@@ -50,11 +50,26 @@ public class Mysticism implements ModInitializer, DedicatedServerModInitializer 
 
 
         SpiritNetworking.init();
-        io.github.mysticism.net.SpiritProjectionService.init();
         io.github.mysticism.landmark.extract.LandmarkExtractionService.init();
         io.github.mysticism.activity.SpiritActivityService.init();
         io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService.init();
-        SpiritVisibilityService.init();
+        io.github.mysticism.dimension.spiritworld.SpiritInteractionGuard.init();
+        io.github.mysticism.net.SpiritProjectionService.install(
+                new io.github.mysticism.net.SpiritProjectionService.Navigation() {
+                    public boolean deep(net.minecraft.server.network.ServerPlayerEntity p) {
+                        return io.github.mysticism.navigation.SpiritNavigationService.deep(p);
+                    }
+                    public java.util.Optional<io.github.mysticism.net.SpiritScenePayload.Binding> binding(
+                            net.minecraft.server.network.ServerPlayerEntity p) {
+                        return io.github.mysticism.navigation.SpiritNavigationService.binding(p);
+                    }
+                    public void touch(net.minecraft.server.network.ServerPlayerEntity actor,
+                            net.minecraft.server.network.ServerPlayerEntity target) {
+                        io.github.mysticism.navigation.SpiritNavigationService.touch(actor, target);
+                    }
+                }, io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService::clearRay);
+        io.github.mysticism.net.SpiritProjectionService.init();
+        io.github.mysticism.net.DroppedItemSemanticService.init();
         SpiritBasisEvolver.init();
 
         Registry.register(Registries.CHUNK_GENERATOR, Identifier.of("mysticism","spirit_generator"),

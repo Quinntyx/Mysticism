@@ -35,10 +35,8 @@ public class MysticismClient implements ClientModInitializer {
 
         io.github.mysticism.client.gui.guidebook.GuidebookClient.init();
         SpiritNetworkingClient.init();
+        io.github.mysticism.client.spiritworld.SpiritWorldClient.init();
         ClientLatentPredictor.init();
-        SpiritWorldRenderer.init();
-        SpiritSkybox.init();
-        ShaderManager.init();
         SpiritFogVoxels.init();
 
         SpiritSkybox.setMode(SpiritSkybox.Mode.FLAT);

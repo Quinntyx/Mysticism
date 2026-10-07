@@ -7,7 +7,14 @@
     "landmark.extract.SourceBlockUpdateMixin",
     "activity.mixin.ActivityStatMixin",
     "activity.mixin.ActivityPlacementMixin",
-    "activity.mixin.ActivitySpawnMixin"
+    "activity.mixin.ActivitySpawnMixin",
+    "dimension.spiritworld.terrain.mixin.SpiritMeshSneakMixin",
+    "dimension.spiritworld.terrain.mixin.SpiritMeshCollisionMixin",
+    "navigation.mixin.SpiritNativeMobMixin",
+    "navigation.mixin.SpiritFlightToggleMixin",
+    "net.mixin.DroppedItemSemanticMixin",
+    "net.mixin.SourceEntityLookupAccessor",
+    "net.mixin.SourceChunkHolderAccessor"
   ],
   "injectors": {
     "defaultRequire": 1
