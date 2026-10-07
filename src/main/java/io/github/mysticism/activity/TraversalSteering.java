@@ -10,16 +10,39 @@ public final class TraversalSteering {
 
     /** Turn the chosen movement toward a captured LOCATION, then advance q in the updated basis. */
     public static void deepStep(Vec384f q, Basis384f basis, Vec384f target, double dx, double dy, double dz) {
+        deepStep(q, basis, target, dx, dy, dz, false);
+    }
+    public static void deepStep(Vec384f q, Basis384f basis, Vec384f target, double dx, double dy, double dz,
+                                boolean capturedLanding) {
         if (!Double.isFinite(dx) || !Double.isFinite(dy) || !Double.isFinite(dz)) return;
         double distance = Math.sqrt(dx*dx + dy*dy + dz*dz);
         if (distance < 1e-8 || distance > 4) return; // stationary and teleport are not semantic travel
         BasisIntegrator384f.step(basis, q, target, dx, dy, dz, ROTATION_PER_BLOCK);
-        advance(q, basis, dx, dy, dz);
+        // Retain ordinary movement-dependent pursuit until acquisition range. Ease translation
+        // near a captured landing so fixed walking steps cannot overshoot/orbit the tiny final band.
+        // Rotation still receives the FULL physical movement, not the eased semantic displacement.
+        double remaining = Math.sqrt(q.squareDistance(target));
+        double scale = capturedLanding
+                ? Math.min(1, remaining * BLOCKS_PER_SEMANTIC_UNIT * ROTATION_PER_BLOCK * .5) : 1;
+        advance(q, basis, dx * scale, dy * scale, dz * scale);
     }
     public static void advance(Vec384f q, Basis384f basis, double dx, double dy, double dz) {
         q.add(basis.i.clone().mul((float)(dx / BLOCKS_PER_SEMANTIC_UNIT)))
                 .add(basis.j.clone().mul((float)(dy / BLOCKS_PER_SEMANTIC_UNIT)))
                 .add(basis.k.clone().mul((float)(dz / BLOCKS_PER_SEMANTIC_UNIT)));
+    }
+    /**
+     * Terminal acquisition keeps every residual component reachable while the source grid aligns.
+     * Driven only by real movement; each step is <= movement/96 and <= 25% of the residual.
+     * No target assignment, normalization, stationary drift or source-basis-only translation.
+     */
+    public static void approachStep(Vec384f q, Vec384f target, double dx, double dy, double dz) {
+        if (!Double.isFinite(dx) || !Double.isFinite(dy) || !Double.isFinite(dz)) return;
+        double movement = Math.sqrt(dx*dx + dy*dy + dz*dz);
+        if (movement < 1e-8 || movement > 4) return;
+        double remaining = Math.sqrt(q.squareDistance(target));
+        if (remaining < 1e-8) return;
+        q.converge(target, (float)Math.min(.25, movement / (BLOCKS_PER_SEMANTIC_UNIT * remaining)));
     }
     /** Valid touch participants already have aligned bases, avoiding antipodal interpolation. */
     public static Basis384f blend(Basis384f from, Basis384f to, float fraction) {
