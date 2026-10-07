@@ -48,7 +48,7 @@ public final class SpiritSemanticEntityRenderer {
     public static void init() {
         if (initialized) return; initialized=true;
         WorldRenderEvents.AFTER_ENTITIES.register(SpiritSemanticEntityRenderer::render);
-        InvalidateRenderStateCallback.EVENT.register(SpiritSemanticEntityRenderer::clear);
+        SpiritRenderReload.register(Identifier.of("mysticism","spirit_entities"),SpiritSemanticEntityRenderer::clear);
         ClientPlayConnectionEvents.DISCONNECT.register((handler,client)->clear());
         ClientLifecycleEvents.CLIENT_STOPPING.register(client->clear());
     }

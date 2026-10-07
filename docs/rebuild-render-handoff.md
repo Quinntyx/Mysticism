@@ -179,6 +179,23 @@ interpolation/alpha and basis-dependent scale. Source players receive the same p
 No public rendering API changes. No tests/build/live checks run for this precise follow-up;
 parent retains its merged event-order adjustment and owns compile/runtime validation.
 
+## Fabric resource-lifecycle compile correction
+
+Replaced nonexistent Satin `InvalidateRenderStateCallback` with actual Fabric
+`SimpleSynchronousResourceReloadListener` through public
+`SpiritRenderReload.register(Identifier,Runnable)`. Client resource apply runs cleanup
+synchronously on the render thread (asserted), not delayed to an unrelated later tick.
+Item/entity allocators reset; postprocess framebuffers/occupancy GPU texture release,
+source image clears and failure resets. CPU occupancy remains available for GPU rebuild.
+No parent initializer/config hook needed; existing idempotent init methods register it.
+
+Terrain owner/parent must replace its same obsolete callback with
+`SpiritRenderReload.register(Identifier.of("mysticism","spirit_terrain"),
+()->{closeBuffers();dirty=true;});` (inside SpiritTerrainClient).
+Retain its accepted frame/collision, rebuild VBOs on next draw; do NOT call `clear()` for
+resource invalidation. Terrain source not edited here. Parent's SCALE cast left unstaged.
+No tests/builds run for this requested callback-only correction.
+
 ## Parent lang replacements (requested, not applied to shared resources)
 
 * `guidebook.mysticism.crossing.enter.body`: "V1 debug entry: /spirit enter starts shallow

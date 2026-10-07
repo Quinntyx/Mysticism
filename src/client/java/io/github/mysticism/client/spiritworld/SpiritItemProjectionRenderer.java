@@ -35,7 +35,7 @@ public final class SpiritItemProjectionRenderer {
     public static void init() {
         if (initialized) return; initialized=true;
         WorldRenderEvents.AFTER_ENTITIES.register(SpiritItemProjectionRenderer::render);
-        InvalidateRenderStateCallback.EVENT.register(SpiritItemProjectionRenderer::resetSession);
+        SpiritRenderReload.register(Identifier.of("mysticism","spirit_items"),SpiritItemProjectionRenderer::resetSession);
         ClientPlayConnectionEvents.DISCONNECT.register((handler,client)->resetSession());
         ClientLifecycleEvents.CLIENT_STOPPING.register(client->resetSession());
     }

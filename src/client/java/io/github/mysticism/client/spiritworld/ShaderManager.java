@@ -162,7 +162,7 @@ public final class ShaderManager {
         ClientTickEvents.END_CLIENT_TICK.register(ShaderManager::updateSession);
         ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {release();SpiritMediumTexture.clear();SpiritEntryScene.clear();});
         ClientPlayConnectionEvents.DISCONNECT.register((handler,client)->{release();SpiritMediumTexture.clear();SpiritEntryScene.clear();});
-        org.ladysnake.satin.api.event.InvalidateRenderStateCallback.EVENT.register(()->{SpiritEntryScene.clear();failed=false;});
+        SpiritRenderReload.register(Identifier.of("mysticism","spirit_postprocess"),()->{release();SpiritEntryScene.clear();failed=false;});
         HudRenderCallback.EVENT.register((draw, counter) -> {
             if (sessionWorld != null && (effectStrength()>.001f || sessionWorld.getRegistryKey().getValue().equals(SPIRIT))
                     && (!status.startsWith("volumetric") || failed))
