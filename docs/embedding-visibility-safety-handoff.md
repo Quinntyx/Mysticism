@@ -1,6 +1,6 @@
 # Embedding / visibility safety handoff
 
-Only engine, command, common visibility/CPU selection and three new regression tests changed. No initializer, components, networking payloads, renderer/shader, terrain/core, mixins or build config edits. CORE_API and existing tests were read; AGENTS.md was absent in worktree/ancestors. No agents spawned.
+Only engine/helper, command, common visibility/CPU selection and five new regression suites changed. No initializer, components, networking payloads, renderer/shader, terrain/core, mixins or build config edits. CORE_API and existing tests were read; AGENTS.md was absent in worktree/ancestors. No agents spawned.
 
 ## Changes / wiring
 
@@ -13,7 +13,7 @@ Existing `SpiritVisibilityService.init()` and `EmbeddingCommand.register(...)` i
 
 **Client conflict outstanding:** inspected sibling volumetrics renderer freezes `frozenBasis/frozenOrigin/realmAnchor` and uses `Projection384f`, not this head-relative layout. Membership balancing IS wired; new positions are NOT rendered yet. Parent/client reviewer must resolve this spec conflict. API: constructor `(Map<String,Vec384f>, embedding.EmbeddingProfile)`; `select(current,profile,limit,previousGlyphs)`; record `Glyph(id,clusterId,clusterSlot,slot,embedding)`; `position(glyph,current,basis,interpolatedHead,radius)`. Payload still carries only IDs/vectors. Client can cache selection from its decoded visible snapshot outside render/tick, retain slots and interpolate position targets. Do not re-key terrain/realm projections or teleport players. No fog changes.
 
-## Actual validation
+## Initial validation (before callback-delivery follow-up)
 
 Interactive tmux **%460**, explicit **bash -lc**, visible output, no final-build redirection:
 
@@ -43,6 +43,30 @@ A preceding no-shim run requested `verifyProductionJar`: seven suites passed, bu
 
 - Client adoption/interpolation remains outstanding; tangent pole changes need smoothing. Slots are transient: deterministic rebuild is tested, historical membership hysteresis is not saved.
 - No live Fabric player/event/network or GPU smoke test. Actual production gate/selection are tested; event/send wiring compiles but needs integrated review.
-- Future callbacks remain synchronous on the completing thread, outside engine monitor; blocking callbacks can delay worker/timer. Interrupt-ignoring providers can continue on bounded daemon workers after timeout. EmbeddingHelper.shutdown still holds its own class monitor while calling close: parent should review caller-held locks.
+- Callback publication now uses process-wide reserved delivery capacity (32). A foreign callback that never returns retains its reservation; once all slots are occupied, new uncached asynchronous subscriptions are rejected immediately with retryable backpressure, rather than admitted without a deadline-capable delivery worker. Reservations release after callback execution, not merely future.isDone(). Already-terminal readiness/cache queries need no reservation. Arbitrary callbacks cannot safely be forcibly terminated; inference providers ignoring interruption can also outlive their promise on existing bounded daemon workers.
 - Cold selection is substantial bounded CPU work; worker overload sheds queued work and current-vector gating rejects stale off-radius results. Refresh detects index-generation replacement/size changes every 20 ticks, not same-size in-place mutations; authoritative wave-1 item generations replace the index.
 - Legacy spatial/KNN commands retain synchronous index operations. Inspected seed/readiness paths already compose async work; no model IO/inference/join was added to startup/tick.
+
+## Callback/queue safety follow-up — 2026-10-07
+
+Independent review reproduced two blockers in `82e1a6b`: one timeout callback blocked the sole scheduler, and cancelled visibility futures retained all 64 queue nodes while catalogue admission threw from tick and prematurely acknowledged its generation. Both were reproduced **before edits** using the reader's actual `ReviewProbe`, compiled into `.pi/safety-fix-output/original-classes` in this worktree. The immutable original `EmbeddingHelper` was also compiled separately: its targeted shutdown test failed because provider close held the helper lifecycle monitor and prevented another thread acquiring it.
+
+Fixes:
+
+- Each accepted embedding/readiness subscriber has its own future and reserves one of **32 process-wide delivery workers** through complete synchronous callback execution. No user callback executes on inference/deadline threads or engine monitor. The global pool is fixed, daemon, bounded to 32 queued publications, and idle workers expire after 10 seconds; it is shared across engine restarts to avoid accumulating callback threads. There is no unbounded callback queue or fallback executor. Each accepted subscriber is independently deliverable even when all others block. New subscriptions fail immediately when no reservation remains. Caller cancellation stays detached; its reservation remains bounded until shared work terminates.
+- Visibility owns its queued `Job` runnable/future: cancel removes that exact runnable immediately. Catalogue/viewer replacement coalesces queued work. Submission converts rejection into bounded backpressure; catalogue generation is acknowledged only after admission succeeds. Rejection and exceptional builds reset the generation marker for the next 20-tick retry.
+- Helper shutdown detaches engine/readiness/status under its class monitor, then closes outside it. Late readiness status updates are guarded by engine identity under the lifecycle lock.
+
+Final scoped pass (second/final fix-test round): visible **tmux %460**, `bash -lc "python3 .pi/safety-fix-output/run-fixed.py"`; Java 21 `javac/java`, existing read-only mapped artifacts and actual cached parent IndexPair classes, no Gradle/dependency/cache mutation. All output/temp fixtures remain under the own output directory. Compiled the three changed production classes and seven test mains; **exit 0**:
+
+| Suite | Checks |
+|---|---:|
+| AsyncEmbeddingEngineSafetyTest | 184 |
+| AsyncEmbeddingCallbackIsolationTest | 28 |
+| SpiritVisibilityQueueTest | 474 |
+| SpiritGlyphSelectionTest | 296 |
+| EmbeddingCommandLifecycleTest | 144 |
+| EmbeddingPipelineTest | 133 |
+| EmbeddingPersistenceTest | 93 |
+
+New coverage includes independently delivered deduped/unrelated timeouts, readiness timeout, success/cache clones, shutdown, all 32 delivery callbacks blocked, immediate admission refusal and permit recovery, callback thread bound, helper provider-close cross-lock, 200 cancel/re-admit cycles, full-queue catalogue rejection/same-generation retry, failed-build retry and closed-executor rejection. The original-helper AssertionError is an expected **pre-fix reproduction**, not a final failing test. `git diff --check` passed. No full integrated Gradle/jar run, landmark rerun, Fabric multiplayer lifecycle or GPU validation was run in this follow-up. Parent owns those checks and merging; no new registration/config changes are required.

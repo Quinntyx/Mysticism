@@ -14,6 +14,7 @@ import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.util.Identifier;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.function.Supplier;
 
 /** Tick only copies player vectors, polls bounded CPU work and sends <=128 member deltas.
  * Catalogue scans/clustering are off-thread, with no world, registry, model IO or inference. */
@@ -26,7 +27,7 @@ public final class SpiritVisibilityService {
         final Set<String> sent = new TreeSet<>();
         CompletableFuture<List<SpiritGlyphSelection.Glyph>> query;
     }
-    private static final class Runtime implements AutoCloseable {
+    static final class Runtime implements AutoCloseable {
         final ThreadPoolExecutor worker = new ThreadPoolExecutor(1, 1, 0, TimeUnit.SECONDS,
                 new ArrayBlockingQueue<>(64), r -> { var t = new Thread(r, "Mysticism-GlyphSelection"); t.setDaemon(true); return t; },
                 new ThreadPoolExecutor.AbortPolicy());
@@ -35,6 +36,58 @@ public final class SpiritVisibilityService {
         int size, ticks;
         CompletableFuture<SpiritGlyphSelection> building;
         SpiritGlyphSelection catalogue;
+        /** Unlike supplyAsync, cancelling this future also removes its actual queued runnable. */
+        static final class Job<T> extends CompletableFuture<T> implements Runnable {
+            final ThreadPoolExecutor owner; final Supplier<T> supplier;
+            Job(ThreadPoolExecutor owner, Supplier<T> supplier) { this.owner = owner; this.supplier = supplier; }
+            @Override public boolean cancel(boolean interrupt) { owner.remove(this); return super.cancel(false); }
+            @Override public void run() {
+                if (isDone()) return;
+                try { complete(supplier.get()); } catch (Throwable error) { completeExceptionally(error); }
+            }
+        }
+        <T> Job<T> submit(Supplier<T> supplier) {
+            Job<T> job = new Job<>(worker, supplier);
+            try { worker.execute(job); return job; }
+            catch (RejectedExecutionException full) { job.cancel(false); return null; }
+        }
+        void refreshCatalogue(KnnIndex next) {
+            int nextSize = next.size();
+            if (next == index && nextSize == size) return;
+            if (building != null) building.cancel(false);
+            building = null; catalogue = null;
+            viewers.values().forEach(v -> {
+                if (v.query != null) v.query.cancel(false);
+                v.query = null; v.selected = List.of();
+            });
+            if (nextSize > SpiritGlyphSelection.MAX_CANDIDATES) {
+                index = next; size = nextSize; return; // Explicit oversized-generation fail-closed.
+            }
+            Job<SpiritGlyphSelection> accepted = submit(() -> {
+                var snapshot = new TreeMap<String, Vec384f>();
+                synchronized (next) {
+                    if (next.size() > SpiritGlyphSelection.MAX_CANDIDATES)
+                        throw new IllegalArgumentException("Glyph catalogue grew beyond budget");
+                    next.forEach((id, vector) -> {
+                        if (snapshot.size() >= SpiritGlyphSelection.MAX_CANDIDATES)
+                            throw new IllegalArgumentException("Glyph catalogue grew beyond budget");
+                        snapshot.put(id, vector);
+                    });
+                }
+                return new SpiritGlyphSelection(snapshot, EmbeddingProfile.current());
+            });
+            // Never acknowledge a generation until executor admission succeeds.
+            if (accepted == null) { index = null; size = -1; return; }
+            index = next; size = nextSize; building = accepted;
+        }
+        void pollCatalogue() {
+            if (building == null || !building.isDone()) return;
+            try { catalogue = building.getNow(null); }
+            catch (CompletionException | CancellationException unavailable) {
+                catalogue = null; index = null; size = -1; // Failed build must retry as well.
+            }
+            building = null;
+        }
         @Override public void close() {
             if (building != null) building.cancel(false);
             viewers.values().forEach(v -> { if (v.query != null) v.query.cancel(false); });
@@ -53,36 +106,8 @@ public final class SpiritVisibilityService {
         // Existing wave-1 index is generation-replaced, synchronized and returns cloned snapshots.
         var state = ItemEmbeddingIndexState.get(server);
         KnnIndex index = state.getIndex();
-        if (runtime.ticks % 20 == 1 && (index != runtime.index || index.size() != runtime.size)) {
-            runtime.index = index; runtime.size = index.size(); runtime.catalogue = null;
-            if (runtime.building != null) runtime.building.cancel(false);
-            runtime.viewers.values().forEach(v -> {
-                if (v.query != null) v.query.cancel(false);
-                v.query = null; v.selected = List.of();
-            });
-            if (runtime.size <= SpiritGlyphSelection.MAX_CANDIDATES) {
-                runtime.building = CompletableFuture.supplyAsync(() -> {
-                    var snapshot = new TreeMap<String, Vec384f>();
-                    // SimpleKnnIndex snapshots under its monitor. Recheck the cap under that
-                    // SAME monitor before forEach allocates its snapshot (not after cloning it).
-                    synchronized (index) {
-                        if (index.size() > SpiritGlyphSelection.MAX_CANDIDATES)
-                            throw new IllegalArgumentException("Glyph catalogue grew beyond budget");
-                        index.forEach((id, vector) -> {
-                            if (snapshot.size() >= SpiritGlyphSelection.MAX_CANDIDATES)
-                                throw new IllegalArgumentException("Glyph catalogue grew beyond budget");
-                            snapshot.put(id, vector);
-                        });
-                    }
-                    return new SpiritGlyphSelection(snapshot, EmbeddingProfile.current());
-                }, runtime.worker);
-            } else runtime.building = null; // Explicit fail-closed; never truncate to nearest K.
-        }
-        if (runtime.building != null && runtime.building.isDone()) {
-            try { runtime.catalogue = runtime.building.getNow(null); }
-            catch (CompletionException | CancellationException unavailable) { runtime.catalogue = null; }
-            runtime.building = null;
-        }
+        if (runtime.ticks % 20 == 1) runtime.refreshCatalogue(index);
+        runtime.pollCatalogue();
         var connected = new HashSet<UUID>();
         for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
             UUID id = player.getUuid(); connected.add(id);
@@ -118,9 +143,9 @@ public final class SpiritVisibilityService {
                 var catalogue = runtime.catalogue;
                 var query = current.clone();
                 var previous = viewer.selected;
-                try { viewer.query = CompletableFuture.supplyAsync(() ->
-                        catalogue.select(query, EmbeddingProfile.current(), requestedLimit, previous), runtime.worker); }
-                catch (RejectedExecutionException full) { /* retain/gate existing members; retry next interval */ }
+                viewer.query = runtime.submit(() ->
+                        catalogue.select(query, EmbeddingProfile.current(), requestedLimit, previous));
+                // Rejection is bounded backpressure: retain/gate existing members, retry next interval.
             }
         }
         runtime.viewers.entrySet().removeIf(e -> {
