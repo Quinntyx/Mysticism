@@ -40,6 +40,10 @@ Call on server thread. Normal completions return on server thread; shutdown/unlo
 - Disposable old source-generation/catalogue and derived influences are discarded together. Current native source saves retain records, aliases and revisions. Player stats/inventory/source chunks are never cleared.
 - Lifecycle cancellation: player activity disconnect/respawn/dimension changes; source chunk unload/edit invalidates an active snapshot; dimension unload/server stop cancel reads, worker jobs, pending mutations and release activity pauses.
 
+## Review correction: source/activity reconciliation
+
+`SpiritActivityService.prepareSourceUpdate(server, before, after)` returns the existing `LandmarkExtractionService.TopologyPlan`. SourceLandmarks acquires the activity mutation pause before computing the importance-limited source update; prepares the overlay correction before `stagePut`; commits it immediately after the core source publication and before completing the request; cancels it on failure/unload/shutdown. It applies `effective + (newBase - oldBase)` and normalizes, preserving the prior activity residual, importance mass/timestamps, owners and immutable claims. No-change source vectors do not repeatedly erase personality history. Revision/overlay identity checks reject stale publication. This closes the reviewed bug where an existing persisted activity vector permanently masked source changes. No additional tests or Gradle were run for this correction.
+
 ## Bounds / honest remaining limits
 
 One active source operation/server, request queue 64, hint queue 128, frontier-retry queue 64, worker queue 4. Live reads <=512 cells and stop after ~1.5ms between cell samples; this is **not** a hard whole-tick deadline for metadata/NBT page IO/publication. Region volume <=32768 and <=16 chunk IO adapters; local overlap operation <=64 parents, <=512 hydrated pages/parent, expanded topology <=131072 cells. These are per-operation limits, not a global catalog cap. Oversized operations fail visibly through futures/status rather than fabricate coverage.

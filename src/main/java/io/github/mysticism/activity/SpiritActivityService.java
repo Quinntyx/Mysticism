@@ -4,6 +4,7 @@ import io.github.mysticism.component.MysticismEntityComponents;
 import io.github.mysticism.embedding.*;
 import io.github.mysticism.landmark.*;
 import io.github.mysticism.landmark.extract.LandmarkProfiles;
+import io.github.mysticism.landmark.extract.LandmarkExtractionService;
 import io.github.mysticism.vector.Vec384f;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.entity.event.v1.ServerEntityWorldChangeEvents;
@@ -180,6 +181,27 @@ public final class SpiritActivityService {
     // Merges are extractor-owned: LandmarkMerge.prepare(server, realProof), then core
     // stageMerge with reconciled observed geometry, Plan.commit only after core completion.
     // No independent convenience merge can bypass transactional history conservation.
+    /** Prepare under pauseLandmarkMutations; commit immediately after the matching core put.
+     * Source change is already importance-limited. Preserve personality, mass, clocks and claims. */
+    public static LandmarkExtractionService.TopologyPlan prepareSourceUpdate(MinecraftServer server,Landmark before,Landmark after){
+        if(!server.isOnThread())throw new IllegalStateException("activity server thread");
+        Session session=SESSIONS.get(server);if(session==null||!session.externalPause.held)throw new IllegalStateException("source update requires activity mutation pause");
+        before.baseEmbedding().profile().requireCompatible(after.baseEmbedding().profile());
+        if(!before.id().equals(after.id())||after.revision()!=before.revision()+1)throw new IllegalArgumentException("source update identity/revision");
+        var store=LandmarkStore.get(server);var metadata=store.metadata(before.id()).orElseThrow();
+        if(metadata.revision()!=before.revision())throw new IllegalStateException("stale source update");
+        var state=LandmarkActivityState.get(server);var expected=state.entries.get(before.id());
+        LandmarkActivityState.Influence next=null;
+        if(expected!=null){next=new LandmarkActivityState.Influence(ActivityMath.reconcileSource(expected.vector,before.baseEmbedding().vector(),after.baseEmbedding().vector()),expected.level,expected.tick);next.mergedBase=expected.mergedBase;next.claims=expected.claims;next.owners.addAll(expected.owners);}
+        var prepared=next;
+        return new LandmarkExtractionService.TopologyPlan(){boolean done;
+            public void commit(){if(!server.isOnThread())throw new IllegalStateException("activity server thread");if(done)return;
+                if(state.entries.get(before.id())!=expected||store.metadata(after.id()).orElseThrow().revision()!=after.revision())throw new IllegalStateException("source update publication changed");
+                if(prepared!=null)state.publish(after.id(),prepared);done=true;
+            }
+            public void cancel(){if(!server.isOnThread())throw new IllegalStateException("activity server thread");done=true;}
+        };
+    }
     /** Discard only derived landmark overlays alongside a disposable old source catalogue. */
     public static void discardGeneratedInfluences(MinecraftServer server){if(!server.isOnThread())throw new IllegalStateException("activity server thread");var state=LandmarkActivityState.get(server);for(var id:List.copyOf(state.entries.keySet()))state.remove(id);}
     public static long skipped(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.skipped;}

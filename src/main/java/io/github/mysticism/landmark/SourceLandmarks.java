@@ -143,6 +143,7 @@ public final class SourceLandmarks {
         Ensure(Session s,String dimension,BlockPos pos,String preferred,boolean activity,CompletableFuture<Optional<LandmarkMetadata>> future){super(s,dimension,new Bounds(pos.getX()-12L,pos.getY()-12L,pos.getZ()-12L,pos.getX()+13L,pos.getY()+13L,pos.getZ()+13L),future);this.position=pos;this.preferred=preferred;this.activity=activity;}
         void advance(){
             if(mutation!=null){mutation.advance(1,512);if(mutation.complete()){
+                if(history!=null){history.commit();history=null;}
                 var metadata=s.store.metadata(published.id());complete(metadata);
                 if(published.kind()==Landmark.Kind.CAVE)for(var face:published.geometry().frontiers()){var b=face.missingBounds();s.hint(dimension,new BlockPos((int)b.minX(),(int)b.minY(),(int)b.minZ()));}
                 if(value.adjoining!=null)s.offer(new Transfer(s,published.id(),value.adjoining,activity?bounds:null,true,activity,new CompletableFuture<>()));
@@ -164,12 +165,14 @@ public final class SourceLandmarks {
                 if(!EmbeddingHelper.isReady()&&backup==null){s.status="Waiting for real embedding/index readiness";return;}
                 embedding=EmbeddingHelper.isReady()?EmbeddingHelper.composeDescriptors(value.descriptors).handle((v,e)->{if(e==null)return v;if(backup!=null)return backup.clone();throw new CompletionException(e);}):CompletableFuture.completedFuture(backup);work=embedding;return;
             }
-            if(!embedding.isDone())return;Vec384f vector=embedding.getNow(null);Landmark old=value.prior;
+            if(!embedding.isDone())return;
+            if(resume==null){try{pause();}catch(IllegalStateException busy){return;}}
+            Vec384f vector=embedding.getNow(null);Landmark old=value.prior;
             // Terrain changes move low-importance semantics strongly, high-importance ones slowly.
             if(old!=null){double inertia=SpiritActivityService.importance(s.server,s.store.metadata(old.id()).orElseThrow());vector=DescriptorVectors.compose(List.of(new DescriptorVectors.WeightedVector(old.baseEmbedding().vector(),1),new DescriptorVectors.WeightedVector(vector,0.05+0.5*(1-inertia))));}
             long revision=old==null?0:old.revision()+1;
             published=new Landmark(value.id,dimension,ALGORITHM,value.kind,value.biome,value.anchor,OwnershipGeometry.bounds(value.anchor,value.geometry),LandmarkProfiles.wrap(vector),old==null?.08:old.baseImportance(),old==null?new ActivityMetadata(0,time):old.activity(),old==null?new Ownership(List.of()):old.ownership(),value.geometry,revision,"native 3D source observation; generated-only IO");
-            if(resume==null){try{pause();}catch(IllegalStateException busy){return;}}
+            if(old!=null)history=SpiritActivityService.prepareSourceUpdate(s.server,old,published);
             mutation=s.store.stagePut(published,old==null?-1:old.revision());s.status="Source geometry publication";
         }
     }
