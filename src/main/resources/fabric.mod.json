@@ -4,7 +4,9 @@
   "version": "${version}",
   "name": "mysticism",
   "description": "A minecraft mod that implements sympathetic magic and mysticism. ",
-  "authors": ["Quinntyx"],
+  "authors": [
+    "Quinntyx"
+  ],
   "contact": {},
   "license": "MIT",
   "environment": "*",
@@ -24,6 +26,7 @@
   },
   "mixins": [
     "mysticism.mixins.json",
+    "mysticism.spirit.mixins.json",
     {
       "config": "mysticism.client.mixins.json",
       "environment": "client"

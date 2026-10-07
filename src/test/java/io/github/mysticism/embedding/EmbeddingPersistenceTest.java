@@ -150,9 +150,9 @@ public final class EmbeddingPersistenceTest {
     private static void network(){
         int[] submitted=vector().toBits();var added=new SpiritDeltaPayload.Added("minecraft:stone",submitted);submitted[0]=0;added.bits()[0]=0;check(added.bits()[0]!=0,"Payload arrays copied on both edges");
         var message=new SpiritDeltaPayload(List.of(added),List.of("gone"));var buf=buffer();try{SpiritDeltaPayload.CODEC.encode(buf,message);var decoded=SpiritDeltaPayload.CODEC.decode(buf);check(decoded.add().get(0).id().equals("minecraft:stone")&&Arrays.equals(decoded.add().get(0).bits(),vector().toBits()),"Packet roundtrip");}finally{buf.release();}
-        var wrong=buffer();try{wrong.writeVarInt(EmbeddingSpace.SCHEMA);wrong.writeString("wrong");wrong.writeVarInt(EmbeddingSpace.DIMENSIONS);rejects(()->SpiritDeltaPayload.CODEC.decode(wrong));}finally{wrong.release();}
+        var wrong=buffer();try{wrong.writeBoolean(false);wrong.writeLong(0);wrong.writeVarInt(EmbeddingSpace.SCHEMA);wrong.writeString("wrong");wrong.writeVarInt(EmbeddingSpace.DIMENSIONS);rejects(()->SpiritDeltaPayload.CODEC.decode(wrong));}finally{wrong.release();}
         var malformed=buffer();try{malformed.writeString("id");malformed.writeVarInt(Integer.MAX_VALUE);rejects(()->SpiritDeltaPayload.Added.CODEC.decode(malformed));}finally{malformed.release();}
-        var counts=buffer();try{counts.writeVarInt(EmbeddingSpace.SCHEMA);counts.writeString(EmbeddingSpace.FINGERPRINT);counts.writeVarInt(EmbeddingSpace.DIMENSIONS);counts.writeVarInt(-1);rejects(()->SpiritDeltaPayload.CODEC.decode(counts));}finally{counts.release();}
+        var counts=buffer();try{counts.writeBoolean(false);counts.writeLong(0);counts.writeVarInt(EmbeddingSpace.SCHEMA);counts.writeString(EmbeddingSpace.FINGERPRINT);counts.writeVarInt(EmbeddingSpace.DIMENSIONS);counts.writeVarInt(-1);rejects(()->SpiritDeltaPayload.CODEC.decode(counts));}finally{counts.release();}
         int[] bad=vector().toBits();bad[0]=Float.floatToIntBits(Float.NaN);rejects(()->new SpiritDeltaPayload.Added("id",bad));
     }
     private static void framed(ByteBuf body){
@@ -172,9 +172,9 @@ public final class EmbeddingPersistenceTest {
         rejects(()->new SpiritDeltaPayload(List.of(),List.of("x".repeat(257))));
         var raw=buffer();
         try{
-            raw.writeVarInt(EmbeddingSpace.SCHEMA);raw.writeString(EmbeddingSpace.FINGERPRINT);raw.writeVarInt(EmbeddingSpace.DIMENSIONS);raw.writeVarInt(2048);
+            raw.writeBoolean(false);raw.writeLong(0);raw.writeVarInt(EmbeddingSpace.SCHEMA);raw.writeString(EmbeddingSpace.FINGERPRINT);raw.writeVarInt(EmbeddingSpace.DIMENSIONS);raw.writeVarInt(2048);
             for(var a:additions)SpiritDeltaPayload.Added.CODEC.encode(raw,a);raw.writeVarInt(0);
-            check(raw.readableBytes()==2_105_415,"Exact independent-review transport reproduction");
+            check(raw.readableBytes()==2_107_472,"Exact protocol-3 transport reproduction, including absent-session/placement tags");
             var channel=new EmbeddedChannel(new SizePrepender());try{rejects(()->channel.writeOutbound(raw.copy()));}finally{channel.finishAndReleaseAll();}
             rejects(()->SpiritDeltaPayload.CODEC.decode(raw));
         }finally{raw.release();}
