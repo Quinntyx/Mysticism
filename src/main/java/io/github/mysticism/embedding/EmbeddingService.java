@@ -67,19 +67,20 @@ public final class EmbeddingService implements EmbeddingProvider {
             throw new IllegalStateException("Ollama response model mismatch");
         return decodeEmbedding(response);
     }
-    /** Native v2 768 -> first 256 -> L2, as documented. Reject all other lengths. */
+    /** Approved native v2 profile: retain all 768 coordinates, L2; no old vector resizing. */
     public static Vec384f decodeEmbedding(JsonObject response) {
         JsonArray batch=response.getAsJsonArray("embeddings");
         if(batch==null || batch.size()!=1)throw new IllegalArgumentException("Expected exactly one embedding");
         JsonArray values=batch.get(0).getAsJsonArray();
         if(values.size()!=EmbeddingSpace.NATIVE_DIMENSIONS)throw new IllegalArgumentException("Expected native Nomic v2 768 dimensions, got "+values.size());
-        float[] reduced=new float[EmbeddingSpace.DIMENSIONS];
+        if(EmbeddingSpace.DIMENSIONS!=EmbeddingSpace.NATIVE_DIMENSIONS)throw new IllegalStateException("Parent must activate native Nomic v2 dimensions/profile before inference");
+        float[] reduced=new float[EmbeddingSpace.NATIVE_DIMENSIONS];
         for(int i=0;i<values.size();i++) {
             JsonElement value=values.get(i);
             if(!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber())throw new IllegalArgumentException("Non-numeric embedding");
             double number=value.getAsDouble();
             if(!Double.isFinite(number) || Math.abs(number)>Float.MAX_VALUE)throw new IllegalArgumentException("Nonfinite embedding");
-            if(i<reduced.length)reduced[i]=(float)number;
+            reduced[i]=(float)number;
         }
         Vec384f vector=new Vec384f(reduced);
         if(vector.length()==0)throw new IllegalArgumentException("Zero embedding");

@@ -21,7 +21,6 @@ public class ItemEmbeddingIndexState extends PersistentState {
     private KnnIndex index=new SimpleKnnIndex();
     private Map<String,String> descriptors=Map.of();
     private boolean populated;
-    private NbtCompound archive;
     private CompletableFuture<Void> rebuilding;
     public KnnIndex getIndex(){return index;}
     public boolean isPopulated(){return populated;}
@@ -36,17 +35,16 @@ public class ItemEmbeddingIndexState extends PersistentState {
                 state.descriptors=Map.copyOf(DESCRIPTORS.parse(NbtOps.INSTANCE,nbt.get("descriptors")).getOrThrow());
                 if(!vectors.keySet().equals(state.descriptors.keySet()))throw new IllegalArgumentException("Incomplete item generation");
                 vectors.forEach(state.index::upsert);state.populated=nbt.getBoolean("populated");
-                if(nbt.contains("archive"))state.archive=nbt.getCompound("archive").copy();
                 return state;
-            }catch(RuntimeException error){LOGGER.warn("Invalid item generation; archiving and rebuilding",error);}
-        }else LOGGER.warn("Incompatible item embedding profile; archiving legacy vectors, rebuilding from registry IDs");
-        state=new ItemEmbeddingIndexState();state.archive=nbt.copy();state.markDirty();return state;
+            }catch(RuntimeException error){LOGGER.warn("Invalid item generation; discarding derived vectors and rebuilding",error);}
+        }else LOGGER.warn("Incompatible item embedding profile; discarding derived vectors, rebuilding from registry IDs");
+        state=new ItemEmbeddingIndexState();state.markDirty();return state;
     }
     @Override public NbtCompound writeNbt(NbtCompound nbt,RegistryWrapper.WrapperLookup lookup){
         EmbeddingNbt.stamp(nbt);Map<String,Vec384f> snapshot=new TreeMap<>();index.forEach(snapshot::put);
         nbt.put("entries",ENTRIES.encodeStart(NbtOps.INSTANCE,snapshot).getOrThrow());
         nbt.put("descriptors",DESCRIPTORS.encodeStart(NbtOps.INSTANCE,descriptors).getOrThrow());
-        nbt.putBoolean("populated",populated);if(archive!=null)nbt.put("archive",archive.copy());return nbt;
+        nbt.putBoolean("populated",populated);nbt.remove("archive");return nbt;
     }
     public static final PersistentState.Type<ItemEmbeddingIndexState> TYPE=new PersistentState.Type<>(ItemEmbeddingIndexState::new,ItemEmbeddingIndexState::fromNbt,null);
     public static ItemEmbeddingIndexState get(MinecraftServer server){return server.getOverworld().getPersistentStateManager().getOrCreate(TYPE,SAVE_KEY);}

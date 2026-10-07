@@ -26,7 +26,6 @@ public class SpatialEmbeddingIndexState extends PersistentState {
     private final Map<String,ISpiritualRegion> regions=new TreeMap<>();
     private final Map<String,String> descriptors=new TreeMap<>();
     private boolean needsRebuild;
-    private NbtCompound archive;
     private CompletableFuture<Void> rebuilding;
     public KnnIndex getIndex(){return index;}
     public void touch(){markDirty();}
@@ -39,7 +38,7 @@ public class SpatialEmbeddingIndexState extends PersistentState {
         // Decode geometry independently: legacy vector length must not discard canonical regions.
         var decodedGeometry=BIOMES.parse(NbtOps.INSTANCE,nbt.get("regions"));
         boolean geometryValid=decodedGeometry.error().isEmpty();
-        if(!geometryValid)LOGGER.warn("Malformed spatial geometry; archiving and retaining only valid regions");
+        if(!geometryValid)LOGGER.warn("Malformed spatial geometry; retaining only valid source regions");
         var geometry=decodedGeometry.result();
         geometry.ifPresent(state.regions::putAll);
         if(!geometryValid && nbt.get("regions") instanceof NbtCompound rawRegions){
@@ -55,11 +54,10 @@ public class SpatialEmbeddingIndexState extends PersistentState {
                         && (state.needsRebuild ? vectors.isEmpty() : vectors.keySet().equals(state.regions.keySet()));
                 if(!complete)throw new IllegalArgumentException("Incomplete spatial generation");
                 vectors.forEach(state.index::upsert);
-                if(nbt.contains("archive"))state.archive=nbt.getCompound("archive").copy();
                 return state;
-            }catch(RuntimeException error){LOGGER.warn("Invalid spatial generation; archiving and rebuilding",error);}
+            }catch(RuntimeException error){LOGGER.warn("Invalid spatial generation; discarding derived vectors and rebuilding",error);}
         }else LOGGER.warn("Incompatible spatial profile; preserving geometry, rebuilding biome/dimension descriptors");
-        state.archive=nbt.copy();state.index=new SimpleKnnIndex();state.descriptors.clear();state.needsRebuild=true;
+        state.index=new SimpleKnnIndex();state.descriptors.clear();state.needsRebuild=true;
         state.regions.forEach((id,region)->{
             if(region instanceof BiomeSpiritualRegion biome){String dimension=id.split("\\|",2)[0];state.descriptors.put(id,CanonicalDescriptors.region(dimension,biome.biomeId().toString()));}
         });
@@ -73,7 +71,7 @@ public class SpatialEmbeddingIndexState extends PersistentState {
         nbt.put("regions",BIOMES.encodeStart(NbtOps.INSTANCE,geometry).getOrThrow());
         nbt.put("descriptors",DESCRIPTORS.encodeStart(NbtOps.INSTANCE,descriptors).getOrThrow());
         nbt.putBoolean("needsRebuild",needsRebuild);
-        if(archive!=null)nbt.put("archive",archive.copy());return nbt;
+        nbt.remove("archive");return nbt;
     }
     public static final PersistentState.Type<SpatialEmbeddingIndexState> TYPE=new PersistentState.Type<>(SpatialEmbeddingIndexState::new,SpatialEmbeddingIndexState::fromNbt,null);
     public static SpatialEmbeddingIndexState get(MinecraftServer server){return server.getOverworld().getPersistentStateManager().getOrCreate(TYPE,SAVE_KEY);}
