@@ -1,5 +1,11 @@
 # Wave 2: server landmark extraction
 
+## Root review R1: generated-dimension admission fix
+
+One `SourceDimensions.isSource` policy excludes `mysticism:spirit` everywhere: the real block-edit entry point, controller dirty/enqueue/discovery, production pending/stitch queues, world resolution/job admission, and persistent-journal reads/writes/mutations. Overworld, nether, end and other ordinary modded source dimensions remain supported. The actual bounded `SourceWorkQueue.edited` adapter rejects generated writes **before** invalidation callbacks or capacity accounting; the controller uses that same adapter. Stale spirit journal rows are discarded before identity/history accounting, and the journal is marked dirty to persist the filtered scheduling state. Real source IDs, revisions, fingerprints and history are preserved unchanged. Existing authoritative `LandmarkStore` records are not deleted by this scheduling migration.
+
+Visible existing tmux `%463`, Java 21, cached Minecraft/Fabric classpath: scoped owned-production `javac --release 21 -proc:none` passed; `run-self-tests.sh` passed ExtractionSelfTest **104063**, BoundaryCavesSelfTest **6416**, ExtractionPersistenceSelfTest **3212**, SourceAdmissionSelfTest **2068** checks. The new test exercises the real production queue/edit adapter (1024 generated writes, no queued work/invalidation; real vanilla edits enqueue; coalescing/FIFO/capacity), plus a full 512-row contaminated legacy journal, exact preservation of real history, filtered reload/startup admission and direct stale enqueue rejection. This is not a live injected Minecraft block-write test; no integrated Gradle task or server/model runtime was run in this fix round. Parent still owns mixin/initializer/topology registration and serialized integrated validation.
+
 ## Owned implementation
 
 Only new `src/main/java/io/github/mysticism/landmark/extract/**`, matching tests, and this document. No initializer, foundation landmark core, build, manifest, networking, terrain or sibling changes.

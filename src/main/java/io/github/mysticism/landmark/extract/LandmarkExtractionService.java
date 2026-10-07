@@ -58,6 +58,7 @@ public final class LandmarkExtractionService {
     }
     /** Call from the supplied World.setBlockState mixin, including before model readiness. */
     public static void changed(ServerWorld world,BlockPos pos){
+        if(!SourceDimensions.isSource(world.getRegistryKey().getValue().toString()))return;
         Controller c=SERVERS.get(world.getServer());if(c!=null)c.dirty(region(world,pos.getX(),pos.getY(),pos.getZ()));
     }
     private static ExtractionJournal.Region region(ServerWorld world,int x,int y,int z){return new ExtractionJournal.Region(world.getRegistryKey().getValue().toString(),Math.floorDiv(x-8,32)*32+8,Math.floorDiv(y,32)*32,Math.floorDiv(z-8,32)*32+8);}
@@ -73,20 +74,23 @@ public final class LandmarkExtractionService {
         final ItemEmbeddingIndexState itemIndex;
         final Map<String,List<String>> lineage=new HashMap<>();
         final Set<String> retired=ConcurrentHashMap.newKeySet();
-        final LinkedHashSet<ExtractionJournal.Region> pending=new LinkedHashSet<>();
+        final SourceWorkQueue pending=new SourceWorkQueue(PENDING_REGIONS);
         final LinkedHashSet<ChunkKey> loaded=new LinkedHashSet<>();
         final ExecutorService worker=new ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(1),Thread.ofPlatform().daemon().name("mysticism-extraction").factory(),new ThreadPoolExecutor.AbortPolicy());
         volatile boolean closed;boolean historyFull;
-        final LinkedHashSet<ExtractionJournal.Region> stitches=new LinkedHashSet<>();
+        final SourceWorkQueue stitches=new SourceWorkQueue(PENDING_REGIONS);
         StitchJob stitch;
         Job job;long ticks,nextWarningTick;int lastSampled,playerCursor;String status="Starting";
         Controller(MinecraftServer server){this.server=server;store=LandmarkStore.get(server);journal=ExtractionJournal.get(server);itemIndex=ItemEmbeddingIndexState.get(server);var savedLineage=store.lineage();if(savedLineage.size()>ExtractionJournal.MAX_IDS)historyFull=true;else lineage.putAll(savedLineage);rememberRetired(store.aliases().keySet());rememberRetired(store.tombstones().keySet());for(var e:journal.entries())dirty(e.region);}
         void rememberRetired(Collection<String> ids){for(String id:ids){if(retired.contains(id))continue;if(retired.size()==ExtractionJournal.MAX_IDS){historyFull=true;return;}retired.add(id);}}
         void dirty(ExtractionJournal.Region r){
-            if(job!=null && job.entry.region.equals(r))job.invalid=true;
-            enqueue(r);
+            pending.edited(r,()->{
+                if(job!=null && job.entry.region.equals(r))job.invalid=true;
+                enqueue(r);
+            });
         }
         void enqueue(ExtractionJournal.Region r){
+            if(!SourceDimensions.isSource(r.dimension()))return;
             if(job!=null && job.entry.region.equals(r) && !job.invalid)return;
             if(pending.size()<PENDING_REGIONS || pending.contains(r))pending.add(r);
             else status="Deferred region queue full; tracked chunks retry";
@@ -103,12 +107,13 @@ public final class LandmarkExtractionService {
             if(stitch!=null && stitch.region.dimension().equals(dimension)){stitch.cancel();stitch=null;}
             loaded.removeIf(chunk->chunk.dimension().equals(dimension));pending.removeIf(region->region.dimension().equals(dimension));stitches.removeIf(r->r.dimension().equals(dimension));
         }
-        boolean skip(ServerWorld world){return world.getRegistryKey().getValue().toString().equals("mysticism:spirit");}
+        boolean skip(ServerWorld world){return !SourceDimensions.isSource(world.getRegistryKey().getValue().toString());}
         void schedule(ServerWorld world,int cx,int cz){
+            if(skip(world))return;
             for(int x:new int[]{cx*16,cx*16+15})for(int z:new int[]{cz*16,cz*16+15})
                 for(int y=Math.floorDiv(world.getBottomY(),32)*32;y<world.getTopY();y+=32)enqueue(region(world,x,y,z));
         }
-        ServerWorld world(String dimension){return server.getWorld(RegistryKey.of(RegistryKeys.WORLD,Identifier.of(dimension)));}
+        ServerWorld world(String dimension){return SourceDimensions.isSource(dimension)?server.getWorld(RegistryKey.of(RegistryKeys.WORLD,Identifier.of(dimension))):null;}
         void tick(){
             long deadline=System.nanoTime()+NANOS_PER_TICK;ticks++;lastSampled=0;
             try {
@@ -124,7 +129,8 @@ public final class LandmarkExtractionService {
                     ChunkKey k=loaded.iterator().next();loaded.remove(k);loaded.add(k);ServerWorld w=world(k.dimension());
                     if(w!=null && w.getChunkManager().getWorldChunk(k.x(),k.z())!=null)schedule(w,k.x(),k.z());else loaded.remove(k);
                 }
-                if(job!=null && job.invalid){job.cancel();job=null;}
+                if(job!=null && (job.invalid || !SourceDimensions.isSource(job.entry.region.dimension()))){job.cancel();job=null;}
+                if(stitch!=null && !SourceDimensions.isSource(stitch.region.dimension())){stitch.cancel();stitch=null;}
                 if(stitch!=null){stitch.advance();if(stitch.done){stitch.cancel();stitch=null;}return;}
                 if(job==null && !stitches.isEmpty()){var r=stitches.iterator().next();stitches.remove(r);if(world(r.dimension())!=null)stitch=new StitchJob(this,r);return;}
                 if(job==null && !pending.isEmpty()){
@@ -140,6 +146,7 @@ public final class LandmarkExtractionService {
             }
         }
         boolean anyLoaded(ServerWorld world,ExtractionJournal.Region r){
+            if(skip(world) || !SourceDimensions.isSource(r.dimension()))return false;
             for(int x=r.x();x<r.x()+32;x+=8)for(int z=r.z();z<r.z()+32;z+=8)
                 if(world.getChunkManager().getWorldChunk(Math.floorDiv(x,16),Math.floorDiv(z,16))!=null)return true;
             return false;
@@ -151,7 +158,7 @@ public final class LandmarkExtractionService {
         final Controller c;final ExtractionJournal.Region region;final ArrayDeque<String> ids=new ArrayDeque<>();final TreeMap<String,Landmark> old=new TreeMap<>();
         final ArrayList<GeometryPage> pages=new ArrayList<>();final Map<String,List<GeometryPage>> sources=new TreeMap<>();final Map<String,LandmarkMetadata> headers=new TreeMap<>();LandmarkStore.GeometryRead read;int pageCount;CompletableFuture<Optional<BoundaryCaves.Union>> future;
         LandmarkStore.PendingMutation mutation;TopologyPlan history;BoundaryCaves.Union union;final Set<String> seen=new HashSet<>();boolean done;
-        StitchJob(Controller c,ExtractionJournal.Region region){this.c=c;this.region=region;Set<String> candidates=new TreeSet<>();
+        StitchJob(Controller c,ExtractionJournal.Region region){if(!SourceDimensions.isSource(region.dimension()))throw new IllegalArgumentException("excluded source dimension");this.c=c;this.region=region;Set<String> candidates=new TreeSet<>();
             for(int[] d:new int[][]{{0,0,0},{-32,0,0},{32,0,0},{0,-32,0},{0,32,0},{0,0,-32},{0,0,32}}){var e=c.journal.existing(new ExtractionJournal.Region(region.dimension(),region.x()+d[0],region.y()+d[1],region.z()+d[2]));if(e!=null)candidates.addAll(e.ids());}
             if(candidates.size()>BoundaryCaves.MAX_FRAGMENTS)throw new IllegalStateException("boundary candidate budget");ids.addAll(candidates);
         }
@@ -201,6 +208,7 @@ public final class LandmarkExtractionService {
         int sampled,lastSampled;volatile boolean invalid;boolean done;
         final LinkedHashSet<String> committed;
         Job(Controller c,ServerWorld world,ExtractionJournal.Entry entry){
+            if(!SourceDimensions.isSource(entry.region.dimension()) || c.skip(world))throw new IllegalArgumentException("excluded source dimension");
             this.c=c;this.world=world;this.entry=entry;root=Bounds.cube(entry.region.x(),entry.region.y(),entry.region.z(),32);
             version=c.journal.reserve(entry);oldIds=new ArrayDeque<>(entry.ids());committed=new LinkedHashSet<>(entry.ids());
         }
