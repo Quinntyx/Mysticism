@@ -390,7 +390,7 @@ public final class SpiritTerrainService {
                 BlockPos floor=block(found.get().floor());
                 Vec3d target=new Vec3d(floor.getX()+.5,floor.getY()+1,floor.getZ()+.5);
                 p.teleport(world,target.x,target.y,target.z,p.getYaw(),p.getPitch()); p.setVelocity(Vec3d.ZERO); p.fallDistance=0; actor.entering=false;
-                var pose=returns.remove(p.getUuid()); if(pose!=null)p.setNoGravity(pose.noGravity);
+                var pose=returns.get(p.getUuid()); if(pose!=null)p.setNoGravity(pose.noGravity); // Retain source pose until actual leave.
                 p.sendMessage(Text.literal("[Spirit terrain] Entered personally selected landmark air"),true);
             }
         }

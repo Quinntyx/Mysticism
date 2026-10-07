@@ -77,6 +77,21 @@ public final class LandmarkStore extends PersistentState {
     public Map<String,String> aliases() { checkThread(); return Collections.unmodifiableMap(new TreeMap<>(aliases)); }
     public Map<String,Long> tombstones() { checkThread(); return Collections.unmodifiableMap(new TreeMap<>(tombstones)); }
     public Map<String,List<String>> lineage() { checkThread(); return Collections.unmodifiableMap(new TreeMap<>(lineage)); }
+    /** Single-seed tombstone lookup; no catalog copy or geometry hydration. */
+    public OptionalLong tombstoneRevision(String id) {
+        checkThread(); Long revision = tombstones.get(Objects.requireNonNull(id));
+        return revision == null ? OptionalLong.empty() : OptionalLong.of(revision);
+    }
+    /** Bounded single-seed lineage read for prepared split verification. */
+    public List<String> lineageChildren(String id, int maxChildren) {
+        checkThread();
+        if (maxChildren < 0 || maxChildren > 512) throw new IllegalArgumentException("lineage read budget");
+        var children = lineage.get(Objects.requireNonNull(id));
+        if (children == null) return List.of();
+        if (children.size() > maxChildren) throw new IllegalArgumentException("lineage read budget");
+        return List.copyOf(children);
+    }
+
     /** Metadata-only: no geometry NBT copies or reconstruction. */
     public Optional<LandmarkMetadata> metadata(String id) {
         checkThread(); id=resolve(id); Ref ref=records.get(id); if(ref==null) return Optional.empty();

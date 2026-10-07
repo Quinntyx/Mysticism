@@ -52,7 +52,7 @@ public final class SpiritMixinContractSelfTest {
                 "Source edit target descriptor changed");
         check(ServerPlayerEntity.class.getDeclaredMethod("increaseStat", Stat.class, int.class).getReturnType() == void.class,
                 "Stat delta target descriptor changed");
-        check(BlockItem.class.getDeclaredMethod("place", ItemPlacementContext.class).getReturnType() == net.minecraft.util.ActionResult.class,
+        check(BlockItem.class.getDeclaredMethod("place", ItemPlacementContext.class, BlockState.class).getReturnType() == boolean.class,
                 "Placement target descriptor changed");
         check(ServerWorld.class.getDeclaredMethod("spawnEntity", Entity.class).getReturnType() == boolean.class,
                 "Spawn target descriptor changed");
