@@ -1,36 +1,57 @@
 package io.github.mysticism.client.net;
 
-import io.github.mysticism.client.spiritworld.ClientSpiritCache;
 import io.github.mysticism.net.*;
-import net.fabricmc.api.*;
+import io.github.mysticism.dimension.spiritworld.SpiritGlyphSelection;
+import io.github.mysticism.dimension.spiritworld.terrain.TerrainMeshFrame;
+import io.github.mysticism.client.spiritworld.terrain.SpiritTerrainClient;
 import net.fabricmc.fabric.api.client.networking.v1.*;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.MinecraftClient;
-import org.slf4j.*;
+import java.util.*;
 
-@Environment(EnvType.CLIENT)
+/** One reader per stream; connection/world/player/session guards precede all cache/collision changes. */
 public final class SpiritNetworkingClient {
-    public static final Logger LOGGER=LoggerFactory.getLogger("MysticismClient-SpiritNetworking");
-    private static boolean initialized;
-    public static void observe(MinecraftClient c) {
-        ClientSpiritCache.observe(c.getNetworkHandler(),c.world,c.player,c.world==null?null:c.world.getRegistryKey().getValue().toString(),c.player==null?null:c.player.getUuid());
+    private static boolean initialized;private static Object handler,world,player;
+    private static final Map<String,SpiritGlyphSelection.Glyph> glyphs=new TreeMap<>();private static long glyphSequence,terrainSequence;
+    private static TerrainMeshFrame terrain;private static SpiritTerrainPayload pending;private static int nextPart;
+    private static final Map<Long,TerrainMeshFrame.Cell> assembled=new TreeMap<>();
+    private SpiritNetworkingClient(){}
+    public static List<SpiritGlyphSelection.Glyph> glyphs(){return List.copyOf(glyphs.values());}
+    private static void geometryClear(){glyphs.clear();glyphSequence=terrainSequence=0;terrain=null;pending=null;nextPart=0;assembled.clear();SpiritTerrainClient.clear();}
+    public static void clear(){SpiritSceneClient.clear();geometryClear();}
+    private static void observe(MinecraftClient c){Object h=c.getNetworkHandler(),w=c.world,p=c.player;if(h!=handler||w!=world||p!=player){clear();if(h!=handler)SpiritSceneClient.resetConnection();handler=h;world=w;player=p;}if(c.world==null||!c.world.getRegistryKey().getValue().toString().equals("mysticism:spirit"))clear();}
+    private static boolean current(MinecraftClient c,Object h,Object w,Object p,SpiritFramePayload.Session session){return c.getNetworkHandler()==h&&c.world==w&&c.player==p&&c.player!=null&&c.world!=null&&session.player().equals(c.player.getUuid())&&session.dimension().equals(c.world.getRegistryKey().getValue().toString());}
+    private static boolean session(SpiritFramePayload.Session s){return SpiritSceneClient.session().map(s::equals).orElse(false);}
+    private static void terrain(SpiritTerrainPayload packet){
+        if(!session(packet.session())||packet.sequence()<=terrainSequence)return;
+        if(pending==null||packet.sequence()!=pending.sequence()){
+            if(packet.part()!=0)return;pending=packet;nextPart=0;assembled.clear();
+            if(!packet.full()){if(terrain==null||!terrain.materials().equals(packet.frame().materials())||!terrain.sourceDimension().equals(packet.frame().sourceDimension())){pending=null;return;}terrain.cells().forEach(c->assembled.put(c.key(),c));}
+            packet.removed().forEach(assembled::remove);
+        }
+        var f=packet.frame();var base=pending.frame();
+        if(packet.part()!=nextPart||packet.parts()!=pending.parts()||packet.full()!=pending.full()||f.revision()!=base.revision()||f.shallow()!=base.shallow()||!f.materials().equals(base.materials())||!f.sourceDimension().equals(base.sourceDimension())||!f.sourceOrigin().equals(base.sourceOrigin())||!f.carrierOrigin().equals(base.carrierOrigin())){pending=null;assembled.clear();return;}
+        f.cells().forEach(c->assembled.put(c.key(),c));if(assembled.size()>2048){pending=null;assembled.clear();return;}nextPart++;
+        if(nextPart==packet.parts()){
+            var complete=new TerrainMeshFrame(f.revision(),f.shallow(),f.sourceDimension(),f.sourceOrigin(),f.carrierOrigin(),f.materials(),List.copyOf(assembled.values()));
+            SpiritTerrainClient.accept(complete);terrain=complete;terrainSequence=packet.sequence();pending=null;assembled.clear();
+        }
     }
-    /** Guards queued work by actual connection/world/player object identity, not dimension string alone. */
-    public static boolean sameLifetime(Object connection,Object world,Object player,Object currentConnection,Object currentWorld,Object currentPlayer) {
-        return connection!=null && connection==currentConnection && world!=null && world==currentWorld && player!=null && player==currentPlayer;
-    }
-    public static void init() {
-        if(initialized)return;initialized=true;
-        ClientTickEvents.START_CLIENT_TICK.register(SpiritNetworkingClient::observe);
-        ClientPlayConnectionEvents.JOIN.register((handler,sender,client)->{ClientSpiritCache.observe(null,null,null,null,null);observe(client);});
-        ClientPlayConnectionEvents.DISCONNECT.register((handler,client)->ClientSpiritCache.observe(null,null,null,null,null));
-        ClientPlayNetworking.registerGlobalReceiver(SpiritFramePayload.ID,(payload,context)->{
-            var c=context.client();var handler=context.player().networkHandler;var world=c.world;var player=context.player();
-            c.execute(()->{if(!sameLifetime(handler,world,player,c.getNetworkHandler(),c.world,c.player))return;observe(c);if(!ClientSpiritCache.accept(payload))LOGGER.debug("Rejected stale/foreign glyph frame");});
+    public static void init(){
+        if(initialized)return;initialized=true;ClientTickEvents.START_CLIENT_TICK.register(SpiritNetworkingClient::observe);
+        ClientPlayConnectionEvents.JOIN.register((h,s,c)->{handler=null;world=null;player=null;clear();SpiritSceneClient.resetConnection();observe(c);});
+        ClientPlayConnectionEvents.DISCONNECT.register((h,c)->{clear();SpiritSceneClient.resetConnection();handler=world=player=null;});
+        ClientPlayNetworking.registerGlobalReceiver(SpiritScenePayload.ID,(payload,context)->{
+            var c=context.client();var h=context.player().networkHandler;var w=c.world;var p=context.player();
+            c.execute(()->{observe(c);if(!current(c,h,w,p,payload.session()))return;var old=SpiritSceneClient.session();if(!SpiritSceneClient.accept(payload))return;if(old.isEmpty()||!old.get().equals(payload.session()))geometryClear();ClientPlayNetworking.send(new SpiritSessionAckPayload(payload.session().connection(),payload.session().generation()));});
         });
         ClientPlayNetworking.registerGlobalReceiver(SpiritDeltaPayload.ID,(payload,context)->{
-            var c=context.client();var handler=context.player().networkHandler;var world=c.world;var player=context.player();
-            c.execute(()->{if(!sameLifetime(handler,world,player,c.getNetworkHandler(),c.world,c.player))return;observe(c);if(!ClientSpiritCache.accept(payload))LOGGER.debug("Rejected legacy/stale/unbootstrapped glyph delta");});
+            var c=context.client();var h=context.player().networkHandler;var w=c.world;var p=context.player();
+            c.execute(()->{observe(c);if(payload.session()==null||!current(c,h,w,p,payload.session())||!session(payload.session())||payload.sequence()<=glyphSequence)return;payload.remove().forEach(glyphs::remove);for(var added:payload.add())glyphs.put(added.id(),added.glyph());if(glyphs.size()>128){glyphs.clear();return;}glyphSequence=payload.sequence();});
+        });
+        ClientPlayNetworking.registerGlobalReceiver(SpiritTerrainPayload.ID,(payload,context)->{
+            var c=context.client();var h=context.player().networkHandler;var w=c.world;var p=context.player();
+            c.execute(()->{observe(c);if(current(c,h,w,p,payload.session()))terrain(payload);});
         });
     }
 }

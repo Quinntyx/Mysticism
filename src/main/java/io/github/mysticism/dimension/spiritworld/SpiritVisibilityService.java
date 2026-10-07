@@ -22,9 +22,16 @@ public final class SpiritVisibilityService {
     private SpiritVisibilityService() {}
     private static boolean initialized;
     private static final Map<MinecraftServer, Runtime> SERVERS = new IdentityHashMap<>();
+    private static final class GlyphInfo {
+        final SpiritGlyphSelection.Glyph glyph; final float[] vector; final int[] bits;
+        GlyphInfo(SpiritGlyphSelection.Glyph glyph){this.glyph=glyph;vector=glyph.embedding().data();bits=new int[vector.length];for(int i=0;i<bits.length;i++)bits[i]=Float.floatToIntBits(vector[i]);}
+        boolean same(GlyphInfo other){return this==other||other!=null&&glyph.clusterId().equals(other.glyph.clusterId())&&glyph.clusterSlot()==other.glyph.clusterSlot()&&glyph.slot()==other.glyph.slot()&&Arrays.equals(bits,other.bits);}
+        boolean inside(float[] current){double d=0;for(int i=0;i<vector.length;i++){double delta=(double)vector[i]-current[i];d+=delta*delta;}return d<SpiritGlyphSelection.SEMANTIC_RADIUS*SpiritGlyphSelection.SEMANTIC_RADIUS;}
+    }
     private static final class Viewer {
         List<SpiritGlyphSelection.Glyph> selected = List.of();
-        final Set<String> sent = new TreeSet<>();
+        final Map<String,GlyphInfo> infos = new TreeMap<>();
+        final Map<String,GlyphInfo> sent = new TreeMap<>();
         String protocolFailure;
         boolean fullSnapshotRequired;
         CompletableFuture<List<SpiritGlyphSelection.Glyph>> query;
@@ -60,7 +67,7 @@ public final class SpiritVisibilityService {
             building = null; catalogue = null;
             viewers.values().forEach(v -> {
                 if (v.query != null) v.query.cancel(false);
-                v.query = null; v.selected = List.of();
+                v.query = null; v.selected = List.of(); v.infos.clear();
             });
             if (nextSize > SpiritGlyphSelection.MAX_CANDIDATES) {
                 index = next; size = nextSize; return; // Explicit oversized-generation fail-closed.
@@ -121,6 +128,7 @@ public final class SpiritVisibilityService {
                 }
                 continue;
             }
+            if(!runtime.viewers.containsKey(id)&&runtime.viewers.size()>=64){if(runtime.ticks%20==1)player.sendMessage(net.minecraft.text.Text.literal("[Spirit transport] 64-observer capacity reached"),true);continue;}
             Viewer viewer = runtime.viewers.computeIfAbsent(id, ignored -> new Viewer());
             Vec384f current = player.getComponent(MysticismEntityComponents.LATENT_POS).get();
             boolean valid = true;
@@ -128,18 +136,18 @@ public final class SpiritVisibilityService {
             catch (RuntimeException invalid) { valid = false; }
             if (!valid || runtime.catalogue == null) {
                 if (viewer.query != null) viewer.query.cancel(false);
-                viewer.query = null; viewer.selected = List.of(); send(player, viewer, List.of()); continue;
+                viewer.query = null; viewer.selected = List.of(); viewer.infos.clear(); send(player, viewer, List.of()); continue;
             }
             if (viewer.query != null && viewer.query.isDone()) {
                 try { viewer.selected = viewer.query.getNow(List.of()); }
                 catch (CompletionException | CancellationException unavailable) { viewer.selected = List.of(); }
-                viewer.query = null;
+                viewer.query = null; viewer.infos.clear(); for(var glyph:viewer.selected)viewer.infos.put(glyph.id(),new GlyphInfo(glyph));
             }
             // Re-gate <=128 results against CURRENT, never the asynchronous/target attunement.
             var visible = new ArrayList<SpiritGlyphSelection.Glyph>();
-            for (var glyph : viewer.selected)
-                if (glyph.embedding().squareDistance(current) < SpiritGlyphSelection.SEMANTIC_RADIUS * SpiritGlyphSelection.SEMANTIC_RADIUS)
-                    visible.add(glyph);
+            float[] coordinates=current.data();
+            for (var info : viewer.infos.values())
+                if(info.inside(coordinates))visible.add(info.glyph);
             send(player, viewer, visible);
             if (viewer.query == null && runtime.ticks % 10 == 1) {
                 var catalogue = runtime.catalogue;
@@ -159,25 +167,24 @@ public final class SpiritVisibilityService {
 
     private static void send(ServerPlayerEntity player, Viewer viewer, List<SpiritGlyphSelection.Glyph> selected) {
         if (!isSpiritWorld(player)) { viewer.sent.clear(); return; }
-        var frame = io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService.projectionFrame(player.getServer());
-        if (frame.isEmpty()) return; // Terrain initializes asynchronously; no invented fallback frame.
         try {
-            boolean bootstrap = io.github.mysticism.net.SpiritProjectionService.activate(player, frame.get());
+            boolean bootstrap = io.github.mysticism.net.SpiritProjectionService.activate(player);
             if (bootstrap) viewer.fullSnapshotRequired = true;
             boolean full = viewer.fullSnapshotRequired;
-            var current = new TreeSet<String>();
+            var current = new TreeMap<String,GlyphInfo>();
             var added = new ArrayList<SpiritDeltaPayload.Added>();
             for (var glyph : selected) {
-                current.add(glyph.id());
-                if (full || !viewer.sent.contains(glyph.id()))
-                    added.add(SpiritDeltaPayload.Added.of(glyph.id(), glyph.embedding()));
+                var info=viewer.infos.get(glyph.id());if(info==null)continue;
+                current.put(glyph.id(),info);
+                if (full || !info.same(viewer.sent.get(glyph.id())))
+                    added.add(SpiritDeltaPayload.Added.glyph(glyph));
             }
             var removed = new ArrayList<String>();
-            if (!full) for (String id : viewer.sent) if (!current.contains(id)) removed.add(id);
+            if (!full) for (String id : viewer.sent.keySet()) if (!current.containsKey(id)) removed.add(id);
             if (!added.isEmpty() || !removed.isEmpty())
                 io.github.mysticism.net.SpiritProjectionService.send(player, added, removed);
             // Publication succeeded. A failed bootstrap/delta must never advance this snapshot.
-            viewer.sent.clear(); viewer.sent.addAll(current); viewer.protocolFailure = null;
+            viewer.sent.clear(); viewer.sent.putAll(current); viewer.protocolFailure = null;
             viewer.fullSnapshotRequired = false;
         } catch (RuntimeException unavailable) {
             String message = unavailable.getMessage() == null ? unavailable.getClass().getSimpleName() : unavailable.getMessage();
