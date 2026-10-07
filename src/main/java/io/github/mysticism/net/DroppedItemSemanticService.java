@@ -47,7 +47,7 @@ public final class DroppedItemSemanticService {
     private static State track(ItemEntity entity){
         if(states.size()>=MAX_ACTIVE)return null;var owner=initial(entity);if(owner==null)return null;var nav=owner.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION);if(!nav.semanticReady()||!nav.modelCompatible())return null;
         String item=Registries.ITEM.getId(entity.getStack().getItem()).toString();var target=ItemEmbeddingIndexState.get(entity.getServer()).getVec(item);if(target==null||target.length()==0)return null;
-        try{EmbeddingSpace.requireCurrent(target);var latent=q(owner).add(lift(basis(owner),entity.getPos().subtract(owner.getEyePos()).multiply(1/SpiritProjectionService.SCALE)));var s=new State(latent,target,entity.getPos(),entity.hasNoGravity(),item);s.observer=owner;states.put(entity,s);entity.setNoGravity(true);return s;}catch(RuntimeException unavailable){return null;}
+        try{EmbeddingSpace.requireCurrent(target);var latent=q(owner).clone().add(lift(basis(owner),entity.getPos().subtract(owner.getEyePos()).multiply(1/SpiritProjectionService.SCALE)));var s=new State(latent,target,entity.getPos(),entity.hasNoGravity(),item);s.observer=owner;states.put(entity,s);entity.setNoGravity(true);return s;}catch(RuntimeException unavailable){return null;}
     }
     private static boolean choose(ItemEntity entity,State s){
         var all=observers(entity.getServer());ServerPlayerEntity best=null;double distance=Double.POSITIVE_INFINITY;float[] semantic=s.q.data();
@@ -80,12 +80,12 @@ public final class DroppedItemSemanticService {
         try{return project(p,s.q).squaredDistanceTo(p.getEyePos())<=4;}catch(RuntimeException invalid){return false;}
     }
     public static List<SpiritScenePayload.Drop> snapshots(ServerPlayerEntity viewer){
-        var result=new ArrayList<SpiritScenePayload.Drop>();var tracked=new HashSet<UUID>();
-        for(var e:states.entrySet()){var item=e.getKey();var s=e.getValue();if(item.getWorld()!=viewer.getWorld()||item.isRemoved())continue;try{if(project(viewer,s.q).squaredDistanceTo(viewer.getEyePos())>SpiritProjectionService.OBSERVER_RADIUS*SpiritProjectionService.OBSERVER_RADIUS)continue;result.add(new SpiritScenePayload.Drop(item.getUuid(),item.getId(),s.q,s.target,item.getPos(),item.getStack()));tracked.add(item.getUuid());if(result.size()==SpiritScenePayload.MAX_DROPS)return List.copyOf(result);}catch(RuntimeException invalid){}}
+        var result=new ArrayList<SpiritScenePayload.Drop>();var indexed=new HashSet<UUID>();for(var item:states.keySet())indexed.add(item.getUuid());
+        for(var e:states.entrySet()){var item=e.getKey();var s=e.getValue();if(item.getWorld()!=viewer.getWorld()||item.isRemoved())continue;try{if(project(viewer,s.q).squaredDistanceTo(viewer.getEyePos())>SpiritProjectionService.OBSERVER_RADIUS*SpiritProjectionService.OBSERVER_RADIUS)continue;result.add(new SpiritScenePayload.Drop(item.getUuid(),item.getId(),s.q,s.target,item.getPos(),item.getStack()));if(result.size()==SpiritScenePayload.MAX_DROPS)return List.copyOf(result);}catch(RuntimeException invalid){}}
         // Unindexed/over-budget drops stay visibly recoverable vanilla proxies, explicitly non-semantic.
         var box=viewer.getBoundingBox().expand(SpiritProjectionService.OBSERVER_RADIUS);int[] inspected={0};
         ((SourceEntityLookupAccessor)(ServerWorld)viewer.getWorld()).mysticism$entityLookup().forEachIntersects(TypeFilter.instanceOf(ItemEntity.class),box,item->{
-            if(!item.isRemoved()&&!tracked.contains(item.getUuid())&&!item.getStack().isEmpty()&&result.size()<SpiritScenePayload.MAX_DROPS){try{var virtual=q(viewer).add(lift(basis(viewer),item.getPos().subtract(viewer.getEyePos()).multiply(1/SpiritProjectionService.SCALE)));result.add(new SpiritScenePayload.Drop(item.getUuid(),item.getId(),virtual,null,item.getPos(),item.getStack()));}catch(RuntimeException invalid){}}
+            if(!item.isRemoved()&&!indexed.contains(item.getUuid())&&!item.getStack().isEmpty()&&result.size()<SpiritScenePayload.MAX_DROPS){try{var virtual=q(viewer).clone().add(lift(basis(viewer),item.getPos().subtract(viewer.getEyePos()).multiply(1/SpiritProjectionService.SCALE)));result.add(new SpiritScenePayload.Drop(item.getUuid(),item.getId(),virtual,null,item.getPos(),item.getStack()));}catch(RuntimeException invalid){}}
             return ++inspected[0]>=64||result.size()>=SpiritScenePayload.MAX_DROPS?LazyIterationConsumer.NextIteration.ABORT:LazyIterationConsumer.NextIteration.CONTINUE;
         });return List.copyOf(result);
     }
