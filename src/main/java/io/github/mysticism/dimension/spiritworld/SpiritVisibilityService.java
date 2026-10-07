@@ -25,6 +25,8 @@ public final class SpiritVisibilityService {
     private static final class Viewer {
         List<SpiritGlyphSelection.Glyph> selected = List.of();
         final Set<String> sent = new TreeSet<>();
+        String protocolFailure;
+        boolean fullSnapshotRequired;
         CompletableFuture<List<SpiritGlyphSelection.Glyph>> query;
     }
     static final class Runtime implements AutoCloseable {
@@ -156,17 +158,34 @@ public final class SpiritVisibilityService {
     }
 
     private static void send(ServerPlayerEntity player, Viewer viewer, List<SpiritGlyphSelection.Glyph> selected) {
-        if (!ServerPlayNetworking.canSend(player, SpiritDeltaPayload.ID)) { viewer.sent.clear(); return; }
-        var current = new TreeSet<String>();
-        var added = new ArrayList<SpiritDeltaPayload.Added>();
-        for (var glyph : selected) {
-            current.add(glyph.id());
-            if (!viewer.sent.contains(glyph.id())) added.add(SpiritDeltaPayload.Added.of(glyph.id(), glyph.embedding()));
+        if (!isSpiritWorld(player)) { viewer.sent.clear(); return; }
+        var frame = io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService.projectionFrame(player.getServer());
+        if (frame.isEmpty()) return; // Terrain initializes asynchronously; no invented fallback frame.
+        try {
+            boolean bootstrap = io.github.mysticism.net.SpiritProjectionService.activate(player, frame.get());
+            if (bootstrap) viewer.fullSnapshotRequired = true;
+            boolean full = viewer.fullSnapshotRequired;
+            var current = new TreeSet<String>();
+            var added = new ArrayList<SpiritDeltaPayload.Added>();
+            for (var glyph : selected) {
+                current.add(glyph.id());
+                if (full || !viewer.sent.contains(glyph.id()))
+                    added.add(SpiritDeltaPayload.Added.of(glyph.id(), glyph.embedding()));
+            }
+            var removed = new ArrayList<String>();
+            if (!full) for (String id : viewer.sent) if (!current.contains(id)) removed.add(id);
+            if (!added.isEmpty() || !removed.isEmpty())
+                io.github.mysticism.net.SpiritProjectionService.send(player, added, removed);
+            // Publication succeeded. A failed bootstrap/delta must never advance this snapshot.
+            viewer.sent.clear(); viewer.sent.addAll(current); viewer.protocolFailure = null;
+            viewer.fullSnapshotRequired = false;
+        } catch (RuntimeException unavailable) {
+            String message = unavailable.getMessage() == null ? unavailable.getClass().getSimpleName() : unavailable.getMessage();
+            if (!Objects.equals(message, viewer.protocolFailure)) {
+                viewer.protocolFailure = message;
+                player.sendMessage(net.minecraft.text.Text.literal("[Spirit projection] " + message), true);
+            }
         }
-        var removed = new ArrayList<String>();
-        for (String id : viewer.sent) if (!current.contains(id)) removed.add(id);
-        if (!added.isEmpty() || !removed.isEmpty()) ServerPlayNetworking.send(player, new SpiritDeltaPayload(added, removed));
-        viewer.sent.clear(); viewer.sent.addAll(current);
     }
 
     private static void forget(MinecraftServer server, ServerPlayerEntity player, boolean notify) {

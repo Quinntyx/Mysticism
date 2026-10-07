@@ -88,6 +88,32 @@ public final class SpiritTerrainService {
     public static void cancelEnter(ServerPlayerEntity player) {
         var c=SERVERS.get(player.getServer()); if(c!=null)c.leave(player);
     }
+    /** Read the real saved controller frame; never construct a competing glyph frame. */
+    public static Optional<ProjectionFrame> projectionFrame(MinecraftServer server) {
+        if (!server.isOnThread()) throw new IllegalStateException("terrain requires server thread");
+        var c = SERVERS.get(server);
+        return c == null ? Optional.empty() : Optional.ofNullable(c.state.frame());
+    }
+    /** Return to the prepared source pose, with an overworld spawn fallback after reconnect. */
+    public static boolean exit(ServerPlayerEntity player) {
+        MinecraftServer server = player.getServer();
+        if (server == null || !server.isOnThread() || !player.getWorld().getRegistryKey().equals(WORLD)) return false;
+        var c = SERVERS.get(server);
+        var pose = c == null ? null : c.returns.get(player.getUuid());
+        if (pose != null && server.getWorld(pose.world.getRegistryKey()) == pose.world) {
+            player.teleport(pose.world, pose.position.x, pose.position.y, pose.position.z, pose.yaw, pose.pitch);
+            player.setNoGravity(pose.noGravity);
+        } else {
+            ServerWorld target = server.getOverworld();
+            BlockPos spawn = target.getSpawnPos();
+            int y = target.getTopY(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, spawn.getX(), spawn.getZ());
+            player.teleport(target, spawn.getX() + .5, y, spawn.getZ() + .5, player.getYaw(), player.getPitch());
+            player.setNoGravity(false);
+        }
+        if (c != null) c.leave(player);
+        player.setVelocity(Vec3d.ZERO); player.fallDistance = 0;
+        return true;
+    }
     private static Context context(MinecraftServer server) {
         if(!server.isOnThread())throw new IllegalStateException("terrain requires server thread");
         ServerWorld world=server.getWorld(WORLD); if(world==null)throw new IllegalStateException("spirit dimension unavailable");

@@ -43,12 +43,17 @@ public class Mysticism implements ModInitializer, DedicatedServerModInitializer 
                 registryAccess,
                 environment) -> {
             EmbeddingCommand.register(dispatcher);
+            io.github.mysticism.command.SpiritCommand.register(dispatcher);
             HorizonSeederCommand.register(dispatcher);
             LatentCommands.register(dispatcher, registryAccess, environment);
         });
 
 
         SpiritNetworking.init();
+        io.github.mysticism.net.SpiritProjectionService.init();
+        io.github.mysticism.landmark.extract.LandmarkExtractionService.init();
+        io.github.mysticism.activity.SpiritActivityService.init();
+        io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService.init();
         SpiritVisibilityService.init();
         SpiritBasisEvolver.init();
 
