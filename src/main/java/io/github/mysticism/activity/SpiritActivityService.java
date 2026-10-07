@@ -45,6 +45,29 @@ public final class SpiritActivityService {
         long skipped; int cursor;
         final LinkedHashMap<Region,String> nearbyCursors=new LinkedHashMap<>(16,0.75f,true);
         Pulse discovering; NearbyDiscovery discovery;
+        final MutationPause externalPause=new MutationPause();
+    }
+    /** Thread-confined pause state used by the real extractor/landmark tick gate. */
+    static final class MutationPause {
+        boolean held;
+        Runnable acquire(boolean busy,java.util.function.BooleanSupplier onThread){
+            if(!onThread.getAsBoolean())throw new IllegalStateException("activity server thread");
+            if(held||busy)throw new IllegalStateException("activity landmark mutations busy/paused");
+            held=true;
+            return new Runnable(){boolean resumed;
+                @Override public void run(){
+                    if(!onThread.getAsBoolean())throw new IllegalStateException("activity server thread");
+                    if(resumed)return;held=false;resumed=true;
+                }
+            };
+        }
+    }
+    /** Acquire before any extractor prepare/staging; release on cancellation or after commit.
+     * Does not cancel, finish or overwrite a pending activity write. Nested acquisition rejects. */
+    public static Runnable pauseLandmarkMutations(MinecraftServer server){
+        if(!server.isOnThread())throw new IllegalStateException("activity server thread");
+        Session s=SESSIONS.computeIfAbsent(server,k->new Session());
+        return s.externalPause.acquire(s.mutation!=null||s.discovery!=null||s.discovering!=null,server::isOnThread);
     }
     private record Region(String dimension,int x,int y,int z) {
         static Region of(Pulse pulse){return new Region(pulse.dimension,Math.floorDiv(pulse.pos.getX(),24),Math.floorDiv(pulse.pos.getY(),24),Math.floorDiv(pulse.pos.getZ(),24));}
@@ -162,8 +185,10 @@ public final class SpiritActivityService {
         Session s=SESSIONS.computeIfAbsent(server,k->new Session());
         // Dimension exits and disconnects invalidate in-flight observations even between sample cadences.
         for(var id:List.copyOf(s.players.keySet())){var p=server.getPlayerManager().getPlayer(id);if(p==null||!dimension(p.getServerWorld()).equals(s.players.get(id).dimension))clearPlayer(server,id);}
-        if(s.mutation!=null){try{s.mutation.advance(1,256);if(s.mutation.complete()){s.committed.run();s.mutation=null;s.committed=null;s.mutationDimension=null;}}catch(RuntimeException stale){cancelMutation(s);s.skipped++;}}
-        if(s.mutation==null&&s.discovery!=null)advanceDiscovery(server,s);
+        if(!s.externalPause.held){
+            if(s.mutation!=null){try{s.mutation.advance(1,256);if(s.mutation.complete()){s.committed.run();s.mutation=null;s.committed=null;s.mutationDimension=null;}}catch(RuntimeException stale){cancelMutation(s);s.skipped++;}}
+            if(s.mutation==null&&s.discovery!=null)advanceDiscovery(server,s);
+        }
         if(server.getTicks()%20!=0)return;
         List<ServerPlayerEntity> online=server.getPlayerManager().getPlayerList();
         // At most four inventory samples per second, independent of player count.
@@ -171,6 +196,9 @@ public final class SpiritActivityService {
             ServerPlayerEntity p=online.get(Math.floorMod(s.cursor++,online.size()));
             personal(p).ifPresent(a->sample(server,p,a,s));
         }
+        // Personal sampling above may enqueue bounded dwell; do not drain landmark jobs or
+        // events while an extractor owns the pause. Completed futures retain <=8 slots.
+        if(s.externalPause.held)return;
         // Poll only completed futures; getNow never joins or waits.
         int jobs=s.jobs.size();for(int n=0;n<jobs;n++){Job j=s.jobs.remove();if(!j.future.isDone()){s.jobs.add(j);continue;}
             if(j.future.isCompletedExceptionally()||j.future.isCancelled()){s.skipped++;continue;}
