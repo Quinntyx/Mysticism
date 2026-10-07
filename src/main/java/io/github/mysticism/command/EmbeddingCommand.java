@@ -1,6 +1,6 @@
 package io.github.mysticism.command;
 
-import ai.djl.util.Pair;
+import io.github.mysticism.vector.IndexPair;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
@@ -32,6 +32,13 @@ import net.minecraft.util.math.ChunkPos;
 
 import java.util.*;
 import java.util.stream.Collectors;
+import java.util.concurrent.CompletableFuture;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+import net.fabricmc.fabric.api.entity.event.v1.ServerEntityWorldChangeEvents;
+import net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents;
+import net.minecraft.server.MinecraftServer;
+import io.github.mysticism.vector.EmbeddingSpace;
 
 public class EmbeddingCommand {
 
@@ -42,10 +49,72 @@ public class EmbeddingCommand {
                     builder
             );
 
+    private static boolean initialized;
+    // Production lifecycle gate is world-free; access only on the owning server thread.
+    static final class Queries<S> {
+        static final int MAX_PER_SERVER = 128;
+        private final Map<S, Map<UUID, CompletableFuture<Vec384f>>> pending = new IdentityHashMap<>();
+        boolean track(S server, UUID player, CompletableFuture<Vec384f> request) {
+            var requests = pending.computeIfAbsent(server, ignored -> new HashMap<>());
+            if (!requests.containsKey(player) && requests.size() >= MAX_PER_SERVER) return false;
+            var old = requests.put(player, request); // publish replacement BEFORE invoking cancel callbacks
+            if (old != null) old.cancel(false);
+            return true;
+        }
+        boolean finish(S server, UUID player, CompletableFuture<Vec384f> request) {
+            var requests = pending.get(server);
+            if (requests == null || !requests.remove(player, request)) return false;
+            if (requests.isEmpty()) pending.remove(server);
+            return true;
+        }
+        boolean cancel(S server, UUID player) {
+            var requests = pending.get(server);
+            if (requests == null) return false;
+            var old = requests.remove(player);
+            if (requests.isEmpty()) pending.remove(server);
+            if (old != null) old.cancel(false);
+            return old != null;
+        }
+        void stop(S server) {
+            var requests = pending.remove(server);
+            if (requests != null) List.copyOf(requests.values()).forEach(f -> f.cancel(false));
+        }
+        int size(S server) { var requests = pending.get(server); return requests == null ? 0 : requests.size(); }
+    }
+    private static final Queries<MinecraftServer> QUERIES = new Queries<>();
+
+    public static void init() {
+        if (initialized) return;
+        initialized = true;
+        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> QUERIES.cancel(server, handler.player.getUuid()));
+        ServerEntityWorldChangeEvents.AFTER_PLAYER_CHANGE_WORLD.register((player, origin, destination) -> {
+            if (QUERIES.cancel(destination.getServer(), player.getUuid()))
+                player.sendMessage(Text.literal("Embedding query cancelled after dimension change."), false);
+        });
+        ServerPlayerEvents.AFTER_RESPAWN.register((oldPlayer, newPlayer, alive) ->
+                QUERIES.cancel(newPlayer.getServer(), newPlayer.getUuid()));
+        ServerLifecycleEvents.SERVER_STOPPING.register(QUERIES::stop);
+    }
+
     public static void register(CommandDispatcher<ServerCommandSource> dispatcher) {
+        init();
+        dispatcher.register(CommandManager.literal("myst").then(CommandManager.literal("embed")
+                .then(CommandManager.literal("status").executes(ctx -> {
+                    String status = EmbeddingHelper.getInitializationStatus() + "; cache=" + EmbeddingHelper.getCacheSize()
+                            + "; pending=" + EmbeddingHelper.getInflightSize()
+                            + "; profile=" + EmbeddingHelper.profile().fingerprint();
+                    ctx.getSource().sendFeedback(() -> Text.literal(status), false);
+                    return 1;
+                }))
+                .then(CommandManager.literal("get")
+                        .then(CommandManager.argument("descriptor", StringArgumentType.greedyString())
+                                .executes(ctx -> query(ctx.getSource(), StringArgumentType.getString(ctx, "descriptor")))))
+                .then(CommandManager.literal("vector")
+                        .then(CommandManager.argument("descriptor", StringArgumentType.greedyString())
+                                .executes(ctx -> query(ctx.getSource(), StringArgumentType.getString(ctx, "descriptor")))))));
         dispatcher.register(
                 CommandManager.literal("embedding")
-                        // existing get_init (kept as-is)
+                        // Compatibility alias, now nonblocking.
                         .then(CommandManager.literal("get_init")
                                 .then(CommandManager.argument("slot", StringArgumentType.string())
                                         .suggests(SLOT_SUGGESTIONS)
@@ -122,12 +191,12 @@ public class EmbeddingCommand {
         if (itemVec.isEmpty()) return 0;
 
         KnnIndex spatial = SpatialEmbeddingIndexState.get(player.getServer()).getIndex();
-        List<Pair<String, Float>> res = spatial.kNN(1, itemVec.get(), Metric.COSINE);
+        List<IndexPair<String, Float>> res = spatial.kNN(1, itemVec.get(), Metric.COSINE);
         if (res.isEmpty()) {
             ctx.getSource().sendFeedback(() -> Text.literal("No spatial regions indexed yet.").formatted(Formatting.YELLOW), false);
             return 1;
         }
-        Pair<String, Float> top = res.get(0);
+        IndexPair<String, Float> top = res.get(0);
         ctx.getSource().sendFeedback(() -> Text.literal(String.format("Best region: %s (dot=%.4f)", top.getKey(), top.getValue()))
                 .formatted(Formatting.AQUA), false);
         return 1;
@@ -142,7 +211,7 @@ public class EmbeddingCommand {
         if (itemVec.isEmpty()) return 0;
 
         KnnIndex spatial = SpatialEmbeddingIndexState.get(player.getServer()).getIndex();
-        List<Pair<String, Float>> results = spatial.kNN(k, itemVec.get(), Metric.COSINE);
+        List<IndexPair<String, Float>> results = spatial.kNN(k, itemVec.get(), Metric.COSINE);
         results.sort((a, b) -> Float.compare(b.getValue(), a.getValue()));
 
         if (results.isEmpty()) {
@@ -152,7 +221,7 @@ public class EmbeddingCommand {
 
         ctx.getSource().sendFeedback(() -> Text.literal("Top " + results.size() + " regions (DOT):").formatted(Formatting.AQUA), false);
         int i = 1;
-        for (Pair<String, Float> p : results) {
+        for (IndexPair<String, Float> p : results) {
             String line = String.format("#%d  %.4f  %s", i++, p.getValue(), p.getKey());
             ctx.getSource().sendFeedback(() -> Text.literal(line), false);
         }
@@ -167,7 +236,7 @@ public class EmbeddingCommand {
         if (itemVec.isEmpty()) return 0;
 
         SpatialEmbeddingIndexState spatialState = SpatialEmbeddingIndexState.get(player.getServer());
-        List<Pair<String, Float>> res = spatialState.getIndex().kNN(1, itemVec.get(), Metric.COSINE);
+        List<IndexPair<String, Float>> res = spatialState.getIndex().kNN(1, itemVec.get(), Metric.COSINE);
         if (res.isEmpty()) {
             ctx.getSource().sendFeedback(() -> Text.literal("No spatial regions indexed yet.").formatted(Formatting.YELLOW), false);
             return 1;
@@ -199,7 +268,7 @@ public class EmbeddingCommand {
             return 0;
         }
 
-        List<Pair<String, Float>> results = spatial.getIndex().kNN(k + 1, regionVec.get(), Metric.COSINE);
+        List<IndexPair<String, Float>> results = spatial.getIndex().kNN(k + 1, regionVec.get(), Metric.COSINE);
         // drop self if present
         results = results.stream()
                 .filter(p -> !p.getKey().equals(currentRegionId))
@@ -214,7 +283,7 @@ public class EmbeddingCommand {
 
         ctx.getSource().sendFeedback(() -> Text.literal("Nearest regions to current chunk:").formatted(Formatting.AQUA), false);
         int i = 1;
-        for (Pair<String, Float> p : results) {
+        for (IndexPair<String, Float> p : results) {
             String line = String.format("#%d  %.4f  %s", i++, p.getValue(), p.getKey());
             ctx.getSource().sendFeedback(() -> Text.literal(line), false);
         }
@@ -234,7 +303,7 @@ public class EmbeddingCommand {
         }
 
         ItemEmbeddingIndexState itemState = ItemEmbeddingIndexState.get(player.getServer());
-        List<Pair<String, Float>> results = itemState.getIndex().kNN(k, regionVec.get(), Metric.COSINE);
+        List<IndexPair<String, Float>> results = itemState.getIndex().kNN(k, regionVec.get(), Metric.COSINE);
         results.sort((a, b) -> Float.compare(b.getValue(), a.getValue()));
 
         if (results.isEmpty()) {
@@ -244,7 +313,7 @@ public class EmbeddingCommand {
 
         ctx.getSource().sendFeedback(() -> Text.literal("Top " + results.size() + " items related to this chunk:").formatted(Formatting.AQUA), false);
         int i = 1;
-        for (Pair<String, Float> p : results) {
+        for (IndexPair<String, Float> p : results) {
             String id = p.getKey();
             String pretty = id;
             try {
@@ -352,7 +421,7 @@ public class EmbeddingCommand {
             return 0;
         }
 
-        List<Pair<String, Float>> results = index.kNN(k, query, Metric.COSINE);
+        List<IndexPair<String, Float>> results = index.kNN(k, query, Metric.COSINE);
         if (results.isEmpty()) {
             src.sendFeedback(() -> Text.literal("No neighbors found (index empty?)").formatted(Formatting.YELLOW), false);
             return 1;
@@ -363,7 +432,7 @@ public class EmbeddingCommand {
                 .formatted(Formatting.AQUA), false);
 
         int rank = 1;
-        for (Pair<String, Float> p : results) {
+        for (IndexPair<String, Float> p : results) {
             String id = p.getKey();
             float score = p.getValue();
 
@@ -435,41 +504,63 @@ public class EmbeddingCommand {
             return 1;
         }
 
+        // Registry/tag capture must stay on the server thread, not in the model callback.
+        String id = Registries.ITEM.getId(itemStack.getItem()).toString();
+        var tags = Registries.ITEM.getEntry(itemStack.getItem()).streamTags().map(t -> t.id().toString()).toList();
+        return query(source, io.github.mysticism.embedding.CanonicalDescriptors.item(id, tags));
+    }
+
+    private static int query(ServerCommandSource source, String descriptor) throws CommandSyntaxException {
+        ServerPlayerEntity player = source.getPlayerOrThrow();
         if (!EmbeddingHelper.isReady()) {
-            source.sendError(Text.literal("Embedding service is not ready yet. Please wait for initialization to complete."));
+            source.sendError(Text.literal("Embedding service unavailable: " + EmbeddingHelper.getInitializationStatus()));
             return 0;
         }
-
-        String itemName = itemStack.getName().getString();
-        try {
-            Vec384f embeddingObj = EmbeddingHelper.getEmbedding(itemName).get();
-            float[] embedding = embeddingObj.data();
-
-            source.sendFeedback(() -> Text.literal("Item: ").formatted(Formatting.AQUA)
-                    .append(Text.literal(itemName).formatted(Formatting.WHITE))
-                    .append(Text.literal(" (Slot: " + slotName + ")").formatted(Formatting.GRAY)), false);
-
-            source.sendFeedback(() -> Text.literal("Embedding Vector Dimensionality: " + embedding.length).formatted(Formatting.GREEN), false);
-            source.sendFeedback(() -> Text.literal("Embedding Vector Dimensionality: " + embeddingObj.length()).formatted(Formatting.GREEN), false);
-
-            StringBuilder embeddingStr = new StringBuilder();
-            embeddingStr.append("[");
-            int displayCount = Math.min(10, embedding.length);
-            for (int i = 0; i < displayCount; i++) {
-                if (i > 0) embeddingStr.append(", ");
-                embeddingStr.append(String.format("%.4f", embedding[i]));
-            }
-            if (embedding.length > displayCount) {
-                embeddingStr.append(", ... (").append(embedding.length - displayCount).append(" more)");
-            }
-            embeddingStr.append("]");
-
-            source.sendFeedback(() -> Text.literal("Embedding: ").formatted(Formatting.GOLD)
-                    .append(Text.literal(embeddingStr.toString()).formatted(Formatting.WHITE)), false);
-
-    //        Mysticism.LOGGER.info("Full embedding for '{}': {}", itemName, Arrays.toString(embedding));
-
-        } catch (Throwable ignored) { };
+        if (descriptor.isBlank() || descriptor.length() > 8192) {
+            source.sendError(Text.literal("Descriptor must contain 1–8192 characters."));
+            return 0;
+        }
+        var server = source.getServer();
+        UUID id = player.getUuid();
+        var dimension = player.getWorld().getRegistryKey();
+        var profile = EmbeddingHelper.profile();
+        CompletableFuture<Vec384f> request = EmbeddingHelper.getEmbedding(descriptor);
+        if (!QUERIES.track(server, id, request)) {
+            request.cancel(false);
+            source.sendError(Text.literal("Embedding command queue is full; please retry."));
+            return 0;
+        }
+        source.sendFeedback(() -> Text.literal("Embedding query queued (" + profile.fingerprint() + ")."), false);
+        request.whenComplete((value, error) -> {
+            // No entity, registry, command-source or world access on the embedding worker.
+            if (request.isCancelled() || server.isStopping()) return;
+            server.execute(() -> {
+                if (!QUERIES.finish(server, id, request)) return;
+                if (server.isStopping() || server.getPlayerManager().getPlayer(id) != player) return;
+                if (!player.getWorld().getRegistryKey().equals(dimension)) {
+                    source.sendError(Text.literal("Embedding query cancelled after dimension change."));
+                    return;
+                }
+                if (!profile.equals(EmbeddingHelper.profile())) {
+                    source.sendError(Text.literal("Embedding profile changed; please retry."));
+                    return;
+                }
+                if (error != null) {
+                    source.sendError(Text.literal("Embedding query failed: " + error.getClass().getSimpleName()));
+                    return;
+                }
+                try {
+                    EmbeddingSpace.requireCurrent(value);
+                    float[] vector = value.data();
+                    StringJoiner preview = new StringJoiner(", ", "[", ", …]");
+                    for (int i = 0; i < Math.min(10, vector.length); i++)
+                        preview.add(String.format(Locale.ROOT, "%.4f", vector[i]));
+                    source.sendFeedback(() -> Text.literal("Embedding: " + vector.length + " dimensions " + preview), false);
+                } catch (RuntimeException invalid) {
+                    source.sendError(Text.literal("Embedding query returned an invalid current-profile vector."));
+                }
+            });
+        });
         return 1;
     }
 

@@ -7,6 +7,7 @@ import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
 public final class SpiritNetworking {
     public static void init() {
         PayloadTypeRegistry.playS2C().register(SpiritDeltaPayload.ID, SpiritDeltaPayload.CODEC);
+        PayloadTypeRegistry.playS2C().register(SpiritFramePayload.ID, SpiritFramePayload.CODEC);
         // (Register C2S payloads here if you add them later)
     }
 }

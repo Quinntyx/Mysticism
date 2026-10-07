@@ -18,8 +18,13 @@ public final class EmbeddingHelper {
         try{
             provider=new EmbeddingService();
             engine=new AsyncEmbeddingEngine(provider,threads,256,8192,Duration.ofMillis(Long.getLong("mysticism.embedding.deadlineMillis",30000)));
-            readiness=engine.readiness();failure="Initializing";
-            readiness.whenComplete((v,e)->{failure=e==null?"Ready":"Unavailable: "+e;});
+            AsyncEmbeddingEngine started=engine;
+            readiness=started.readiness();failure="Initializing";
+            readiness.whenComplete((v,e)->{
+                synchronized(EmbeddingHelper.class){
+                    if(engine==started)failure=e==null?"Ready":"Unavailable: "+e;
+                }
+            });
         }catch(Throwable t){
             if(provider!=null)try{provider.close();}catch(Throwable closing){t.addSuppressed(closing);}
             failure="Unavailable: "+t;readiness=CompletableFuture.failedFuture(t);
@@ -30,7 +35,15 @@ public final class EmbeddingHelper {
     public static boolean isReady(){AsyncEmbeddingEngine e=engine;return e!=null && e.isReady();}
     /** Compatibility only. Never call on a server tick/startup thread. */
     public static void awaitReady(){readiness.join();}
-    public static synchronized void shutdown(){AsyncEmbeddingEngine e=engine;engine=null;if(e!=null)e.close();readiness=CompletableFuture.failedFuture(new IllegalStateException("Embeddings stopped"));failure="Stopped";}
+    public static void shutdown(){
+        AsyncEmbeddingEngine stopped;
+        synchronized(EmbeddingHelper.class){
+            stopped=engine;engine=null;
+            readiness=CompletableFuture.failedFuture(new IllegalStateException("Embeddings stopped"));failure="Stopped";
+        }
+        // Provider close and future delivery must not run while holding the shared lifecycle lock.
+        if(stopped!=null)stopped.close();
+    }
     public static CompletableFuture<Vec384f> getEmbedding(String descriptor){AsyncEmbeddingEngine e=engine;return e==null?CompletableFuture.failedFuture(new IllegalStateException("Embeddings unavailable")):e.embed(descriptor);}
     public static Optional<Vec384f> getEmbeddingBlocking(String descriptor){try{return Optional.of(getEmbedding(descriptor).get());}catch(InterruptedException e){Thread.currentThread().interrupt();return Optional.empty();}catch(Exception e){return Optional.empty();}}
     public static CompletableFuture<Vec384f> composeDescriptors(List<DescriptorVectors.WeightedDescriptor> descriptors){return DescriptorVectors.embed(descriptors);}
