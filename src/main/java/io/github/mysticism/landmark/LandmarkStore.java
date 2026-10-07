@@ -36,6 +36,10 @@ public final class LandmarkStore extends PersistentState {
     private transient PendingMutation pending;
     private transient Path dataDirectory;
     private transient GeometryRead activeRead;
+    private transient long ownershipRevision;
+    /** Runtime snapshot stamp for source masks/aliases/catalogue; activity-only CAS retains it.
+     * Not a save-schema version. Compare only against this same store instance. */
+    public long ownershipRevision(){checkThread();return ownershipRevision;}
     public static final int DECODED_PAGE_LIMIT=8, DECODED_LEAF_LIMIT=65536;
     private final LinkedHashMap<String,CachedPage> decoded=new LinkedHashMap<>(16,0.75f,true);
     private final LinkedHashMap<String,LandmarkMetadata> metadataCache=new LinkedHashMap<>(16,0.75f,true);
@@ -147,7 +151,7 @@ public final class LandmarkStore extends PersistentState {
     private int sourceGeneration;
     public boolean usesNativeSourceProfile(EmbeddingProfile current){checkThread();return sourceGeneration==2&&(profile==null||profile.equals(current));}
     public void clearGeneratedIfIncompatible(EmbeddingProfile current) {
-        checkThread();if(sourceGeneration!=2 || profile!=null && !profile.equals(current)){unlocked();records.clear();aliases.clear();tombstones.clear();lineage.clear();decoded.clear();metadataCache.clear();residentLeaves=0;profile=current;sourceGeneration=2;markDirty();}
+        checkThread();if(sourceGeneration!=2 || profile!=null && !profile.equals(current)){unlocked();records.clear();aliases.clear();tombstones.clear();lineage.clear();decoded.clear();metadataCache.clear();residentLeaves=0;profile=current;sourceGeneration=2;ownershipRevision++;markDirty();}
     }
     /** Resumable semantic admission; no total-catalogue cap or hydration. */
     public SourceRangePage semanticRangePage(LandmarkEmbedding current,double radius,String afterId,int maxResults,int maxScanned) {
@@ -276,7 +280,7 @@ public final class LandmarkStore extends PersistentState {
         List<PageWrite> writes=new ArrayList<>();
         for(String key:old.geometryKeys()) writes.add(new PageWrite(key,null)); // required immutable references; never recreated
         writes.add(new PageWrite(recordKey(next),()->LandmarkNbt.encodeMetadata(next)));
-        pending=new PendingMutation(List.copyOf(writes),List.of(next),Set.of(),Map.of(),Map.of(),Map.of(),profile); return pending;
+        pending=new PendingMutation(List.copyOf(writes),List.of(next),Set.of(),Map.of(),Map.of(),Map.of(),profile);pending.changesSource=false; return pending;
     }
     /** Metadata/CAS merge with opaque references. Distinct page AABBs must be disjoint;
      * overlapping masks require the reconciled overload. Validation is budgeted by advance. */
@@ -394,7 +398,7 @@ public final class LandmarkStore extends PersistentState {
         private final List<Bounds> validatedBounds=new ArrayList<>();
         private long validatedLeaves;
         public long validatedLeaves() { checkThread(); return validatedLeaves; }
-        private boolean complete,cancelled;
+        private boolean complete,cancelled,changesSource=true;
         private PendingMutation(List<PageWrite> writes,List<LandmarkMetadata> values,Set<String> removals,Map<String,String> newAliases,Map<String,Long> retired,Map<String,List<String>> history,EmbeddingProfile nextProfile) {
             this.writes=writes; this.values=values; this.removals=removals; this.newAliases=newAliases; this.retired=retired; this.history=history; this.nextProfile=nextProfile;
         }
@@ -444,6 +448,7 @@ public final class LandmarkStore extends PersistentState {
                 removals.forEach(records::remove); for(LandmarkMetadata l:values) records.put(l.id(),new Ref(recordKey(l),l.revision()));
                 aliases.putAll(newAliases); tombstones.putAll(retired); lineage.putAll(history); profile=nextProfile;
                 for(String id:List.copyOf(aliases.keySet())) aliases.put(id,resolve(id));
+                if(changesSource)ownershipRevision++;
                 markDirty(); complete=true; pending=null; worked++;
             }
             return worked;

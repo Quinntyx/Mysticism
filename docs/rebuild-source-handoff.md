@@ -40,6 +40,25 @@ Call on server thread. Normal completions return on server thread; shutdown/unlo
 - Disposable old source-generation/catalogue and derived influences are discarded together. Current native source saves retain records, aliases and revisions. Player stats/inventory/source chunks are never cleared.
 - Lifecycle cancellation: player activity disconnect/respawn/dimension changes; source chunk unload/edit invalidates an active snapshot; dimension unload/server stop cancel reads, worker jobs, pending mutations and release activity pauses.
 
+## Exact region ownership hook for TERRAIN (follow-up to terrain 87510e0)
+
+```java
+public static CompletableFuture<SourceOwnership.Region> SourceLandmarks.owners(
+    MinecraftServer server, String dimension, Bounds sourceBounds, int maxCells);
+// SourceOwnership.Region:
+String dimension(); Bounds bounds(); long ownershipRevision();
+Map<BlockPos,String> owners(); Optional<String> ownerAt(BlockPos position);
+boolean isCurrent(MinecraftServer server);
+```
+
+Call on server thread after normal source init. Result is an immutable map of exact native source blocks to canonical source IDs. Both observed AIR and SOLID octree leaves count; UNKNOWN/unowned blocks have **no entry**. AABBs only select candidate/page IO, never assign ownership. Full requested volume must fit `maxCells <=32768`; no partial/truncated success. Conflict between different source masks fails rather than guessing. No source-world access, chunk loads, inference, or readiness dependency. Completed maps are detached immutable snapshots; `isCurrent(server)` checks same store instance and a runtime source-topology stamp. Creation, growth, transfer, merge, split, delete or reset invalidates old maps; activity-only CAS does not. This adds no saved schema/migration.
+
+One ownership request advances/server tick alongside extraction: <=4 metadata records **or** <=1 geometry page with <=512 reconstructed leaves **or** <=256 octree node visits/128 staged leaves **or** <=256 block-map insertions. Queue <=8 including the active request; at most one retained page and 128 staged leaf ranges. Cancellation is polled on tick; dimension unload/server stop cancel queued/active reads and release the shared repository geometry cursor. A concurrent source publication fails the request as stale; consumer re-requests. Cold NBT IO remains synchronous and page-bounded, not a hard wall-clock guarantee. Entire catalogue traversal is resumable; a large catalogue or shared reader contention can delay completion.
+
+**Terrain consumption required (not edited in SOURCE worktree):** request this mask for the exact local/target sliding source bounds in parallel with `region(...)`, retaining/cancelling the future with the Window/session. Check `mask.isCurrent(server)` and matching dimension/bounds before publishing labels or granting support/exit. Label each unit source sample from `mask.ownerAt(pos)`, never from `Window.id`; absent means empty/unowned, not retained-owner permission. Compaction must not merge different owner IDs or owned with unowned voxels: split nonuniform ownership down to unit cells. `sourcePosition` must verify actual mapped foot/body sample ownership against the resolved retained ID; support must use the actual floor-contact cell's map owner, and exit must fail while ownership is absent/stale/outside the queried region. Replace the AABB-only authority check at SpiritTerrainService.sourcePosition (terrain 87510e0 lines 136–141). Do not retune/re-anchor from a changed owner. Current authoritative map is usable only within its requested bounds; refresh after walking outside or topology invalidation.
+
+No tests/build run for this bounded hook, per parent instruction. Terrain wiring remains TERRAIN-owned; this SOURCE commit supplies the callable API, not a claim that terrain has already consumed it.
+
 ## Review correction: source/activity reconciliation
 
 `SpiritActivityService.prepareSourceUpdate(server, before, after)` returns the existing `LandmarkExtractionService.TopologyPlan`. SourceLandmarks acquires the activity mutation pause before computing the importance-limited source update; prepares the overlay correction before `stagePut`; commits it immediately after the core source publication and before completing the request; cancels it on failure/unload/shutdown. It applies `effective + (newBase - oldBase)` and normalizes, preserving the prior activity residual, importance mass/timestamps, owners and immutable claims. No-change source vectors do not repeatedly erase personality history. Revision/overlay identity checks reject stale publication. This closes the reviewed bug where an existing persisted activity vector permanently masked source changes. No additional tests or Gradle were run for this correction.
