@@ -290,6 +290,11 @@ public final class SpiritNavigationService {
         }
         var component = p.getComponent(MysticismEntityComponents.LATENT_BASIS);
         Basis384f destination = nav.targetBasis();
+        final float acquisitionDistanceSquared = .0005f * .0005f;
+        // A source-grid basis cannot pursue displacement perpendicular to its span. Keep ordinary
+        // movement-dependent pursuit until the FULL residual is already inside the acquisition band.
+        // This conservative gate also allows stationary alignment without locking in an unreachable q.
+        if (distance > acquisitionDistanceSquared) { endApproach(p, s); return false; }
         if (s.landingFrom == null) { s.landingFrom = component.get().clone(); s.landingTick = 0; }
         if (!nav.landingApproach()) { nav.setLandingApproach(true); sync(p); }
         if (s.landingTick < 40) {
@@ -307,11 +312,13 @@ public final class SpiritNavigationService {
         }
         TraversalSteering.advance(q, component.get(), delta.x, delta.y, delta.z);
         distance = q.squareDistance(target);
-        if (distance > .035f * .035f) { endApproach(p, s); return true; }
-        // 3.36 blocks is APPROACH radius, not permission to replace q or jump onto another floor.
+        // Movement during partial alignment can create a new perpendicular residual. Release the
+        // approach immediately; resume ordinary pursuit next tick without advancing q twice this tick.
+        if (distance > acquisitionDistanceSquared) { endApproach(p, s); return true; }
+        // 3.36 blocks is eligibility radius, not permission to replace q or jump onto another floor.
         // Acquisition requires <=4.8 cm semantic residual and an already-aligned, visible real target floor.
         Basis384f current = component.get();
-        if (s.landingTick < 40 || distance > .0005f * .0005f
+        if (s.landingTick < 40 || distance > acquisitionDistanceSquared
                 || current.i.squareDistance(destination.i) > 1e-8f || current.j.squareDistance(destination.j) > 1e-8f
                 || current.k.squareDistance(destination.k) > 1e-8f) return true;
         var support = SpiritTerrainService.support(p);
