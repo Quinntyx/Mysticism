@@ -138,8 +138,8 @@ public final class MeshCollision {
     public static boolean clearRay(ServerPlayerEntity player,Vec3d from,Vec3d to) {
         Index i=index(player);return i!=null && from.distanceTo(to)<=128 && i.clearRay(from,to);
     }
-    /** Reject unsafe affine motion through the local body before publishing BOTH visible/collision geometry.
-     * Long/ambiguous sweeps are conservatively held; tiny transforms are sampled at <=2cm and strict body penetration checked. */
+    /** Conservative continuous affine-motion guard: the union of endpoint AABBs contains EVERY intermediate
+     * vertex under linear affine interpolation. An ambiguous swept/body overlap is held, never sampled through. */
     public static boolean transitionClear(TerrainMeshFrame old,TerrainMeshFrame next,Box body) {
         if(old==null)return true;
         Map<Long,TerrainMeshFrame.Cell> previous=new HashMap<>();for(var c:old.cells())previous.put(c.key(),c);
@@ -150,16 +150,10 @@ public final class MeshCollision {
                     && c.axisZ().equals(before.axisZ()) && c.collision().equals(before.collision()))continue;
             if(!c.bounds().intersects(local) && (before==null || !before.bounds().intersects(local)))continue;
             if(before==null) {for(Box b:c.collision())if(penetration(strict,new Shape(c,b,c.bounds(b)))!=null)return false;continue;}
-            double motion=0;for(int corner=0;corner<8;corner++)motion=Math.max(motion,c.point(corner&1,(corner>>1)&1,(corner>>2)&1)
-                    .distanceTo(before.point(corner&1,(corner>>1)&1,(corner>>2)&1)));
-            Box swept=c.bounds().union(before.bounds());if(!swept.intersects(strict))continue;
-            if(motion>.32)return false;
-            int steps=Math.max(1,(int)Math.ceil(motion/.02));
-            for(int step=1;step<=steps;step++) {
-                double t=(double)step/steps;
-                var blend=new TerrainMeshFrame.Cell(c.key(),c.material(),c.landmarkId(),c.sourceMin(),before.min().lerp(c.min(),t),c.size(),
-                        before.axisX().lerp(c.axisX(),t),before.axisY().lerp(c.axisY(),t),before.axisZ().lerp(c.axisZ(),t),c.color(),c.light(),c.opacity(),c.collision());
-                for(Box b:blend.collision())if(penetration(strict,new Shape(blend,b,blend.bounds(b)))!=null)return false;
+            if(c.collision().isEmpty())continue;
+            for(Box collision:c.collision()) {
+                Box swept=c.bounds(collision).union(before.bounds(collision));
+                if(swept.intersects(strict))return false;
             }
         }
         return true;
