@@ -188,6 +188,20 @@ public final class WalkFlightHandoffTest {
         check(text.contains("deliverVelocity(p, Vec3d.ZERO)"), "Expiry stop is delivered, not only set server-side");
         check(text.contains("EntityVelocityUpdateS2CPacket"), "Delivery uses the self EntityVelocityUpdate packet channel");
         check(text.contains("handoffDue"), "Handoff is gated on the navigation-mode transition");
+        check(text.contains("s.movement.handoff(p.getServer().getTicks(), p.getVelocity(), deep,"),
+                "Service uses accepted player movement, not just unsynchronized server velocity");
+        check(text.contains("session(p).movement.record(p.getServer().getTicks(), before, p.getPos())"),
+                "Sample comes from the actual accepted carrier pose, not the packet destination");
+        check(text.contains("s.movement.clear()"), "Explicit stops/handoffs invalidate their old motion samples");
+        String mixin = Files.readString(source.getParent().getParent().resolve("mixin/SpiritFlightToggleMixin.java"));
+        check(mixin.contains("@Inject(method = \"onPlayerMove\", at = @At(\"TAIL\"))")
+                        && mixin.contains("recordAcceptedMovement(player, mysticism$beforeMove)"),
+                "Registered server mixin records only the accepted handler tail");
+        check(mixin.contains("forceMainThread(") && mixin.contains("shift = At.Shift.AFTER"),
+                "Before-pose snapshot runs after the server-thread guard, never on Netty");
+        check(mixin.contains("requestTeleport(DDDFFLjava/util/Set;)V")
+                        && mixin.contains("resetHandoffMotion(player)"),
+                "Teleports and rejected-move corrections invalidate accepted momentum");
         int deliveries = text.split("deliverVelocity\\(", -1).length - 1;
         check(deliveries >= 3, "Delivery definition plus handoff/expiry call sites all present (found " + deliveries + " references)");
     }

@@ -46,6 +46,7 @@ public final class SpiritNavigationService {
         int unsupported, blendTick, landingTick, supportTick, supportAlignTick;
         boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, jumping, supportPending;
         Boolean handedDeep; // null = navigation never handed this session off; else last handed mode.
+        final AcceptedPlayerMovement movement = new AcceptedPlayerMovement();
         Vec384f targetSnapshot, supportTargetSnapshot;
         Basis384f supportFrom, supportGrid;
         long supportWindow;
@@ -137,11 +138,27 @@ public final class SpiritNavigationService {
             // Every mode switch hands off a stable usable velocity: bounded momentum into flight, and a
             // zeroed standing velocity when walk acquisition validated ground contact (a residual flight
             // descent would clip the fresh mesh and bounce out via depenetration — visible rubber banding).
-            p.setVelocity(deep ? WalkFlightHandoff.toFlight(p.getVelocity())
-                    : WalkFlightHandoff.toWalk(p.getVelocity(), MeshCollision.ground(p).isPresent()));
+            // Ordinary player-move packets update the accepted pose, NOT server horizontal velocity.
+            // Use recent accepted displacement (including the tick before a double-jump packet), so
+            // sending the handoff to the owner cannot cancel a moving client's walk/sprint momentum.
+            p.setVelocity(s.movement.handoff(p.getServer().getTicks(), p.getVelocity(), deep,
+                    !deep && MeshCollision.ground(p).isPresent()));
+            s.movement.clear();
             deliverVelocity(p, p.getVelocity());
         }
         if (abilitiesChanged || handoff) p.sendAbilitiesUpdate();
+    }
+
+    /** Invoked at the successful tail of vanilla's onPlayerMove, after validation/collision acceptance. */
+    public static void recordAcceptedMovement(ServerPlayerEntity p, Vec3d before) {
+        if (spirit(p)) session(p).movement.record(p.getServer().getTicks(), before, p.getPos());
+    }
+
+    /** Teleports/corrections are not momentum; do not carry a previous sprint into the new carrier pose. */
+    public static void resetHandoffMotion(ServerPlayerEntity p) {
+        Map<UUID, Session> sessions = SERVERS.get(p.getServer());
+        Session s = sessions == null ? null : sessions.get(p.getUuid());
+        if (s != null) s.movement.clear();
     }
 
     /** setVelocity alone mutates only server state and the owning client never sees it. Deliver the
@@ -363,6 +380,7 @@ public final class SpiritNavigationService {
             // drifting the carrier while the player decides what to do next. Still deep; no substitute landing.
             // The stop is DELIVERED to the controlling client; setVelocity alone would not reach it.
             p.setVelocity(Vec3d.ZERO); p.fallDistance = 0;
+            s.movement.clear();
             deliverVelocity(p, Vec3d.ZERO);
             endSupportApproach(p, s);
             p.sendMessage(Text.literal("Walk request expired: current support could not be continuously aligned/owned. Still deep; no substitute landing."), true);
