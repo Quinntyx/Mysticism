@@ -22,8 +22,10 @@ public final class WalkRetryGate {
         blockedUntil = tick + cooldownTicks;
     }
 
-    /** Ticks until a new walk request is accepted; 0 when none is pending. */
+    /** Ticks until a new walk request is accepted; 0 when none is pending. A fresh gate has
+     * blockedUntil == Long.MIN_VALUE, so the subtraction must be guarded to avoid overflow. */
     public long remaining(long tick) {
+        if (tick >= blockedUntil) return 0;
         long remaining = blockedUntil - tick;
         return remaining < 0 ? 0 : remaining;
     }

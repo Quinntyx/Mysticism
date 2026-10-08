@@ -9,6 +9,17 @@ public final class WalkRetryGateTest {
     public static void main(String[] args) {
         var gate = new WalkRetryGate(60);
         check(gate.canRequest(1000), "Fresh gate must accept requests");
+        check(gate.remaining(1000) == 0 && gate.remaining(Long.MIN_VALUE) == 0,
+                "Fresh gate must report zero remaining (no Long.MIN_VALUE overflow)");
+        check(!gate.coolingDown(1000) && !gate.coolingDown(Long.MIN_VALUE),
+                "Fresh gate must not report an active cooldown");
+        String freshStatus = NavigationReport.snapshot()
+                .mode(true, true, true)
+                .walk(false, 0, 200, 0, 40, "", "")
+                .walkCooldown(gate.remaining(1000))
+                .text();
+        check(!freshStatus.contains("walk retry"),
+                "Fresh-gate status must not report a nonexistent retry cooldown: " + freshStatus);
         gate.failed(1000);
         check(!gate.canRequest(1000) && !gate.canRequest(1059), "Cooldown must refuse repeated requests before expiry");
         check(gate.canRequest(1060), "Cooldown must accept a request at expiry");
