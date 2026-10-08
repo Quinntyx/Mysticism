@@ -256,8 +256,13 @@ public final class SpiritNavigationService {
         if (state(p).supportApproach()) { state(p).setSupportApproach(false); sync(p); }
     }
 
-    /** Called once by the evolver. True permits ordinary deep movement integration. */
-    public static boolean update(ServerPlayerEntity p, Vec3d delta) {
+    /** Single-delta compatibility: identical delta for both roles (pre-split caller behavior). */
+    public static boolean update(ServerPlayerEntity p, Vec3d delta) { return update(p, delta, delta); }
+
+    /** Called once by the evolver. True permits ordinary deep movement integration. Never snaps q/pose/basis.
+     * physical drives real-movement navigation decisions (jump takeoff grace, blend cancel);
+     * semantic drives q/basis advancement and must match ClientLatentPredictor epoch filtering. */
+    public static boolean update(ServerPlayerEntity p, Vec3d physical, Vec3d semantic) {
         if (!spirit(p)) { if (state(p).active() || state(p).hasSavedAbilities()) deactivate(p); return false; }
         var nav = state(p); Session s = session(p); restoreAnchor(p, s);
         if (nav.hasShallowTarget() && !s.prefetched) {
@@ -288,20 +293,20 @@ public final class SpiritNavigationService {
             nav.shallow(source.dimension(), id, source.position());
             if (support.isPresent()) { s.unsupported = 0; s.jumping = false; }
             else {
-                if (s.unsupported == 0) s.jumping = delta.y > .01;
+                if (s.unsupported == 0) s.jumping = physical.y > .01;
                 if (++s.unsupported > 14 || !s.jumping) { enterDeep(p); return nav.deep() && s.semanticReady; }
             } // Ascending takeoff gets ordinary jump grace; walking over an edge gets immediate freeflight.
             flight(p, false);
             if (s.semanticReady && !anchoredNow) TraversalSteering.advance(p.getComponent(MysticismEntityComponents.LATENT_POS).get(),
-                    p.getComponent(MysticismEntityComponents.LATENT_BASIS).get(), delta.x, delta.y, delta.z);
+                    p.getComponent(MysticismEntityComponents.LATENT_BASIS).get(), semantic.x, semantic.y, semantic.z);
             if (p.getServer().getTicks() % 4 == 0) sync(p);
             return false;
         }
         flight(p, true);
-        if (s.supportPending) { attemptSupport(p, s, delta); return false; }
+        if (s.supportPending) { attemptSupport(p, s, semantic); return false; }
         if (!s.semanticReady) return false;
         if (s.blendTo != null) {
-            if (delta.lengthSquared() > 1e-5) { s.blendFrom = null; s.blendTo = null; }
+            if (physical.lengthSquared() > 1e-5) { s.blendFrom = null; s.blendTo = null; }
             else {
                 float fraction = ++s.blendTick / 20f;
                 p.getComponent(MysticismEntityComponents.LATENT_BASIS).set(TraversalSteering.blend(s.blendFrom, s.blendTo, fraction));
@@ -309,7 +314,7 @@ public final class SpiritNavigationService {
                 return false;
             }
         }
-        if (attemptLanding(p, s, delta)) return false; // Approach advanced q once, without ordinary basis steering.
+        if (attemptLanding(p, s, semantic)) return false; // Approach advanced q once, without ordinary basis steering.
         return nav.deep();
     }
     private static void restoreAnchor(ServerPlayerEntity p, Session s) {

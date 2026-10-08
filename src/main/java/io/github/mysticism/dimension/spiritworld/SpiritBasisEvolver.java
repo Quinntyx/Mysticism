@@ -14,6 +14,21 @@ import java.util.*;
 
 /** Per-player original movement-driven basis evolution. No global frame, target following or teleport drift. */
 public final class SpiritBasisEvolver {
+    /** Bounded PHYSICAL movement drives navigation decisions; epoch-filtered SEMANTIC movement drives q/basis integration. */
+    record TickMovement(Vec3d physical, Vec3d semantic) {}
+
+    /**
+     * Physical stays epoch-agnostic so real movement signals survive lifecycle transitions (a jump
+     * ascending on the tick after a shallow acquisition commit must keep its takeoff grace);
+     * semantic is zeroed across an epoch change so no transition-crossing movement is integrated,
+     * exactly matching ClientLatentPredictor.
+     */
+    static TickMovement tickMovement(Vec3d last, Vec3d now, Long recordedEpoch, long epoch) {
+        Vec3d physical = MotionAlignment.boundedDelta(last, now);
+        boolean continuous = recordedEpoch != null && recordedEpoch == epoch;
+        return new TickMovement(physical, continuous ? physical : Vec3d.ZERO);
+    }
+
     private static final Map<MinecraftServer, Map<UUID, Vec3d>> LAST_POS = new IdentityHashMap<>();
     private static final Map<MinecraftServer, Map<UUID, Long>> LAST_EPOCH = new IdentityHashMap<>();
     private static boolean initialized;
@@ -24,20 +39,21 @@ public final class SpiritBasisEvolver {
         Set<UUID> live = new HashSet<>();
         for (var p : server.getPlayerManager().getPlayerList()) {
             if (!p.getWorld().getRegistryKey().equals(SpiritTerrainService.WORLD)) {
-                positions.remove(p.getUuid()); epochs.remove(p.getUuid()); SpiritNavigationService.update(p, Vec3d.ZERO); continue;
+                positions.remove(p.getUuid()); epochs.remove(p.getUuid()); SpiritNavigationService.update(p, Vec3d.ZERO, Vec3d.ZERO); continue;
             }
             live.add(p.getUuid());
             long epoch = p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION).motionEpoch();
             Vec3d now = p.getPos(), last = positions.put(p.getUuid(), now);
             Long recorded = epochs.put(p.getUuid(), epoch);
-            // Mode changes and reconnects re-anchor both sides: the delta crossing a prediction-epoch
-            // change is re-anchored, never integrated, exactly like ClientLatentPredictor.
-            Vec3d delta = MotionAlignment.alignedDelta(last, now, recorded, epoch);
+            // Bounded physical movement feeds navigation (jump grace, blend cancel); the
+            // epoch-filtered delta feeds semantic integration only, exactly like the client.
+            TickMovement movement = tickMovement(last, now, recorded, epoch);
             var basis = p.getComponent(MysticismEntityComponents.LATENT_BASIS).get();
             var q = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
             var target = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target();
-            if (SpiritNavigationService.update(p, delta)) TraversalSteering.deepStep(q, basis, target, delta.x, delta.y, delta.z,
-                    p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION).hasShallowTarget());
+            if (SpiritNavigationService.update(p, movement.physical(), movement.semantic()))
+                TraversalSteering.deepStep(q, basis, target, movement.semantic().x, movement.semantic().y, movement.semantic().z,
+                        p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION).hasShallowTarget());
             // Periodic authoritative reconciliation also delivers touch interpolation to a stationary recipient.
             if (server.getTicks() % 4 == 0) {
                 MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p);

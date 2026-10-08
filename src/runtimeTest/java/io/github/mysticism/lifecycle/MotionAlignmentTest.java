@@ -18,6 +18,17 @@ public final class MotionAlignmentTest {
     public static void main(String[] args) {
         Vec3d a = new Vec3d(1, 2, 3), b = new Vec3d(1.5, 2, 3.25), step = b.subtract(a);
 
+        // Bounded PHYSICAL movement is epoch-agnostic: navigation decisions that consume real
+        // movement (jump takeoff grace, blend cancellation) must use it, never the filtered delta.
+        check(MotionAlignment.boundedDelta(a, b).equals(step), "bounded physical delta is real movement");
+        zero(MotionAlignment.boundedDelta(null, b), "tracking start re-anchors physical movement");
+        zero(MotionAlignment.boundedDelta(Vec3d.ZERO, new Vec3d(64, 0, 0)), "teleport is not physical movement");
+        zero(MotionAlignment.boundedDelta(Vec3d.ZERO, new Vec3d(Double.NaN, 0, 0)), "nonfinite is not physical movement");
+        check(MotionAlignment.boundedDelta(a, b).equals(MotionAlignment.alignedDelta(a, b, 7L, 7L)),
+                "within one epoch physical and semantic deltas coincide");
+        // ...and the epoch filter remains purely semantic.
+        zero(MotionAlignment.alignedDelta(a, b, 6L, 7L), "epoch change still drops the semantic delta");
+
         // Tracking start (fresh visit, reconnect, first tracked tick): re-anchor, never integrate.
         zero(MotionAlignment.alignedDelta(null, b, null, 7), "null last position must re-anchor");
         zero(MotionAlignment.alignedDelta(a, b, null, 7), "null recorded epoch must re-anchor");
