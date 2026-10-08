@@ -3,6 +3,7 @@ package io.github.mysticism.navigation;
 import io.github.mysticism.activity.TraversalSteering;
 import io.github.mysticism.activity.SpiritActivityService;
 import io.github.mysticism.component.*;
+import io.github.mysticism.dimension.spiritworld.terrain.MeshCollision;
 import io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService;
 import io.github.mysticism.dimension.spiritworld.SpiritBasisEvolver;
 import io.github.mysticism.landmark.*;
@@ -41,8 +42,10 @@ public final class SpiritNavigationService {
     public static void installLandingSafety(LandingSafety safety) { landingSafety = Objects.requireNonNull(safety); }
     private SpiritNavigationService() {}
     private static final class Session {
-        int unsupported, blendTick, landingTick, supportTick, supportAlignTick;
+        int unsupported, blendTick, landingTick, supportTick, supportAlignTick, restingTicks;
         boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, jumping, supportPending;
+        /** Armed once this deep stretch has actually left the ground; natural landing never reverses a standing takeoff. */
+        boolean airborne, naturalSupport;
         Vec384f targetSnapshot, supportTargetSnapshot;
         Basis384f supportFrom, supportGrid;
         long supportWindow;
@@ -229,17 +232,40 @@ public final class SpiritNavigationService {
         Session s = session(p); restoreAnchor(p, s);
         flight(p, true); // remains deep/freeflight until the real terrain acquisition commits
         if (s.supportPending) return; // repeated packets cannot reset budgets or duplicate requests
+        beginSupportApproach(p, s, false);
+        p.sendMessage(Text.literal("Walk request: validating current source-owned support; flight remains active until ready."), true);
+    }
+    /** Shared trigger for explicit walk requests and natural resting landings; terrain validates everything. */
+    private static void beginSupportApproach(ServerPlayerEntity p, Session s, boolean natural) {
         endApproach(p, s); s.blendFrom = null; s.blendTo = null;
         s.supportPending = true; s.supportTick = 0; s.supportFrom = null;
         s.supportId = ""; s.supportDimension = "";
         s.supportTargetSnapshot = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target();
+        s.naturalSupport = natural; s.restingTicks = 0;
         state(p).setSupportApproach(true); sync(p);
-        p.sendMessage(Text.literal("Walk request: validating current source-owned support; flight remains active until ready."), true);
+    }
+    /** A deep-flying player who settles onto available owned custom terrain lands instead of hovering above support. */
+    private static void naturalLanding(ServerPlayerEntity p, Session s, Vec3d delta) {
+        var nav = state(p);
+        var ground = MeshCollision.ground(p);
+        if (ground.isEmpty()) { s.airborne = true; s.restingTicks = 0; return; }
+        if (!s.airborne) { s.restingTicks = 0; return; } // standing takeoff grace: flight continues until real airtime
+        boolean resting = ground.get().normal().y >= NaturalLandingPolicy.MIN_GROUND_NORMAL_Y
+                && delta.y <= NaturalLandingPolicy.MAX_REST_VERTICAL;
+        if (!resting) { s.restingTicks = 0; return; }
+        var action = NaturalLandingPolicy.evaluate(nav.deep(), s.airborne, s.supportPending, s.blendTo != null,
+                nav.landingApproach(), resting, s.restingTicks);
+        if (action != NaturalLandingPolicy.Action.LAND) { ++s.restingTicks; return; }
+        s.restingTicks = 0;
+        if (SpiritTerrainService.currentSupport(p).isEmpty()) return; // unknown/unowned geometry below keeps free flight
+        beginSupportApproach(p, s, true);
+        p.sendMessage(Text.literal("Landing on the source-owned terrain below."), true);
     }
     private static void endSupportApproach(ServerPlayerEntity p, Session s) {
         if (s.supportPending) SpiritTerrainService.cancelCurrentSupport(p);
         s.supportPending = false; s.supportTargetSnapshot = null; s.supportFrom = null; s.supportGrid = null;
         s.supportId = ""; s.supportDimension = ""; s.supportTick = 0; s.supportAlignTick = 0;
+        s.naturalSupport = false; s.airborne = false; s.restingTicks = 0;
         if (state(p).supportApproach()) { state(p).setSupportApproach(false); sync(p); }
     }
 
@@ -285,6 +311,7 @@ public final class SpiritNavigationService {
             return false;
         }
         flight(p, true);
+        naturalLanding(p, s, delta);
         if (s.supportPending) { attemptSupport(p, s, delta); return false; }
         if (!s.semanticReady) return false;
         if (s.blendTo != null) {
@@ -330,8 +357,11 @@ public final class SpiritNavigationService {
                 && delta.lengthSquared() <= 16)
             TraversalSteering.advance(q, component.get(), delta.x, delta.y, delta.z);
         if (++s.supportTick > 200) {
+            boolean natural = s.naturalSupport;
             endSupportApproach(p, s);
-            p.sendMessage(Text.literal("Walk request expired: current support could not be continuously aligned/owned. Still deep; no substitute landing."), true);
+            p.sendMessage(Text.literal(natural
+                    ? "Natural landing expired: current support could not be continuously aligned/owned. Still deep; lift off and descend again to retry."
+                    : "Walk request expired: current support could not be continuously aligned/owned. Still deep; no substitute landing."), true);
             return;
         }
         if (!s.semanticReady) return; // Real late source discovery must finish; never invent q.
