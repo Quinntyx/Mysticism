@@ -1,5 +1,6 @@
 package io.github.mysticism.movement;
 
+import io.github.mysticism.dimension.spiritworld.terrain.MeshCollision;
 import io.github.mysticism.dimension.spiritworld.terrain.MeshMovementValidation;
 import io.github.mysticism.dimension.spiritworld.terrain.TerrainMeshFrame;
 import net.minecraft.util.math.Box;
@@ -78,6 +79,40 @@ public final class SpiritFlightMeshValidationSelfTest {
         check(allows(other, new Vec3d(1.8, 0.5, 1.3)), "short moves stay admissible under the historical wall frame");
     }
 
+    private static void sustainedMovementAndReversals() {
+        UUID player = UUID.randomUUID();
+        UUID other = UUID.randomUUID();
+        var clientFrame = walled();
+        var index = new MeshCollision.Index(clientFrame);
+        Box body = BODY;
+        int wallContacts = 0;
+        try {
+            MeshMovementValidation.record(other, walled());
+            // Six sustained segments, repeatedly reversing horizontal/vertical input while a
+            // newer server frame disagrees with the older published frame used by prediction.
+            for (int segment = 0; segment < 6; segment++) {
+                Vec3d input = segment % 2 == 0 ? new Vec3d(.08, .01, .01) : new Vec3d(-.08, -.01, -.01);
+                for (int tick = 0; tick < 32; tick++) {
+                    MeshMovementValidation.record(player, clientFrame);
+                    MeshMovementValidation.record(player, frame(new TerrainMeshFrame.Cell(1, 0, "validation-test",
+                            new Vec3d(2, 0, 0), new Vec3d(1.5, 0, 0), new Vec3d(1, 3, 3),
+                            UNIT_X, UNIT_Y, UNIT_Z, 0xFFFFFFFF, 0, 1f, List.of(new Box(0, 0, 0, 1, 3, 3)))));
+                    Vec3d predicted = MeshCollision.predicted(index, body, input, true, false, 0);
+                    if (predicted.x < input.x - 1e-6) wallContacts++;
+                    Vec3d feet = new Vec3d((body.minX + body.maxX) / 2, body.minY, (body.minZ + body.maxZ) / 2);
+                    check(MeshMovementValidation.allowsMeshMove(player, body, feet.add(predicted), true),
+                            "published-frame prediction accepted throughout held input and reversal: " + segment + "/" + tick);
+                    body = body.offset(predicted); // accepted packets advance, never reset to their pre-move position
+                }
+            }
+            check(wallContacts > 0, "sustained flight actually reaches and slides along a custom mesh wall");
+            check(!allows(other, new Vec3d(5.3, .5, 1.3)), "another player's history cannot authorize crossing its wall");
+        } finally {
+            MeshMovementValidation.clear(player);
+            MeshMovementValidation.clear(other);
+        }
+    }
+
     private static void historyIsBounded() {
         UUID player = UUID.randomUUID();
         MeshMovementValidation.record(player, open());
@@ -95,6 +130,7 @@ public final class SpiritFlightMeshValidationSelfTest {
         wallCrossingRejected();
         safePredictionDivergenceTolerated();
         mismatchedFramesTolerated();
+        sustainedMovementAndReversals();
         historyIsBounded();
         System.out.println("SpiritFlightMeshValidationSelfTest: " + checks + " checks passed (handler-level mesh validation)");
     }

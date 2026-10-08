@@ -40,7 +40,9 @@ public abstract class SpiritFlightPredictionMixin {
     }
     @Redirect(method = "onPlayerMove",
             at = @At(value = "INVOKE", target = "Lnet/minecraft/server/network/ServerPlayNetworkHandler;isPlayerNotCollidingWithBlocks(Lnet/minecraft/world/WorldView;Lnet/minecraft/util/math/Box;DDD)Z"))
-    private boolean mysticism$meshMoveValidation(WorldView world, Box preMoveBox, double d, double e, double f) {
+    // The redirected invokevirtual consumes its handler receiver before the method arguments,
+    // even though vanilla invokes this gate on the same handler this mixin is applied to.
+    private boolean mysticism$meshMoveValidation(ServerPlayNetworkHandler handler, WorldView world, Box preMoveBox, double d, double e, double f) {
         if (!SpiritNavigationService.flightPredictionTolerance(player))
             return isPlayerNotCollidingWithBlocks(world, preMoveBox, d, e, f);
         // true = unsafe (vanilla teleports back); accepted only when the player's own recent
