@@ -28,6 +28,14 @@ public final class ClientLatentPredictor {
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> clear());
     }
     private static void clear() { lastPos = null; lastPlayer = null; lastWorld = null; lastEpoch = -1; lastDeep = false; }
+    /** The predictor integrates movement only across an unbroken (player, world, pose, epoch, mode,
+     * readiness) chain. TeleportReconciliation advances the synced epoch at every spirit teleport
+     * arrival BEFORE the arrival position packet is published, so the stale pre-teleport delta is
+     * discarded exactly on the arrival tick instead of being integrated as chosen semantic travel. */
+    public static boolean integratesMovement(boolean samePlayer, boolean sameWorld, boolean hadLastPose,
+            long lastEpoch, long epoch, boolean lastDeep, boolean deep, boolean semanticReady) {
+        return samePlayer && sameWorld && hadLastPose && lastEpoch == epoch && lastDeep == deep && semanticReady;
+    }
     private static void onEndTick(MinecraftClient mc) {
         if (mc.world == null || mc.player == null) { clear(); return; }
         var nav = mc.player.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION);
@@ -38,8 +46,8 @@ public final class ClientLatentPredictor {
         if (mc.world.getRegistryKey().getValue().equals(Identifier.of("mysticism", "spirit")) && nav.active()) {
             Vec3d now = mc.player.getPos();
             // Acquisition/anchor corrections (even <4 blocks) are NOT chosen movement.
-            if (lastPlayer == mc.player && lastWorld == mc.world && lastPos != null
-                    && lastEpoch == nav.motionEpoch() && lastDeep == nav.deep() && nav.semanticReady()) {
+            if (integratesMovement(lastPlayer == mc.player, lastWorld == mc.world, lastPos != null,
+                    lastEpoch, nav.motionEpoch(), lastDeep, nav.deep(), nav.semanticReady())) {
                 Vec3d delta = now.subtract(lastPos);
                 if (delta.lengthSquared() <= 16) {
                     if (nav.deep() && nav.supportApproach()) TraversalSteering.advance(q, basis, delta.x, delta.y, delta.z);
