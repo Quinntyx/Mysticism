@@ -107,8 +107,20 @@ public final class SpiritNavigationService {
         Session removed = sessions == null ? null : sessions.remove(p.getUuid());
         if (removed != null && removed.capture != null) removed.capture.cancel(false);
         if (removed != null && removed.supportPending) SpiritTerrainService.cancelCurrentSupport(p);
-        // Pending support ownership/alignment is session-local, never resumed from a saved/wire flag.
+        // Pending support ownership/alignment and landing approach are session-local,
+        // never resumed from a saved/wire flag.
         state(p).setSupportApproach(false);
+        state(p).setLandingApproach(false);
+    }
+    /** Repeated entry starts a brand-new movement/semantic lifecycle; no previous visit state survives. */
+    private static Session freshVisit(ServerPlayerEntity p) {
+        Map<UUID, Session> sessions = SERVERS.computeIfAbsent(p.getServer(), s -> new HashMap<>());
+        Session previous = sessions.put(p.getUuid(), new Session());
+        if (previous != null) {
+            if (previous.capture != null) previous.capture.cancel(false);
+            if (previous.supportPending) SpiritTerrainService.cancelCurrentSupport(p);
+        }
+        return sessions.get(p.getUuid());
     }
     private static void sync(ServerPlayerEntity p) { MysticismEntityComponents.SPIRIT_NAVIGATION.sync(p); }
     private static void deactivate(ServerPlayerEntity p) {
@@ -138,8 +150,9 @@ public final class SpiritNavigationService {
         if (!SpiritTerrainService.prepareEnter(p)) { deactivate(p); return false; }
         var mapped = SpiritTerrainService.sourcePosition(p);
         nav.shallow(dimension, mapped.map(SpiritTerrainService.SourcePosition::landmarkId).orElse(""), source);
-        Session s = session(p); s.semanticReady = false; s.checkedRestore = true;
-        nav.setSemanticReady(false); nav.setLandingApproach(false);
+        Session s = freshVisit(p); // stale blend/landing/support/jump state from any prior visit can never leak in
+        s.semanticReady = false; s.checkedRestore = true;
+        nav.setSemanticReady(false); nav.setLandingApproach(false); nav.setSupportApproach(false);
         s.confirmedOwned = false; s.warnedAnchor = false; s.prefetched = false;
         try {
             // Source-identical carrier pose: no shared origin, entry search or replacement floor.
@@ -302,6 +315,7 @@ public final class SpiritNavigationService {
     private static void restoreAnchor(ServerPlayerEntity p, Session s) {
         if (s.checkedRestore) return; s.checkedRestore = true;
         endSupportApproach(p, s);
+        endApproach(p, s); // a persisted landingApproach flag never resumes as an approach mid-flight
         var nav = state(p); Vec384f q = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
         // Physical pose survives model reset, but discarded q/IDs cannot authorize semantic travel.
         s.semanticReady = nav.active() && nav.semanticReady();
