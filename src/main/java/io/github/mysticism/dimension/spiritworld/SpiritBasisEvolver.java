@@ -29,7 +29,8 @@ public final class SpiritBasisEvolver {
             var basis = p.getComponent(MysticismEntityComponents.LATENT_BASIS).get();
             var q = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
             var target = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target();
-            if (SpiritNavigationService.update(p, delta)) TraversalSteering.deepStep(q, basis, target, delta.x, delta.y, delta.z);
+            if (SpiritNavigationService.update(p, delta)) TraversalSteering.deepStep(q, basis, target, delta.x, delta.y, delta.z,
+                    p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION).hasShallowTarget());
             // Periodic authoritative reconciliation also delivers touch interpolation to a stationary recipient.
             if (server.getTicks() % 4 == 0) {
                 MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p);

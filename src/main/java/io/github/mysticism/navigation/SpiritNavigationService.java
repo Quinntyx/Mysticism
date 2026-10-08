@@ -292,30 +292,35 @@ public final class SpiritNavigationService {
         var component = p.getComponent(MysticismEntityComponents.LATENT_BASIS);
         Basis384f destination = nav.targetBasis();
         final float acquisitionDistanceSquared = .0005f * .0005f;
-        // A source-grid basis cannot pursue displacement perpendicular to its span. Keep ordinary
-        // movement-dependent pursuit until the FULL residual is already inside the acquisition band.
-        // This conservative gate also allows stationary alignment without locking in an unreachable q.
+        // Keep ordinary movement-dependent pursuit until the FULL residual is inside the final band.
+        // Then use bounded movement-driven convergence, not source-basis-only translation: arbitrary
+        // continued movement must not recreate an unreachable perpendicular residual during alignment.
         if (distance > acquisitionDistanceSquared) { endApproach(p, s); return false; }
         if (s.landingFrom == null) { s.landingFrom = component.get().clone(); s.landingTick = 0; }
         if (!nav.landingApproach()) { nav.setLandingApproach(true); sync(p); }
-        if (s.landingTick < 40) {
-            Basis384f proposed = TraversalSteering.blend(s.landingFrom, destination, (s.landingTick + 1) / 40f);
-            // Reject a singular/antipodal interpolation jump rather than forcing the final basis.
-            Basis384f before = component.get();
-            if (before.i.squareDistance(proposed.i) > .01f || before.j.squareDistance(proposed.j) > .01f
-                    || before.k.squareDistance(proposed.k) > .01f) {
-                s.attemptedLanding = true; endApproach(p, s);
-                p.sendMessage(Text.literal("Captured source-grid alignment cannot transition continuously; remaining deep nearby."), false);
-                return false;
-            }
-            // Terrain must validate candidate geometry/body clearance before any basis change is applied.
-            if (safety.canAlign(p, proposed)) { component.set(proposed); ++s.landingTick; }
+        Basis384f proposed = s.landingTick < 40
+                ? TraversalSteering.blend(s.landingFrom, destination, (s.landingTick + 1) / 40f) : component.get();
+        // Reject a singular/antipodal interpolation jump rather than forcing the final basis.
+        Basis384f before = component.get();
+        if (before.i.squareDistance(proposed.i) > .01f || before.j.squareDistance(proposed.j) > .01f
+                || before.k.squareDistance(proposed.k) > .01f) {
+            s.attemptedLanding = true; endApproach(p, s);
+            p.sendMessage(Text.literal("Captured source-grid alignment cannot transition continuously; remaining deep nearby."), false);
+            return false;
         }
-        TraversalSteering.advance(q, component.get(), delta.x, delta.y, delta.z);
+        Vec384f original = q.clone(), candidate = q.clone();
+        TraversalSteering.approachStep(candidate, target, delta.x, delta.y, delta.z);
+        // The real terrain guard reads q from the component. Preview the bounded candidate on this
+        // server thread, restoring the ORIGINAL value/reference even if validation throws. No sync,
+        // event or publication occurs here; the guard must remain a query. Never assign target to q.
+        boolean clear;
+        q.converge(candidate, 1);
+        try { clear = safety.canAlign(p, proposed); }
+        finally { q.converge(original, 1); }
+        if (!clear) { endApproach(p, s); return false; } // normal deep pursuit remains available
+        component.set(proposed); q.converge(candidate, 1);
+        if (s.landingTick < 40) ++s.landingTick;
         distance = q.squareDistance(target);
-        // Movement during partial alignment can create a new perpendicular residual. Release the
-        // approach immediately; resume ordinary pursuit next tick without advancing q twice this tick.
-        if (distance > acquisitionDistanceSquared) { endApproach(p, s); return true; }
         // 3.36 blocks is eligibility radius, not permission to replace q or jump onto another floor.
         // Acquisition requires <=4.8 cm semantic residual and an already-aligned, visible real target floor.
         Basis384f current = component.get();
