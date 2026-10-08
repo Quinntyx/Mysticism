@@ -191,9 +191,13 @@ public final class LandmarkStore extends PersistentState {
     public boolean geometryReadAvailable(){checkThread();return activeRead==null;}
     public GeometryRead beginGeometryRead(String id) {return beginGeometryRead(id,null);}
     /** Bounds-gated cold geometry traversal: skip unrelated page leaves, one header per operation. */
-    public GeometryRead beginGeometryRead(String id,Bounds range) {
+    public GeometryRead beginGeometryRead(String id,Bounds range) {return beginGeometryRead(id,range,0);}
+    /** Resume only at a completed/skipped page boundary against the caller's immutable key list. */
+    public GeometryRead beginGeometryRead(String id,Bounds range,int nextPageIndex) {
         checkThread(); if(activeRead!=null) throw new IllegalStateException("another geometry read is active");
-        activeRead=new GeometryRead(metadata(id).orElseThrow(()->new IllegalStateException("missing landmark")),range); return activeRead;
+        LandmarkMetadata value=metadata(id).orElseThrow(()->new IllegalStateException("missing landmark"));
+        if(nextPageIndex<0 || nextPageIndex>value.geometryKeys().size()) throw new IllegalArgumentException("geometry page cursor");
+        activeRead=new GeometryRead(value,range,nextPageIndex); return activeRead;
     }
     /** One active read; batches hold <=8 pages. Drain before advancing. Budgets count cache hits too. */
     public final class GeometryRead {
@@ -204,7 +208,9 @@ public final class LandmarkStore extends PersistentState {
         private LandmarkNbt.GeometryDecoder decoder;
         private boolean cancelled;
         public boolean isCurrent() { checkThread(); Ref ref=records.get(metadata.id()); return ref!=null && ref.revision==metadata.revision(); }
-        private GeometryRead(LandmarkMetadata metadata,Bounds range) { this.metadata=metadata;this.range=range; }
+        private GeometryRead(LandmarkMetadata metadata,Bounds range,int nextPageIndex) { this.metadata=metadata;this.range=range;this.cursor=nextPageIndex; }
+        /** Does not advance while the current page is partially decoded. */
+        public int nextPageIndex() { checkThread(); return cursor; }
         public LandmarkMetadata metadata() { checkThread(); return metadata; }
         public boolean complete() { checkThread(); return cursor==metadata.geometryKeys().size(); }
         public int advance(int maxPages,int maxLeaves) {
