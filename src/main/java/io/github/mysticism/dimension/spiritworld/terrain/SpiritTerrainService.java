@@ -3,6 +3,7 @@ package io.github.mysticism.dimension.spiritworld.terrain;
 import io.github.mysticism.activity.SpiritActivityService;
 import io.github.mysticism.component.MysticismEntityComponents;
 import io.github.mysticism.navigation.SpiritNavigationService;
+import io.github.mysticism.navigation.WalkTargetAcquisition;
 import io.github.mysticism.landmark.*;
 import io.github.mysticism.landmark.extract.LandmarkProfiles;
 import io.github.mysticism.vector.*;
@@ -189,34 +190,134 @@ public final class SpiritTerrainService {
         @Override public Basis384f sourceBasis(){return sourceBasis.clone();}
         @Override public Vec384f sourceCoordinate(){return sourceCoordinate.clone();}
     }
-    private record WalkCandidate(Window field,WalkSupport support) {}
+    record WalkCandidate(Window field,WalkSupport support) {}
+    record DiscoveredWalkTarget(Window field,LandmarkMetadata metadata) {}
+    /** Server-facing reads/publication separated from the acquisition transaction for deterministic runtime regressions. */
+    interface WalkEnvironment {
+        boolean semanticReady();
+        Vec3d position();
+        Box boundingBox();
+        Basis384f basis();
+        Vec384f coordinate();
+        Optional<MeshCollision.Hit> ground();
+        Optional<LandmarkMetadata> metadata(String id);
+        Optional<String> exactOwner(Window w,Vec3d at);
+        long ownershipRevision(Window w);
+        void ensureProof(Window w,WalkSupport support);
+        void refreshBody(Window probe,Vec3d at);
+        List<SourceMeshBuilder.Node> compact(Window w);
+        BuiltMesh build(Session preview,long revision,Basis384f basis);
+        void accept(BuiltMesh built);
+        void publicationFailed();
+    }
+    private static WalkEnvironment walkEnvironment(ServerPlayerEntity p,Session s) {
+        return new WalkEnvironment() {
+            public boolean semanticReady(){return MysticismEntityComponents.SPIRIT_NAVIGATION.get(p).semanticReady();}
+            public Vec3d position(){return p.getPos();}
+            public Box boundingBox(){return p.getBoundingBox();}
+            public Basis384f basis(){return SpiritTerrainService.basis(p);}
+            public Vec384f coordinate(){return q(p);}
+            public Optional<MeshCollision.Hit> ground(){return MeshCollision.ground(p);}
+            public Optional<LandmarkMetadata> metadata(String id){return LandmarkStore.get(p.getServer()).metadata(id);}
+            public Optional<String> exactOwner(Window w,Vec3d at){return SpiritTerrainService.exactOwner(p,s,w,at);}
+            public long ownershipRevision(Window w){return w.owners.ownershipRevision();}
+            public void ensureProof(Window w,WalkSupport support){ensureWalkProof(p,s,w,support);}
+            public void refreshBody(Window probe,Vec3d at){ServerWorld world=world(p.getServer(),probe.dimension);if(world!=null)captureLoaded(world,probe,at,200,false);}
+            public List<SourceMeshBuilder.Node> compact(Window w){return SpiritTerrainService.compact(p.getServer(),w,w.origin);}
+            public BuiltMesh build(Session preview,long revision,Basis384f basis){return buildMesh(p,preview,revision,basis);}
+            public void accept(BuiltMesh built){acceptFrame(p,s,built);}
+            public void publicationFailed(){status(p,s,"Walking acquisition held: mesh publication failed.");}
+        };
+    }
     /** Current visible contact only; no target attraction, q replacement or remembered-entry rebinding. */
-    public static Optional<WalkSupport> currentSupport(ServerPlayerEntity p) {return walkCandidate(p).map(WalkCandidate::support);}
-    private static Optional<WalkCandidate> walkCandidate(ServerPlayerEntity p) {
-        Session s=session(p);
-        if(s==null || s.shallow || !MysticismEntityComponents.SPIRIT_NAVIGATION.get(p).semanticReady())return Optional.empty();
-        var hit=MeshCollision.ground(p);if(hit.isEmpty())return Optional.empty();
-        var cell=hit.get().cell();Window w=windowFor(s,cell);if(w==null)return Optional.empty();
-        Vec3d contact=p.getPos().add(0,.025-.15*hit.get().time(),0).subtract(hit.get().normal().multiply(.001));
-        Optional<String> owner=exactOwner(p,s,w,sourceContact(cell,contact));if(owner.isEmpty())return Optional.empty();
-        if(!owner.get().equals(ownerId(p,w)))return Optional.empty();
-        Vec3d feet=sourcePoint(cell,p.getPos());if(!ownedBody(p,s,w,feet,owner.get()))return Optional.empty();
+    public static Optional<WalkSupport> currentSupport(ServerPlayerEntity p) {
+        Session s=session(p);return s==null?Optional.empty():walkCandidate(s,walkEnvironment(p,s)).map(WalkCandidate::support);
+    }
+    static Optional<WalkCandidate> walkCandidate(Session s,WalkEnvironment env) {
+        if(s.shallow || !env.semanticReady())return Optional.empty();
+        var hit=env.ground();if(hit.isEmpty())return Optional.empty();
+        var cell=hit.get().cell();Window w=windowFor(s,cell);if(w==null || !retainedWalkWindow(s,w))return Optional.empty();
+        Vec3d contact=env.position().add(0,.025-.15*hit.get().time(),0).subtract(hit.get().normal().multiply(.001));
+        Optional<String> owner=env.exactOwner(w,sourceContact(cell,contact));if(owner.isEmpty())return Optional.empty();
+        var metadata=env.metadata(owner.get());if(metadata.isEmpty() || !metadata.get().header().dimension().equals(w.dimension))return Optional.empty();
+        // Producer binding is placement/provenance, not the exclusive owner of all its displayed cells.
+        // A different exact owner needs a discovery for THIS producer and a still-current geometry revision.
+        DiscoveredWalkTarget target=s.walkTarget;
+        if(!owner.get().equals(w.id) && (target==null || target.field()!=w
+                || !target.metadata().id().equals(owner.get())
+                || !target.metadata().geometryKeys().equals(metadata.get().geometryKeys())))return Optional.empty();
+        Vec3d feet=sourcePoint(cell,env.position());if(!ownedBody(env,w,feet,owner.get()))return Optional.empty();
         Vec3d offset=feet.subtract(w.origin);Vec384f coordinate=w.semantic.clone()
                 .add(w.sourceBasis.i.clone().mul((float)(offset.x/SCALE)))
                 .add(w.sourceBasis.j.clone().mul((float)(offset.y/SCALE)))
                 .add(w.sourceBasis.k.clone().mul((float)(offset.z/SCALE)));
-        WalkSupport support=new WalkSupport(owner.get(),w.dimension,feet,w.sourceBasis,coordinate,hit.get().normal(),w.identity,w.owners.ownershipRevision());
-        ensureWalkProof(p,s,w,support);return Optional.of(new WalkCandidate(w,support));
+        WalkSupport support=new WalkSupport(owner.get(),w.dimension,feet,w.sourceBasis,coordinate,hit.get().normal(),w.identity,env.ownershipRevision(w));
+        env.ensureProof(w,support);return Optional.of(new WalkCandidate(w,support));
     }
-    private static boolean ownedBody(ServerPlayerEntity p,Session s,Window w,Vec3d at,String id) {
+    private static boolean ownedBody(WalkEnvironment env,Window w,Vec3d at,String id) {
         Box b=body(at);
         for(BlockPos pos:BlockPos.iterate(MathHelper.floor(b.minX),MathHelper.floor(b.minY),MathHelper.floor(b.minZ),MathHelper.floor(b.maxX),MathHelper.floor(b.maxY),MathHelper.floor(b.maxZ)))
-            if(!exactOwner(p,s,w,new Vec3d(pos.getX(),pos.getY(),pos.getZ())).filter(id::equals).isPresent())return false;
+            if(!env.exactOwner(w,new Vec3d(pos.getX(),pos.getY(),pos.getZ())).filter(id::equals).isPresent())return false;
         return true;
     }
     public static void cancelCurrentSupport(ServerPlayerEntity p) {
-        Session s=session(p);if(s==null)return;if(s.walkFuture!=null)s.walkFuture.cancel(false);
-        s.walkProbe=null;s.walkFuture=null;s.walkField=0;s.walkNextProbe=0;
+        Session s=session(p);if(s!=null)cancelCurrentSupport(s);
+    }
+    static void cancelCurrentSupport(Session s) {
+        if(s.walkFuture!=null)s.walkFuture.cancel(false);
+        s.walkProbe=null;s.walkFuture=null;s.walkField=0;s.walkNextProbe=0;s.walkTarget=null;
+        if(s.walkDiscoveryFuture!=null)s.walkDiscoveryFuture.cancel(false);s.walkDiscoveryFuture=null;
+    }
+    /** True while a pending walk's discovered source target is still being extracted/published. */
+    public static boolean walkTargetPending(ServerPlayerEntity p) {
+        Session s=session(p);return s!=null && s.walkDiscoveryFuture!=null && !s.walkDiscoveryFuture.isDone();
+    }
+    /** A pending walk acquires a real discovered source target at the current contact instead of
+     * rejecting available terrain as unknown. Real bounded extraction pipeline, throttled, one
+     * in flight. The seed is the inverse-mapped source feet/body AIR of the CONTACTED producer
+     * window (never the solid support voxel: underground solid seeds would publish only the floor
+     * cell and leave the body unowned), in that window's source dimension, attached without
+     * replacing any established binding. Exact floor/body ownership stays validated by walkCandidate. */
+    public static void discoverWalkTarget(ServerPlayerEntity p) {
+        if(!p.getServer().isOnThread())return;
+        Context c=SERVERS.get(p.getServer());if(c==null)return;
+        Session s=c.sessions.get(p.getUuid());
+        if(s==null || s.shallow || !p.getWorld().getRegistryKey().equals(WORLD))return;
+        var hit=MeshCollision.ground(p);
+        if(hit.isEmpty())return; // No contacted support cell: nothing real to discover.
+        Window expected=windowFor(s,hit.get().cell());if(expected==null)return;
+        boolean inFlight=s.walkDiscoveryFuture!=null && !s.walkDiscoveryFuture.isDone();
+        if(WalkTargetAcquisition.discovery(true,inFlight,c.tick-s.walkDiscoveryTick)==WalkTargetAcquisition.Discovery.WAIT)return;
+        s.walkDiscoveryTick=c.tick;
+        // Seed from inverse-mapped source feet/body air so connected air+wall extraction owns the body too.
+        BlockPos seed=BlockPos.ofFloored(sourcePoint(hit.get().cell(),p.getPos()));
+        var future=SourceLandmarks.ensureSourceLocation(p.getServer(),expected.dimension,seed);
+        s.walkDiscoveryFuture=future;
+        future.whenComplete((found,error)->p.getServer().execute(()->{
+            if(!live(p,s) || s.walkDiscoveryFuture!=future)return;
+            s.walkDiscoveryFuture=null;
+            if(error!=null || found==null || found.isEmpty() || !retainedWalkWindow(s,expected))return;
+            var m=found.get();
+            if(!completeWalkDiscovery(s,expected,m,SpiritActivityService.effectiveEmbedding(p.getServer(),m).vector()))return;
+            requestOwnership(p,s,expected,Vec3d.ofCenter(seed));notifyAnchor(p,s,expected);publish(p,s,true);
+        }));
+    }
+    /** Discovery completion retains a separate walking target even when attachment keeps another binding. */
+    static boolean completeWalkDiscovery(Session s,Window expected,LandmarkMetadata m,Vec384f effective) {
+        if(s.shallow || !retainedWalkWindow(s,expected) || !m.header().dimension().equals(expected.dimension))return false;
+        var decision=WalkTargetAcquisition.attach(expected.id,m.id(),
+                expected.owner==null?List.of():expected.owner.geometryKeys(),m.geometryKeys());
+        if(decision==WalkTargetAcquisition.Attach.BIND_NEW) {
+            expected.id=m.id();expected.owner=m;expected.supportEmbedding=m.header().baseEmbedding().vector();
+        } else if(decision==WalkTargetAcquisition.Attach.REFRESH_REVISION) {
+            expected.owner=m;expected.supportEmbedding=effective.clone();
+        }
+        s.walkTarget=new DiscoveredWalkTarget(expected,m);
+        return true;
+    }
+    /** The discovered target must still be a live producer window; eviction/replacement invalidates it. */
+    private static boolean retainedWalkWindow(Session s,Window w) {
+        return s.local==w || s.target==w || s.regions.containsValue(w) || s.prepared.containsValue(w);
     }
     private static void ensureWalkProof(ServerPlayerEntity p,Session s,Window field,WalkSupport hint) {
         Window probe=s.walkProbe;var owner=LandmarkStore.get(p.getServer()).metadata(hint.landmarkId());
@@ -239,44 +340,48 @@ public final class SpiritTerrainService {
         var current=currentSupport(p);return current.isPresent() && acquireCurrentSupport(p,current.get());
     }
     public static boolean acquireCurrentSupport(ServerPlayerEntity p,WalkSupport expected) {
-        var candidate=walkCandidate(p);if(candidate.isEmpty())return false;
-        Session s=session(p);WalkSupport current=candidate.get().support();Window field=candidate.get().field(),probe=s.walkProbe;
+        Session s=session(p);return s!=null && acquireCurrentSupport(s,walkEnvironment(p,s),expected);
+    }
+    static boolean acquireCurrentSupport(Session s,WalkEnvironment env,WalkSupport expected) {
+        var candidate=walkCandidate(s,env);if(candidate.isEmpty())return false;
+        WalkSupport current=candidate.get().support();Window field=candidate.get().field(),probe=s.walkProbe;
         if(expected.windowIdentity()!=current.windowIdentity() || !expected.landmarkId().equals(current.landmarkId())
                 || expected.ownershipRevision()!=current.ownershipRevision() || current.normal().y<.99
                 || probe==null || !probe.ready || s.walkField!=field.identity || probe.owner==null
-                || !LandmarkStore.get(p.getServer()).metadata(probe.id).map(m->m.geometryKeys().equals(probe.owner.geometryKeys())).orElse(false))return false;
-        Basis384f b=basis(p),source=current.sourceBasis();
+                || !probe.id.equals(current.landmarkId()) || !probe.dimension.equals(current.sourceDimension())
+                || !env.metadata(probe.id).map(m->m.geometryKeys().equals(probe.owner.geometryKeys())).orElse(false))return false;
+        Basis384f b=env.basis(),source=current.sourceBasis();
         if(b.i.squareDistance(source.i)+b.j.squareDistance(source.j)+b.k.squareDistance(source.k)>1e-8)return false;
-        Vec384f error=current.sourceCoordinate().sub(q(p));
+        Vec384f error=current.sourceCoordinate().sub(env.coordinate());
         if(new Vec3d(error.dot(b.i)*SCALE,error.dot(b.j)*SCALE,error.dot(b.k)*SCALE).lengthSquared()>1e-6)return false;
-        ServerWorld world=world(p.getServer(),probe.dimension);
-        if(world!=null)captureLoaded(world,probe,current.sourcePosition(),200,false);
+        env.refreshBody(probe,current.sourcePosition());
         if(!clearCachedBody(probe,current.sourcePosition()) || !hasCachedFloor(probe,current.sourcePosition()))return false;
-        Window next=new Window(current.sourceDimension(),current.sourcePosition(),q(p),source,current.landmarkId());
-        next.owner=LandmarkStore.get(p.getServer()).metadata(next.id).orElse(null);if(next.owner==null)return false;
+        Window next=new Window(current.sourceDimension(),current.sourcePosition(),env.coordinate(),source,current.landmarkId());
+        next.owner=env.metadata(next.id).orElse(null);if(next.owner==null)return false;
         next.owners=field.owners;next.geometryNodes=field.geometryNodes.isEmpty()?field.nodes:field.geometryNodes;
-        next.tiles.putAll(probe.tiles);next.nodes=compact(p.getServer(),next,next.origin);next.ready=true;
-        Session preview=new Session(next,p.getPos());preview.shallow=true;preview.acquiredView=true;preview.revision=s.revision;
+        next.tiles.putAll(probe.tiles);next.nodes=env.compact(next);next.ready=true;
+        Session preview=new Session(next,env.position());preview.shallow=true;preview.acquiredView=true;preview.revision=s.revision;
         preview.regions.putAll(s.regions);preview.target=s.target;preview.closestId=s.closestId;
         if(!s.local.id.isEmpty() && !s.local.id.equals(next.id))preview.regions.putIfAbsent(s.local.id,s.local);
-        BuiltMesh built=buildMesh(p,preview,s.revision+1,b);TerrainMeshFrame frame=built.frame();
-        if(!MeshCollision.bodyClear(frame,p.getBoundingBox()) || !MeshCollision.transitionClear(s.frame,frame,p.getBoundingBox()))return false;
+        BuiltMesh built=env.build(preview,s.revision+1,b);TerrainMeshFrame frame=built.frame();
+        if(!MeshCollision.bodyClear(frame,env.boundingBox()) || !MeshCollision.transitionClear(s.frame,frame,env.boundingBox()))return false;
         // All validation precedes publication. No q/basis/position/velocity/attunement mutation.
         Window previous=s.local;Vec3d previousCarrier=s.carrier;
         boolean previousShallow=s.shallow,previousAcquired=s.acquiredView,previousAnchor=s.anchorDelivered;
         Map<String,Window> previousRegions=new LinkedHashMap<>(s.regions);
-        s.local=next;s.carrier=p.getPos();s.shallow=true;s.acquiredView=true;s.anchorDelivered=true;
+        s.local=next;s.carrier=env.position();s.shallow=true;s.acquiredView=true;s.anchorDelivered=true;
         s.regions.clear();s.regions.putAll(preview.regions);
-        try {acceptFrame(p,s,built);}
+        try {env.accept(built);}
         catch(RuntimeException failure) {
             s.local=previous;s.carrier=previousCarrier;s.shallow=previousShallow;s.acquiredView=previousAcquired;s.anchorDelivered=previousAnchor;
             s.regions.clear();s.regions.putAll(previousRegions);
-            status(p,s,"Walking acquisition held: mesh publication failed.");return false;
+            env.publicationFailed();return false;
         }
         s.ingesting=null;s.sourceRequested=null;
         if(s.sourceFuture!=null)s.sourceFuture.cancel(false);if(s.ownerFuture!=null)s.ownerFuture.cancel(false);
         if(previous.ownershipFuture!=null)previous.ownershipFuture.cancel(false);
-        s.walkProbe=null;s.walkField=0;if(s.walkFuture!=null)s.walkFuture.cancel(false);
+        s.walkProbe=null;s.walkField=0;s.walkTarget=null;if(s.walkFuture!=null)s.walkFuture.cancel(false);
+        if(s.walkDiscoveryFuture!=null)s.walkDiscoveryFuture.cancel(false);s.walkDiscoveryFuture=null;
         confirmTargetFade(s);return true;
     }
     public static boolean exit(ServerPlayerEntity p) {
@@ -535,7 +640,7 @@ public final class SpiritTerrainService {
         Session s=session(p);return s!=null && MeshCollision.transitionClear(s.frame,build(p,s,s.revision+1,proposed),p.getBoundingBox());
     }
     private static TerrainMeshFrame build(ServerPlayerEntity p,Session s,long revision) {return build(p,s,revision,basis(p));}
-    private record BuiltMesh(TerrainMeshFrame frame,Map<Long,Window> producers) {}
+    record BuiltMesh(TerrainMeshFrame frame,Map<Long,Window> producers) {}
     private static TerrainMeshFrame build(ServerPlayerEntity p,Session s,long revision,Basis384f observer) {
         return buildMesh(p,s,revision,observer).frame();
     }
@@ -602,9 +707,12 @@ public final class SpiritTerrainService {
     }
     /** All runtime frame replacements commit provenance together and roll both back on transport failure. */
     private static void acceptFrame(ServerPlayerEntity p,Session s,BuiltMesh built) {
+        acceptFrame(s,built,frame->{if(p.getWorld().getRegistryKey().equals(WORLD))transport.accept(p,frame);});
+    }
+    static void acceptFrame(Session s,BuiltMesh built,java.util.function.Consumer<TerrainMeshFrame> publication) {
         TerrainMeshFrame previous=s.frame;Map<Long,Window> previousProducers=s.frameProducers;long previousRevision=s.revision;
         s.frame=built.frame();s.frameProducers=built.producers();s.revision=s.frame.revision();
-        try {if(p.getWorld().getRegistryKey().equals(WORLD))transport.accept(p,s.frame);}
+        try {publication.accept(s.frame);}
         catch(RuntimeException failure){s.frame=previous;s.frameProducers=previousProducers;s.revision=previousRevision;throw failure;}
     }
     private static void confirmTargetFade(Session s) {
@@ -614,7 +722,7 @@ public final class SpiritTerrainService {
         // Stitching can retain an already-opaque overlapping skin. It must not skip our requested fade steps.
         target.publishedAlpha=found?Math.min(target.alpha,visible):0;
     }
-    private static final class Window {
+    static final class Window {
         final long identity=WINDOW_IDS.incrementAndGet();final String dimension;Vec3d origin;Vec384f semantic,supportEmbedding;final Vec384f captured;final Basis384f sourceBasis;
         boolean proofValid;List<String> proofKeys=List.of();SourceOwnership.Region owners;CompletableFuture<SourceOwnership.Region> ownershipFuture;long nextOwnerRequest;
         String id;LandmarkMetadata owner;boolean ready,dirty,confirmedOrigin,replacing,nearReady,retired;float alpha=1,publishedAlpha;int refreshCursor;
@@ -624,14 +732,15 @@ public final class SpiritTerrainService {
         final Map<BlockPos,SourceMeshBuilder.Tile> tiles=new HashMap<>();List<SourceMeshBuilder.Node> nodes=List.of(),geometryNodes=List.of();long compactedOwnership=-1;
         Window(String dimension,Vec3d origin,Vec384f semantic,Basis384f basis,String id){this.dimension=dimension;this.origin=origin;this.semantic=semantic.clone();captured=semantic.clone();supportEmbedding=semantic.clone();sourceBasis=basis.clone();this.id=id;}
     }
-    private static final class Session {
-        Window local,target,walkProbe;Vec3d carrier,sourceRequested;boolean shallow=true,entered,anchorDelivered,acquiredView;long revision,created,walkField,walkNextProbe;
-        TerrainMeshFrame frame;Map<Long,Window> frameProducers=Map.of();CompletableFuture<?> ownerFuture,sourceFuture,targetFuture,targetOwnerFuture,walkFuture;Iterator<SourceLandmarks.Cell> ingesting;
+    static final class Session {
+        DiscoveredWalkTarget walkTarget;
+        Window local,target,walkProbe;Vec3d carrier,sourceRequested;boolean shallow=true,entered,anchorDelivered,acquiredView;long revision,created,walkField,walkNextProbe,walkDiscoveryTick;
+        TerrainMeshFrame frame;Map<Long,Window> frameProducers=Map.of();CompletableFuture<?> ownerFuture,sourceFuture,targetFuture,targetOwnerFuture,walkFuture;CompletableFuture<Optional<LandmarkMetadata>> walkDiscoveryFuture;Iterator<SourceLandmarks.Cell> ingesting;
         final Map<String,Window> regions=new LinkedHashMap<>();final MeshRepresentatives selection=new MeshRepresentatives();
         final Map<String,Window> prepared=new LinkedHashMap<>();
         String scanCursor,status,closestId="";int dimensionCursor,regionCursor;boolean scanning;Set<String> selected=Set.of();
         Session(Window local,Vec3d carrier){this.local=local;this.carrier=carrier;}
-        void cancel(){if(ownerFuture!=null)ownerFuture.cancel(false);if(sourceFuture!=null)sourceFuture.cancel(false);if(targetFuture!=null)targetFuture.cancel(false);if(targetOwnerFuture!=null)targetOwnerFuture.cancel(false);if(walkFuture!=null)walkFuture.cancel(false);cancelWindow(local);if(target!=null)cancelWindow(target);for(var w:regions.values())cancelWindow(w);for(var w:prepared.values())cancelWindow(w);regions.clear();prepared.clear();}
+        void cancel(){if(ownerFuture!=null)ownerFuture.cancel(false);if(sourceFuture!=null)sourceFuture.cancel(false);if(targetFuture!=null)targetFuture.cancel(false);if(targetOwnerFuture!=null)targetOwnerFuture.cancel(false);if(walkFuture!=null)walkFuture.cancel(false);if(walkDiscoveryFuture!=null)walkDiscoveryFuture.cancel(false);cancelWindow(local);if(target!=null)cancelWindow(target);for(var w:regions.values())cancelWindow(w);for(var w:prepared.values())cancelWindow(w);regions.clear();prepared.clear();}
     }
     private static void cancelWindow(Window w){if(w.ownershipFuture!=null)w.ownershipFuture.cancel(false);if(w.nearFuture!=null)w.nearFuture.cancel(false);w.stream=null;w.nearCells=null;w.nearSamples=null;}
     private static final class Context {

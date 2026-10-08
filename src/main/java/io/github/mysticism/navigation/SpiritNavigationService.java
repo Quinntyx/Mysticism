@@ -330,18 +330,21 @@ public final class SpiritNavigationService {
                 && delta.lengthSquared() <= 16)
             TraversalSteering.advance(q, component.get(), delta.x, delta.y, delta.z);
         if (++s.supportTick > 200) {
+            boolean discovering = SpiritTerrainService.walkTargetPending(p);
             endSupportApproach(p, s);
-            p.sendMessage(Text.literal("Walk request expired: current support could not be continuously aligned/owned. Still deep; no substitute landing."), true);
+            p.sendMessage(Text.literal(discovering
+                    ? "Walk request expired: discovered source target is still extracting/publishing; request walking again. Still deep; no substitute landing."
+                    : "Walk request expired: current support could not be continuously aligned/owned. Still deep; no substitute landing."), true);
             return;
         }
-        if (!s.semanticReady) return; // Real late source discovery must finish; never invent q.
+        if (!s.semanticReady) { SpiritTerrainService.discoverWalkTarget(p); return; } // Real late source discovery must finish; never invent q.
         if (s.supportTargetSnapshot.squareDistance(p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target()) > 0) {
             endSupportApproach(p, s);
             p.sendMessage(Text.literal("Walk request cancelled after attunement changed; captured target was not altered by landing."), true);
             return;
         }
         var found = SpiritTerrainService.currentSupport(p);
-        if (found.isEmpty()) return; // Terrain starts/reuses bounded exact source-cell proof, never a join.
+        if (found.isEmpty()) { SpiritTerrainService.discoverWalkTarget(p); return; } // Acquire a real discovered source target instead of rejecting available terrain as unknown.
         var support = found.get(); Basis384f destination = support.sourceBasis();
         if (s.supportFrom == null) {
             s.supportFrom = component.get().clone(); s.supportGrid = destination.clone(); s.supportAlignTick = 0;
