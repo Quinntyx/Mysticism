@@ -436,9 +436,8 @@ public final class SpiritTerrainService {
         w.compactedOwnership=w.owners!=null && w.owners.isCurrent(server)?w.owners.ownershipRevision():-1;
         List<SourceMeshBuilder.Node> near=SourceMeshBuilder.compact(w.tiles,center,owners);
         if(w.geometryNodes.isEmpty() || w.tiles.isEmpty())return near;
-        int minX=Integer.MAX_VALUE,minY=minX,minZ=minX,maxX=Integer.MIN_VALUE,maxY=maxX,maxZ=maxX;
-        for(BlockPos p:w.tiles.keySet()){minX=Math.min(minX,p.getX());minY=Math.min(minY,p.getY());minZ=Math.min(minZ,p.getZ());maxX=Math.max(maxX,p.getX());maxY=Math.max(maxY,p.getY());maxZ=Math.max(maxZ,p.getZ());}
-        return SourceMeshBuilder.replaceNear(w.geometryNodes,near,new Bounds(minX,minY,minZ,(long)maxX+1,(long)maxY+1,(long)maxZ+1),center);
+        // Replace only proven sampled cells, never the tiles bounding box: gaps between disjoint patches keep their persisted geometry.
+        return SourceMeshBuilder.replaceNear(w.geometryNodes,near,w.tiles.keySet(),center);
     }
     private static Window windowFor(Session s,TerrainMeshFrame.Cell cell) {
         // Server-local provenance belongs to the accepted frame, not mutable ownership or latest compaction.
@@ -506,6 +505,7 @@ public final class SpiritTerrainService {
                 }
                 if(s.ingesting!=null){int count=0;while(s.ingesting.hasNext() && count++<256){var cell=s.ingesting.next();ingest(server,s.local,List.of(cell),1);}if(!s.ingesting.hasNext())s.ingesting=null;}
                 enforceRetention(s.local,s.local.origin.add(p.getPos().subtract(s.carrier)));
+                enforceSessionRetention(s);
                 if(s.local.dirty && c.tick%4==0){Vec3d source=s.local.origin.add(p.getPos().subtract(s.carrier));s.local.nodes=compact(server,s.local,source);s.local.dirty=false;}
                 // Immediate target prewarm is independent of catalog traversal/cluster locks.
                 var nav=p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION);
@@ -529,6 +529,14 @@ public final class SpiritTerrainService {
         if(victims.isEmpty())return;
         for(BlockPos p:victims){w.tiles.remove(p);w.liveTiles.remove(p);}
         w.dirty=true;
+    }
+    /** Retention is scheduled for EVERY retained window each tick, not only s.local: commit-time passes
+     *  alone (512 of up to 4096 merged samples) cannot keep pace with sustained near-patch commits, and
+     *  nonlocal windows would otherwise grow without bound. */
+    private static void enforceSessionRetention(Session s) {
+        if(s.target!=null)enforceRetention(s.target,s.target.nearFocus==null?s.target.origin:s.target.nearFocus);
+        for(var w:s.regions.values())enforceRetention(w,w.nearFocus==null?w.origin:w.nearFocus);
+        for(var w:s.prepared.values())enforceRetention(w,w.nearFocus==null?w.origin:w.nearFocus);
     }
     private static void status(ServerPlayerEntity p,Session s,String message){if(!Objects.equals(message,s.status)){s.status=message;p.sendMessage(Text.literal(message),true);}}
     private static Vec3d origin(ServerPlayerEntity p,Session s,Window w) {

@@ -5,6 +5,7 @@ import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
 import java.util.*;
 import java.util.function.Predicate;
+import java.util.function.Function;
 
 /** Discovery retention budget regressions: bounded eviction work, exact-support protection,
  *  last-resort floor, deterministic air-first ordering and render-distance coverage that is
@@ -144,6 +145,79 @@ public final class DiscoveryBudgetTest {
                 "Air retention eviction must not change a single rendered/compacted node");
     }
 
+    /** Simulated service schedule: each near-patch commit merges up to 4096 staged samples, runs one
+     *  commit-time pass, then per-tick bounded passes for EVERY retained window until the next commit
+     *  (near staging ingests 4096 cells at 128 cells/tick, i.e. ~32 ticks). Sustained commits must stay
+     *  under the cap and never touch the exact support radius. */
+    private static void sustainedCommitsStayBounded() {
+        Set<BlockPos> retained=new HashSet<>();
+        Set<BlockPos> protectedNear=samplesWithinExactRadius();
+        for(int commit=0;commit<24;commit++) {
+            int base=commit*16-8; // disjoint 16-block patch marching down +x
+            Set<BlockPos> patch=new HashSet<>();
+            for(int x=base;x<base+16;x++)for(int z=-8;z<8;z++) {
+                for(int y=56;y<65;y++)patch.add(new BlockPos(x,y,z));
+                for(int y=65;y<72;y++)patch.add(new BlockPos(x,y,z));
+            }
+            check(patch.size()==4096,"Fixture must model a full 16-block staged commit");
+            retained.addAll(patch);
+            // Commit-time pass, then ~32 per-tick passes before the next commit.
+            List<BlockPos> victims=DiscoveryBudget.evictionPlan(retained.size(),retained,FOCUS,AIR);
+            check(victims.size()<=DiscoveryBudget.MAX_EVICTED_PER_PASS,"Commit pass must stay bounded");
+            retained.removeAll(victims);
+            for(int t=0;t<32 && !DiscoveryBudget.evictionPlan(retained.size(),retained,FOCUS,AIR).isEmpty();t++) {
+                victims=DiscoveryBudget.evictionPlan(retained.size(),retained,FOCUS,AIR);
+                check(victims.size()<=DiscoveryBudget.MAX_EVICTED_PER_PASS,"Tick pass must stay bounded");
+                retained.removeAll(victims);
+            }
+            check(retained.size()<=DiscoveryBudget.MAX_TILES,
+                    "Sustained commits must converge under the cap, commit "+commit+" retained "+retained.size());
+            for(BlockPos p:protectedNear)check(retained.contains(p),"Exact-support sample "+p+" evicted during sustained commits");
+        }
+    }
+    private static Set<BlockPos> samplesWithinExactRadius() {
+        Set<BlockPos> samples=new HashSet<>();
+        for(int x=-8;x<8;x++)for(int z=-8;z<8;z++)for(int y=56;y<72;y++)samples.add(new BlockPos(x,y,z));
+        return samples;
+    }
+
+    private static void sampledCoverageReplacesOnlyProvenCells() {
+        Vec3d center=new Vec3d(40,64,0);
+        SourceMeshBuilder.Tile stone=new SourceMeshBuilder.Tile(new TerrainMeshFrame.Material("minecraft:stone",Map.of()),
+                List.of(new Box(0,0,0,1,1,1)),0xffffff,0,false,true);
+        Map<BlockPos,SourceMeshBuilder.Tile> tiles=new HashMap<>();
+        Function<int[],BlockPos> at=a->new BlockPos(a[0],a[1],a[2]);
+        // Two disjoint 16-block sampled patches at x=-8..7 and x=72..87 with a wide unsampled gap between.
+        for(int[] patch:new int[][]{{-8},{72}})for(int x=patch[0];x<patch[0]+16;x++)for(int z=-8;z<8;z++) {
+            tiles.put(at.apply(new int[]{x,63,z}),stone);
+            tiles.put(at.apply(new int[]{x,64,z}),stone);
+        }
+        List<SourceMeshBuilder.Node> near=SourceMeshBuilder.compact(tiles,center);
+        check(!near.isEmpty(),"Fixture must compact sampled patches");
+        List<SourceMeshBuilder.Node> base=new ArrayList<>();
+        List<BlockPos> gapPositions=new ArrayList<>();
+        for(int x=24;x<=55;x++)for(int z=-8;z<8;z++)gapPositions.add(new BlockPos(x,63,z)); // inside the bbox, never sampled
+        for(BlockPos p:gapPositions)base.add(new SourceMeshBuilder.Node(p,1,stone,""));
+        base.add(new SourceMeshBuilder.Node(new BlockPos(0,63,0),1,stone,""));        // under patch A: proven sampled
+        base.add(new SourceMeshBuilder.Node(new BlockPos(4,56,0),8,stone,""));        // straddles patch A's x edge and its top layer
+        base.add(new SourceMeshBuilder.Node(new BlockPos(-32,56,0),8,stone,""));      // outside every patch
+        Set<BlockPos> sampled=tiles.keySet();
+        List<SourceMeshBuilder.Node> result=SourceMeshBuilder.replaceNear(base,near,sampled,center);
+        Set<String> keys=new HashSet<>();
+        for(SourceMeshBuilder.Node n:result)keys.add(n.position()+"/"+n.side());
+        // Gap geometry inside the overall sampled extent but never sampled itself must survive intact.
+        for(BlockPos p:gapPositions)check(keys.contains(p+"/1"),"Unsampled gap node "+p+" was erased by the sampled bbox");
+        long sampledCell=result.stream().filter(n->n.position().equals(new BlockPos(0,63,0))).count();
+        check(sampledCell==1,"Proven sampled cell must be replaced by exactly one near-patch node, got "+sampledCell);
+        check(keys.contains(new BlockPos(-32,56,0)+"/8"),"Fully unsampled coarse node must survive");
+        check(!keys.contains(new BlockPos(4,56,0)+"/8"),"Straddling coarse node must be refined, not kept wholesale");
+        check(keys.contains(new BlockPos(4,56,0)+"/4"),"Unsampled bottom half of a straddling node must survive");
+        check(keys.contains(new BlockPos(8,56,0)+"/4"),"Unsampled beyond-edge half of a straddling node must survive");
+        check(keys.contains(new BlockPos(8,60,0)+"/4"),"Unsampled upper beyond-edge quarter must survive");
+        check(!keys.contains(new BlockPos(4,60,4)+"/4"),"Mixed sampled split child must be refined, not kept wholesale");
+        check(keys.contains(new BlockPos(4,60,4)+"/2") || keys.contains(new BlockPos(4,60,4)+"/1"),"Refinement must keep the unsampled remainder of a mixed child");
+    }
+
     private static void contract() {
         check(DiscoveryBudget.RENDER_DISTANCE==128,"Render-distance coverage contract is explicit");
         check(DiscoveryBudget.MIN_RETENTION_RADIUS<DiscoveryBudget.EXACT_RETENTION_RADIUS,"Floor sits below exact retention");
@@ -158,6 +232,8 @@ public final class DiscoveryBudgetTest {
         lastResortRespectsMinimumFloor();
         airFirstAndDeterministic();
         airEvictionKeepsRenderGeometry();
+        sustainedCommitsStayBounded();
+        sampledCoverageReplacesOnlyProvenCells();
         contract();
         System.out.println("DiscoveryBudgetTest: "+assertions+" assertions passed");
     }

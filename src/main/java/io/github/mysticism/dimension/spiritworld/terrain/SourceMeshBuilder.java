@@ -109,16 +109,48 @@ final class SourceMeshBuilder {
                 .thenComparingLong(n->n.position.asLong()).thenComparingInt(Node::side));
         return result;
     }
-    /** Replace only an actually sampled source patch; retain the producing region's far surfaces. */
-    static List<Node> replaceNear(List<Node> base,List<Node> near,Bounds cut,Vec3d center) {
-        List<Node> result=new ArrayList<>(near);for(Node node:base)outside(node,cut,result);
+    /** Replace only PROVEN sampled source cells; every unsampled cell keeps its persisted geometry.
+     *  Unlike a bounding-box cut, gaps between disjoint sampled patches (and never-sampled areas inside
+     *  the overall extent) retain their base nodes instead of being shattered and erased. */
+    static List<Node> replaceNear(List<Node> base,List<Node> near,Set<BlockPos> sampled,Vec3d center) {
+        Map<Long,Integer> buckets=new HashMap<>();
+        for(BlockPos p:sampled)buckets.merge(bucket(p),1,Integer::sum);
+        List<Node> result=new ArrayList<>(near);
+        for(Node node:base)replace(node,sampled,buckets,result);
         result.sort(Comparator.comparingDouble(n->distanceSquared(nodeBox(n),center)));return List.copyOf(result);
     }
+    /** 16-block sampled-volume buckets: nodes never straddle one (sides are powers of two <=16 dividing 16,
+     *  aligned), so a zero bucket rejects in O(1) and large nodes aggregate a handful of bucket counts. */
     private static Box nodeBox(Node n){BlockPos p=n.position();return new Box(p.getX(),p.getY(),p.getZ(),(double)p.getX()+n.side(),(double)p.getY()+n.side(),(double)p.getZ()+n.side());}
-    private static void outside(Node n,Bounds cut,List<Node> result) {
-        BlockPos p=n.position();int side=n.side();Bounds box=new Bounds(p.getX(),p.getY(),p.getZ(),(long)p.getX()+side,(long)p.getY()+side,(long)p.getZ()+side);
-        if(!box.intersects(cut)){result.add(n);return;}if(cut.contains(box)||side==1)return;
-        int half=side/2;for(int child=0;child<8;child++)outside(new Node(p.add((child&1)==0?0:half,(child&2)==0?0:half,(child&4)==0?0:half),half,n.tile(),n.ownerId()),cut,result);
+    private static long bucket(BlockPos p) {
+        return ((long)(p.getX()>>4)&0x3FFFFFL)<<42 | ((long)(p.getZ()>>4)&0x3FFFFFL)<<20 | ((long)(p.getY()>>4)&0xFFFFFL);
+    }
+    private static void replace(Node n,Set<BlockPos> sampled,Map<Long,Integer> buckets,List<Node> result) {
+        BlockPos p=n.position();int side=n.side();long cells=(long)side*side*side;
+        long sampledVolume=0;
+        if(side<=16) {
+            sampledVolume=buckets.getOrDefault(bucket(p),0);
+            if(sampledVolume<=0){result.add(n);return;} // nothing sampled in this bucket: persisted geometry survives
+            if(side==16 && sampledVolume>=cells)return; // node coincides with a fully sampled bucket
+        } else {
+            for(int bx=p.getX()>>4;bx<=(p.getX()+side-1)>>4;bx++)
+                for(int by=p.getY()>>4;by<=(p.getY()+side-1)>>4;by++)
+                    for(int bz=p.getZ()>>4;bz<=(p.getZ()+side-1)>>4;bz++)
+                        sampledVolume+=buckets.getOrDefault(bucket(new BlockPos(bx<<4,by<<4,bz<<4)),0);
+            if(sampledVolume<=0){result.add(n);return;} // nothing sampled under this node: survives
+            int half=side/2; // some sampled volume: refine instead of scanning up to 64^3 cells
+            for(int child=0;child<8;child++)replace(new Node(p.add((child&1)==0?0:half,(child&2)==0?0:half,(child&4)==0?0:half),half,n.tile(),n.ownerId()),sampled,buckets,result);
+            return;
+        }
+        boolean any=false,all=true;
+        for(BlockPos cell:BlockPos.iterate(p,p.add(side-1,side-1,side-1))) {
+            if(sampled.contains(cell))any=true;else{all=false;if(any)break;}
+        }
+        if(!any){result.add(n);return;} // partial bucket without samples under this node: survives
+        if(all)return;
+        if(side==1)return; // sampled unit leaf: the exact near tile covers it
+        int half=side/2;
+        for(int child=0;child<8;child++)replace(new Node(p.add((child&1)==0?0:half,(child&2)==0?0:half,(child&4)==0?0:half),half,n.tile(),n.ownerId()),sampled,buckets,result);
     }
     /** Refine a persisted coarse leaf only inside the bounded exact-mask window, preserving far geometry. */
     static List<Node> splitOwnership(List<Node> source,Map<BlockPos,String> owners,Bounds range,Vec3d center) {
