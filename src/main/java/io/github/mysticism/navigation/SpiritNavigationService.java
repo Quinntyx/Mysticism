@@ -7,12 +7,14 @@ import io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService;
 import io.github.mysticism.dimension.spiritworld.SpiritBasisEvolver;
 import io.github.mysticism.landmark.*;
 import io.github.mysticism.net.SpiritScenePayload;
+import io.github.mysticism.net.SpiritFlightCorrectionPayload;
 import io.github.mysticism.vector.*;
 import net.fabricmc.fabric.api.entity.event.v1.*;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerWorldEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.server.MinecraftServer;
@@ -122,15 +124,25 @@ public final class SpiritNavigationService {
         clear(p);
     }
     private static void flight(ServerPlayerEntity p, boolean deep) {
-        boolean changed = !p.getAbilities().allowFlying || p.getAbilities().flying != deep;
+        boolean changed = !p.getAbilities().allowFlying || p.getAbilities().flying != deep
+                || session(p).walk.correctionConflicts(deep);
         p.getAbilities().allowFlying = true; p.getAbilities().flying = deep;
         p.setNoGravity(false); p.fallDistance = 0;
         if (changed) {
             p.sendAbilitiesUpdate();
-            // The client applies this correction without echoing a toggle packet; advance the
-            // recorded gesture state so the next genuine client edge is not read as a duplicate.
-            session(p).walk.serverCorrected(deep);
+            // Sending is not receipt. Keep stale off packets suppressed until the client echoes
+            // this ordered barrier, rather than rearming walking during retarget/cancellation.
+            ServerPlayNetworking.send(p, new SpiritFlightCorrectionPayload(session(p).walk.serverCorrected(deep)));
         }
+    }
+
+    /** Networking verifies the live connection/player before invoking this on the server thread.
+     * Never create a session for a delayed acknowledgment after exit, respawn or disconnect. */
+    public static void acknowledgeFlightCorrection(ServerPlayerEntity p, UUID token) {
+        if (!spirit(p)) return;
+        Map<UUID, Session> sessions = SERVERS.get(p.getServer());
+        Session s = sessions == null ? null : sessions.get(p.getUuid());
+        if (s != null) s.walk.acknowledgeCorrection(token);
     }
 
     public static boolean enter(ServerPlayerEntity p) {

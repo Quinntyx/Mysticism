@@ -13,9 +13,9 @@ import io.github.mysticism.vector.Vec384f;
  * <li>A pending walk is superseded by any explicit destination change (epoch), never
  * completed against the older destination.</li>
  * <li>A fresh gesture after a retarget may legitimately request a new walk.</li>
- * <li>Server-driven flight corrections (abilities updates applied by vanilla without an echoed
- * flight-on packet) advance the recorded gesture state, so correction → cancellation/expiry →
- * genuine retry works without an intervening flight-on packet.</li>
+ * <li>Sending a correction does not rearm walking across retarget/cancellation. Its ordered
+ * acknowledgment drains stale packets and then allows a genuine retry without an explicit
+ * client flight-on; old/duplicate/foreign acknowledgments never rearm it.</li>
  * <li>A flight-on packet queued before a server correction always requests deep mode and
  * cancels pending walking, even when its recorded state is classified as a duplicate.</li>
  * <li>Accepting an asynchronous capture supersedes older navigation intents at acceptance, and a
@@ -47,6 +47,8 @@ public final class WalkRetargetingTest {
         toggleEdges();
         duplicatePacketsCannotRestart();
         correctionRetry();
+        correctionAcknowledgments();
+        correctionDirection();
         queuedFlightOnCancelsWalk();
         retargetSupersedesPendingWalk();
         acceptanceSupersede();
@@ -70,24 +72,27 @@ public final class WalkRetargetingTest {
         check(gatedStart(tracker, false), "Fresh flight-off gesture starts a walk");
         check(tracker.pending(), "Walk intent is pending");
         check(!tracker.startWalk(), "A second start cannot replace or reset the pending intent");
-        tracker.endWalk(); // e.g. cancelled by an explicit retarget
+        tracker.serverCorrected(true); // production restores flight while support validation is pending
+        tracker.bumpDestination(); // an explicit retarget supersedes that request
+        check(tracker.superseded(), "Retarget supersedes the corrected pending walk");
+        tracker.endWalk(); // cancelled immediately by the explicit retarget
         check(!tracker.pending(), "Ended walk is no longer pending");
-        // The client's local flight state is still off: a stale retransmission arrives.
+        // Flight-off was queued before the client received the correction: not a new gesture.
         check(!gatedStart(tracker, false), "Stale flight-off retransmission must not restart the walk");
         check(!tracker.pending(), "No walk intent was resurrected by the stale packet");
     }
 
-    /** P1: a server-driven flight correction (abilities update, applied by vanilla without an
-     * echoed flight-on packet) must not make the next genuine gesture look like a duplicate.
-     * correction → cancellation/expiry → genuine retry, with no intervening flight-on packet. */
+    /** A correction is not receipt. Cancellation/expiry preserves stale suppression until the
+     * client acknowledges the ordered barrier; only then can same-value off be a genuine retry. */
     private static void correctionRetry() {
         WalkIntentTracker corrected = new WalkIntentTracker();
-        check(corrected.observeToggle(false), "First flight-off gesture accepted");
-        check(corrected.startWalk(), "Walk requested");
-        corrected.serverCorrected(true); // server restores client flight via an abilities update
+        check(gatedStart(corrected, false), "First flight-off gesture accepted");
+        var token = corrected.serverCorrected(true); // send, not receipt
         corrected.endWalk(); // cancellation or expiry
-        check(corrected.observeToggle(false), "Genuine retry after a server correction is fresh without an intervening flight-on packet");
-        check(corrected.startWalk(), "Genuine retry after a server correction starts a new walk");
+        check(!gatedStart(corrected, false), "Same-value off before correction receipt is still stale after expiry");
+        check(corrected.acknowledgeCorrection(token), "Current correction receipt rearms retry");
+        check(!corrected.pending(), "Acknowledgment alone never starts walking");
+        check(gatedStart(corrected, false), "Genuine retry after correction receipt starts walking without an intervening flight-on packet");
 
         WalkIntentTracker uncorrected = new WalkIntentTracker();
         uncorrected.observeToggle(false);
@@ -97,32 +102,87 @@ public final class WalkRetargetingTest {
 
         WalkIntentTracker echo = new WalkIntentTracker();
         echo.observeToggle(false);
-        echo.serverCorrected(true);
-        check(!echo.observeToggle(true), "A packet matching the server-corrected state is still a duplicate");
+        var echoToken = echo.serverCorrected(true);
+        check(echo.acknowledgeCorrection(echoToken), "Echo confirms correction receipt");
+        check(!echo.observeToggle(true), "A packet matching the acknowledged server-corrected state is still a duplicate");
         check(echo.observeToggle(false), "The opposite state after a correction is a fresh edge");
         check(echo.startWalk(), "Fresh edge after a correction starts a walk");
     }
 
-    /** P2: flight-off → server correction → queued flight-on while walking is still pending.
-     * Use the service's production arbitration, not the raw edge classifier: a matching flight-on
-     * must still dispatch enterDeep, whose normal cleanup ends the walk and terrain acquisition. */
-    private static void queuedFlightOnCancelsWalk() {
-        WalkIntentTracker tracker = new WalkIntentTracker();
-        check(gatedStart(tracker, false), "Flight-off starts pending walking");
-        tracker.serverCorrected(true);
-        check(tracker.pending(), "Server flight restoration alone does not cancel the walk");
-        // correctionRetry separately proves this value is a duplicate in the raw edge classifier.
-        var request = tracker.flightRequest(true);
-        check(request == WalkIntentTracker.FlightRequest.DEEP, "Duplicate flight-on must still dispatch enterDeep");
-        check(tracker.pending(), "Arbitration retains pending state until the service cancels terrain acquisition");
-        if (request == WalkIntentTracker.FlightRequest.DEEP) tracker.endWalk(); // enterDeep cleanup
-        check(!tracker.pending(), "No pending walk remains to commit shallow after the newer flight-on");
+    private static void correctionAcknowledgments() {
+        WalkIntentTracker tracker = new WalkIntentTracker(), other = new WalkIntentTracker();
+        check(gatedStart(tracker, false), "Initial walk starts");
+        var first = tracker.serverCorrected(true);
+        var latest = tracker.serverCorrected(true); // repeated stale off triggers another correction in production
+        var foreign = other.serverCorrected(true);
+        tracker.bumpDestination();
+        tracker.endWalk();
+        check(!tracker.acknowledgeCorrection(first), "Obsolete correction cannot rearm the cancelled walk");
+        check(!tracker.acknowledgeCorrection(foreign), "Another player's correction cannot rearm walking");
+        check(!tracker.acknowledgeCorrection(null), "Missing acknowledgment cannot rearm walking");
+        check(!gatedStart(tracker, false), "Stale off is suppressed across repeated corrections and retarget");
         check(tracker.flightRequest(true) == WalkIntentTracker.FlightRequest.DEEP,
-                "Repeated flight-on remains an idempotent deep request, never a walk");
-        check(!tracker.pending(), "Repeated flight-on cannot resurrect walking");
-        check(gatedStart(tracker, false), "A later genuine flight-off can request walking again");
-        check(!gatedStart(tracker, false), "Duplicate flight-off cannot replace or reset the pending retry");
-        check(tracker.pending() && !tracker.superseded(), "Retry retains the current destination epoch");
+                "Outstanding correction never blocks genuine flight-on cancellation");
+        check(gatedStart(tracker, false), "An explicit client on/off gesture is a genuine retry even before correction receipt");
+        check(!tracker.superseded(), "Explicit pre-receipt retry belongs to the latest destination");
+        tracker.bumpDestination();
+        tracker.endWalk();
+        check(!gatedStart(tracker, false), "Duplicate off after another retarget still cannot restart walking");
+        check(tracker.acknowledgeCorrection(latest), "Only the latest barrier acknowledges correction receipt");
+        check(!tracker.pending(), "Receipt preserves cancellation");
+        check(gatedStart(tracker, false), "Fresh post-receipt retry starts in the new destination epoch");
+        check(!tracker.superseded(), "Retry cannot revive the old epoch");
+        check(!tracker.acknowledgeCorrection(latest), "Duplicate acknowledgment cannot rearm a second retry");
+        tracker.endWalk();
+        check(!gatedStart(tracker, false), "Duplicate acknowledgment did not turn a stale off into a fresh retry");
+        WalkIntentTracker replacement = new WalkIntentTracker();
+        var replacementToken = replacement.serverCorrected(true);
+        check(!replacement.acknowledgeCorrection(latest), "Retired-session acknowledgment cannot affect the replacement");
+        check(replacement.acknowledgeCorrection(replacementToken), "Replacement session accepts its own correction");
+        check(other.acknowledgeCorrection(foreign), "Other player's barrier remains independent");
+        check(gatedStart(other, false), "Other player retries independently");
+        var shallow = tracker.serverCorrected(false);
+        check(tracker.acknowledgeCorrection(shallow), "Shallow correction is acknowledged too");
+        check(!gatedStart(tracker, false), "Shallow flight-off is not a fresh deep walk request");
+        check(tracker.flightRequest(true) == WalkIntentTracker.FlightRequest.DEEP, "Flight-on still leaves shallow normally");
+    }
+
+    private static void correctionDirection() {
+        WalkIntentTracker tracker = new WalkIntentTracker();
+        var shallow = tracker.serverCorrected(false);
+        check(tracker.correctionConflicts(true), "In-flight shallow correction conflicts with a newer flight-on");
+        check(!tracker.correctionConflicts(false), "The same correction direction need not be resent");
+        check(tracker.flightRequest(true) == WalkIntentTracker.FlightRequest.DEEP, "Newer flight-on wins over in-flight shallow correction");
+        var deep = tracker.serverCorrected(true); // flight() resends even though vanilla already set abilities.flying=true
+        check(!tracker.acknowledgeCorrection(shallow), "Older shallow acknowledgment cannot regress the newer deep state");
+        check(!tracker.correctionConflicts(true), "Newer deep correction matches the mode");
+        check(tracker.acknowledgeCorrection(deep), "Latest deep correction is acknowledged");
+        check(!tracker.correctionConflicts(false), "Completed correction does not force future abilities updates");
+        check(!tracker.pending(), "Opposite correction arbitration never invents walking");
+    }
+
+    /** P2: queued flight-on cancels walking both before correction receipt and when the recorded
+     * state already matches. Normal service enterDeep cleanup must still end terrain acquisition. */
+    private static void queuedFlightOnCancelsWalk() {
+        for (boolean acknowledged : new boolean[]{false, true}) {
+            WalkIntentTracker tracker = new WalkIntentTracker();
+            check(gatedStart(tracker, false), "Flight-off starts pending walking");
+            var token = tracker.serverCorrected(true);
+            if (acknowledged) check(tracker.acknowledgeCorrection(token), "Correction is acknowledged without changing pending walking");
+            check(tracker.pending(), "Server flight restoration alone does not cancel the walk");
+            var request = tracker.flightRequest(true);
+            check(request == WalkIntentTracker.FlightRequest.DEEP, "Duplicate flight-on must still dispatch enterDeep");
+            check(tracker.pending(), "Arbitration retains pending state until the service cancels terrain acquisition");
+            if (request == WalkIntentTracker.FlightRequest.DEEP) tracker.endWalk(); // enterDeep cleanup
+            check(!tracker.pending(), "No pending walk remains to commit shallow after the newer flight-on");
+            check(tracker.flightRequest(true) == WalkIntentTracker.FlightRequest.DEEP,
+                    "Repeated flight-on remains an idempotent deep request, never a walk");
+            check(!tracker.pending(), "Repeated flight-on cannot resurrect walking");
+            if (!acknowledged) check(tracker.acknowledgeCorrection(token), "Client now receives the correction");
+            check(gatedStart(tracker, false), "A later genuine flight-off can request walking again");
+            check(!gatedStart(tracker, false), "Duplicate flight-off cannot replace or reset the pending retry");
+            check(tracker.pending() && !tracker.superseded(), "Retry retains the current destination epoch");
+        }
     }
 
     private static void retargetSupersedesPendingWalk() {
