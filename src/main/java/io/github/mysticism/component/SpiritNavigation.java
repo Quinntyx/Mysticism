@@ -14,13 +14,14 @@ import org.ladysnake.cca.api.v3.component.sync.AutoSyncedComponent;
 
 /** Per-player navigation, not a shared world frame. Target coordinates and vectors are snapshots. */
 public final class SpiritNavigation implements ComponentV3, AutoSyncedComponent {
-    private boolean active, deep, semanticReady, landingApproach;
+    private boolean active, deep, semanticReady, landingApproach, supportApproach;
     private boolean modelCompatible = true;
     private long motionEpoch;
     private String dimension = "", landmark = "";
     private Vec3d position = Vec3d.ZERO;
     private String targetDimension = "", targetLandmark = "";
     private BlockPos target = BlockPos.ORIGIN;
+    private Vec3d targetPosition = Vec3d.ZERO;
     private Basis384f targetBasis = new Basis384f();
     private boolean savedAbilities, allowFlying, flying, noGravity;
 
@@ -29,6 +30,7 @@ public final class SpiritNavigation implements ComponentV3, AutoSyncedComponent 
     public boolean semanticReady() { return semanticReady; }
     public boolean modelCompatible() { return modelCompatible; }
     public boolean landingApproach() { return landingApproach; }
+    public boolean supportApproach() { return supportApproach; }
     public long motionEpoch() { return motionEpoch; }
     private void resetPrediction() { motionEpoch = motionEpoch == Long.MAX_VALUE ? 0 : motionEpoch + 1; }
     public void setSemanticReady(boolean ready) {
@@ -39,6 +41,10 @@ public final class SpiritNavigation implements ComponentV3, AutoSyncedComponent 
         if (landingApproach != approach) resetPrediction();
         landingApproach = approach;
     }
+    public void setSupportApproach(boolean approach) {
+        if (supportApproach != approach) resetPrediction();
+        supportApproach = approach;
+    }
     public String sourceDimension() { return dimension; }
     public String landmarkId() { return landmark; }
     public Vec3d sourcePosition() { return position; }
@@ -46,6 +52,7 @@ public final class SpiritNavigation implements ComponentV3, AutoSyncedComponent 
     public String targetDimension() { return targetDimension; }
     public String targetLandmarkId() { return targetLandmark; }
     public BlockPos targetBlock() { return target; }
+    public Vec3d targetPosition() { return targetPosition; }
     public Basis384f targetBasis() { return targetBasis.clone(); }
     public void enterDeep() {
         if (!active || !deep) resetPrediction();
@@ -54,25 +61,28 @@ public final class SpiritNavigation implements ComponentV3, AutoSyncedComponent 
     public void shallow(String dimension, String id, Vec3d pos) {
         check(dimension, id, pos);
         if (!active || deep || !this.dimension.equals(dimension) || !landmark.equals(id)) resetPrediction();
-        this.dimension = dimension; landmark = id; position = pos; active = true; deep = false;
+        this.dimension = dimension; landmark = id; position = pos; active = true; deep = false; supportApproach = false;
     }
     public void setActive(boolean active) {
         if (this.active != active) resetPrediction();
         this.active = active;
-        if (!active) { deep = false; semanticReady = false; landingApproach = false; }
+        if (!active) { deep = false; semanticReady = false; landingApproach = false; supportApproach = false; }
     }
     public void target(String dimension, String id, BlockPos pos) { target(dimension, id, pos, new Basis384f()); }
     public void target(String dimension, String id, BlockPos pos, Basis384f basis) {
-        check(dimension, id, Vec3d.of(pos));
+        target(dimension, id, new Vec3d(pos.getX() + .5, pos.getY(), pos.getZ() + .5), basis);
+    }
+    public void target(String dimension, String id, Vec3d pos, Basis384f basis) {
+        check(dimension, id, pos);
         if (id.isBlank() || basis == null) throw new IllegalArgumentException("Target requires real landmark and source basis");
         EmbeddingSpace.requireCurrent(basis.i); EmbeddingSpace.requireCurrent(basis.j); EmbeddingSpace.requireCurrent(basis.k);
         if (Math.abs(basis.i.length()-1) > .001 || Math.abs(basis.j.length()-1) > .001
                 || Math.abs(basis.k.length()-1) > .001 || Math.abs(basis.i.dot(basis.j)) > .001
                 || Math.abs(basis.i.dot(basis.k)) > .001 || Math.abs(basis.j.dot(basis.k)) > .001)
             throw new IllegalArgumentException("Target requires real landmark and orthonormal source basis");
-        targetDimension = dimension; targetLandmark = id; target = pos.toImmutable(); targetBasis = basis.clone();
+        targetDimension = dimension; targetLandmark = id; targetPosition = pos; target = BlockPos.ofFloored(pos); targetBasis = basis.clone();
     }
-    public void clearTarget() { targetDimension = ""; targetLandmark = ""; target = BlockPos.ORIGIN; targetBasis = new Basis384f(); }
+    public void clearTarget() { targetDimension = ""; targetLandmark = ""; target = BlockPos.ORIGIN; targetPosition = Vec3d.ZERO; targetBasis = new Basis384f(); }
 
     // Persist the pre-entry flight state so logout/restart does not grant permanent survival flight.
     public void rememberAbilities(boolean allowFlying, boolean flying, boolean noGravity) {
@@ -91,7 +101,7 @@ public final class SpiritNavigation implements ComponentV3, AutoSyncedComponent 
             throw new IllegalArgumentException("Invalid source navigation location");
     }
     @Override public void readFromNbt(NbtCompound tag, RegistryWrapper.WrapperLookup lookup) {
-        active = false; deep = false; semanticReady = false; landingApproach = false;
+        active = false; deep = false; semanticReady = false; landingApproach = false; supportApproach = false;
         dimension = ""; landmark = ""; position = Vec3d.ZERO; clearTarget();
         savedAbilities = tag.getBoolean("savedAbilities");
         allowFlying = tag.getBoolean("allowFlying"); flying = tag.getBoolean("flying"); noGravity = tag.getBoolean("noGravity");
@@ -113,21 +123,31 @@ public final class SpiritNavigation implements ComponentV3, AutoSyncedComponent 
         catch (IllegalArgumentException invalidBinding) { landmark = ""; }
         semanticReady = active && tag.getBoolean("semanticReady");
         landingApproach = active && deep && semanticReady && tag.getBoolean("landingApproach");
+        supportApproach = active && deep && semanticReady && tag.getBoolean("supportApproach");
         try {
-            if (tag.getBoolean("hasTarget")) target(tag.getString("targetDimension"), tag.getString("targetLandmark"),
-                    new BlockPos(tag.getInt("tx"), tag.getInt("ty"), tag.getInt("tz")), Basis384f.fromBits(tag.getIntArray("targetBasis")));
+            if (tag.getBoolean("hasTarget")) {
+                Vec3d foot;
+                if (tag.contains("tfx") || tag.contains("tfy") || tag.contains("tfz")) {
+                    if (!tag.contains("tfx", NbtElement.NUMBER_TYPE) || !tag.contains("tfy", NbtElement.NUMBER_TYPE)
+                            || !tag.contains("tfz", NbtElement.NUMBER_TYPE)) throw new IllegalArgumentException("Invalid captured source foot");
+                    foot = new Vec3d(tag.getDouble("tfx"), tag.getDouble("tfy"), tag.getDouble("tfz"));
+                } else foot = new Vec3d(tag.getInt("tx") + .5, tag.getInt("ty"), tag.getInt("tz") + .5);
+                target(tag.getString("targetDimension"), tag.getString("targetLandmark"), foot, Basis384f.fromBits(tag.getIntArray("targetBasis")));
+            }
         } catch (IllegalArgumentException invalidTarget) { clearTarget(); }
     }
     @Override public void writeToNbt(NbtCompound tag, RegistryWrapper.WrapperLookup lookup) {
         EmbeddingNbt.stamp(tag);
         tag.putBoolean("active", active); tag.putBoolean("deep", deep);
         tag.putBoolean("semanticReady", semanticReady); tag.putBoolean("landingApproach", landingApproach);
+        tag.putBoolean("supportApproach", supportApproach);
         tag.putLong("motionEpoch", motionEpoch);
         tag.putString("sourceDimension", dimension); tag.putString("landmark", landmark);
         tag.putDouble("x", position.x); tag.putDouble("y", position.y); tag.putDouble("z", position.z);
         tag.putBoolean("hasTarget", hasShallowTarget());
         tag.putString("targetDimension", targetDimension); tag.putString("targetLandmark", targetLandmark);
         tag.putInt("tx", target.getX()); tag.putInt("ty", target.getY()); tag.putInt("tz", target.getZ());
+        tag.putDouble("tfx", targetPosition.x); tag.putDouble("tfy", targetPosition.y); tag.putDouble("tfz", targetPosition.z);
         if (hasShallowTarget()) tag.putIntArray("targetBasis", targetBasis.toBits());
         else tag.remove("targetBasis");
         tag.putBoolean("savedAbilities", savedAbilities); tag.putBoolean("allowFlying", allowFlying);
