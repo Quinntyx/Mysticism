@@ -43,6 +43,7 @@ public final class SpiritNavigationService {
     private static final class Session {
         int unsupported, blendTick, landingTick, supportTick, supportAlignTick;
         boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, jumping, supportPending;
+        long restoreNextTick; int restoreFailures;
         Vec384f targetSnapshot, supportTargetSnapshot;
         Basis384f supportFrom, supportGrid;
         long supportWindow;
@@ -129,7 +130,11 @@ public final class SpiritNavigationService {
 
     public static boolean enter(ServerPlayerEntity p) {
         init();
-        if (spirit(p)) return false;
+        if (spirit(p)) {
+            // A silent rejection feeds the enter/leave command loop after a partial failure; state the coherent exit.
+            p.sendMessage(Text.literal("Already in the spirit world; /spirit leave exits the current shallow location."), false);
+            return false;
+        }
         var server = p.getServer(); var world = server.getWorld(SpiritTerrainService.WORLD);
         if (world == null) { p.sendMessage(Text.literal("Spirit dimension unavailable."), false); return false; }
         Vec3d source = p.getPos(); String dimension = p.getWorld().getRegistryKey().getValue().toString();
@@ -141,9 +146,11 @@ public final class SpiritNavigationService {
         Session s = session(p); s.semanticReady = false; s.checkedRestore = true;
         nav.setSemanticReady(false); nav.setLandingApproach(false);
         s.confirmedOwned = false; s.warnedAnchor = false; s.prefetched = false;
+        boolean carried = false;
         try {
             // Source-identical carrier pose: no shared origin, entry search or replacement floor.
             p.teleport(world, source.x, source.y, source.z, p.getYaw(), p.getPitch());
+            carried = spirit(p);
             SpiritTerrainService.setShallow(p, true); flight(p, false);
             p.setVelocity(Vec3d.ZERO); sync(p);
             if (nav.hasShallowTarget()) {
@@ -153,8 +160,41 @@ public final class SpiritNavigationService {
             p.sendMessage(Text.literal("Shallow spirit: walk/jump normally; double-jump flies deep. /spirit leave exits current shallow location."), false);
             return true;
         } catch (RuntimeException failure) {
-            SpiritTerrainService.cancelEnter(p); deactivate(p);
-            p.sendMessage(Text.literal("Spirit entry failed: " + failure.getMessage()), false); return false;
+            recoverFailedEnter(p, failure, carried, source, dimension);
+            return false;
+        }
+    }
+    /** A partial entry must land in a coherent usable state: back at the remembered source pose, or a retained
+     * shallow carrier with live geometry — never inactive flight over missing terrain or an exit-less void fall. */
+    private static void recoverFailedEnter(ServerPlayerEntity p, RuntimeException failure, boolean carried, Vec3d source, String dimension) {
+        String detail = failure.getMessage() == null ? failure.getClass().getSimpleName() : failure.getMessage();
+        EntryRecovery.Action action = EntryRecovery.Action.ABORT;
+        if (carried && spirit(p)) {
+            if (EntryRecovery.recoverableSource(dimension, source)) {
+                try { if (SpiritTerrainService.returnToSource(p, dimension, source)) action = EntryRecovery.Action.RETURN_TO_SOURCE; }
+                catch (RuntimeException secondary) { /* keep the carrier instead of throwing out of recovery */ }
+            }
+            if (action != EntryRecovery.Action.RETURN_TO_SOURCE) action = EntryRecovery.Action.RETAIN_CARRIER;
+        }
+        switch (action) {
+            case RETURN_TO_SOURCE -> {
+                // The world-change handlers deactivate and cancel coherently; make it explicit for ordering.
+                SpiritTerrainService.cancelEnter(p); deactivate(p);
+                p.sendMessage(Text.literal("Spirit entry failed mid-transition (" + detail + "); returned to "
+                        + dimension + " " + MathHelper.floor(source.x) + " " + MathHelper.floor(source.y) + " " + MathHelper.floor(source.z) + "."), false);
+            }
+            case RETAIN_CARRIER -> {
+                // The source pose is unusable; retain the already-built carrier mesh and shallow binding so the
+                // player keeps real geometry and a working /spirit leave instead of falling through the void.
+                flight(p, false); sync(p);
+                p.sendMessage(Text.literal("Spirit entry failed mid-transition (" + detail
+                        + "); shallow carrier retained — /spirit leave exits."), false);
+            }
+            case ABORT -> {
+                // Failure before the carrier teleport: no spirit-world state exists to recover.
+                SpiritTerrainService.cancelEnter(p); deactivate(p);
+                p.sendMessage(Text.literal("Spirit entry failed: " + detail), false);
+            }
         }
     }
     private static void anchorSource(ServerPlayerEntity p, Session s, SpiritTerrainService.SourcePosition source) {
@@ -247,6 +287,7 @@ public final class SpiritNavigationService {
     public static boolean update(ServerPlayerEntity p, Vec3d delta) {
         if (!spirit(p)) { if (state(p).active() || state(p).hasSavedAbilities()) deactivate(p); return false; }
         var nav = state(p); Session s = session(p); restoreAnchor(p, s);
+        if (!ensureTerrainSession(p, s)) return false; // Recovery returned the player to the source world this tick.
         if (nav.hasShallowTarget() && !s.prefetched) {
             SpiritTerrainService.prefetchTarget(p, nav.targetDimension(), nav.targetLandmarkId(), nav.targetPosition(),
                     p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target(), nav.targetBasis()); s.prefetched = true;
@@ -298,6 +339,30 @@ public final class SpiritNavigationService {
         }
         if (attemptLanding(p, s, delta)) return false; // Approach advanced q once, without ordinary basis steering.
         return nav.deep();
+    }
+    /** A cancelled/unbuilt carrier session must self-heal from the per-player binding; a session that cannot be
+     * rebuilt returns the player to the remembered source pose instead of stranding flight over missing terrain
+     * with permanently failing walk requests and an exit-less command loop. */
+    private static boolean ensureTerrainSession(ServerPlayerEntity p, Session s) {
+        var nav = state(p);
+        if (!nav.active() || !SpiritTerrainService.needsRestore(p)) { s.restoreFailures = 0; return true; }
+        long now = p.getServer().getTicks();
+        if (now < s.restoreNextTick) return true;
+        s.restoreNextTick = now + EntryRecovery.RETRY_INTERVAL_TICKS;
+        if (SpiritTerrainService.restore(p, false)) { s.restoreFailures = 0; return true; }
+        ++s.restoreFailures;
+        if (s.restoreFailures < EntryRecovery.REBUILD_FAILURE_LIMIT
+                || !EntryRecovery.recoverableSource(nav.sourceDimension(), nav.sourcePosition())) return true;
+        try {
+            if (SpiritTerrainService.returnToSource(p, nav.sourceDimension(), nav.sourcePosition())) {
+                s.restoreFailures = 0; s.restoreNextTick = 0;
+                // World-change handlers own coherent deactivation; only the recovery outcome is reported here.
+                p.sendMessage(Text.literal("Spirit terrain could not be rebuilt; returned to the remembered source pose."), false);
+                return false;
+            }
+        } catch (RuntimeException ignored) { }
+        s.restoreFailures = EntryRecovery.REBUILD_BACKOFF_FAILURES; // Back off; retry escalation later.
+        return true;
     }
     private static void restoreAnchor(ServerPlayerEntity p, Session s) {
         if (s.checkedRestore) return; s.checkedRestore = true;
