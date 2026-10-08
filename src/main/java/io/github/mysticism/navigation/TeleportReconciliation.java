@@ -3,16 +3,19 @@ package io.github.mysticism.navigation;
 import io.github.mysticism.component.MysticismEntityComponents;
 import io.github.mysticism.dimension.spiritworld.SpiritBasisEvolver;
 import io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService;
+import net.minecraft.registry.RegistryKey;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.World;
 
 /** Server-authoritative teleport arrival reconciliation for the spirit world.
  * A teleport arrival is NOT chosen movement, but every stale piece of the previous movement state
  * used to leak into it and produced visible rubber banding:
  * <ul>
  *   <li>the server kept its residual velocity through the arrival (vanilla zeroes only the CLIENT
- *       velocity on an absolute PlayerPositionLook packet), so the authoritative carrier drifted away
- *       from the mutually accepted arrival pose and was then corrected back — the rubber band;</li>
+ *       velocity on an absolute PlayerPositionLook packet, and preserves relative-axis CLIENT
+ *       velocity). Both peers must drop residual momentum, or they drift away from the mutually
+ *       accepted arrival pose and are then corrected back — the rubber band;</li>
  *   <li>the evolver's last-integrated pose was pre-teleport, and the existing &gt;4-block delta clamp
  *       only discarded LARGE teleports: a 0–4 block /tp inside the spirit world was integrated as
  *       real movement and advanced the latent position (both server evolver and client predictor);</li>
@@ -49,11 +52,19 @@ public final class TeleportReconciliation {
      * last-integrated pose with the arrival pose so the next integration delta is exactly ZERO. */
     public static void afterSpiritTeleport(ServerPlayerEntity player) {
         if (!inSpirit(player)) return;
-        player.setVelocity(Vec3d.ZERO);
+        player.setVelocity(velocityAfterArrival(player.getWorld().getRegistryKey(), player.getVelocity()));
         player.fallDistance = 0;
         // The evolver re-seeds from the CURRENT (arrival) pose: the arrival delta is reconciliation,
         // never semantic travel, and ordinary movement on the next tick integrates normally.
         SpiritBasisEvolver.resetMotion(player);
+    }
+
+    /** Shared arrival momentum policy for both peers. Apply AFTER vanilla resolves relative position
+     * flags: those flags preserve client velocity on their axes in 1.21.1, but an arrival in spirit
+     * must start from rest just like the server. Source-world arrivals retain vanilla momentum.
+     * Independent of navigation mode/readiness and the order of prediction-epoch delivery. */
+    public static Vec3d velocityAfterArrival(RegistryKey<World> world, Vec3d vanillaVelocity) {
+        return world.equals(SpiritTerrainService.WORLD) ? Vec3d.ZERO : vanillaVelocity;
     }
 
     private static boolean inSpirit(ServerPlayerEntity player) {

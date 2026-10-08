@@ -7,7 +7,15 @@ import io.github.mysticism.component.SpiritNavigation;
 import io.github.mysticism.vector.Basis384f;
 import io.github.mysticism.vector.Vec384f;
 import net.minecraft.nbt.NbtCompound;
+import net.minecraft.network.packet.s2c.play.PlayerPositionLookS2CPacket;
+import net.minecraft.network.packet.s2c.play.PositionFlag;
+import net.minecraft.registry.RegistryKey;
+import net.minecraft.registry.RegistryKeys;
+import net.minecraft.util.Identifier;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.World;
+
+import java.util.EnumSet;
 
 /** Deterministic regressions for spirit-world teleport arrival reconciliation: an arrival delta is
  * server-decided, never chosen movement, so stale prediction/movement state must be reset at arrival
@@ -158,12 +166,87 @@ public final class TeleportArrivalReconciliationTest {
         check(reconciled.integrableDelta(player, world, pose.add(3.25, 0, 0), 8, true, true) != null, "Movement after the re-seeded tick integrates");
     }
 
+    /** 1.21.1 PlayerPositionLook fixture: relative axes retain the old client velocity, absolute
+     * axes zero it. This models vanilla packet application; the subsequent arrival policy and
+     * prediction continuity are the REAL production implementations, not test replacements. */
+    private static Vec3d vanillaArrivalVelocity(PlayerPositionLookS2CPacket packet, Vec3d before) {
+        var flags = packet.getFlags();
+        return new Vec3d(flags.contains(PositionFlag.X) ? before.x : 0,
+                flags.contains(PositionFlag.Y) ? before.y : 0,
+                flags.contains(PositionFlag.Z) ? before.z : 0);
+    }
+
+    private static void relativeTeleportDropsClientMomentum() {
+        RegistryKey<World> spirit = RegistryKey.of(RegistryKeys.WORLD, Identifier.of("mysticism", "spirit"));
+        RegistryKey<World> source = RegistryKey.of(RegistryKeys.WORLD, Identifier.of("minecraft", "overworld"));
+        Vec3d velocity = new Vec3d(0.35, -0.0784, -0.2); // moving AND falling before /tp
+        Vec3d before = new Vec3d(10, 64, 10);
+        // /tp ~2 ~ ~: XYZ remain relative, so vanilla retains ALL three velocity components.
+        var relative = new PlayerPositionLookS2CPacket(2, 0, 0, 0, 0,
+                EnumSet.allOf(PositionFlag.class), 19);
+        Vec3d arrival = before.add(relative.getX(), relative.getY(), relative.getZ());
+        Vec3d retained = vanillaArrivalVelocity(relative, velocity);
+        check(retained.equals(velocity), "Relative teleport preserves nonzero vanilla client momentum (the reported defect)");
+        check(arrival.equals(new Vec3d(12, 64, 10)), "Relative teleport still arrives exactly two blocks away");
+
+        Object player = new Object(), world = new Object();
+        PredictionContinuity historyOnly = new PredictionContinuity();
+        historyOnly.integrableDelta(player, world, before, 8, true, true);
+        historyOnly.onArrivalApplied();
+        check(historyOnly.integrableDelta(player, world, arrival, 8, true, true) == null,
+                "Prediction-history reset discards the arrival itself");
+        Vec3d drift = historyOnly.integrableDelta(player, world, arrival.add(retained), 8, true, true);
+        check(drift != null && drift.squaredDistanceTo(retained) < 1e-20,
+                "History-only reset still integrates stale client momentum next tick");
+        Vec384f corrupted = q();
+        TraversalSteering.deepStep(corrupted, new Basis384f(), q(), drift.x, drift.y, drift.z);
+        check(corrupted.squareDistance(q()) > 0, "Retained relative-teleport momentum corrupts semantic travel");
+
+        // Same epoch-before-arrival ordering, now with BOTH prediction and physical state reset.
+        // Momentum policy is independent of deep/shallow mode and semantic readiness.
+        for (boolean deep : new boolean[] {true, false}) {
+            PredictionContinuity reconciled = new PredictionContinuity();
+            reconciled.integrableDelta(player, world, before, 7, deep, true);
+            reconciled.integrableDelta(player, world, before, 8, deep, true);
+            Vec3d stopped = TeleportReconciliation.velocityAfterArrival(spirit, retained);
+            reconciled.onArrivalApplied();
+            check(reconciled.integrableDelta(player, world, arrival, 8, deep, true) == null,
+                    "Relative arrival re-baselines prediction in either navigation mode");
+            Vec3d next = reconciled.integrableDelta(player, world, arrival.add(stopped), 8, deep, true);
+            check(next != null && next.equals(Vec3d.ZERO), "No stale client drift after relative arrival");
+            Vec384f latent = q();
+            TraversalSteering.advance(latent, new Basis384f(), next.x, next.y, next.z);
+            check(latent.squareDistance(q()) == 0, "Post-arrival rest does not advance semantic position");
+            Vec3d walking = reconciled.integrableDelta(player, world, arrival.add(0.25, 0, 0), 8, deep, true);
+            check(walking != null && walking.equals(new Vec3d(0.25, 0, 0)), "Fresh chosen movement resumes after arrival");
+        }
+
+        // All mixed XYZ combinations, with and without relative rotation. Absolute packets remain
+        // at rest; no relative component escapes spirit reconciliation. Source worlds keep vanilla
+        // semantics, including partial-axis momentum retention; don't rewrite packet flags to stop it.
+        PositionFlag[] axes = {PositionFlag.X, PositionFlag.Y, PositionFlag.Z};
+        for (int mask = 0; mask < 8; mask++) {
+            for (boolean relativeRotation : new boolean[] {false, true}) {
+                EnumSet<PositionFlag> flags = EnumSet.noneOf(PositionFlag.class);
+                for (int axis = 0; axis < 3; axis++) if ((mask & (1 << axis)) != 0) flags.add(axes[axis]);
+                if (relativeRotation) { flags.add(PositionFlag.X_ROT); flags.add(PositionFlag.Y_ROT); }
+                var packet = new PlayerPositionLookS2CPacket(2, 64, 10, 15, -5, flags, 20 + mask);
+                Vec3d vanilla = vanillaArrivalVelocity(packet, velocity);
+                check(TeleportReconciliation.velocityAfterArrival(spirit, vanilla).equals(Vec3d.ZERO),
+                        "Spirit arrivals clear every relative-axis momentum combination");
+                check(TeleportReconciliation.velocityAfterArrival(source, vanilla) == vanilla,
+                        "Non-spirit arrivals preserve vanilla relative/absolute momentum semantics");
+            }
+        }
+    }
+
     public static void main(String[] args) {
         arrivalDeltaIsNotSemanticTravel();
         predictionEpochAdvancesOnEveryArrival();
         predictionEpochPersists();
         predictorGateDropsStaleArrivalDelta();
         arrivalReseedSurvivesEpochBeforeArrival();
+        relativeTeleportDropsClientMomentum();
         System.out.println("TeleportArrivalReconciliationTest: " + checks + " checks passed");
     }
 }
