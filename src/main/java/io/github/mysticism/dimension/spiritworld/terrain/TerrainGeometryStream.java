@@ -40,7 +40,7 @@ final class TerrainGeometryStream {
             // No global palette truncation: cold materials omitted from this bounded reservoir can be revisited on a new spatial pass.
             if(tile==null){tile=SourceMeshBuilder.stored(state,at);if(materials.size()<TerrainMeshFrame.MAX_MATERIALS)materials.put(state,tile);}
             var node=new SourceMeshBuilder.Node(at,side,tile,owner);double d=distance.applyAsDouble(node);
-            if(d>128*128)continue;
+            if(d>(double)DiscoveryBudget.RENDER_DISTANCE*DiscoveryBudget.RENDER_DISTANCE)continue;
             var key=new SourceMeshBuilder.Key(at.getX(),at.getY(),at.getZ(),side);
             if(nodes.containsKey(key))continue;
             if(nodes.size()>=MAX_NODES) {
