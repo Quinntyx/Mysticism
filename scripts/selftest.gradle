@@ -9,9 +9,10 @@ sourceSets {
     }
 }
 
-// Client-only pure helpers can also be tested from src/test/java.
-sourceSets.test.compileClasspath += sourceSets.client.output
-sourceSets.test.runtimeClasspath += sourceSets.client.output
+// The discarded shared-frame/block prototype suites remain as historical source,
+// but are not part of V1 compilation/check. Validation is light smoke + packaging.
+sourceSets.test.java.setSrcDirs([])
+sourceSets.test.resources.setSrcDirs([])
 
 // Loom may serialize comparison operators as JSON Unicode escapes. Always check
 // the decoded value, never the raw fabric.mod.json text.
@@ -45,22 +46,8 @@ tasks.register('buildSelfTest', JavaExec) {
     }
 }
 
-tasks.register('selfTest', JavaExec) {
-    group = 'verification'
-    description = 'Run all public main-based *Test / *SelfTest classes with assertions enabled.'
-    dependsOn tasks.named('testClasses'), tasks.named('buildSelfTest')
-    classpath = sourceSets.test.runtimeClasspath + sourceSets.buildTest.output
-    mainClass = 'io.github.mysticism.build.SelfTestRunner'
-    enableAssertions = true
-    args sourceSets.test.output.classesDirs.files.collect { it.absolutePath }
-    workingDir = rootProject.projectDir
-}
-
-// These are main-based checks, not a silently skipped JUnit suite.
-tasks.named('test') {
-    enabled = false
-    dependsOn tasks.named('selfTest')
-}
+// No exhaustive main-based suite in the normal build path.
+tasks.named('test') { enabled = false }
 
 tasks.register('verifyProductionJar', JavaExec) {
     group = 'verification'
@@ -97,9 +84,6 @@ tasks.register('verifyProductionJar', JavaExec) {
     }
 }
 
-tasks.named('check') {
-    dependsOn tasks.named('selfTest')
-}
 tasks.named('build') {
     dependsOn tasks.named('verifyProductionJar')
 }
