@@ -6,6 +6,12 @@ import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.WorldView;
 import com.google.gson.JsonParser;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.JumpInsnNode;
+import org.objectweb.asm.tree.MethodInsnNode;
+import org.objectweb.asm.tree.MethodNode;
+import org.spongepowered.asm.mixin.injection.Redirect;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -130,12 +136,108 @@ public final class MeshMovementVerdictTest {
         check(MeshCollision.class.getDeclaredMethod("movementRejected",TerrainMeshFrame.class,Box.class,Box.class).getReturnType()==boolean.class
                 &&MeshCollision.class.getDeclaredMethod("movementRejected",net.minecraft.entity.player.PlayerEntity.class,Box.class,Box.class).getReturnType()==boolean.class,
                 "verdict entry points exist for the server handler hook");
+        var redirect=io.github.mysticism.mixin.SpiritMeshMovementMixin.class.getDeclaredMethod("mysticism$spiritShortCircuit",
+                net.minecraft.server.world.ServerWorld.class,net.minecraft.entity.Entity.class,Box.class)
+                .getAnnotation(Redirect.class);
+        check(redirect!=null&&redirect.method().length==1&&redirect.method()[0].equals("onPlayerMove")&&redirect.at()!=null
+                &&redirect.at().value().equals("INVOKE")
+                &&redirect.at().target().equals("Lnet/minecraft/server/world/ServerWorld;isSpaceEmpty(Lnet/minecraft/entity/Entity;Lnet/minecraft/util/math/Box;)Z"),
+                "short-circuit redirect must target the moved-wrongly isSpaceEmpty call in onPlayerMove");
+    }
+    /** Literal transcription of the verified onPlayerMove acceptance decision (cached Minecraft
+     * bytecode offsets noted): 885 noClip/ifne, 899 sleeping/ifne, 905 movedWrongly/ifeq 923,
+     * 917 isSpaceEmpty/ifne 938, 932 isPlayerNotCollidingWithBlocks/ifeq 994, else requestTeleport. */
+    private enum Outcome { ACCEPT, TELEPORT }
+    private static Outcome vanillaDecision(boolean noClip,boolean sleeping,boolean movedWrongly,
+            boolean previousSpaceEmpty,boolean collisionVerdict) {
+        if(noClip||sleeping)return Outcome.ACCEPT;
+        if(movedWrongly&&previousSpaceEmpty)return Outcome.TELEPORT;
+        return collisionVerdict?Outcome.TELEPORT:Outcome.ACCEPT;
+    }
+    /** The complete handler decision including the moved-wrongly short-circuit the first hook alone
+     * could never reach: with the vanilla void semantics (spaceEmpty always true, verdict operand only
+     * consulted on the fall-through) a >0.25 re-simulation divergence teleports REGARDLESS of the mesh
+     * verdict; forcing the short-circuit open routes the whole decision through the mesh verdict. */
+    private static void completeHandlerDecision() {
+        var frame=ledgeFrame();
+        Box clear=body(2.5,1.0,1),penetrating=body(2.5,0.4,1),previous=body(1,0,1),overlapping=body(2.5,0.45,1);
+        boolean divergent=true;
+        // Void carrier world as vanilla sees it: previous box never blocked, block verdict constant false.
+        // Even with the mesh verdict wired into the collision operand (the first hook alone), the
+        // moved-wrongly short-circuit never reaches it for a divergent claim.
+        boolean clearVerdict=MeshCollision.movementRejected(frame,previous,clear);
+        check(!clearVerdict,"mesh verdict says the collision-clear divergent endpoint is safe");
+        check(vanillaDecision(false,false,divergent,true,clearVerdict)==Outcome.TELEPORT,
+                "bug reproduction: vanilla void semantics teleport a divergent claim even when the verdict says safe");
+        check(vanillaDecision(false,false,!divergent,true,MeshCollision.movementRejected(frame,previous,penetrating))==Outcome.TELEPORT,
+                "agreeing re-simulation with a penetrating destination is rejected by the verdict operand");
+        // Redirected spirit decision: isSpaceEmpty forced false (no vanilla blocks exist to block the
+        // previous box), so the ENTIRE decision routes through the mesh verdict operand.
+        check(spiritDecision(false,false,divergent,frame,previous,clear)==Outcome.ACCEPT,
+                "THE FIX: divergent re-simulation with a mesh-clear endpoint is accepted, not rubber-banded");
+        check(spiritDecision(false,false,divergent,frame,previous,penetrating)==Outcome.TELEPORT,
+                "divergent claim embedded in the ledge is still teleported back to the server pose");
+        check(spiritDecision(false,false,!divergent,frame,previous,penetrating)==Outcome.TELEPORT,
+                "agreeing re-simulation cannot smuggle in a penetrating destination");
+        check(spiritDecision(false,false,divergent,frame,overlapping,penetrating)==Outcome.ACCEPT,
+                "recovery claims from an already-overlapping body are accepted (no teleport oscillation)");
+        check(spiritDecision(true,false,divergent,frame,previous,penetrating)==Outcome.ACCEPT
+                &&spiritDecision(false,true,divergent,frame,previous,penetrating)==Outcome.ACCEPT,
+                "noClip/sleeping escape paths keep vanilla acceptance");
+    }
+    private static Outcome spiritDecision(boolean noClip,boolean sleeping,boolean movedWrongly,
+            TerrainMeshFrame frame,Box previousBox,Box destination) {
+        return vanillaDecision(noClip,sleeping,movedWrongly,false,MeshCollision.movementRejected(frame,previousBox,destination));
+    }
+    /** Pins the REAL onPlayerMove control flow from the cached Minecraft bytecode: the moved-wrongly
+     * short-circuit (isSpaceEmpty/ifne) jumps into the requestTeleport block WITHOUT consulting
+     * isPlayerNotCollidingWithBlocks, which is exactly what the redirect must open. */
+    private static void handlerDecisionStructure() throws Exception {
+        byte[] bytes;
+        try (var in=MeshMovementVerdictTest.class.getClassLoader().getResourceAsStream("net/minecraft/server/network/ServerPlayNetworkHandler.class")) {
+            check(in!=null,"cached Minecraft ServerPlayNetworkHandler bytecode must be on the runtime classpath");
+            bytes=in.readAllBytes();
+        }
+        var node=new ClassNode();new ClassReader(bytes).accept(node,0);
+        MethodNode move=null;for(var m:node.methods)if(m.name.equals("onPlayerMove"))move=m;
+        check(move!=null,"onPlayerMove exists");
+        int spaceEmpty=0,verdictCall=-1,requestTeleport=-1;
+        var insns=move.instructions;
+        for(int i=0;i<insns.size();i++) {
+            if(!(insns.get(i) instanceof MethodInsnNode call))continue;
+            if(call.name.equals("isSpaceEmpty")) {
+                check(call.owner.equals("net/minecraft/server/world/ServerWorld")
+                        &&call.desc.equals("(Lnet/minecraft/entity/Entity;Lnet/minecraft/util/math/Box;)Z")&&call.itf==false,
+                        "isSpaceEmpty call site matches the redirect target owner/descriptor");
+                spaceEmpty++;
+            }
+            if(call.name.equals("isPlayerNotCollidingWithBlocks"))verdictCall=i;
+            if(call.name.equals("requestTeleport")&&call.desc.equals("(DDDFF)V")&&requestTeleport<0)requestTeleport=i;
+        }
+        check(spaceEmpty==1,"onPlayerMove contains exactly one isSpaceEmpty call (the redirect target)");
+        check(verdictCall>0,"onPlayerMove calls isPlayerNotCollidingWithBlocks");
+        check(requestTeleport>0,"onPlayerMove can requestTeleport");
+        check(insns.get(verdictCall+1) instanceof JumpInsnNode jump && jump.getOpcode()==org.objectweb.asm.Opcodes.IFEQ
+                && insns.indexOf(jump.label)>verdictCall,
+                "verdict false falls through to acceptance (ifeq past the teleport block)");
+        int spaceIndex=-1;for(int i=0;i<insns.size();i++)if(insns.get(i) instanceof MethodInsnNode c&&c.name.equals("isSpaceEmpty"))spaceIndex=i;
+        check(insns.get(spaceIndex+1) instanceof JumpInsnNode bypass && bypass.getOpcode()==org.objectweb.asm.Opcodes.IFNE,
+                "the isSpaceEmpty result short-circuits on a conditional jump (ifne)");
+        int target=insns.indexOf(((JumpInsnNode)insns.get(spaceIndex+1)).label);
+        check(target>spaceIndex,"the short-circuit branch re-enters downstream of the isSpaceEmpty call");
+        int firstInTarget=-1;for(int i=target;i<insns.size();i++)if(insns.get(i) instanceof MethodInsnNode){firstInTarget=i;break;}
+        check(firstInTarget>=0&&((MethodInsnNode)insns.get(firstInTarget)).name.equals("requestTeleport")&&firstInTarget>verdictCall,
+                "the short-circuit path teleports without ever consulting the collision verdict (the bypass)");
+        int firstAfterFall=-1;for(int i=spaceIndex+2;i<insns.size();i++)if(insns.get(i) instanceof MethodInsnNode){firstAfterFall=i;break;}
+        check(firstAfterFall==verdictCall,"the opened fall-through consults the collision verdict");
     }
     public static void main(String[] args) throws Exception {
         SharedConstants.createGameVersion();
         ledgeJumpReproducer();
         slopeWalkingSequence();
         fadedCellConsistency();
+        completeHandlerDecision();
+        handlerDecisionStructure();
         mixinContract();
         System.out.println("MeshMovementVerdictTest: "+checks+" checks passed");
     }
