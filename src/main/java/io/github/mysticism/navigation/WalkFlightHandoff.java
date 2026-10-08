@@ -8,15 +8,25 @@ import net.minecraft.util.math.Vec3d;
  * published mesh, and a descent clip at walk acquisition re-triggers depenetration jitter every step.
  * Server-authoritative bookkeeping also stays inside the integrable band the semantic steering accepts. */
 public final class WalkFlightHandoff {
-    /** Matches the evolver/steering integrable band: per-tick deltas above this are discarded as
-     * teleport-scale movement, so a handoff faster than this would freeze semantic travel. */
-    public static final double MAX_HANDOFF_SPEED = 4.0;
+    /** Matches vanilla's own velocity-packet clamp: EntityVelocityUpdateS2CPacket clamps every axis to
+     * ±3.9 blocks/tick, so this is the fastest handoff the server can deliver to the controlling client
+     * EXACTLY (larger caps would diverge server and delivered values). Still inside the 4 blocks/tick
+     * evolver/steering integrable band, so handed-off movement is never discarded as teleport-scale. */
+    public static final double MAX_HANDOFF_SPEED = 3.9;
     /** Vanilla jump ascent produces a clearly positive per-tick Y delta at takeoff. */
     public static final double JUMP_TAKEOFF_DELTA = 0.01;
     /** Gravity's first unsupported per-tick displacement (~-0.0784) is far past this epsilon. */
     public static final double FALLING_DELTA = -1e-4;
     public static final int TAKEOFF_GRACE_TICKS = 14;
     private WalkFlightHandoff() {}
+
+    /** A handoff must run on the FIRST assertion of a navigation mode and on every mode transition —
+    * including the normal double-jump entry, where vanilla's abilities handler has already preset
+    * flying=true server-side before navigation sees the packet (so an abilities-only diff would see no
+    * change). lastHandedDeep == null means navigation never handed this player off (fresh session). */
+    public static boolean handoffDue(Boolean lastHandedDeep, boolean requestedDeep) {
+        return lastHandedDeep == null || lastHandedDeep != requestedDeep;
+    }
 
     /** walk→flight: keep the player's momentum for continuity (a jump takeoff keeps rising), but bound it
      * so no stale burst, collision push or teleport residue enters the new flight mode. */

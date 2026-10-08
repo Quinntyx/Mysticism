@@ -4,7 +4,12 @@ import io.github.mysticism.activity.TraversalSteering;
 import io.github.mysticism.vector.Basis384f;
 import io.github.mysticism.vector.EmbeddingSpace;
 import io.github.mysticism.vector.Vec384f;
+import net.minecraft.network.packet.Packet;
+import net.minecraft.network.packet.s2c.play.EntityVelocityUpdateS2CPacket;
+import net.minecraft.server.network.ServerPlayNetworkHandler;
 import net.minecraft.util.math.Vec3d;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 /** Deterministic regressions for walk/flight transition stability: every mode switch must hand off a
  * bounded, mode-appropriate velocity, and a settled shallow pose must never spontaneously start flight.
@@ -13,6 +18,9 @@ public final class WalkFlightHandoffTest {
     private static int checks;
     private static void check(boolean value,String why){checks++;if(!value)throw new AssertionError(why);}
     private static void near(double actual,double expected,String why){check(Math.abs(actual-expected)<1e-9,why+" (got "+actual+")");}
+    /** Vanilla encodes velocity packets at 1/8000 blocks/tick resolution; arbitrary values lose up to
+    * one step. The delivery contract for arbitrary momentum is one wire step, not bit equality. */
+    private static void wireNear(double actual,double expected,String why){check(Math.abs(actual-expected)<=1.0/8000,why+" (got "+actual+")");}
 
     private static void toFlightContinuity() {
         // Ordinary gameplay velocities at a walk→flight handoff must pass through EXACTLY: clamping or
@@ -47,8 +55,10 @@ public final class WalkFlightHandoffTest {
 
     private static void handoffSpeedIsSemanticallyIntegrable() {
         // The steering integrator discards per-tick movement above 4 blocks (teleport-scale). The handoff
-        // cap must match it exactly so post-transition movement keeps advancing semantic travel.
-        check(WalkFlightHandoff.MAX_HANDOFF_SPEED==4.0,"Handoff cap must equal the steering integrable band");
+        // cap must stay inside that band so post-transition movement keeps advancing semantic travel,
+        // and inside vanilla's ±3.9 velocity-packet clamp so the delivered value matches the server value.
+        check(WalkFlightHandoff.MAX_HANDOFF_SPEED > 0 && WalkFlightHandoff.MAX_HANDOFF_SPEED <= 4.0,
+                "Handoff cap must be inside the steering integrable band");
         Basis384f basis=new Basis384f();Vec384f target=axis(0).mul(1000);
         Vec384f skipped=q();TraversalSteering.deepStep(skipped,basis,target,30,0,0);
         check(skipped.squareDistance(q())==0,"Raw burst is discarded as teleport-scale (the defect)");
@@ -108,13 +118,90 @@ public final class WalkFlightHandoffTest {
         check(WalkFlightHandoff.leavesGround(false,2,-0.0784),"Vanished floor converts on the first falling tick");
     }
 
-    public static void main(String[] args){
+    private static void handoffTrigger() {
+        // Handoff is driven by the NAVIGATION-mode transition, not an abilities diff: normal double-jump
+        // entry reaches navigation only after vanilla's abilities handler has already preset flying=true
+        // server-side, so an abilities-only check would silently skip the handoff.
+        check(WalkFlightHandoff.handoffDue(null, true), "Fresh session hands off on first flight assertion");
+        check(WalkFlightHandoff.handoffDue(null, false), "Fresh session hands off on first walk assertion");
+        check(WalkFlightHandoff.handoffDue(false, true), "Double-jump entry: vanilla preset flying server-side, navigation still hands off");
+        check(WalkFlightHandoff.handoffDue(true, false), "Walk acquisition hands off deep->shallow");
+        check(!WalkFlightHandoff.handoffDue(false, false), "Repeated shallow assertion must not re-handoff");
+        check(!WalkFlightHandoff.handoffDue(true, true), "Repeated deep assertion must not re-handoff");
+        // Simulated post-vanilla packet state across a full entry: abilities preset by vanilla each time,
+        // session previously shallow — the deep assertion must still hand off exactly once.
+        Boolean handed = false;
+        int handoffs = 0;
+        for (boolean requested : new boolean[]{true, true, true}) {
+            if (WalkFlightHandoff.handoffDue(handed, requested)) { handed = requested; handoffs++; }
+        }
+        check(handoffs == 1, "Double-jump entry hands off exactly once despite preset abilities");
+    }
+
+    private static void deliveryReachesControllingClient() {
+        // setVelocity alone mutates only server state; the controlling client never sees it. The mapped
+        // delivery channel is a self EntityVelocityUpdate packet, applied client-side via setVelocityClient.
+        try {
+            check(EntityVelocityUpdateS2CPacket.class.getConstructor(int.class, Vec3d.class) != null,
+                    "Self velocity packet constructor (id, velocity) exists");
+            check(ServerPlayNetworkHandler.class.getMethod("sendPacket", Packet.class) != null,
+                    "Player network handler exposes sendPacket delivery");
+        } catch (ReflectiveOperationException failure) {
+            throw new AssertionError("Mapped delivery targets changed", failure);
+        }
+        // The handed-off value must survive the packet's /8000 wire quantization EXACTLY, so the client
+        // starts the new mode from the same bounded pose the server computed.
+        var handed = new EntityVelocityUpdateS2CPacket(1, WalkFlightHandoff.toFlight(new Vec3d(30, 0, 0)));
+        near(handed.getVelocityX(), WalkFlightHandoff.MAX_HANDOFF_SPEED, "Clamped handoff velocity survives packet quantization");
+        near(handed.getVelocityY(), 0, "Handoff quantization leaves other axes untouched");
+        // The delivered value must EQUAL the server value at the cap itself — the cap is chosen so vanilla's
+        // packet clamp never rewrites it (the round trip is the delivery contract, not a tolerance).
+        var capped = new EntityVelocityUpdateS2CPacket(1, new Vec3d(WalkFlightHandoff.MAX_HANDOFF_SPEED, -WalkFlightHandoff.MAX_HANDOFF_SPEED, 0));
+        near(capped.getVelocityX(), WalkFlightHandoff.MAX_HANDOFF_SPEED, "Cap axis round-trips exactly (+)");
+        near(capped.getVelocityY(), -WalkFlightHandoff.MAX_HANDOFF_SPEED, "Cap axis round-trips exactly (-)");
+        check(handed.getVelocityX() == capped.getVelocityX(), "Delivered cap equals server cap");
+        var takeoff = new EntityVelocityUpdateS2CPacket(1, WalkFlightHandoff.toFlight(new Vec3d(0, 0.42, 0)));
+        wireNear(takeoff.getVelocityY(), 0.42, "Ordinary jump momentum delivers within one wire step");
+        var stop = new EntityVelocityUpdateS2CPacket(1, Vec3d.ZERO);
+        check(stop.getVelocityX() == 0 && stop.getVelocityY() == 0 && stop.getVelocityZ() == 0,
+                "Delivered expiry stop is exactly zero");
+        var plunge = new EntityVelocityUpdateS2CPacket(1, WalkFlightHandoff.toFlight(new Vec3d(0, -40, 0)));
+        near(plunge.getVelocityY(), -WalkFlightHandoff.MAX_HANDOFF_SPEED, "Clamped falling residue delivers intact");
+        // Ordinary walk handoff: the delivered stop must also round-trip exactly.
+        var walkStop = new EntityVelocityUpdateS2CPacket(1, WalkFlightHandoff.toWalk(new Vec3d(1.2, -3.4, .5), true));
+        check(walkStop.getVelocityX() == 0 && walkStop.getVelocityY() == 0 && walkStop.getVelocityZ() == 0,
+                "Grounded walk handoff delivers an exact zero to the controlling client");
+    }
+
+    /** Offline wiring contract: the service must actually DELIVER at both handoff and expiry, and gate on
+    * the navigation-mode transition. Source-level by design; the live path needs a running server. */
+    private static void serviceWiringContract() throws Exception {
+        Path root = Path.of("").toAbsolutePath();
+        Path source = null;
+        for (Path dir = root; dir != null; dir = dir.getParent()) {
+            Path candidate = dir.resolve("src/main/java/io/github/mysticism/navigation/SpiritNavigationService.java");
+            if (Files.exists(candidate)) { source = candidate; break; }
+        }
+        check(source != null, "SpiritNavigationService source discoverable from " + root);
+        String text = Files.readString(source);
+        check(text.contains("deliverVelocity(p, p.getVelocity())"), "Mode handoff delivers the new velocity to the controlling client");
+        check(text.contains("deliverVelocity(p, Vec3d.ZERO)"), "Expiry stop is delivered, not only set server-side");
+        check(text.contains("EntityVelocityUpdateS2CPacket"), "Delivery uses the self EntityVelocityUpdate packet channel");
+        check(text.contains("handoffDue"), "Handoff is gated on the navigation-mode transition");
+        int deliveries = text.split("deliverVelocity\\(", -1).length - 1;
+        check(deliveries >= 3, "Delivery definition plus handoff/expiry call sites all present (found " + deliveries + " references)");
+    }
+
+    public static void main(String[] args) throws Exception {
         toFlightContinuity();
         toWalkGrounding();
         handoffSpeedIsSemanticallyIntegrable();
         takeoffDecision();
         leaveGroundDecision();
         transitionSequences();
+        handoffTrigger();
+        deliveryReachesControllingClient();
+        serviceWiringContract();
         System.out.println("WalkFlightHandoffTest: "+checks+" checks passed");
     }
 }

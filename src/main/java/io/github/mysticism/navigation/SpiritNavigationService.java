@@ -18,6 +18,7 @@ import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.network.packet.s2c.play.EntityVelocityUpdateS2CPacket;
 import net.minecraft.text.Text;
 import net.minecraft.util.math.*;
 import java.util.*;
@@ -44,6 +45,7 @@ public final class SpiritNavigationService {
     private static final class Session {
         int unsupported, blendTick, landingTick, supportTick, supportAlignTick;
         boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, jumping, supportPending;
+        Boolean handedDeep; // null = navigation never handed this session off; else last handed mode.
         Vec384f targetSnapshot, supportTargetSnapshot;
         Basis384f supportFrom, supportGrid;
         long supportWindow;
@@ -122,17 +124,31 @@ public final class SpiritNavigationService {
         clear(p);
     }
     private static void flight(ServerPlayerEntity p, boolean deep) {
-        boolean changed = !p.getAbilities().allowFlying || p.getAbilities().flying != deep;
+        Session s = session(p);
+        // Handoff is driven by the NAVIGATION-mode transition, not by an abilities diff: normal double-jump
+        // entry reaches navigation only after vanilla's abilities handler already preset flying=true
+        // server-side, so an abilities-only check would silently skip the handoff.
+        boolean handoff = WalkFlightHandoff.handoffDue(s == null ? null : s.handedDeep, deep);
+        boolean abilitiesChanged = !p.getAbilities().allowFlying || p.getAbilities().flying != deep;
         p.getAbilities().allowFlying = true; p.getAbilities().flying = deep;
         p.setNoGravity(false); p.fallDistance = 0;
-        if (changed) {
+        if (handoff) {
+            if (s != null) s.handedDeep = deep;
             // Every mode switch hands off a stable usable velocity: bounded momentum into flight, and a
             // zeroed standing velocity when walk acquisition validated ground contact (a residual flight
             // descent would clip the fresh mesh and bounce out via depenetration — visible rubber banding).
             p.setVelocity(deep ? WalkFlightHandoff.toFlight(p.getVelocity())
                     : WalkFlightHandoff.toWalk(p.getVelocity(), MeshCollision.ground(p).isPresent()));
-            p.sendAbilitiesUpdate();
+            deliverVelocity(p, p.getVelocity());
         }
+        if (abilitiesChanged || handoff) p.sendAbilitiesUpdate();
+    }
+
+    /** setVelocity alone mutates only server state and the owning client never sees it. Deliver the
+    * handed-off velocity as a self EntityVelocityUpdate packet so the CONTROLLING client starts the new
+    * mode from the same bounded pose instead of continuing its stale client-side motion. */
+    private static void deliverVelocity(ServerPlayerEntity p, Vec3d velocity) {
+        p.networkHandler.sendPacket(new EntityVelocityUpdateS2CPacket(p.getId(), velocity));
     }
 
     public static boolean enter(ServerPlayerEntity p) {
@@ -345,7 +361,9 @@ public final class SpiritNavigationService {
         if (++s.supportTick > 200) {
             // Expired intent leaves a stable usable hover: an unbounded residual velocity would keep
             // drifting the carrier while the player decides what to do next. Still deep; no substitute landing.
+            // The stop is DELIVERED to the controlling client; setVelocity alone would not reach it.
             p.setVelocity(Vec3d.ZERO); p.fallDistance = 0;
+            deliverVelocity(p, Vec3d.ZERO);
             endSupportApproach(p, s);
             p.sendMessage(Text.literal("Walk request expired: current support could not be continuously aligned/owned. Still deep; no substitute landing."), true);
             return;
