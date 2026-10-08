@@ -42,7 +42,8 @@ public final class SpiritNavigationService {
     private SpiritNavigationService() {}
     private static final class Session {
         int unsupported, blendTick, landingTick, supportTick, supportAlignTick;
-        boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, jumping, supportPending;
+        boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, jumping;
+        final WalkIntentTracker walk = new WalkIntentTracker();
         Vec384f targetSnapshot, supportTargetSnapshot;
         Basis384f supportFrom, supportGrid;
         long supportWindow;
@@ -78,7 +79,7 @@ public final class SpiritNavigationService {
             }
             for (var p : server.getPlayerManager().getPlayerList()) {
                 Session s = sessions == null ? null : sessions.get(p.getUuid());
-                if (s != null && s.supportPending && (world.getRegistryKey().equals(SpiritTerrainService.WORLD)
+                if (s != null && s.walk.pending() && (world.getRegistryKey().equals(SpiritTerrainService.WORLD)
                         || s.supportDimension.isEmpty() || s.supportDimension.equals(dimension))) {
                     endSupportApproach(p, s);
                     p.sendMessage(Text.literal("Walk request cancelled by source/dimension unload; remaining deep."), true);
@@ -106,7 +107,7 @@ public final class SpiritNavigationService {
         Map<UUID, Session> sessions = SERVERS.get(p.getServer());
         Session removed = sessions == null ? null : sessions.remove(p.getUuid());
         if (removed != null && removed.capture != null) removed.capture.cancel(false);
-        if (removed != null && removed.supportPending) SpiritTerrainService.cancelCurrentSupport(p);
+        if (removed != null && removed.walk.pending()) SpiritTerrainService.cancelCurrentSupport(p);
         // Pending support ownership/alignment is session-local, never resumed from a saved/wire flag.
         state(p).setSupportApproach(false);
     }
@@ -174,7 +175,7 @@ public final class SpiritNavigationService {
                 MathHelper.floor(source.position().x), MathHelper.floor(source.position().y), MathHelper.floor(source.position().z))) return;
         boolean wasDeep = nav.deep();
         nav.shallow(source.dimension(), source.landmarkId(), source.position());
-        if (wasDeep) { nav.enterDeep(); nav.setSupportApproach(s.supportPending); } // Never take flight away or lose pending prediction mode.
+        if (wasDeep) { nav.enterDeep(); nav.setSupportApproach(s.walk.pending()); } // Never take flight away or lose pending prediction mode.
         s.semanticReady = true; nav.setSemanticReady(true);
         Vec384f q = SpiritActivityService.effectiveEmbedding(p.getServer(), metadata).vector();
         Vec3d offset = source.position().subtract(metadata.header().anchor().x(), metadata.header().anchor().y(), metadata.header().anchor().z());
@@ -183,7 +184,7 @@ public final class SpiritNavigationService {
         var att = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT);
         if (!nav.hasShallowTarget() && att.target().length() < 1e-6) {
             att.set(q); // initialize only an absent default, never overwrite a captured coordinate (even ZERO)
-            if (s.supportPending) s.supportTargetSnapshot = att.target();
+            if (s.walk.pending()) s.supportTargetSnapshot = att.target();
         }
         MysticismEntityComponents.LATENT_ATTUNEMENT.sync(p); MysticismEntityComponents.LATENT_POS.sync(p); sync(p);
     }
@@ -220,25 +221,30 @@ public final class SpiritNavigationService {
         }
     }
 
-    /** Vanilla false-flight requests current support, not a remembered entry or captured destination. */
+    /** Vanilla false-flight requests current support, not a remembered entry or captured destination.
+     * Only a fresh client gesture (state edge) may start a walk: a retransmitted or stale flight-off
+     * packet must never restart a request or override the latest requested destination. */
     public static void onFlightToggle(ServerPlayerEntity p, boolean flying) {
         if (!spirit(p)) return;
-        if (flying) { enterDeep(p); return; }
+        Session s = session(p);
+        boolean fresh = s.walk.observeToggle(flying);
+        if (flying) { if (fresh) enterDeep(p); return; }
         if (!state(p).active()) enterDeep(p);
         if (!state(p).deep()) { flight(p, false); return; }
-        Session s = session(p); restoreAnchor(p, s);
+        restoreAnchor(p, s);
         flight(p, true); // remains deep/freeflight until the real terrain acquisition commits
-        if (s.supportPending) return; // repeated packets cannot reset budgets or duplicate requests
+        if (s.walk.pending() || !fresh) return; // repeated packets cannot reset budgets or duplicate requests
         endApproach(p, s); s.blendFrom = null; s.blendTo = null;
-        s.supportPending = true; s.supportTick = 0; s.supportFrom = null;
+        if (!s.walk.startWalk()) return;
+        s.supportTick = 0; s.supportFrom = null;
         s.supportId = ""; s.supportDimension = "";
         s.supportTargetSnapshot = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target();
         state(p).setSupportApproach(true); sync(p);
         p.sendMessage(Text.literal("Walk request: validating current source-owned support; flight remains active until ready."), true);
     }
     private static void endSupportApproach(ServerPlayerEntity p, Session s) {
-        if (s.supportPending) SpiritTerrainService.cancelCurrentSupport(p);
-        s.supportPending = false; s.supportTargetSnapshot = null; s.supportFrom = null; s.supportGrid = null;
+        if (s.walk.pending()) SpiritTerrainService.cancelCurrentSupport(p);
+        s.walk.endWalk(); s.supportTargetSnapshot = null; s.supportFrom = null; s.supportGrid = null;
         s.supportId = ""; s.supportDimension = ""; s.supportTick = 0; s.supportAlignTick = 0;
         if (state(p).supportApproach()) { state(p).setSupportApproach(false); sync(p); }
     }
@@ -285,7 +291,7 @@ public final class SpiritNavigationService {
             return false;
         }
         flight(p, true);
-        if (s.supportPending) { attemptSupport(p, s, delta); return false; }
+        if (s.walk.pending()) { attemptSupport(p, s, delta); return false; }
         if (!s.semanticReady) return false;
         if (s.blendTo != null) {
             if (delta.lengthSquared() > 1e-5) { s.blendFrom = null; s.blendTo = null; }
@@ -326,6 +332,13 @@ public final class SpiritNavigationService {
     private static void attemptSupport(ServerPlayerEntity p, Session s, Vec3d delta) {
         var nav = state(p); var component = p.getComponent(MysticismEntityComponents.LATENT_BASIS);
         var q = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
+        // Defensive epoch net: a pending walk requested before the latest explicit destination
+        // change must never complete against the older destination.
+        if (s.walk.superseded()) {
+            endSupportApproach(p, s);
+            p.sendMessage(Text.literal("Walk request superseded by a newer requested destination; remaining deep."), true);
+            return;
+        }
         if (s.semanticReady && Double.isFinite(delta.x) && Double.isFinite(delta.y) && Double.isFinite(delta.z)
                 && delta.lengthSquared() <= 16)
             TraversalSteering.advance(q, component.get(), delta.x, delta.y, delta.z);
@@ -335,11 +348,16 @@ public final class SpiritNavigationService {
             return;
         }
         if (!s.semanticReady) return; // Real late source discovery must finish; never invent q.
-        if (s.supportTargetSnapshot.squareDistance(p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target()) > 0) {
+        var attunement = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT);
+        var attunementTarget = attunement.target();
+        // Only an EXPLICIT attunement re-key supersedes the walk. Background personal-concept
+        // drift on a non-explicit target is not a destination request; the walk follows it.
+        if (WalkIntentTracker.attunementSupersedes(s.supportTargetSnapshot, attunementTarget, attunement.explicitTarget())) {
             endSupportApproach(p, s);
-            p.sendMessage(Text.literal("Walk request cancelled after attunement changed; captured target was not altered by landing."), true);
+            p.sendMessage(Text.literal("Walk request cancelled: an explicit destination re-key supersedes it."), true);
             return;
         }
+        if (s.supportTargetSnapshot.squareDistance(attunementTarget) > 0) s.supportTargetSnapshot = attunementTarget;
         var found = SpiritTerrainService.currentSupport(p);
         if (found.isEmpty()) return; // Terrain starts/reuses bounded exact source-cell proof, never a join.
         var support = found.get(); Basis384f destination = support.sourceBasis();
@@ -481,7 +499,9 @@ public final class SpiritNavigationService {
         state(p).target(dimension, id, foot, basis);
         p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).set(embedding.clone());
         sync(p); MysticismEntityComponents.LATENT_ATTUNEMENT.sync(p);
-        Session s = session(p); s.attemptedLanding = false; s.prefetched = true; s.warnedLanding = false;
+        Session s = session(p);
+        s.walk.bumpDestination(); // A newer explicit destination supersedes any pending walk intent.
+        s.attemptedLanding = false; s.prefetched = true; s.warnedLanding = false;
         endSupportApproach(p, s); endApproach(p, s);
         if (spirit(p)) SpiritTerrainService.prefetchTarget(p, dimension, id, foot, embedding, basis);
         else s.prefetched = false;
@@ -511,7 +531,12 @@ public final class SpiritNavigationService {
     private static boolean captureSource(ServerPlayerEntity p, String dimension, Vec3d foot, String requiredId) {
         BlockPos block = BlockPos.ofFloored(foot); // ownership seed only; never the captured feet
         Session s = session(p);
-        if (s.capture != null && !s.capture.isDone()) { p.sendMessage(Text.literal("Source discovery already pending."), false); return false; }
+        if (s.capture != null && !s.capture.isDone()) {
+            // The latest requested destination wins: an older pending discovery never rejects or
+            // outlives a newer capture. Its stale completion is dead via the capture nonce.
+            s.capture.cancel(false);
+            p.sendMessage(Text.literal("Superseding the older pending source discovery with this capture."), false);
+        }
         var server = p.getServer();
         // Snapshot the source-grid basis before async completion, not a later moving deep basis.
         Basis384f basis = state(p).active() && !state(p).deep() ? p.getComponent(MysticismEntityComponents.LATENT_BASIS).get().clone() : new Basis384f();
@@ -530,6 +555,15 @@ public final class SpiritNavigationService {
             p.sendMessage(Text.literal("Captured " + metadata.id() + " at " + dimension + " " + block.toShortString() + " (vector snapshot)."), false);
         }));
         p.sendMessage(Text.literal("Capturing generated source landmark asynchronously…"), false); return true;
+    }
+    /** An explicit concept/attunement re-key without a new shallow capture (e.g. /myst set attune
+     * or the personal-concept capture) is still a destination request: it supersedes any pending
+     * walk intent or landing pursuit, which must never complete against the older destination. */
+    public static void explicitDestinationChange(ServerPlayerEntity p) {
+        Session s = session(p);
+        s.walk.bumpDestination();
+        endSupportApproach(p, s); endApproach(p, s);
+        s.targetSnapshot = null; s.attemptedLanding = false; s.warnedLanding = false;
     }
     /** Caller validates BOTH projected reach/alignment/collision rays before invoking. */
     public static void touch(ServerPlayerEntity actor, ServerPlayerEntity target) {
