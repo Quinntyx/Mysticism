@@ -49,7 +49,9 @@ public final class MeshMovementValidation {
         synchronized(frames) {
             var iterator=frames.descendingIterator(); // newest first: the client's own frame usually matches immediately
             while(iterator.hasNext()) {
-                Vec3d result=MeshCollision.predicted(iterator.next().index(),preMove,wanted,flying,false,0);
+                // Packet coordinates already include prediction's depenetration and wall slide.
+                // Replaying them as raw input would apply the escape correction a second time.
+                Vec3d result=MeshCollision.replayClaimed(iterator.next().index(),preMove,wanted,flying);
                 if(result.subtract(wanted).lengthSquared()<=PREDICTION_TOLERANCE*PREDICTION_TOLERANCE)return true;
             }
         }

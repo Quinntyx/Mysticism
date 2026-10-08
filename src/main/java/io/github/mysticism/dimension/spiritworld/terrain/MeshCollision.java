@@ -104,8 +104,19 @@ public final class MeshCollision {
      *  pushed by rotating observer-local geometry between frame publications; depenetration eases
      *  out of embedding instead of violently teleporting the player (free-flight rubber banding). */
     public static Vec3d predicted(Index i,Box body,Vec3d wanted,boolean flying,boolean onGround,double stepHeight) {
+        return predictedWithCorrection(i,body,wanted,flying,onGround,stepHeight,i.depenetrate(body,flying?.5:4));
+    }
+    /** Replay a packet's already-resolved displacement, not raw movement input. Prediction adds
+     *  an initial depenetration before sliding; that correction is already INCLUDED in the claim.
+     *  Recover the remaining motion, then sweep it from the corrected body and add the correction
+     *  exactly once. This still clips wall crossing, even while the body is initially embedded. */
+    public static Vec3d replayClaimed(Index i,Box body,Vec3d claimed,boolean flying) {
+        Vec3d correction=i.depenetrate(body,flying?.5:4);
+        return predictedWithCorrection(i,body,claimed.subtract(correction),flying,false,0,correction);
+    }
+    private static Vec3d predictedWithCorrection(Index i,Box body,Vec3d wanted,boolean flying,boolean onGround,double stepHeight,Vec3d correction) {
         if(wanted.length()>256)wanted=wanted.multiply(256/wanted.length());
-        Vec3d result=i.depenetrate(body,flying?.5:4);
+        Vec3d result=correction;
         // Bound swept traversal for unusually fast flight/teleports rather than tunnelling through a grid overflow.
         int pieces=Math.min(64,Math.max(1,(int)Math.ceil(wanted.length()/4)));
         Vec3d piece=wanted.multiply(1.0/pieces);

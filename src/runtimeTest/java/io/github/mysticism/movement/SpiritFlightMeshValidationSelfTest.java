@@ -113,6 +113,89 @@ public final class SpiritFlightMeshValidationSelfTest {
         }
     }
 
+    private static TerrainMeshFrame shiftedWall(double x) {
+        return frame(new TerrainMeshFrame.Cell(1, 0, "validation-test", Vec3d.ZERO, new Vec3d(x, 0, 0),
+                new Vec3d(1, 3, 3), UNIT_X, UNIT_Y, UNIT_Z, 0xFFFFFFFF, 0, 1f,
+                List.of(new Box(0, 0, 0, 1, 3, 3))));
+    }
+
+    private static Vec3d feet(Box body) {
+        return new Vec3d(body.getCenter().x, body.minY, body.getCenter().z);
+    }
+
+    private static void frameTransitionPredictionAndAdmission() {
+        UUID player = UUID.randomUUID();
+        UUID other = UUID.randomUUID();
+        var older = shiftedWall(0);
+        var current = shiftedWall(1);
+        var oldIndex = new MeshCollision.Index(older);
+        var currentIndex = new MeshCollision.Index(current);
+        // Publication is safe while the player is beside the wall (outside its Z footprint).
+        // A preceding packet predicted under the old frame then moves into the new wall's footprint.
+        Box original = new Box(1.2, .5, -1, 1.8, 2.3, -.4);
+        try {
+            check(MeshCollision.bodyClear(older, original) && MeshCollision.bodyClear(current, original),
+                    "both published frames initially leave the player clear");
+            check(MeshCollision.transitionClear(older, current, original), "frame transition is permitted by production publication guard");
+            MeshMovementValidation.record(player, older);
+            MeshMovementValidation.record(player, current);
+            MeshMovementValidation.record(other, older);
+            Vec3d preceding = MeshCollision.predicted(oldIndex, original, new Vec3d(0, 0, 1.5), true, false, 0);
+            check(preceding.distanceTo(new Vec3d(0, 0, 1.5)) < 1e-9, "stale-frame preceding movement is unobstructed");
+            check(MeshMovementValidation.allowsMeshMove(player, original, feet(original).add(preceding), true),
+                    "preceding stale-frame movement is actually admitted");
+            Box embedded = original.offset(preceding);
+            check(!MeshCollision.bodyClear(current, embedded), "accepted movement enters the newer frame's wall");
+            Vec3d correction = MeshCollision.predicted(currentIndex, embedded, Vec3d.ZERO, true, false, 0);
+            check(correction.distanceTo(new Vec3d(-.5, 0, 0)) < 1e-9, "honest client produces the bounded half-block correction");
+            // Guard the failure fixture: feeding a resolved claim back as raw input doubles its
+            // correction under the same frame; the older frame clips it at the neighboring wall.
+            Vec3d doubled = MeshCollision.predicted(currentIndex, embedded, correction, true, false, 0);
+            Vec3d olderReplay = MeshCollision.predicted(oldIndex, embedded, correction, true, false, 0);
+            check(doubled.distanceTo(new Vec3d(-1, 0, 0)) < 1e-9, "raw-input replay incorrectly doubles correction");
+            check(Math.abs(olderReplay.x - (-.19999)) < 1e-6, "older frame cannot mask the correction replay defect");
+            check(!MeshMovementValidation.allowsMeshMove(other, embedded, feet(embedded).add(correction), true),
+                    "a different player's older-only history still rejects movement through its wall");
+            check(MeshMovementValidation.allowsMeshMove(player, embedded, feet(embedded).add(correction), true),
+                    "combined prediction/admission accepts the honest frame-transition correction without teleport-back");
+            // The same correction must work with only the matching frame, not rely on stale admission.
+            MeshMovementValidation.clear(player);
+            MeshMovementValidation.record(player, current);
+            check(MeshMovementValidation.allowsMeshMove(player, embedded, feet(embedded).add(correction), true),
+                    "matching frame alone admits its already-resolved correction");
+            for (Vec3d input : List.of(Vec3d.ZERO, new Vec3d(-.4, 0, 0), new Vec3d(.4, 0, 0),
+                    new Vec3d(-.2, .07, .08), new Vec3d(-.12, .1, -.06))) {
+                Vec3d resolved = MeshCollision.predicted(currentIndex, embedded, input, true, false, 0);
+                check(MeshCollision.replayClaimed(currentIndex, embedded, resolved, true).distanceTo(resolved) < 1e-9,
+                        "resolved replay reproduces correction plus clipped/reversed/diagonal input exactly: " + input);
+                check(MeshMovementValidation.allowsMeshMove(player, embedded, feet(embedded).add(resolved), true),
+                        "embedded prediction/admission accepts correction plus actual input: " + input);
+            }
+            check(!MeshMovementValidation.allowsMeshMove(player, embedded, feet(embedded).add(4, 0, 0), true),
+                    "being embedded must not authorize a forged displacement through the wall");
+            // Continue from the accepted coordinates, easing out and then repeatedly reversing
+            // real input against the wall. Exercise prediction and admission together every move.
+            Box body = embedded.offset(correction);
+            int contacts = 0;
+            for (int tick = 0; tick < 96; tick++) {
+                Vec3d input = tick < 2 ? Vec3d.ZERO : new Vec3d((tick / 12) % 2 == 0 ? .12 : -.12, 0, .01);
+                Vec3d predicted = MeshCollision.predicted(currentIndex, body, input, true, false, 0);
+                if (input.x > 0 && predicted.x < input.x - 1e-6) contacts++;
+                check(predicted.length() <= .5 + input.length() + 1e-9, "prediction remains bounded after correction");
+                check(MeshMovementValidation.allowsMeshMove(player, body, feet(body).add(predicted), true),
+                        "correction followed by sustained movement/reversal is admitted: " + tick);
+                body = body.offset(predicted);
+            }
+            check(contacts > 0, "continued movement reaches the wall; collision remains active");
+            check(MeshCollision.bodyClear(current, body), "continued accepted motion escapes embedding without tunnelling");
+            check(!MeshMovementValidation.allowsMeshMove(player, body, feet(body).add(4, 0, 0), true),
+                    "correction reconciliation must not authorize crossing the wall");
+        } finally {
+            MeshMovementValidation.clear(player);
+            MeshMovementValidation.clear(other);
+        }
+    }
+
     private static void historyIsBounded() {
         UUID player = UUID.randomUUID();
         MeshMovementValidation.record(player, open());
@@ -131,6 +214,7 @@ public final class SpiritFlightMeshValidationSelfTest {
         safePredictionDivergenceTolerated();
         mismatchedFramesTolerated();
         sustainedMovementAndReversals();
+        frameTransitionPredictionAndAdmission();
         historyIsBounded();
         System.out.println("SpiritFlightMeshValidationSelfTest: " + checks + " checks passed (handler-level mesh validation)");
     }
