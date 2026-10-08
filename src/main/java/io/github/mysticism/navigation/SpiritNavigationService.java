@@ -331,7 +331,7 @@ public final class SpiritNavigationService {
         var nav = state(p); var component = p.getComponent(MysticismEntityComponents.LATENT_BASIS);
         var q = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
         if (s.semanticReady && Double.isFinite(delta.x) && Double.isFinite(delta.y) && Double.isFinite(delta.z)
-                && delta.lengthSquared() <= 16)
+                && delta.lengthSquared() <= MovementIntegration.REPOSITION_LIMIT * MovementIntegration.REPOSITION_LIMIT)
             TraversalSteering.advance(q, component.get(), delta.x, delta.y, delta.z);
         if (++s.supportTick > 200) {
             endSupportApproach(p, s);

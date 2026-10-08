@@ -1,5 +1,6 @@
 package io.github.mysticism.activity;
 
+import io.github.mysticism.navigation.MovementIntegration;
 import io.github.mysticism.vector.*;
 
 /** Shared server/client movement math. Shallow preserves source-grid axes; deep rotates per player. */
@@ -16,7 +17,8 @@ public final class TraversalSteering {
                                 boolean capturedLanding) {
         if (!Double.isFinite(dx) || !Double.isFinite(dy) || !Double.isFinite(dz)) return;
         double distance = Math.sqrt(dx*dx + dy*dy + dz*dz);
-        if (distance < 1e-8 || distance > 4) return; // stationary and teleport are not semantic travel
+        // Same bound the integrators admit: an admitted lag burst must actually advance navigation.
+        if (distance < 1e-8 || distance > MovementIntegration.REPOSITION_LIMIT) return; // stationary and teleport are not semantic travel
         BasisIntegrator384f.step(basis, q, target, dx, dy, dz, ROTATION_PER_BLOCK);
         // Retain ordinary movement-dependent pursuit until acquisition range. Ease translation
         // near a captured landing so fixed walking steps cannot overshoot/orbit the tiny final band.
@@ -39,7 +41,7 @@ public final class TraversalSteering {
     public static void approachStep(Vec384f q, Vec384f target, double dx, double dy, double dz) {
         if (!Double.isFinite(dx) || !Double.isFinite(dy) || !Double.isFinite(dz)) return;
         double movement = Math.sqrt(dx*dx + dy*dy + dz*dz);
-        if (movement < 1e-8 || movement > 4) return;
+        if (movement < 1e-8 || movement > MovementIntegration.REPOSITION_LIMIT) return;
         double remaining = Math.sqrt(q.squareDistance(target));
         if (remaining < 1e-8) return;
         q.converge(target, (float)Math.min(.25, movement / (BLOCKS_PER_SEMANTIC_UNIT * remaining)));

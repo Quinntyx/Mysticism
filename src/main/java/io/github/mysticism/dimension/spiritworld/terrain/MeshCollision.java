@@ -114,19 +114,28 @@ public final class MeshCollision {
         if(wanted.length()>256)wanted=wanted.multiply(256/wanted.length());
         Vec3d[] correction=new Vec3d[1];
         Vec3d result=resolve(i,body,wanted,correction);
-        recordCorrection(player,correction[0]==null?Vec3d.ZERO:correction[0]);
+        Vec3d applied=correction[0]==null?Vec3d.ZERO:correction[0];
         if(!player.getAbilities().flying && (player.isOnGround() || wanted.y<0 && result.y>wanted.y+1e-5)
                 && result.subtract(wanted).horizontalLengthSquared()>1e-8) {
-            double step=player.getStepHeight();
-            if(step>0) {
-                Vec3d up=i.slide(body,new Vec3d(0,step,0));
-                Vec3d over=i.slide(body.offset(up),new Vec3d(wanted.x,0,wanted.z));
-                Vec3d down=i.slide(body.offset(up).offset(over),new Vec3d(0,wanted.y-up.y,0));
-                Vec3d stepped=up.add(over).add(down);
-                if(stepped.horizontalLengthSquared()>result.horizontalLengthSquared()+1e-8)result=stepped;
-            }
+            // Step-up starts from the depenetrated body and the selected result always retains the
+            // recorded correction, so integrators never subtract a phantom collision response.
+            Box steppedFrom=applied.lengthSquared()>0?body.offset(applied):body;
+            result=stepUp(i,steppedFrom,applied,wanted,player.getStepHeight(),result);
         }
+        recordCorrection(player,applied);
         return result;
+    }
+    /** Vanilla-style step-up selection shared by move(): up/over/down attempted from `from`.
+     *  `applied` (depenetration already contained in `direct`) is carried onto the stepped path so
+     *  the selected displacement always contains the recorded correction. Zero applied is
+     *  byte-identical to the historical behavior. */
+    public static Vec3d stepUp(Index i,Box from,Vec3d applied,Vec3d wanted,double step,Vec3d direct) {
+        if(step<=0)return direct;
+        Vec3d up=i.slide(from,new Vec3d(0,step,0));
+        Vec3d over=i.slide(from.offset(up),new Vec3d(wanted.x,0,wanted.z));
+        Vec3d down=i.slide(from.offset(up).offset(over),new Vec3d(0,wanted.y-up.y,0));
+        Vec3d stepped=applied.add(up).add(over).add(down);
+        return stepped.horizontalLengthSquared()>direct.horizontalLengthSquared()+1e-8?stepped:direct;
     }
     /** Pure swept resolution shared by move(): depenetration correction first, then bounded slide
      *  travel. The physical result is unchanged; the correction is reported separately so movement
