@@ -14,8 +14,22 @@ public final class MeshCollision {
     private static volatile Function<UUID,TerrainMeshFrame> client = id -> null;
     private static final Map<UUID,Index> SERVER = new java.util.concurrent.ConcurrentHashMap<>(), CLIENT = new java.util.concurrent.ConcurrentHashMap<>();
     public static void clientFrames(Function<UUID,TerrainMeshFrame> provider) { client=Objects.requireNonNull(provider); }
-    public static void clear(UUID player) { SERVER.remove(player); CLIENT.remove(player); }
-    public static void clearClient() { CLIENT.clear(); }
+    public static void clear(UUID player) { SERVER.remove(player); CLIENT.remove(player); SERVER_CORRECTIONS.remove(player); CLIENT_CORRECTIONS.remove(player); }
+    public static void clearClient() { CLIENT.clear(); CLIENT_CORRECTIONS.clear(); }
+    /** Movement-response accounting for the integrators: depenetration displacement applied to this
+     *  body since the last drain. Collision corrections are not chosen movement; integration that
+     *  folds them in repeats the correction every tick and jitters/rubber-bands. */
+    public static Vec3d drainCorrection(PlayerEntity p) { return drainCorrection(p.getUuid(), p.getWorld().isClient); }
+    public static Vec3d drainCorrection(UUID player, boolean clientSide) {
+        var drained = (clientSide ? CLIENT_CORRECTIONS : SERVER_CORRECTIONS).put(player, Vec3d.ZERO);
+        return drained == null ? Vec3d.ZERO : drained;
+    }
+    public static void recordCorrection(UUID player, boolean clientSide, Vec3d correction) {
+        if (player == null || correction.equals(Vec3d.ZERO)) return;
+        (clientSide ? CLIENT_CORRECTIONS : SERVER_CORRECTIONS).merge(player, correction, Vec3d::add);
+    }
+    private static final Map<UUID,Vec3d> SERVER_CORRECTIONS=new java.util.concurrent.ConcurrentHashMap<>(), CLIENT_CORRECTIONS=new java.util.concurrent.ConcurrentHashMap<>();
+    private static void recordCorrection(PlayerEntity p,Vec3d correction) { recordCorrection(p.getUuid(),p.getWorld().isClient,correction); }
     public record Hit(double time, Vec3d normal, TerrainMeshFrame.Cell cell) {}
     private record Bucket(int x,int y,int z) {}
     private record Shape(TerrainMeshFrame.Cell cell,Box local,Box bounds) {}
@@ -98,11 +112,9 @@ public final class MeshCollision {
         if(i==null)return wanted;
         Box body=player.getBoundingBox();
         if(wanted.length()>256)wanted=wanted.multiply(256/wanted.length());
-        Vec3d result=i.depenetrate(body);
-        // Bound swept traversal for unusually fast flight/teleports rather than tunnelling through a grid overflow.
-        int pieces=Math.min(64,Math.max(1,(int)Math.ceil(wanted.length()/4)));
-        Vec3d piece=wanted.multiply(1.0/pieces);
-        for(int p=0;p<pieces;p++)result=result.add(i.slide(body.offset(result),piece));
+        Vec3d[] correction=new Vec3d[1];
+        Vec3d result=resolve(i,body,wanted,correction);
+        recordCorrection(player,correction[0]==null?Vec3d.ZERO:correction[0]);
         if(!player.getAbilities().flying && (player.isOnGround() || wanted.y<0 && result.y>wanted.y+1e-5)
                 && result.subtract(wanted).horizontalLengthSquared()>1e-8) {
             double step=player.getStepHeight();
@@ -114,6 +126,18 @@ public final class MeshCollision {
                 if(stepped.horizontalLengthSquared()>result.horizontalLengthSquared()+1e-8)result=stepped;
             }
         }
+        return result;
+    }
+    /** Pure swept resolution shared by move(): depenetration correction first, then bounded slide
+     *  travel. The physical result is unchanged; the correction is reported separately so movement
+     *  integration can distinguish collision response from chosen movement. */
+    public static Vec3d resolve(Index i,Box body,Vec3d wanted,Vec3d[] correction) {
+        Vec3d result=i.depenetrate(body);
+        if(correction!=null && correction.length>0)correction[0]=result;
+        // Bound swept traversal for unusually fast flight/teleports rather than tunnelling through a grid overflow.
+        int pieces=Math.min(64,Math.max(1,(int)Math.ceil(wanted.length()/4)));
+        Vec3d piece=wanted.multiply(1.0/pieces);
+        for(int p=0;p<pieces;p++)result=result.add(i.slide(body.offset(result),piece));
         return result;
     }
     /** Vanilla's carrier-air ledge check would prevent all sneaking; use the real mesh below the future footprint. */
