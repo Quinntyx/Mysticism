@@ -15,8 +15,10 @@ public final class WalkTargetAcquisition {
     public enum Attach { BIND_NEW, REFRESH_REVISION, KEEP_BINDING }
     private WalkTargetAcquisition() {}
 
-    /** One pending-walk decision. A running discovery is never duplicated or restarted early. */
-    public static Discovery discovery(boolean inFlight, long ticksSinceKick) {
+    /** One pending-walk decision. Discovery only targets a CONTACTED support (a real ground cell
+     * whose producer window is resolvable); a running discovery is never duplicated or restarted early. */
+    public static Discovery discovery(boolean groundedContact, boolean inFlight, long ticksSinceKick) {
+        if (!groundedContact) return Discovery.WAIT;
         if (inFlight) return Discovery.WAIT;
         return ticksSinceKick >= RETRY_TICKS ? Discovery.START : Discovery.WAIT;
     }

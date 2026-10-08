@@ -226,25 +226,29 @@ public final class SpiritTerrainService {
     }
     /** A pending walk acquires a real discovered source target at the current contact instead of
      * rejecting available terrain as unknown. Real bounded extraction pipeline, throttled, one
-     * in flight; the discovered landmark is attached without overwriting an established binding. */
+     * in flight. The seed is the inverse-mapped source feet/body AIR of the CONTACTED producer
+     * window (never the solid support voxel: underground solid seeds would publish only the floor
+     * cell and leave the body unowned), in that window's source dimension, attached without
+     * replacing any established binding. Exact floor/body ownership stays validated by walkCandidate. */
     public static void discoverWalkTarget(ServerPlayerEntity p) {
         if(!p.getServer().isOnThread())return;
         Context c=SERVERS.get(p.getServer());if(c==null)return;
         Session s=c.sessions.get(p.getUuid());
         if(s==null || s.shallow || !p.getWorld().getRegistryKey().equals(WORLD))return;
+        var hit=MeshCollision.ground(p);
+        if(hit.isEmpty())return; // No contacted support cell: nothing real to discover.
+        Window expected=windowFor(s,hit.get().cell());if(expected==null)return;
         boolean inFlight=s.walkDiscoveryFuture!=null && !s.walkDiscoveryFuture.isDone();
-        if(WalkTargetAcquisition.discovery(inFlight,c.tick-s.walkDiscoveryTick)==WalkTargetAcquisition.Discovery.WAIT)return;
+        if(WalkTargetAcquisition.discovery(true,inFlight,c.tick-s.walkDiscoveryTick)==WalkTargetAcquisition.Discovery.WAIT)return;
         s.walkDiscoveryTick=c.tick;
-        Vec3d contact=MeshCollision.ground(p)
-                .map(hit->sourceContact(hit.cell(),p.getPos().add(0,.025-.15*hit.time(),0).subtract(hit.normal().multiply(.001))))
-                .orElse(p.getPos()); // airborne seed: exact source cell under the current carrier
-        Window expected=s.local;
-        var future=SourceLandmarks.ensureSourceLocation(p.getServer(),expected.dimension,BlockPos.ofFloored(contact));
+        // Seed from inverse-mapped source feet/body air so connected air+wall extraction owns the body too.
+        BlockPos seed=BlockPos.ofFloored(sourcePoint(hit.get().cell(),p.getPos()));
+        var future=SourceLandmarks.ensureSourceLocation(p.getServer(),expected.dimension,seed);
         s.walkDiscoveryFuture=future;
         future.whenComplete((found,error)->p.getServer().execute(()->{
             if(!live(p,s) || s.walkDiscoveryFuture!=future)return;
             s.walkDiscoveryFuture=null;
-            if(error!=null || found==null || found.isEmpty() || s.local!=expected)return;
+            if(error!=null || found==null || found.isEmpty() || !retainedWalkWindow(s,expected))return;
             var m=found.get();
             var decision=WalkTargetAcquisition.attach(expected.id,m.id(),
                     expected.owner==null?List.of():expected.owner.geometryKeys(),m.geometryKeys());
@@ -253,8 +257,12 @@ public final class SpiritTerrainService {
             } else if(decision==WalkTargetAcquisition.Attach.REFRESH_REVISION) {
                 expected.owner=m;expected.supportEmbedding=SpiritActivityService.effectiveEmbedding(p.getServer(),m).vector();
             }
-            requestOwnership(p,s,expected,contact);notifyAnchor(p,s,expected);publish(p,s,true);
+            requestOwnership(p,s,expected,Vec3d.ofCenter(seed));notifyAnchor(p,s,expected);publish(p,s,true);
         }));
+    }
+    /** The discovered target must still be a live producer window; eviction/replacement invalidates it. */
+    private static boolean retainedWalkWindow(Session s,Window w) {
+        return s.local==w || s.target==w || s.regions.containsValue(w) || s.prepared.containsValue(w);
     }
     private static void ensureWalkProof(ServerPlayerEntity p,Session s,Window field,WalkSupport hint) {
         Window probe=s.walkProbe;var owner=LandmarkStore.get(p.getServer()).metadata(hint.landmarkId());
