@@ -531,12 +531,22 @@ public final class SpiritNavigationService {
         }));
         p.sendMessage(Text.literal("Capturing generated source landmark asynchronously…"), false); return true;
     }
-    /** Caller validates BOTH projected reach/alignment/collision rays before invoking. */
+    /** Caller validates BOTH projected reach/alignment/collision rays before invoking.
+     * The touch effect is the RECIPIENT's basis blend. The recipient's own lifecycle intents
+     * (pending walk request, landing approach, in-progress blend) are per-player state: an
+     * incoming touch is rejected while they are active instead of silently cancelling them.
+     * Movement, expiry and the recipient's own actions still cancel those intents normally. */
     public static void touch(ServerPlayerEntity actor, ServerPlayerEntity target) {
         if (actor == target || !deep(actor) || !deep(target) || !state(actor).semanticReady() || !state(target).semanticReady()
                 || actor.getServer() != target.getServer()
                 || actor.getWorld() != target.getWorld()) return;
-        Session s = session(target); endSupportApproach(target, s); endApproach(target, s);
+        Session s = session(target);
+        var targetState = state(target);
+        if (!TouchReception.mayDisturb(new TouchReception.Intent(
+                s.supportPending || targetState.supportApproach(),
+                s.landingFrom != null || targetState.landingApproach(),
+                s.blendTo != null))) return;
+        endSupportApproach(target, s); endApproach(target, s);
         s.blendFrom = target.getComponent(MysticismEntityComponents.LATENT_BASIS).get().clone();
         s.blendTo = actor.getComponent(MysticismEntityComponents.LATENT_BASIS).get().clone(); s.blendTick = 0;
         // Target vector and semantic q deliberately unchanged. Network authenticates/validates the touch.
