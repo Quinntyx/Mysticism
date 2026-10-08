@@ -138,6 +138,13 @@ public final class MeshCollision {
     public static boolean clearRay(ServerPlayerEntity player,Vec3d from,Vec3d to) {
         Index i=index(player);return i!=null && from.distanceTo(to)<=128 && i.clearRay(from,to);
     }
+    /** Actual affine SAT body clearance, including a newly acquired source window. */
+    public static boolean bodyClear(TerrainMeshFrame frame,Box body) {
+        Box strict=body.expand(-1e-5);
+        for(var cell:frame.cells())if(cell.bounds().intersects(strict))
+            for(Box collision:cell.collision())if(penetration(strict,new Shape(cell,collision,cell.bounds(collision)))!=null)return false;
+        return true;
+    }
     /** Conservative continuous affine-motion guard: the union of endpoint AABBs contains EVERY intermediate
      * vertex under linear affine interpolation. An ambiguous swept/body overlap is held, never sampled through. */
     public static boolean transitionClear(TerrainMeshFrame old,TerrainMeshFrame next,Box body) {
