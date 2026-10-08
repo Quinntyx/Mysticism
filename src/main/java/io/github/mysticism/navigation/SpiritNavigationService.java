@@ -42,7 +42,7 @@ public final class SpiritNavigationService {
     private SpiritNavigationService() {}
     private static final class Session {
         int unsupported, blendTick, landingTick, supportTick, supportAlignTick;
-        boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, jumping, supportPending;
+        boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, jumping, supportPending, everSupported;
         Vec384f targetSnapshot, supportTargetSnapshot;
         Basis384f supportFrom, supportGrid;
         long supportWindow;
@@ -205,6 +205,29 @@ public final class SpiritNavigationService {
         }
         deactivate(p); return true;
     }
+
+    /** Bounded entry-support grace: a fresh standing stance keeps walking while octree ownership publishes. */
+    public static final int ENTRY_SUPPORT_GRACE_TICKS = 100;
+
+    /** Shallow stance outcome for one update tick. */
+    public enum Stance { WALK, FREE_FALL, HOLD_ENTRY_SUPPORT }
+    public record StanceStep(Stance stance, int unsupportedTicks) {}
+
+    /** Pure shallow-stance decision. Entering spirit mode while standing on supported source terrain
+     * must begin supported walking, not unconditional flight: while no support or ownership has ever
+     * confirmed for this shallow session and the terrain's octree ownership is still publishing
+     * asynchronously, a standing player holds, bounded by {@link #ENTRY_SUPPORT_GRACE_TICKS}, instead
+     * of immediately entering freeflight. Ascending takeoff keeps the ordinary 14-tick jump grace;
+     * walking over an edge, a confirmed-then-lost stance, and grace expiry all enter freeflight. */
+    public static StanceStep entryStance(int unsupported, boolean everSupported, boolean confirmedOwned,
+            boolean standing, boolean jumping, boolean ownershipPending) {
+        if (standing && !everSupported && !confirmedOwned && ownershipPending && unsupported < ENTRY_SUPPORT_GRACE_TICKS)
+            return new StanceStep(Stance.HOLD_ENTRY_SUPPORT, unsupported + 1);
+        int ticks = unsupported + 1;
+        if (ticks > 14 || !jumping) return new StanceStep(Stance.FREE_FALL, ticks);
+        return new StanceStep(Stance.WALK, ticks);
+    }
+
     public static void enterDeep(ServerPlayerEntity p) {
         if (!spirit(p)) return;
         var permissions = state(p);
@@ -256,6 +279,27 @@ public final class SpiritNavigationService {
             if (p.getAbilities().flying) { enterDeep(p); return nav.deep() && s.semanticReady; }
             var mapping = SpiritTerrainService.sourcePosition(p);
             var support = SpiritTerrainService.support(p);
+            if (support.isPresent()) { s.unsupported = 0; s.jumping = false; s.everSupported = true; }
+            else {
+                if (s.unsupported == 0) s.jumping = delta.y > .01;
+                boolean standing = p.isOnGround() || Math.abs(delta.y) < .05;
+                var stance = entryStance(s.unsupported, s.everSupported, s.confirmedOwned, standing,
+                        s.jumping, SpiritTerrainService.ownershipPending(p));
+                s.unsupported = stance.unsupportedTicks();
+                if (stance.stance() == Stance.FREE_FALL) { enterDeep(p); return nav.deep() && s.semanticReady; }
+                if (stance.stance() == Stance.HOLD_ENTRY_SUPPORT) {
+                    // Bounded walking hold: octree ownership for this fresh supported stance is still
+                    // publishing. Flight stays off and q keeps tracking real physical movement.
+                    if (s.semanticReady && Double.isFinite(delta.x) && Double.isFinite(delta.y) && Double.isFinite(delta.z)
+                            && delta.lengthSquared() <= 16)
+                        TraversalSteering.advance(p.getComponent(MysticismEntityComponents.LATENT_POS).get(),
+                                p.getComponent(MysticismEntityComponents.LATENT_BASIS).get(), delta.x, delta.y, delta.z);
+                    flight(p, false);
+                    if (p.getServer().getTicks() % 4 == 0) sync(p);
+                    return false;
+                }
+                // Stance.WALK: ordinary jump grace falls through to the shared shallow walking tail.
+            }
             if (mapping.isEmpty()) { enterDeep(p); return nav.deep() && s.semanticReady; }
             var source = mapping.get(); boolean anchoredNow = false;
             String id = source.landmarkId();
@@ -273,11 +317,8 @@ public final class SpiritNavigationService {
             // Ownership checks precede initial anchoring; discovery cannot overwrite an established binding.
             if (!s.semanticReady && !source.landmarkId().isEmpty()) { anchorSource(p, s, source); anchoredNow = s.semanticReady; }
             nav.shallow(source.dimension(), id, source.position());
-            if (support.isPresent()) { s.unsupported = 0; s.jumping = false; }
-            else {
-                if (s.unsupported == 0) s.jumping = delta.y > .01;
-                if (++s.unsupported > 14 || !s.jumping) { enterDeep(p); return nav.deep() && s.semanticReady; }
-            } // Ascending takeoff gets ordinary jump grace; walking over an edge gets immediate freeflight.
+            // Unsupported stances were already resolved by entryStance above (bounded walking hold,
+            // jump grace, or freeflight); a confirmed stance simply keeps walking.
             flight(p, false);
             if (s.semanticReady && !anchoredNow) TraversalSteering.advance(p.getComponent(MysticismEntityComponents.LATENT_POS).get(),
                     p.getComponent(MysticismEntityComponents.LATENT_BASIS).get(), delta.x, delta.y, delta.z);
@@ -377,7 +418,7 @@ public final class SpiritNavigationService {
             return;
         }
         var at = mapped.get(); nav.shallow(at.dimension(), at.landmarkId(), at.position());
-        s.confirmedOwned = true; s.unsupported = 0; s.jumping = false; endSupportApproach(p, s);
+        s.confirmedOwned = true; s.everSupported = true; s.unsupported = 0; s.jumping = false; endSupportApproach(p, s);
         SpiritBasisEvolver.resetMotion(p); flight(p, false);
         MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p); sync(p);
         p.sendMessage(Text.literal("Shallow: walking on the current source-owned landmark. Captured attunement retained."), true);
@@ -453,6 +494,7 @@ public final class SpiritNavigationService {
             var source = SpiritTerrainService.sourcePosition(p);
             if (source.isPresent()) {
                 var at = source.get(); nav.shallow(at.dimension(), at.landmarkId(), at.position()); s.unsupported = 0;
+                s.everSupported = true;
                 endApproach(p, s); SpiritBasisEvolver.resetMotion(p); flight(p, false);
                 MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p); sync(p);
             }
