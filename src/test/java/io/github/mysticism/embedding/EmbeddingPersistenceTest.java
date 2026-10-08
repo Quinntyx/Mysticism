@@ -39,7 +39,7 @@ public final class EmbeddingPersistenceTest {
         var save=current.writeNbt(new NbtCompound(),null);check(EmbeddingNbt.compatible(save),"Persistence profile header");check(ItemEmbeddingIndexState.fromNbt(save,null).getIndex().size()==1,"Current item roundtrip");
         var legacy=item("minilm");legacy.put("entries",entries("minecraft:stone",new int[384]));
         var migrated=ItemEmbeddingIndexState.fromNbt(legacy,null);check(!migrated.isPopulated()&&migrated.getIndex().size()==0,"MiniLM never padded/truncated");
-        var archive=migrated.writeNbt(new NbtCompound(),null).getCompound("archive");check(archive.getCompound("entries").getIntArray("minecraft:stone").length==384,"Exact legacy archive");
+        var rebuilt=migrated.writeNbt(new NbtCompound(),null);check(!rebuilt.contains("archive")&&rebuilt.getCompound("entries").isEmpty(),"Obsolete vectors are discarded, not archived or migrated");check(EmbeddingNbt.compatible(rebuilt),"Rebuild is stamped with the current profile");
         var sameDimensions=ItemEmbeddingIndexState.fromNbt(item("different-nomic-revision"),null);check(sameDimensions.getIndex().size()==0,"Equal dimensions do not imply compatibility");
         var malformed=item(EmbeddingSpace.FINGERPRINT);int[] bits=vector().toBits();bits[0]=Float.floatToIntBits(Float.NaN);malformed.put("entries",entries("minecraft:stone",bits));check(ItemEmbeddingIndexState.fromNbt(malformed,null).getIndex().size()==0,"Malformed persisted vector rejected");
         check(Codecs.VEC384F.parse(NbtOps.INSTANCE,new NbtIntArray(new int[384])).error().isPresent(),"Codec returns error, not thrown decoder exception");
@@ -51,7 +51,7 @@ public final class EmbeddingPersistenceTest {
         var legacy=new NbtCompound();legacy.put("regions",geometry);legacy.put("embedding",entries(id,new int[384]));
         var migrated=SpatialEmbeddingIndexState.fromNbt(legacy,null);check(migrated.needsRebuild()&&migrated.getIndex().size()==0,"Spatial vectors unavailable until rebuilt");check(migrated.regionsView().size()==1,"Geometry survives incompatible vector decoding");
         var save=migrated.writeNbt(new NbtCompound(),null);var reload=SpatialEmbeddingIndexState.fromNbt(save,null);var resave=reload.writeNbt(new NbtCompound(),null);
-        check(reload.needsRebuild()&&reload.regionsView().size()==1,"Interrupted migration resumes");check(resave.getCompound("archive").equals(legacy),"Repeated unavailable startup does not nest/grow archive");
+        check(reload.needsRebuild()&&reload.regionsView().size()==1,"Interrupted rebuild retains canonical geometry");check(!save.contains("archive")&&!resave.contains("archive"),"Repeated unavailable startup cannot retain obsolete vectors in archives");
         var current=new SpatialEmbeddingIndexState();current.observeBiome(id,region,CanonicalDescriptors.region("minecraft:overworld","minecraft:plains"),vector());
         current.observeBiome(id,new BiomeSpiritualRegion(0,0,Identifier.of("minecraft:plains"),List.of(new ChunkBox(5,5,5,5))),CanonicalDescriptors.region("minecraft:overworld","minecraft:plains"),vector());
         var observed=(BiomeSpiritualRegion)current.regionsView().get(id);check(observed.boxes().size()==2,"Disjoint observed chunks, no fabricated bounding coverage");
@@ -134,15 +134,15 @@ public final class EmbeddingPersistenceTest {
         var recovered=SpatialEmbeddingIndexState.fromNbt(malformed,null);
         check(recovered.needsRebuild()&&recovered.getIndex().size()==0,"Malformed geometry never activates an index");
         check(recovered.regionsView().size()==1&&recovered.getRegion(id)!=null&&recovered.getRegion(badId)==null,"Valid siblings survive; malformed entry rejected");
-        var saved=recovered.writeNbt(new NbtCompound(),null);check(saved.getCompound("archive").equals(malformed),"Malformed raw geometry archived exactly");
+        var saved=recovered.writeNbt(new NbtCompound(),null);check(!saved.contains("archive")&&!saved.getCompound("regions").contains(badId),"Malformed geometry and obsolete vectors cannot survive in an archive");
         var resaved=SpatialEmbeddingIndexState.fromNbt(saved,null).writeNbt(new NbtCompound(),null);
-        check(resaved.getCompound("archive").equals(malformed),"Archive stable across interrupted migration");
+        check(!resaved.contains("archive")&&resaved.getCompound("regions").contains(id),"Repeated rebuild preserves only valid canonical geometry");
     }
     private static void components(){
         var legacy=new NbtCompound();legacy.putIntArray("v",new int[384]);var position=new LatentPos();position.readFromNbt(legacy,null);var save=new NbtCompound();position.writeToNbt(save,null);
-        check(position.get().length()==0&&EmbeddingNbt.compatible(save),"Legacy position resets in new space");check(save.getCompound("embeddingArchive").equals(legacy),"Legacy CCA position archived");
+        check(position.get().length()==0&&EmbeddingNbt.compatible(save),"Legacy position resets in new space");check(!save.contains("embeddingArchive"),"Obsolete CCA position is discarded instead of archived");
         var attunement=new LatentAttunement(vector());var current=new NbtCompound();attunement.writeToNbt(current,null);var other=new LatentAttunement();other.readFromNbt(current,null);check(other.get().length()==1,"Current attunement roundtrip");
-        var basis=new LatentBasis();var old=new NbtCompound();old.putIntArray("b",new int[1152]);basis.readFromNbt(old,null);var savedBasis=new NbtCompound();basis.writeToNbt(savedBasis,null);check(savedBasis.getIntArray("b").length==3*EmbeddingSpace.DIMENSIONS&&savedBasis.getCompound("embeddingArchive").equals(old),"Basis schema migration");
+        var basis=new LatentBasis();var old=new NbtCompound();old.putIntArray("b",new int[1152]);basis.readFromNbt(old,null);var savedBasis=new NbtCompound();basis.writeToNbt(savedBasis,null);check(savedBasis.getIntArray("b").length==3*EmbeddingSpace.DIMENSIONS&&!savedBasis.contains("embeddingArchive"),"Fresh basis replaces obsolete derived data without an archive");
         check(basis.get().i.data()[0]==1&&basis.get().j.data()[1]==1&&basis.get().k.data()[2]==1,"Migrated basis remains deterministic and nondegenerate");
         rejects(()->position.set(new Vec384f(vector().data(),"foreign")));
     }
@@ -150,9 +150,9 @@ public final class EmbeddingPersistenceTest {
     private static void network(){
         int[] submitted=vector().toBits();var added=new SpiritDeltaPayload.Added("minecraft:stone",submitted);submitted[0]=0;added.bits()[0]=0;check(added.bits()[0]!=0,"Payload arrays copied on both edges");
         var message=new SpiritDeltaPayload(List.of(added),List.of("gone"));var buf=buffer();try{SpiritDeltaPayload.CODEC.encode(buf,message);var decoded=SpiritDeltaPayload.CODEC.decode(buf);check(decoded.add().get(0).id().equals("minecraft:stone")&&Arrays.equals(decoded.add().get(0).bits(),vector().toBits()),"Packet roundtrip");}finally{buf.release();}
-        var wrong=buffer();try{wrong.writeBoolean(false);wrong.writeLong(0);wrong.writeVarInt(EmbeddingSpace.SCHEMA);wrong.writeString("wrong");wrong.writeVarInt(EmbeddingSpace.DIMENSIONS);rejects(()->SpiritDeltaPayload.CODEC.decode(wrong));}finally{wrong.release();}
+        var wrong=buffer();try{wrong.writeBoolean(false);wrong.writeLong(0);wrong.writeVarInt(EmbeddingSpace.DIMENSIONS);wrong.writeString("wrong",64);rejects(()->SpiritDeltaPayload.CODEC.decode(wrong));}finally{wrong.release();}
         var malformed=buffer();try{malformed.writeString("id");malformed.writeVarInt(Integer.MAX_VALUE);rejects(()->SpiritDeltaPayload.Added.CODEC.decode(malformed));}finally{malformed.release();}
-        var counts=buffer();try{counts.writeBoolean(false);counts.writeLong(0);counts.writeVarInt(EmbeddingSpace.SCHEMA);counts.writeString(EmbeddingSpace.FINGERPRINT);counts.writeVarInt(EmbeddingSpace.DIMENSIONS);counts.writeVarInt(-1);rejects(()->SpiritDeltaPayload.CODEC.decode(counts));}finally{counts.release();}
+        var counts=buffer();try{counts.writeBoolean(false);counts.writeLong(0);counts.writeVarInt(EmbeddingSpace.DIMENSIONS);counts.writeString(EmbeddingSpace.FINGERPRINT,64);counts.writeVarInt(-1);rejects(()->SpiritDeltaPayload.CODEC.decode(counts));}finally{counts.release();}
         int[] bad=vector().toBits();bad[0]=Float.floatToIntBits(Float.NaN);rejects(()->new SpiritDeltaPayload.Added("id",bad));
     }
     private static void framed(ByteBuf body){
@@ -170,34 +170,49 @@ public final class EmbeddingPersistenceTest {
         rejects(()->new SpiritDeltaPayload.Added("",vector().toBits()));
         rejects(()->new SpiritDeltaPayload.Added("\uD800x",vector().toBits()));
         rejects(()->new SpiritDeltaPayload(List.of(),List.of("x".repeat(257))));
+        rejects(()->new SpiritDeltaPayload(null,-1,List.of(),List.of()));
         var raw=buffer();
         try{
-            raw.writeBoolean(false);raw.writeLong(0);raw.writeVarInt(EmbeddingSpace.SCHEMA);raw.writeString(EmbeddingSpace.FINGERPRINT);raw.writeVarInt(EmbeddingSpace.DIMENSIONS);raw.writeVarInt(2048);
+            raw.writeBoolean(false);raw.writeLong(0);raw.writeVarInt(EmbeddingSpace.DIMENSIONS);raw.writeString(EmbeddingSpace.FINGERPRINT,64);raw.writeVarInt(2048);
             for(var a:additions)SpiritDeltaPayload.Added.CODEC.encode(raw,a);raw.writeVarInt(0);
-            check(raw.readableBytes()==2_107_472,"Exact protocol-3 transport reproduction, including absent-session/placement tags");
+            check(raw.readableBytes()>1_048_576,"Unbounded current-profile glyphs reproduce the actual Minecraft frame overflow");
             var channel=new EmbeddedChannel(new SizePrepender());try{rejects(()->channel.writeOutbound(raw.copy()));}finally{channel.finishAndReleaseAll();}
             rejects(()->SpiritDeltaPayload.CODEC.decode(raw));
         }finally{raw.release();}
-        var removals=new ArrayList<String>();for(int i=0;i<5000;i++)removals.add("gone:"+i);
-        var batches=SpiritDeltaPayload.batches(additions,removals);
-        check(batches.size()>1,"Large delta split");
-        check(batches.stream().flatMap(p->p.add().stream()).toList().equals(additions),"All additions preserved in order");
-        check(batches.stream().flatMap(p->p.remove().stream()).toList().equals(removals),"All removals preserved in order");
-        rejects(()->batches.clear());check(SpiritDeltaPayload.batches(List.of(),List.of()).isEmpty(),"No empty traffic");
+        // v4 carries a bounded membership delta atomically under one sequence.
+        // The selector and packet share the visible-count budget; fragmentation
+        // under a repeated sequence would cause the receiver to discard pieces.
+        check(SpiritDeltaPayload.MAX_ENTRIES>=io.github.mysticism.dimension.spiritworld.SpiritGlyphSelection.MAX_VISIBLE,"Every selectable glyph fits one atomic delta");
+        var removals=new ArrayList<String>();for(int i=0;i<SpiritDeltaPayload.MAX_ENTRIES;i++)removals.add("gone:"+i);
+        var bounded=Collections.nCopies(SpiritDeltaPayload.MAX_ENTRIES,shortId);
+        var batches=SpiritDeltaPayload.batches(bounded,removals);
+        check(batches.size()==1,"Bounded v4 membership remains atomic");
+        check(batches.get(0).add().equals(bounded)&&batches.get(0).remove().equals(removals),"All additions and removals preserved in order");
+        rejects(()->batches.clear());
+        rejects(()->new SpiritDeltaPayload(Collections.nCopies(SpiritDeltaPayload.MAX_ENTRIES+1,shortId),List.of()));
+        rejects(()->new SpiritDeltaPayload(List.of(),Collections.nCopies(SpiritDeltaPayload.MAX_ENTRIES+1,"gone")));
         for(var batch:batches){
             var buf=buffer();try{
                 SpiritDeltaPayload.CODEC.encode(buf,batch);
-                check(buf.readableBytes()==batch.encodedBytes()&&batch.encodedBytes()<=SpiritDeltaPayload.MAX_ENCODED_BYTES,"Exact encoded byte budget");
-                var decoded=SpiritDeltaPayload.CODEC.decode(buf);check(decoded.add().size()==batch.add().size()&&decoded.remove().equals(batch.remove()),"Batch wire roundtrip");
+                check(buf.readableBytes()<=batch.encodedBytes()&&batch.encodedBytes()<=SpiritDeltaPayload.MAX_ENCODED_BYTES,"Conservative encoded-byte estimate bounds the real wire payload");
+                var decoded=SpiritDeltaPayload.CODEC.decode(buf);check(decoded.add().size()==batch.add().size()&&decoded.remove().equals(batch.remove()),"Atomic delta wire roundtrip");
                 buf.readerIndex(0);buf.writeZero(512);framed(buf);
             }finally{buf.release();}
         }
         for(String id:List.of("中".repeat(256),"😀".repeat(128))){
-            var packet=new SpiritDeltaPayload(List.of(new SpiritDeltaPayload.Added(id,vector().toBits())),List.of(id));var buf=buffer();
-            try{SpiritDeltaPayload.CODEC.encode(buf,packet);check(buf.readableBytes()==packet.encodedBytes(),"UTF-8 wire accounting, including surrogate pairs");check(SpiritDeltaPayload.CODEC.decode(buf).remove().get(0).equals(id),"Bounded Unicode IDs roundtrip");}finally{buf.release();}
+            var glyph=new SpiritDeltaPayload.Added(id,vector().toBits(),id,31,15);
+            var packet=new SpiritDeltaPayload(Collections.nCopies(SpiritDeltaPayload.MAX_ENTRIES,glyph),Collections.nCopies(SpiritDeltaPayload.MAX_ENTRIES,id));var buf=buffer();
+            try{
+                SpiritDeltaPayload.CODEC.encode(buf,packet);
+                check(buf.readableBytes()<=packet.encodedBytes()&&packet.encodedBytes()<=SpiritDeltaPayload.MAX_ENCODED_BYTES,"Maximum-count Unicode IDs, cluster IDs and slots fit the wire budget");
+                var decoded=SpiritDeltaPayload.CODEC.decode(buf);check(decoded.remove().equals(packet.remove())&&decoded.add().get(0).clusterSlot()==31&&decoded.add().get(0).slot()==15,"Unicode and glyph placement roundtrip");
+                buf.readerIndex(0);buf.writeZero(512);framed(buf);
+            }finally{buf.release();}
         }
+        rejects(()->new SpiritDeltaPayload.Added("a",vector().toBits(),"cluster",32,0));
+        rejects(()->new SpiritDeltaPayload.Added("a",vector().toBits(),"cluster",0,16));
         var removalOnly=SpiritDeltaPayload.batches(List.of(),removals);
-        check(removalOnly.size()==2&&removalOnly.get(0).remove().size()==SpiritDeltaPayload.MAX_ENTRIES,"Removal count boundary batches even below byte cap");
+        check(removalOnly.size()==1&&removalOnly.get(0).remove().size()==SpiritDeltaPayload.MAX_ENTRIES,"Removal count boundary remains atomic");
     }
     public static void main(String[] args){items();spatial();geometry();chunkAccessContract();components();network();transport();System.out.println("PASS embedding persistence/network: "+assertions+" assertions");}
 }

@@ -96,13 +96,13 @@ public final class EmbeddingPipelineTest {
         JsonArray embeddings=new JsonArray();embeddings.add(values);JsonObject response=new JsonObject();response.add("embeddings",embeddings);response.addProperty("model",EmbeddingSpace.MODEL);return response;
     }
     private static void decode(){
-        Vec384f vector=EmbeddingService.decodeEmbedding(response(EmbeddingSpace.NATIVE_DIMENSIONS));near(vector.data()[0],.6f);near(vector.data()[1],.8f);check(vector.data().length==EmbeddingSpace.DIMENSIONS,"Matryoshka reduction");
+        Vec384f vector=EmbeddingService.decodeEmbedding(response(EmbeddingSpace.NATIVE_DIMENSIONS));near(vector.data()[0],.6f);near(vector.data()[1],.8f);check(vector.data().length==EmbeddingSpace.DIMENSIONS&&EmbeddingSpace.DIMENSIONS==EmbeddingSpace.NATIVE_DIMENSIONS,"Native v2 coordinates are retained without Matryoshka reduction");
         rejects(()->EmbeddingService.decodeEmbedding(response(256)));rejects(()->EmbeddingService.decodeEmbedding(response(384)));rejects(()->EmbeddingService.decodeEmbedding(new JsonObject()));
         JsonObject r=response(EmbeddingSpace.NATIVE_DIMENSIONS);r.getAsJsonArray("embeddings").add(new JsonArray());rejects(()->EmbeddingService.decodeEmbedding(r));
         for(JsonElement invalid:List.of(JsonNull.INSTANCE,new JsonPrimitive("1"),new JsonPrimitive(Double.NaN),new JsonPrimitive(Double.POSITIVE_INFINITY),new JsonPrimitive(1e100))){
             JsonObject malformed=response(EmbeddingSpace.NATIVE_DIMENSIONS);malformed.getAsJsonArray("embeddings").get(0).getAsJsonArray().set(700,invalid);rejects(()->EmbeddingService.decodeEmbedding(malformed));
         }
-        JsonObject zero=response(EmbeddingSpace.NATIVE_DIMENSIONS);JsonArray values=zero.getAsJsonArray("embeddings").get(0).getAsJsonArray();values.set(0,new JsonPrimitive(0));values.set(1,new JsonPrimitive(0));values.set(700,new JsonPrimitive(1));rejects(()->EmbeddingService.decodeEmbedding(zero));
+        JsonObject tail=response(EmbeddingSpace.NATIVE_DIMENSIONS);JsonArray values=tail.getAsJsonArray("embeddings").get(0).getAsJsonArray();values.set(0,new JsonPrimitive(0));values.set(1,new JsonPrimitive(0));values.set(700,new JsonPrimitive(1));near(EmbeddingService.decodeEmbedding(tail).data()[700],1);check(EmbeddingService.decodeEmbedding(tail).length()==1,"Nonzero native tail coordinates cannot be truncated into a zero vector");values.set(700,new JsonPrimitive(0));rejects(()->EmbeddingService.decodeEmbedding(tail));
     }
     private static class Fake implements EmbeddingProvider {
         final AtomicInteger calls=new AtomicInteger();final CountDownLatch started=new CountDownLatch(1),release=new CountDownLatch(1);

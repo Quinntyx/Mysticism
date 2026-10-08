@@ -9,10 +9,20 @@ sourceSets {
     }
 }
 
-// The discarded shared-frame/block prototype suites remain as historical source,
-// but are not part of V1 compilation/check. Validation is light smoke + packaging.
+// The discarded shared-frame/block prototype suites remain as historical source.
+// Current regressions use the existing main-based runner, not JUnit. Existing
+// embedding regressions and all new runtimeTest sources participate in check/CI.
 sourceSets.test.java.setSrcDirs([])
 sourceSets.test.resources.setSrcDirs([])
+sourceSets {
+    runtimeTest {
+        java.srcDirs = ['src/runtimeTest/java', 'src/test/java/io/github/mysticism/embedding']
+        resources.srcDirs = ['src/runtimeTest/resources']
+        compileClasspath += sourceSets.main.output + sourceSets.client.output +
+                sourceSets.main.compileClasspath + sourceSets.client.compileClasspath
+        runtimeClasspath += sourceSets.main.runtimeClasspath + sourceSets.client.runtimeClasspath
+    }
+}
 
 // Loom may serialize comparison operators as JSON Unicode escapes. Always check
 // the decoded value, never the raw fabric.mod.json text.
@@ -46,8 +56,23 @@ tasks.register('buildSelfTest', JavaExec) {
     }
 }
 
-// No exhaustive main-based suite in the normal build path.
+// JUnit is not this project's test framework. Run every discovered current
+// *Test / *SelfTest main with assertions and propagate its failures instead.
 tasks.named('test') { enabled = false }
+tasks.register('runtimeSelfTest', JavaExec) {
+    group = 'verification'
+    description = 'Run all discovered current main-based runtime regression tests.'
+    dependsOn tasks.named('runtimeTestClasses'), tasks.named('buildTestClasses')
+    classpath = sourceSets.runtimeTest.runtimeClasspath + sourceSets.buildTest.output
+    mainClass = 'io.github.mysticism.build.SelfTestRunner'
+    enableAssertions = true
+    doFirst {
+        setArgs(sourceSets.runtimeTest.output.classesDirs.files.collect { it.absolutePath })
+    }
+}
+tasks.named('check') {
+    dependsOn tasks.named('buildSelfTest'), tasks.named('runtimeSelfTest')
+}
 
 tasks.register('verifyProductionJar', JavaExec) {
     group = 'verification'
