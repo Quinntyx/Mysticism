@@ -5,6 +5,7 @@ import io.github.mysticism.command.SpiritCommand;
 import io.github.mysticism.component.SpiritNavigation;
 import io.github.mysticism.embedding.EmbeddingNbt;
 import net.minecraft.nbt.NbtCompound;
+import net.minecraft.entity.player.PlayerAbilities;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.util.math.Vec3d;
@@ -14,7 +15,8 @@ import java.lang.reflect.Modifier;
 
 /** Offline regressions for partial-entry failure recovery: decision policy, binding coherence,
  * carrier-session self-heal wiring and validated return contracts. No live server, GPU or model
- * assets are claimed or required; this exercises deterministic logic and loadable contracts only. */
+ * assets are claimed or required; this exercises the production return orchestrator, deterministic
+ * logic and loadable contracts with simulated world-change callbacks. */
 public final class EntryFailureRecoveryTest {
     private static int checks;
     private static void check(boolean condition, String message) {
@@ -81,6 +83,87 @@ public final class EntryFailureRecoveryTest {
                 "classifyEntryFailure stays the package-private current-world classification seam");
     }
 
+    /** A simulated teleport/lifecycle boundary using the real navigation component and abilities.
+     * The production orchestrator owns exception handling, post-attempt world probing and callback
+     * selection; the fixture supplies only the server/world operations that need a running game. */
+    private static final class ReturnFixture {
+        final SpiritNavigation nav = new SpiritNavigation();
+        final PlayerAbilities abilities = new PlayerAbilities();
+        final boolean originalAllowFlying, originalFlying, originalNoGravity;
+        boolean inCarrier = true, noGravity, terrain = true, pending = true;
+        int cleanups, retentions;
+
+        ReturnFixture(boolean allowFlying, boolean flying, boolean noGravity) {
+            originalAllowFlying = allowFlying; originalFlying = flying; originalNoGravity = noGravity;
+            nav.rememberAbilities(allowFlying, flying, noGravity);
+            nav.shallow("minecraft:overworld", "", new Vec3d(1.5, 64, 2.5));
+            nav.setSupportApproach(true);
+            abilities.allowFlying = true; abilities.flying = false;
+        }
+        void deactivate() {
+            if (nav.hasSavedAbilities()) {
+                abilities.allowFlying = nav.savedAllowFlying(); abilities.flying = nav.savedFlying();
+                noGravity = nav.savedNoGravity(); nav.clearSavedAbilities();
+            }
+            nav.setActive(false); pending = false;
+        }
+        void cleanup() { ++cleanups; terrain = false; deactivate(); }
+        void retain() { ++retentions; abilities.allowFlying = true; abilities.flying = false; }
+        boolean recover(Runnable attempt) {
+            return EntryRecovery.reconcileSourceReturn(attempt, () -> inCarrier, this::cleanup, this::retain);
+        }
+        void checkSource() {
+            check(!inCarrier && !terrain && !pending && !nav.active() && !nav.hasSavedAbilities()
+                    && !nav.supportApproach(), "Transferred player completes source cleanup, not carrier retention");
+            check(abilities.allowFlying == originalAllowFlying && abilities.flying == originalFlying
+                    && noGravity == originalNoGravity, "Return preserves the original abilities/gravity without regranting flight");
+            check(cleanups == 1 && retentions == 0, "Source cleanup runs once; carrier retention never runs outside carrier");
+        }
+    }
+
+    private static void returnCallbackFailures() {
+        // Exact P1 sequence: transfer, world-change deactivation clears saved abilities, then a later
+        // callback throws. Survival no longer receives allowFlying=true after its recovery state vanished.
+        // Also cover an exception before deactivation and preserve creative/previously-flying abilities.
+        for (boolean[] original : new boolean[][]{{false, false, false}, {true, false, false}, {true, true, true}}) {
+            for (boolean deactivatedByCallback : new boolean[]{false, true}) {
+                var fixture = new ReturnFixture(original[0], original[1], original[2]);
+                check(fixture.recover(() -> {
+                    fixture.inCarrier = false;
+                    if (deactivatedByCallback) fixture.deactivate();
+                    throw new IllegalStateException("return callback failed after transfer");
+                }), "A post-transfer exception is a completed return, never a retained carrier");
+                fixture.checkSource();
+                fixture.deactivate();
+                check(fixture.abilities.allowFlying == original[0] && fixture.abilities.flying == original[1]
+                        && fixture.noGravity == original[2], "Repeated deactivation remains idempotent");
+            }
+        }
+        var successful = new ReturnFixture(false, false, false);
+        check(successful.recover(() -> successful.inCarrier = false), "Normal transfer also completes cleanup");
+        successful.checkSource();
+
+        for (boolean throwsBeforeTransfer : new boolean[]{false, true}) {
+            var retained = new ReturnFixture(false, false, false);
+            check(!retained.recover(() -> {
+                if (throwsBeforeTransfer) throw new IllegalStateException("return refused before transfer");
+                // A refused return leaves the actual world unchanged.
+            }), "A refused/throwing return still inside the carrier must retain it");
+            check(retained.inCarrier && retained.terrain && retained.pending && retained.nav.active()
+                    && retained.nav.hasSavedAbilities() && retained.cleanups == 0 && retained.retentions == 1,
+                    "Pre-transfer failure retains usable terrain, navigation and saved permissions");
+        }
+        var cleanupFailure = new ReturnFixture(false, false, false);
+        boolean propagated = false;
+        try {
+            EntryRecovery.reconcileSourceReturn(() -> cleanupFailure.inCarrier = false,
+                    () -> cleanupFailure.inCarrier,
+                    () -> { throw new IllegalStateException("cleanup failed"); }, cleanupFailure::retain);
+        } catch (IllegalStateException expected) { propagated = true; }
+        check(propagated && cleanupFailure.retentions == 0,
+                "Cleanup errors are not swallowed or converted into off-carrier flight retention");
+    }
+
     private static void bindingCoherence() {
         var nav = new SpiritNavigation();
         // Saved pre-entry abilities must be captured once: a re-remember during deep flight must never
@@ -145,8 +228,9 @@ public final class EntryFailureRecoveryTest {
 
     public static void main(String[] args) throws Exception {
         decisionMatrix();
+        returnCallbackFailures();
         bindingCoherence();
         recoveryContracts();
-        System.out.println("EntryFailureRecoveryTest: " + checks + " checks passed (offline policy/contract only)");
+        System.out.println("EntryFailureRecoveryTest: " + checks + " checks passed (offline return orchestration/policy/contracts)");
     }
 }

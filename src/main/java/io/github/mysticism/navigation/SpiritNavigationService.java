@@ -176,17 +176,16 @@ public final class SpiritNavigationService {
         String detail = failure.getMessage() == null ? failure.getClass().getSimpleName() : failure.getMessage();
         switch (classifyEntryFailure(spirit(p), source, dimension)) {
             case RETURN_TO_SOURCE -> {
-                boolean returned = false;
-                try { returned = SpiritTerrainService.returnToSource(p, dimension, source); }
-                catch (RuntimeException secondary) { /* keep the carrier instead of throwing out of recovery */ }
-                if (returned) {
-                    // The world-change handlers deactivate and cancel coherently; make it explicit for ordering.
-                    SpiritTerrainService.cancelEnter(p); deactivate(p);
-                    p.sendMessage(Text.literal("Spirit entry failed mid-transition (" + detail + "); returned to "
-                            + dimension + " " + MathHelper.floor(source.x) + " " + MathHelper.floor(source.y) + " " + MathHelper.floor(source.z) + "."), false);
-                    return;
-                }
-                retainCarrier(p, detail);
+                EntryRecovery.reconcileSourceReturn(
+                        () -> SpiritTerrainService.returnToSource(p, dimension, source),
+                        () -> spirit(p),
+                        () -> {
+                            // A return callback may already have deactivated us before throwing. Cleanup is
+                            // idempotent; never regrant carrier flight after saved abilities were cleared.
+                            completeSourceRecovery(p);
+                            p.sendMessage(Text.literal("Spirit entry failed mid-transition (" + detail + "); left the spirit carrier."), false);
+                        },
+                        () -> retainCarrier(p, detail));
             }
             case RETAIN_CARRIER -> retainCarrier(p, detail);
             case ABORT -> {
@@ -195,6 +194,11 @@ public final class SpiritNavigationService {
                 p.sendMessage(Text.literal("Spirit entry failed: " + detail), false);
             }
         }
+    }
+    private static void completeSourceRecovery(ServerPlayerEntity p) {
+        // teleport can throw before returnToSource resets motion, even though transfer already succeeded.
+        p.setVelocity(Vec3d.ZERO); p.fallDistance = 0;
+        SpiritTerrainService.cancelEnter(p); deactivate(p);
     }
     /** The source pose is unusable; retain the already-built carrier mesh and shallow binding so the
      * player keeps real geometry and a working /spirit leave instead of falling through the void. */
@@ -359,16 +363,17 @@ public final class SpiritNavigationService {
         ++s.restoreFailures;
         if (s.restoreFailures < EntryRecovery.REBUILD_FAILURE_LIMIT
                 || !EntryRecovery.recoverableSource(nav.sourceDimension(), nav.sourcePosition())) return true;
-        try {
-            if (SpiritTerrainService.returnToSource(p, nav.sourceDimension(), nav.sourcePosition())) {
-                s.restoreFailures = 0; s.restoreNextTick = 0;
-                // World-change handlers own coherent deactivation; only the recovery outcome is reported here.
-                p.sendMessage(Text.literal("Spirit terrain could not be rebuilt; returned to the remembered source pose."), false);
-                return false;
-            }
-        } catch (RuntimeException ignored) { }
-        s.restoreFailures = EntryRecovery.REBUILD_BACKOFF_FAILURES; // Back off; retry escalation later.
-        return true;
+        boolean leftCarrier = EntryRecovery.reconcileSourceReturn(
+                () -> SpiritTerrainService.returnToSource(p, nav.sourceDimension(), nav.sourcePosition()),
+                () -> spirit(p),
+                () -> {
+                    completeSourceRecovery(p);
+                    s.restoreFailures = 0; s.restoreNextTick = 0;
+                    p.sendMessage(Text.literal("Spirit terrain could not be rebuilt; left the spirit carrier."), false);
+                },
+                () -> s.restoreFailures = EntryRecovery.REBUILD_BACKOFF_FAILURES);
+        // A callback throwing after transfer must not resume carrier integration in the source world.
+        return !leftCarrier;
     }
     private static void restoreAnchor(ServerPlayerEntity p, Session s) {
         if (s.checkedRestore) return; s.checkedRestore = true;
