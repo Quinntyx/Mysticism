@@ -3,7 +3,7 @@ package io.github.mysticism.net;
 import io.github.mysticism.component.MysticismEntityComponents;
 import io.github.mysticism.dimension.spiritworld.terrain.*;
 import io.github.mysticism.navigation.SpiritNavigationService;
-import io.github.mysticism.net.mixin.SourceEntityLookupAccessor;
+import io.github.mysticism.mixin.SourceEntityLookupAccessor;
 import io.github.mysticism.vector.*;
 import net.fabricmc.fabric.api.networking.v1.*;
 import net.fabricmc.fabric.api.event.lifecycle.v1.*;

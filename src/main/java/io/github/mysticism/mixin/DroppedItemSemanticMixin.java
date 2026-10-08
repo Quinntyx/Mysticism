@@ -1,4 +1,4 @@
-package io.github.mysticism.net.mixin;
+package io.github.mysticism.mixin;
 
 import io.github.mysticism.net.DroppedItemSemanticService;
 import net.minecraft.entity.ItemEntity;

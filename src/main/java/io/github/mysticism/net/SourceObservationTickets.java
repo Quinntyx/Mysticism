@@ -1,6 +1,6 @@
 package io.github.mysticism.net;
 
-import io.github.mysticism.net.mixin.SourceChunkHolderAccessor;
+import io.github.mysticism.mixin.SourceChunkHolderAccessor;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.*;
 import net.minecraft.world.chunk.ChunkStatus;

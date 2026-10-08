@@ -4,6 +4,17 @@
   "package": "io.github.mysticism.mixin",
   "compatibilityLevel": "JAVA_21",
   "mixins": [
+    "SourceBlockUpdateMixin",
+    "ActivityStatMixin",
+    "ActivityPlacementMixin",
+    "ActivitySpawnMixin",
+    "SpiritMeshSneakMixin",
+    "SpiritMeshCollisionMixin",
+    "SpiritNativeMobMixin",
+    "SpiritFlightToggleMixin",
+    "DroppedItemSemanticMixin",
+    "SourceEntityLookupAccessor",
+    "SourceChunkHolderAccessor"
   ],
   "injectors": {
     "defaultRequire": 1

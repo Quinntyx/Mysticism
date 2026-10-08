@@ -1,4 +1,4 @@
-package io.github.mysticism.net.mixin;
+package io.github.mysticism.mixin;
 import net.minecraft.entity.Entity;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.world.entity.EntityLookup;

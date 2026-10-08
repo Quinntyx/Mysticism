@@ -26,7 +26,6 @@
   },
   "mixins": [
     "mysticism.mixins.json",
-    "mysticism.spirit.mixins.json",
     {
       "config": "mysticism.client.mixins.json",
       "environment": "client"
@@ -42,7 +41,8 @@
     "cardinal-components": [
       "mysticism:latent_pos",
       "mysticism:latent_basis",
-      "mysticism:latent_attunement"
+      "mysticism:latent_attunement",
+      "mysticism:spirit_navigation"
     ]
   }
 }

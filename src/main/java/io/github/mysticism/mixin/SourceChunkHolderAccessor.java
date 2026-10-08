@@ -1,4 +1,4 @@
-package io.github.mysticism.net.mixin;
+package io.github.mysticism.mixin;
 import net.minecraft.server.world.*;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.gen.Invoker;

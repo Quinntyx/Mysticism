@@ -2,7 +2,7 @@ package io.github.mysticism.net;
 
 import io.github.mysticism.component.MysticismEntityComponents;
 import io.github.mysticism.embedding.EmbeddingNbt;
-import io.github.mysticism.net.mixin.SourceEntityLookupAccessor;
+import io.github.mysticism.mixin.SourceEntityLookupAccessor;
 import io.github.mysticism.vector.*;
 import io.github.mysticism.world.state.ItemEmbeddingIndexState;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;

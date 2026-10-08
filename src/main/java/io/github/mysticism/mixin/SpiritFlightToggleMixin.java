@@ -1,4 +1,4 @@
-package io.github.mysticism.navigation.mixin;
+package io.github.mysticism.mixin;
 
 import io.github.mysticism.navigation.SpiritNavigationService;
 import net.minecraft.network.packet.c2s.play.UpdatePlayerAbilitiesC2SPacket;

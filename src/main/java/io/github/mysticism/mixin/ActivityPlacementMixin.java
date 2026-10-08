@@ -1,4 +1,4 @@
-package io.github.mysticism.activity.mixin;
+package io.github.mysticism.mixin;
 
 import io.github.mysticism.activity.SpiritActivityService;
 import net.minecraft.block.BlockState;

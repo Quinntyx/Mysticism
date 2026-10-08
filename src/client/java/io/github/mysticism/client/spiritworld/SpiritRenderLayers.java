@@ -1,5 +1,5 @@
 package io.github.mysticism.client.spiritworld;
-import io.github.mysticism.client.spiritworld.mixin.*;
+import io.github.mysticism.client.mixin.*;
 import net.minecraft.client.render.*;
 import net.minecraft.util.Identifier;
 import java.util.LinkedHashMap;

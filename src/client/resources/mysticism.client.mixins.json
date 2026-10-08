@@ -1,16 +1,16 @@
 {
   "required": true,
-  "package": "io.github.mysticism.client",
+  "package": "io.github.mysticism.client.mixin",
   "compatibilityLevel": "JAVA_21",
   "client": [
-    "mixin.SpiritBackgroundRendererMixin",
-    "mixin.SpiritInteractionMixin",
-    "mixin.SpiritNativeSceneMixin",
-    "spiritworld.mixin.SpiritLayerPhasesAccess",
-    "spiritworld.mixin.SpiritTextureAccess",
-    "spiritworld.mixin.SpiritLayerAccess",
-    "spiritworld.mixin.SpiritTrackerEntriesAccess",
-    "spiritworld.mixin.SpiritTrackerInitialValueAccess"
+    "SpiritBackgroundRendererMixin",
+    "SpiritInteractionMixin",
+    "SpiritNativeSceneMixin",
+    "SpiritLayerPhasesAccess",
+    "SpiritTextureAccess",
+    "SpiritLayerAccess",
+    "SpiritTrackerEntriesAccess",
+    "SpiritTrackerInitialValueAccess"
   ],
   "injectors": {
     "defaultRequire": 1

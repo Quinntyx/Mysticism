@@ -1,5 +1,6 @@
-package io.github.mysticism.landmark.extract;
+package io.github.mysticism.mixin;
 
+import io.github.mysticism.landmark.extract.LandmarkExtractionService;
 import net.minecraft.block.BlockState;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;

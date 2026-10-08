@@ -1,4 +1,4 @@
-package io.github.mysticism.dimension.spiritworld.terrain.mixin;
+package io.github.mysticism.mixin;
 
 import io.github.mysticism.dimension.spiritworld.terrain.MeshCollision;
 import io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService;

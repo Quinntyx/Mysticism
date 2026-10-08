@@ -1,4 +1,4 @@
-package io.github.mysticism.navigation.mixin;
+package io.github.mysticism.mixin;
 
 import io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService;
 import net.minecraft.entity.Entity;

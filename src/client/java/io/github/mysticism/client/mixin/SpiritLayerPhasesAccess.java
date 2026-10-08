@@ -1,4 +1,4 @@
-package io.github.mysticism.client.spiritworld.mixin;
+package io.github.mysticism.client.mixin;
 import net.minecraft.client.render.RenderLayer;
 import net.minecraft.client.render.RenderPhase;
 import org.spongepowered.asm.mixin.Mixin;
