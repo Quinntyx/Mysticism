@@ -24,23 +24,41 @@ public final class SourceLandmarks {
         public boolean air(){return Set.of("minecraft:air","minecraft:cave_air","minecraft:void_air").contains(material.blockId());}
     }
     public record Region(String dimension,Bounds bounds,List<Cell> cells,boolean complete){public Region{cells=List.copyOf(cells);}}
-    private static final Map<MinecraftServer,Session> SESSIONS=new IdentityHashMap<>();private static boolean initialized;
+    private static final Map<MinecraftServer,Session> SESSIONS=new IdentityHashMap<>();
+    private static final GenerationSurveyLifecycle<MinecraftServer> GENERATION=new GenerationSurveyLifecycle<>();private static boolean initialized;
     private SourceLandmarks(){}
     public static void init(){
         if(initialized)return;initialized=true;
-        ServerLifecycleEvents.SERVER_STARTED.register(server->{var store=LandmarkStore.get(server);if(!store.usesNativeSourceProfile(LandmarkProfiles.current()))SpiritActivityService.discardGeneratedInfluences(server);store.clearGeneratedIfIncompatible(LandmarkProfiles.current());SESSIONS.put(server,new Session(server));});
+        ServerLifecycleEvents.SERVER_STARTED.register(server->{var store=LandmarkStore.get(server);if(!store.usesNativeSourceProfile(LandmarkProfiles.current()))SpiritActivityService.discardGeneratedInfluences(server);store.clearGeneratedIfIncompatible(LandmarkProfiles.current());SESSIONS.put(server,new Session(server,GENERATION.started(server)));});
         ServerTickEvents.END_SERVER_TICK.register(server->{Session s=SESSIONS.get(server);if(s!=null)s.tick();});
-        ServerLifecycleEvents.SERVER_STOPPING.register(server->{Session s=SESSIONS.remove(server);if(s!=null)s.close();});
-        ServerWorldEvents.UNLOAD.register((server,world)->{Session s=SESSIONS.get(server);if(s!=null)s.unload(world.getRegistryKey().getValue().toString());});
-        ServerChunkEvents.CHUNK_UNLOAD.register((world,chunk)->{Session s=SESSIONS.get(world.getServer());if(s!=null){String dim=world.getRegistryKey().getValue().toString();s.surveys.unloaded(dim,chunk.getPos().x,chunk.getPos().z);Bounds area=new Bounds(chunk.getPos().getStartX(),world.getBottomY(),chunk.getPos().getStartZ(),chunk.getPos().getStartX()+16L,world.getTopY(),chunk.getPos().getStartZ()+16L);if(s.active!=null&&s.active.dimension.equals(dim)&&s.active.guarded!=null&&s.active.guarded.intersects(area))s.active.cancel(new CancellationException("source chunk unloaded during observation"));}});
+        ServerLifecycleEvents.SERVER_STOPPING.register(SourceLandmarks::stopped);
+        ServerLifecycleEvents.SERVER_STOPPED.register(SourceLandmarks::stopped); // also release early surveys if startup fails
+        ServerWorldEvents.UNLOAD.register((server,world)->{String dim=world.getRegistryKey().getValue().toString();GENERATION.unloaded(server,dim);Session s=SESSIONS.get(server);if(s!=null)s.unload(dim);});
+        ServerChunkEvents.CHUNK_UNLOAD.register((world,chunk)->{String dim=world.getRegistryKey().getValue().toString();GENERATION.unloaded(world.getServer(),dim,chunk.getPos().x,chunk.getPos().z);Session s=SESSIONS.get(world.getServer());if(s!=null){Bounds area=new Bounds(chunk.getPos().getStartX(),world.getBottomY(),chunk.getPos().getStartZ(),chunk.getPos().getStartX()+16L,world.getTopY(),chunk.getPos().getStartZ()+16L);if(s.active!=null&&s.active.dimension.equals(dim)&&s.active.guarded!=null&&s.active.guarded.intersects(area))s.active.cancel(new CancellationException("source chunk unloaded during observation"));}});
         ServerChunkEvents.CHUNK_LOAD.register((world,chunk)->{
             if(!SourceDimensions.isSource(world.getRegistryKey().getValue().toString()))return;
+            survey(world,chunk); // spawn chunks arrive before SERVER_STARTED; never gate generation on Session
             Session s=SESSIONS.get(world.getServer());if(s==null)return;
             int x=chunk.getPos().getStartX()+8,z=chunk.getPos().getStartZ()+8;
             var center=new BlockPos(x,chunk.sampleHeightmap(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,x&15,z&15)+1,z);
             s.hint(world.getRegistryKey().getValue().toString(),center);
             if(s.retries.size()<64)s.retries.add(new FrontierRetry(world.getRegistryKey().getValue().toString(),new Bounds(chunk.getPos().getStartX()-1L,world.getBottomY(),chunk.getPos().getStartZ()-1L,chunk.getPos().getStartX()+17L,world.getTopY(),chunk.getPos().getStartZ()+17L)));
-            s.survey(world,chunk);
+        });
+    }
+    private static void stopped(MinecraftServer server){GENERATION.stopped(server);Session s=SESSIONS.remove(server);if(s!=null)s.close();}
+    /** Read only the supplied loaded chunk, including during spawn-region setup. The view
+     * is consumed synchronously; only immutable bounded source positions survive the event. */
+    private static void survey(ServerWorld world,WorldChunk chunk){
+        int bottom=world.getBottomY(),top=world.getTopY();var origin=chunk.getPos();
+        GENERATION.loaded(world.getServer(),world.getRegistryKey().getValue().toString(),origin.x,origin.z,bottom,top,new GenerationSurvey.ColumnView(){
+            public int height(int localX,int localZ){
+                try{return chunk.hasHeightmap(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES)?chunk.sampleHeightmap(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,localX,localZ):Integer.MIN_VALUE;}
+                catch(RuntimeException failure){return Integer.MIN_VALUE;}
+            }
+            public String biome(int localX,int localZ,int surfaceY){
+                try{return world.getBiomeForNoiseGen((origin.getStartX()+localX)>>2,Math.max(bottom,Math.min(top-1,surfaceY))>>2,(origin.getStartZ()+localZ)>>2).getKey().map(key->key.getValue().toString()).orElse(null);}
+                catch(RuntimeException failure){return null;}
+            }
         });
     }
     public static CompletableFuture<Optional<LandmarkMetadata>> ensureSourceLocation(MinecraftServer server,String dimension,BlockPos position){return ensure(server,dimension,position,null,false);}
@@ -128,35 +146,15 @@ public final class SourceLandmarks {
     }
     private static final class Session {
         final MinecraftServer server;final LandmarkStore store;final ItemEmbeddingIndexState itemIndex;final ExecutorService worker=new ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(4),Thread.ofPlatform().daemon().name("mysticism-source").factory(),new ThreadPoolExecutor.AbortPolicy());
-        final ArrayDeque<SourceOwnership.Request> ownerRequests=new ArrayDeque<>();final GenerationSurveyQueue surveys=new GenerationSurveyQueue();boolean surveyTurn=true;
+        final ArrayDeque<SourceOwnership.Request> ownerRequests=new ArrayDeque<>();final GenerationSurveyQueue surveys;boolean surveyTurn=true;
         final ArrayDeque<FrontierRetry> retries=new ArrayDeque<>();final Map<CompletableFuture<?>,String> auxiliary=new IdentityHashMap<>();final ArrayDeque<Operation<?>> requests=new ArrayDeque<>();final LinkedHashSet<Hint> hints=new LinkedHashSet<>();Operation<?> active;String status="Ready";int playerCursor,lastCells;
-        Session(MinecraftServer server){this.server=server;store=LandmarkStore.get(server);itemIndex=ItemEmbeddingIndexState.get(server);}
+        Session(MinecraftServer server,GenerationSurveyQueue surveys){this.server=server;this.surveys=surveys;store=LandmarkStore.get(server);itemIndex=ItemEmbeddingIndexState.get(server);}
         <T> CompletableFuture<T> computeAndDeliver(String dim,java.util.function.Supplier<T> computation){
             var out=new CompletableFuture<T>();if(auxiliary.size()>=64){out.completeExceptionally(new RejectedExecutionException("source auxiliary budget"));return out;}auxiliary.put(out,dim);
             try{CompletableFuture.supplyAsync(computation,worker).whenComplete((value,error)->server.execute(()->{auxiliary.remove(out);if(SESSIONS.get(server)!=this)out.cancel(false);else if(error!=null)out.completeExceptionally(error);else out.complete(value);}));}catch(RuntimeException failure){auxiliary.remove(out);out.completeExceptionally(failure);}return out;
         }
         void offer(Operation<?> op){if(requests.size()==64){op.future.completeExceptionally(new RejectedExecutionException("source request budget"));return;}if(op instanceof Read)requests.addFirst(op);else requests.addLast(op);}
         void hint(String dim,BlockPos p){admit(hints,new Hint(dim,p.toImmutable()),HINT_BUDGET);}
-        /** Generation landmarking beyond the chunk-center probe: derive representative
-         * surface/peak probes from the loaded chunk's actual heightmap and biome grid so
-         * real terrain across the render distance becomes landmark work, bounded per chunk.
-         * Retain at most MAX_PROBES per loaded chunk outside the evictable recency set;
-         * readiness delays and later chunks cannot strand non-center biome patches. */
-        void survey(ServerWorld world,WorldChunk chunk){
-            String dimension=world.getRegistryKey().getValue().toString();int bottom=world.getBottomY(),top=world.getTopY();var origin=chunk.getPos();
-            List<GenerationSurvey.Probe> probes;
-            try{probes=GenerationSurvey.survey(origin.getStartX(),origin.getStartZ(),bottom,top,new GenerationSurvey.ColumnView(){
-                public int height(int localX,int localZ){
-                    try{return chunk.hasHeightmap(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES)?chunk.sampleHeightmap(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,localX,localZ):Integer.MIN_VALUE;}
-                    catch(RuntimeException failure){return Integer.MIN_VALUE;}
-                }
-                public String biome(int localX,int localZ,int surfaceY){
-                    try{return world.getBiomeForNoiseGen((origin.getStartX()+localX)>>2,Math.max(bottom,Math.min(top-1,surfaceY))>>2,(origin.getStartZ()+localZ)>>2).getKey().map(key->key.getValue().toString()).orElse(null);}
-                    catch(RuntimeException failure){return null;}
-                }
-            });}catch(RuntimeException failure){return;}
-            surveys.loaded(dimension,origin.x,origin.z,surveyHints(probes));
-        }
         void invalidate(String dim,BlockPos pos){if(active!=null&&active.dimension.equals(dim)&&active.guarded!=null&&active.guarded.contains(pos.getX(),pos.getY(),pos.getZ()))active.cancel(new CancellationException("source edit invalidated snapshot"));}
         void tick(){
             lastCells=0;

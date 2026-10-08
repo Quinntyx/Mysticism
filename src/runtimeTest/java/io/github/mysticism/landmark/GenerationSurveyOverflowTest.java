@@ -14,8 +14,9 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Stream;
 
-/** More distinct generation probes than the recency budget arrive before readiness.
- * Drain the real generation queue through prepare + paged store publication, then cold
+/** More distinct source chunk-load surveys than the recency budget arrive before
+ * SERVER_STARTED and readiness. Use the production lifecycle survey/queue handoff,
+ * then drain through prepare + paged store publication, then cold
  * reload and inspect exact octree ownership of the EARLIEST non-center biome patch.
  * No player hints, cave retries, live model/service, or game bootstrap can rescue it. */
 public final class GenerationSurveyOverflowTest {
@@ -25,11 +26,14 @@ public final class GenerationSurveyOverflowTest {
     private static final BlockPalette.State AIR=new BlockPalette.State("minecraft:air",Map.of());
     private static void check(boolean ok,String message){checks++;if(!ok)throw new AssertionError(message);}
     private static String biome(int x){return x<8?"minecraft:forest":"minecraft:desert";}
-    private static List<BlockPos> probes(int chunkX){
-        return SourceLandmarks.surveyHints(GenerationSurvey.survey(chunkX*16,0,-64,320,new GenerationSurvey.ColumnView(){
+    private static GenerationSurvey.ColumnView columns(){
+        return new GenerationSurvey.ColumnView(){
             public int height(int x,int z){return 64;}
             public String biome(int x,int z,int y){return GenerationSurveyOverflowTest.biome(x);}
-        }));
+        };
+    }
+    private static List<BlockPos> probes(int chunkX){
+        return SourceLandmarks.surveyHints(GenerationSurvey.survey(chunkX*16,0,-64,320,columns()));
     }
     private static SourceLandmarks.Region terrain(int chunkX){
         int start=chunkX*16;var cells=new ArrayList<SourceLandmarks.Cell>();
@@ -51,18 +55,22 @@ public final class GenerationSurveyOverflowTest {
         return future.join();
     }
     private static void delayedReadinessPublishesEarlierNonCenterTerrain()throws Exception{
-        var work=new GenerationSurveyQueue();var hints=new LinkedHashSet<BlockPos>();
+        var lifecycle=new GenerationSurveyLifecycle<Object>();Object server=new Object();
+        var hints=new LinkedHashSet<BlockPos>();
+        // Spawn CHUNK_LOAD during loadWorld, before SERVER_STARTED constructs a Session.
         int chunkCount=SourceLandmarks.HINT_BUDGET/2+17;
         for(int i=0;i<chunkCount;i++){
             int chunkX=i*4;var surveyed=probes(chunkX);
             check(surveyed.size()==2,"two actual surface biome components per source chunk");
-            work.loaded(DIM,chunkX,0,surveyed);
+            lifecycle.loaded(server,DIM,chunkX,0,-64,320,columns());
             // Reproduce the former admission loss: both survey probes and the center share
             // the recency budget. The new generation path does NOT depend on that set.
             SourceLandmarks.admit(hints,new BlockPos(chunkX*16+8,65,8),SourceLandmarks.HINT_BUDGET);
             for(var p:surveyed)SourceLandmarks.admit(hints,p,SourceLandmarks.HINT_BUDGET);
-            check(work.next(false).isEmpty(),"no dispatch before embedding/index readiness");
         }
+        // This is the same queue handoff used by the actual SERVER_STARTED callback.
+        var work=lifecycle.started(server);
+        check(work.next(false).isEmpty(),"startup handoff does not bypass embedding/index readiness");
         BlockPos earliestForest=probes(0).getFirst();
         check(!hints.contains(earliestForest),"fixture really evicts the earlier non-center probe");
         check(work.pending()==2*chunkCount&&work.pending()>SourceLandmarks.HINT_BUDGET,"all unsatisfied probes survive delayed readiness beyond 256");

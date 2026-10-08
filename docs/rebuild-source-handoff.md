@@ -110,3 +110,42 @@ or continuous explicit request pressure can delay background surveys, and genera
 surveys intentionally select bounded major components rather than every source cell.
 The other runtime repair areas remain integration-owned; this correction changes no
 projection, collision, render, or embedding profile/migration contract.
+
+## Spawn-region startup ordering correction (P2)
+
+Fabric spawn-region `CHUNK_LOAD` events occur before `SERVER_STARTED` constructs the
+source session. The callback now surveys the supplied actual source chunk **before**
+looking up that session. `GenerationSurveyLifecycle` owns the same residency-bounded
+queue before and after startup; `SERVER_STARTED` hands it to the session rather than
+allocating a replacement. Only immutable surface/peak positions are retained, not live
+column views, world/chunk references, snapshots, stores, or early model initialization.
+Existing paged Ensure ownership/publication, native v2 profiles, request priority,
+independent projections, and custom collision/render contracts are unchanged.
+
+Chunk and dimension unload remove generation debt even before any session exists.
+Both `SERVER_STOPPING` and `SERVER_STOPPED` perform idempotent cleanup, also covering
+startup that fails without reaching `SERVER_STARTED`. Server identities are isolated.
+The startup path adds no chunk tickets, forced generation, or loaded-world rescan.
+
+`GenerationSurveyStartupTest` exercises early two-biome source-column load events,
+startup handoff, readiness gating, detached capture, post-start admission, pre-start
+chunk/dimension unload, separate server identities, and failed-startup cleanup. It also
+checks the **compiled Fabric event registrations and callback order**, so an early
+null-session guard in `CHUNK_LOAD` cannot silently bypass the tested lifecycle helper.
+`GenerationSurveyOverflowTest` now submits all 145 chunks / 290 component probes through
+that actual survey/lifecycle path **before startup**, rather than directly admitting
+probe lists to a queue. After handoff it prepares real terrain masks, publishes through
+the paged store, saves/cold-reloads, and verifies exact persisted ownership of the
+earliest non-center surface biome's floor and air cell without any unload/reload or
+player hints. Its check count changed because readiness is asserted at startup handoff
+instead of once for each pre-start load; no ownership checks were removed.
+
+Validation: `./gradlew --no-daemon --console=plain build` with the installed Java 21 in
+visible tmux pane `%1333` passed all **nine** discovered runtime test mains (startup:
+29 checks; overflow/persistence: 2579 checks), packaging self-tests and production-jar
+verification. `git diff --check` passed. These are deterministic lifecycle, compiled
+adapter-wiring and terrain persistence regressions, **not** a live Minecraft startup
+or actual descriptor-model inference smoke test. Background surveys still wait behind
+active source operations/model inference and explicit requests; bounded surveys select
+major surface components/peaks, not every source cell. The broad eleven-problem runtime
+integration still requires live Minecraft validation in the integration worktree.
