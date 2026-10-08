@@ -16,6 +16,7 @@ public final class WalkNaturalLandingContractTest {
     public static void main(String[] args) {
         cooldownRefusesExplicitRequests();
         naturalLandingBypassesCooldown();
+        expiryThenSupportReadinessWithoutRenewedAirtime();
         System.out.println("walk/natural-landing contract checks: " + checks);
     }
 
@@ -63,5 +64,38 @@ public final class WalkNaturalLandingContractTest {
         check(NaturalLandingPolicy.evaluate(true, true, true, false, false, true, NaturalLandingPolicy.REST_TICKS)
                 == NaturalLandingPolicy.Action.NONE,
                 "a pending walk approach suppresses a duplicate natural landing trigger");
+    }
+
+    /** End-of-approach airborne-history policy: an explicit walk request that fails or expires must
+     * NOT wipe this deep stretch's airtime history. Otherwise a player who settles onto terrain
+     * while their pending request validates is grounded-lockout after expiry: naturalLanding's
+     * !airborne arming check returns forever and support readiness can never land them without a
+     * renewed jump. Failed NATURAL approaches still reset (anti-loop: lift off and descend again),
+     * and success/lifecycle resets also clear it so a fresh stretch re-arms honestly. */
+    private static void expiryThenSupportReadinessWithoutRenewedAirtime() {
+        // Explicit walk request expires after failure: airtime history is preserved.
+        check(SpiritNavigationService.keepsAirborneAfterApproachEnd(false, true),
+                "explicit walk expiry/failure must preserve airborne history");
+        // The player is still in the same deep stretch, has NOT left the ground since the request
+        // failed, and the support below has become ready: carried airtime + resting contact lands.
+        var action = NaturalLandingPolicy.evaluate(
+                true,   // deep
+                true,   // airtime carried over from before the request, preserved across expiry
+                false,  // approach ended (expired)
+                false, false, true, NaturalLandingPolicy.REST_TICKS - 1);
+        check(action == NaturalLandingPolicy.Action.LAND,
+                "a settled player must land naturally after explicit expiry, without renewed airtime");
+        // A failed NATURAL approach resets instead: its retry requires lifting off again.
+        check(!SpiritNavigationService.keepsAirborneAfterApproachEnd(true, true),
+                "failed natural approaches must reset airborne history (anti-loop)");
+        check(NaturalLandingPolicy.evaluate(true, false, false, false, false, true, NaturalLandingPolicy.REST_TICKS)
+                == NaturalLandingPolicy.Action.NONE,
+                "reset airtime blocks an immediate natural re-landing after natural expiry");
+        // Success and lifecycle-driven ends always reset: a fresh deep stretch re-arms honestly,
+        // so a standing takeoff after a successful landing is never immediately reversed.
+        check(!SpiritNavigationService.keepsAirborneAfterApproachEnd(false, false),
+                "successful approach completion must reset airborne history");
+        check(!SpiritNavigationService.keepsAirborneAfterApproachEnd(true, false),
+                "non-failure ends must reset airborne history regardless of approach kind");
     }
 }

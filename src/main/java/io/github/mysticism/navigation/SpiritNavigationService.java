@@ -324,10 +324,25 @@ public final class SpiritNavigationService {
         feedback(p, s, true, "Landing on the source-owned terrain below.");
     }
     private static void endSupportApproach(ServerPlayerEntity p, Session s) {
+        endSupportApproach(p, s, false);
+    }
+    /** Pure policy seam: when a support approach ends, does this deep stretch keep its airborne
+     * history? A failed/expired EXPLICIT walk request preserves it — a player who settled onto
+     * terrain during pending validation must still be able to land naturally afterwards, without
+     * renewed airtime. Everything else resets it: success (a fresh stretch re-arms honestly),
+     * lifecycle resets, and failed NATURAL approaches, whose retry requires lifting off again
+     * (anti-loop, matching the natural expiry message). */
+    public static boolean keepsAirborneAfterApproachEnd(boolean naturalApproach, boolean failedOrExpired) {
+        return failedOrExpired && !naturalApproach;
+    }
+    private static void endSupportApproach(ServerPlayerEntity p, Session s, boolean failedOrExpired) {
+        boolean natural = s.naturalSupport;
         if (s.supportPending) SpiritTerrainService.cancelCurrentSupport(p);
         s.supportPending = false; s.supportTargetSnapshot = null; s.supportFrom = null; s.supportGrid = null;
         s.supportId = ""; s.supportDimension = ""; s.supportTick = 0; s.supportAlignTick = 0;
-        s.naturalSupport = false; s.airborne = false; s.restingTicks = 0;
+        s.naturalSupport = false;
+        if (!keepsAirborneAfterApproachEnd(natural, failedOrExpired)) s.airborne = false;
+        s.restingTicks = 0;
         if (state(p).supportApproach()) { state(p).setSupportApproach(false); sync(p); }
     }
 
@@ -425,7 +440,7 @@ public final class SpiritNavigationService {
             TraversalSteering.advance(q, component.get(), delta.x, delta.y, delta.z);
         if (++s.supportTick > WALK_BUDGET_TICKS) {
             boolean natural = s.naturalSupport;
-            endSupportApproach(p, s);
+            endSupportApproach(p, s, true); // explicit expiry keeps airtime history; natural expiry resets it
             walkFailed(p, s, natural
                     ? "Natural landing expired: current support could not be continuously aligned/owned. Still deep; lift off and descend again to retry."
                     : "Walk request expired: current support could not be continuously aligned/owned. Still deep; no substitute landing.");
@@ -437,7 +452,7 @@ public final class SpiritNavigationService {
                 + (s.supportId.isEmpty() ? "" : ", support " + s.supportId + " @ " + s.supportDimension)
                 + (s.supportFrom == null ? "" : ", aligning " + s.supportAlignTick + "/" + SUPPORT_ALIGN_TICKS) + ").");
         if (s.supportTargetSnapshot.squareDistance(p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target()) > 0) {
-            endSupportApproach(p, s);
+            endSupportApproach(p, s, true);
             walkFailed(p, s, "Walk request cancelled after attunement changed; captured target was not altered by landing.");
             return;
         }
@@ -449,7 +464,7 @@ public final class SpiritNavigationService {
             s.supportWindow = support.windowIdentity(); s.supportId = support.landmarkId(); s.supportDimension = support.sourceDimension();
         } else if (s.supportWindow != support.windowIdentity() || !s.supportId.equals(support.landmarkId())
                 || !s.supportDimension.equals(support.sourceDimension()) || basisError(s.supportGrid, destination) > 1e-12f) {
-            endSupportApproach(p, s);
+            endSupportApproach(p, s, true);
             walkFailed(p, s, "Actual support window/ownership changed; remaining deep. Request walking on the new support again.");
             return;
         }
@@ -458,7 +473,7 @@ public final class SpiritNavigationService {
         Basis384f proposed = aligned ? before : TraversalSteering.blend(s.supportFrom, destination, (s.supportAlignTick + 1) / (float) SUPPORT_ALIGN_TICKS);
         if (before.i.squareDistance(proposed.i) > .01f || before.j.squareDistance(proposed.j) > .01f
                 || before.k.squareDistance(proposed.k) > .01f) {
-            endSupportApproach(p, s);
+            endSupportApproach(p, s, true);
             walkFailed(p, s, "Source-grid alignment would be discontinuous; remaining deep on current geometry.");
             return;
         }
@@ -473,7 +488,7 @@ public final class SpiritNavigationService {
         var mapped = SpiritTerrainService.sourcePosition(p);
         if (mapped.isEmpty() || !mapped.get().landmarkId().equals(support.landmarkId())
                 || !mapped.get().dimension().equals(support.sourceDimension())) {
-            SpiritTerrainService.setShallow(p, false); endSupportApproach(p, s);
+            SpiritTerrainService.setShallow(p, false); endSupportApproach(p, s, true);
             walkFailed(p, s, "Terrain acquisition did not retain its validated source mapping; remaining deep.");
             return;
         }
