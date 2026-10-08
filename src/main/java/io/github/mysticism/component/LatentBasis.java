@@ -5,6 +5,7 @@ import io.github.mysticism.vector.Vec384f;
 import io.github.mysticism.embedding.EmbeddingNbt;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtElement;
+import net.minecraft.network.RegistryByteBuf;
 import net.minecraft.registry.RegistryWrapper;
 import org.ladysnake.cca.api.v3.component.ComponentV3;
 import org.ladysnake.cca.api.v3.component.sync.AutoSyncedComponent;
@@ -70,5 +71,21 @@ public final class LatentBasis implements ComponentV3, AutoSyncedComponent {
         EmbeddingNbt.stamp(tag);
         tag.putIntArray("b", this.basis.toBits());
         tag.remove("embeddingArchive");
+    }
+
+    /**
+     * Client-side authoritative sync application with movement-ordering reconciliation; see
+     * {@link LatentPos#applySyncPacket}. A basis sync whose divergence from the locally integrated
+     * basis is fully explained by unacknowledged movement is held, never applied as a rollback;
+     * every genuine authoritative correction (touch blend, support alignment, anchor) is accepted.
+     */
+    @Override
+    public void applySyncPacket(RegistryByteBuf buf) {
+        NbtCompound tag = buf.readNbt();
+        if (tag == null) return;
+        LatentBasis incoming = new LatentBasis();
+        // The read path ignores the registry lookup; the wire format is self-describing bits.
+        incoming.readFromNbt(tag, null);
+        this.set(LatentSync.reconcile(this, this.basis, incoming.basis));
     }
 }

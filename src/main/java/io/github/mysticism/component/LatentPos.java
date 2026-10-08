@@ -4,6 +4,7 @@ import io.github.mysticism.vector.Vec384f;
 import io.github.mysticism.embedding.EmbeddingNbt;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtElement;
+import net.minecraft.network.RegistryByteBuf;
 import net.minecraft.registry.RegistryWrapper; // Re-add this import
 import org.ladysnake.cca.api.v3.component.ComponentV3;
 import org.ladysnake.cca.api.v3.component.sync.AutoSyncedComponent;
@@ -35,5 +36,26 @@ public final class LatentPos implements ComponentV3, AutoSyncedComponent {
         EmbeddingNbt.stamp(tag);
         tag.putIntArray("v", this.v.toBits());
         tag.remove("embeddingArchive");
+    }
+
+    /**
+     * Client-side authoritative sync application with movement-ordering reconciliation.
+     *
+     * <p>The default implementation overwrites the component verbatim. That is correct for peers,
+     * but for the local player the synced pose was integrated from movement packets the server had
+     * already received, so it can lag the locally predicted pose by the in-flight movement; applying
+     * it verbatim rolls the predicted spirit pose back to a stale snapshot on every sync cadence
+     * (jitter/rubber banding). The installed {@link LatentSync} filter decides between the fresher
+     * prediction and the authoritative value; without a filter (server side, tests, peers) the
+     * historical behaviour is preserved.
+     */
+    @Override
+    public void applySyncPacket(RegistryByteBuf buf) {
+        NbtCompound tag = buf.readNbt();
+        if (tag == null) return;
+        LatentPos incoming = new LatentPos();
+        // The read path ignores the registry lookup; the wire format is self-describing bits.
+        incoming.readFromNbt(tag, null);
+        this.set(LatentSync.reconcile(this, this.v, incoming.v));
     }
 }

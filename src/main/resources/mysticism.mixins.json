@@ -12,6 +12,7 @@
     "SpiritMeshCollisionMixin",
     "SpiritNativeMobMixin",
     "SpiritFlightToggleMixin",
+    "SpiritTeleportBaselineMixin",
     "DroppedItemSemanticMixin",
     "SourceEntityLookupAccessor",
     "SourceChunkHolderAccessor"

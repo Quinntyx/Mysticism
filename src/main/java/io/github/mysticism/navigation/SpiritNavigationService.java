@@ -185,7 +185,10 @@ public final class SpiritNavigationService {
             att.set(q); // initialize only an absent default, never overwrite a captured coordinate (even ZERO)
             if (s.supportPending) s.supportTargetSnapshot = att.target();
         }
-        MysticismEntityComponents.LATENT_ATTUNEMENT.sync(p); MysticismEntityComponents.LATENT_POS.sync(p); sync(p);
+        // Correction ordering: nav (and its motionEpoch) must sync BEFORE the q it re-anchors, so the
+        // client pose-sync guard sees the changed epoch when the delayed/reordered q sync arrives.
+        sync(p);
+        MysticismEntityComponents.LATENT_ATTUNEMENT.sync(p); MysticismEntityComponents.LATENT_POS.sync(p);
     }
     private static boolean live(ServerPlayerEntity p, Session s) {
         Map<UUID, Session> sessions = SERVERS.get(p.getServer());
@@ -379,7 +382,9 @@ public final class SpiritNavigationService {
         var at = mapped.get(); nav.shallow(at.dimension(), at.landmarkId(), at.position());
         s.confirmedOwned = true; s.unsupported = 0; s.jumping = false; endSupportApproach(p, s);
         SpiritBasisEvolver.resetMotion(p); flight(p, false);
-        MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p); sync(p);
+        // Correction ordering: nav (and its motionEpoch) must sync BEFORE the shallow pose it commits.
+        sync(p);
+        MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p);
         p.sendMessage(Text.literal("Shallow: walking on the current source-owned landmark. Captured attunement retained."), true);
     }
     private static float basisError(Basis384f a, Basis384f b) {
@@ -454,7 +459,9 @@ public final class SpiritNavigationService {
             if (source.isPresent()) {
                 var at = source.get(); nav.shallow(at.dimension(), at.landmarkId(), at.position()); s.unsupported = 0;
                 endApproach(p, s); SpiritBasisEvolver.resetMotion(p); flight(p, false);
-                MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p); sync(p);
+                // Correction ordering: nav (and its motionEpoch) must sync BEFORE the landing pose it commits.
+                sync(p);
+                MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p);
             }
         } else { endApproach(p, s); p.sendMessage(Text.literal("Captured destination changed or blocked. Remaining deep nearby."), false); }
         return true;
