@@ -140,9 +140,31 @@ public final class DiscoveryBudgetTest {
                 tiles.keySet(),center,p->tiles.get(p).air());
         check(victims.size()==DiscoveryBudget.MAX_EVICTED_PER_PASS,"Bounded eviction batch expected");
         check(victims.stream().allMatch(p->tiles.get(p).air()),"Only redundant AIR may be evicted");
-        victims.forEach(tiles::remove);
+        // The real merge path includes old persisted SOLID at positions now observed as AIR.
+        List<SourceMeshBuilder.Node> persisted=new ArrayList<>();
+        for(BlockPos p:victims)persisted.add(new SourceMeshBuilder.Node(p,1,stone,"old-owner"));
+        BlockPos untouched=new BlockPos(60,64,60);persisted.add(new SourceMeshBuilder.Node(untouched,1,stone,"old-owner"));
+        List<SourceMeshBuilder.Node> before=SourceMeshBuilder.replaceNear(persisted,compactBefore,tiles.keySet(),center);
+        NegativeCoverage negative=new NegativeCoverage();
+        for(BlockPos p:victims){negative.add(p);tiles.remove(p);}
         check(SourceMeshBuilder.compact(tiles,center).equals(compactBefore),
                 "Air retention eviction must not change a single rendered/compacted node");
+        List<SourceMeshBuilder.Node> after=SourceMeshBuilder.replaceNear(persisted,SourceMeshBuilder.compact(tiles,center),tiles.keySet(),negative,center);
+        check(after.equals(before),"AIR eviction must not resurrect persisted SOLID through replaceNear");
+        for(BlockPos p:victims)check(after.stream().noneMatch(n->covers(n,p)),"Obsolete solid/collision resurrected at "+p);
+        check(after.stream().anyMatch(n->n.position().equals(untouched)),"Unobserved persisted stone must survive");
+        // A new cursor / empty tile cache must still be suppressed by session-local negative coverage.
+        List<SourceMeshBuilder.Node> restarted=SourceMeshBuilder.replaceNear(persisted,List.of(),Set.of(),negative,center);
+        check(restarted.size()==1 && restarted.getFirst().position().equals(untouched),"Stream restart forgot negative coverage");
+        BlockPos fresh=victims.getFirst();negative.remove(fresh);tiles.put(fresh,stone);
+        List<SourceMeshBuilder.Node> changed=SourceMeshBuilder.replaceNear(persisted,SourceMeshBuilder.compact(tiles,center),tiles.keySet(),negative,center);
+        check(changed.stream().filter(n->covers(n,fresh)).count()==1,"A fresh solid observation must supersede AIR exactly once");
+        TerrainMeshFrame frame=published(after,1024,true);
+        check(frame.cells().stream().noneMatch(c->victims.stream().anyMatch(p->sourceContains(c,p))),
+                "Published visible/collidable frame restored an obsolete AIR cell");
+        MeshCollision.Index collision=new MeshCollision.Index(frame);
+        for(BlockPos p:victims)check(collision.clearRay(new Vec3d(p.getX()+.5,p.getY()+1.5,p.getZ()+.5),
+                new Vec3d(p.getX()+.5,p.getY()+.1,p.getZ()+.5)),"Evicted AIR restored an actual SAT collider");
     }
 
     /** Simulated service schedule: each near-patch commit merges up to 4096 staged samples, runs one
@@ -218,6 +240,157 @@ public final class DiscoveryBudgetTest {
         check(keys.contains(new BlockPos(4,60,4)+"/2") || keys.contains(new BlockPos(4,60,4)+"/1"),"Refinement must keep the unsampled remainder of a mixed child");
     }
 
+    private static boolean covers(SourceMeshBuilder.Node n,BlockPos p) {
+        BlockPos at=n.position();return p.getX()>=at.getX() && p.getX()<at.getX()+n.side()
+                && p.getY()>=at.getY() && p.getY()<at.getY()+n.side() && p.getZ()>=at.getZ() && p.getZ()<at.getZ()+n.side();
+    }
+    private static boolean sourceContains(TerrainMeshFrame.Cell c,BlockPos p) {
+        Vec3d min=c.sourceMin(),size=c.size();return p.getX()>=min.x && p.getX()<min.x+size.x
+                && p.getY()>=min.y && p.getY()<min.y+size.y && p.getZ()>=min.z && p.getZ()<min.z+size.z;
+    }
+    private static SourceMeshBuilder.Tile solid(String id) {
+        return new SourceMeshBuilder.Tile(new TerrainMeshFrame.Material(id,Map.of()),List.of(SourceMeshBuilder.UNIT),0xffffff,0,false,true);
+    }
+    /** The exact production append stage and real immutable frame, not retained-coordinate evidence. */
+    private static TerrainMeshFrame published(List<SourceMeshBuilder.Node> nodes,int limit,boolean shallow) {
+        List<TerrainMeshFrame.Material> materials=new ArrayList<>();List<TerrainMeshFrame.Cell> cells=new ArrayList<>();
+        Vec3d x=shallow?new Vec3d(1,0,0):new Vec3d(.9,0,.2),y=new Vec3d(0,1,0),z=shallow?new Vec3d(0,0,1):new Vec3d(-.2,0,.9);
+        MeshPublication.append(nodes,"minecraft:overworld",FOCUS,FOCUS,x,y,z,FOCUS,1,limit,materials,new HashMap<>(),cells,new HashSet<>());
+        if(shallow)cells=MeshStitcher.stitch(cells,materials,"",true,FOCUS);
+        return new TerrainMeshFrame(1,shallow,"minecraft:overworld",FOCUS,FOCUS,materials,cells);
+    }
+    private static void publishedSurfaceSpansRenderDistance() {
+        Set<BlockPos> retained=runRetention(discoveredSurface(90,1,2),FOCUS,AIR,600);
+        Map<BlockPos,SourceMeshBuilder.Tile> tiles=new HashMap<>();SourceMeshBuilder.Tile stone=solid("minecraft:stone");
+        for(BlockPos p:retained)if(!AIR.test(p))tiles.put(p,stone);
+        List<SourceMeshBuilder.Node> nodes=SourceMeshBuilder.compact(tiles,FOCUS);
+        check(nodes.size()>1024,"One-layer/unknown-owner fixture must exceed the old nearest-only mesh budget");
+        for(boolean shallow:new boolean[]{true,false}) {
+            int limit=shallow?1024:640;TerrainMeshFrame frame=published(nodes,limit,shallow);
+            check(frame.cells().size()<=limit,"Published frame exceeded window/wire budget");
+            check(frame.cells().size()<nodes.size(),"Far one-layer surface must coalesce, not require an unbounded frame");
+            for(BlockPos p:tiles.keySet())check(frame.cells().stream().anyMatch(c->sourceContains(c,p)),
+                    "Published "+(shallow?"shallow":"deep")+" surface lost discovered solid "+p);
+            MeshCollision.Index collision=new MeshCollision.Index(frame);
+            for(int sx:new int[]{-1,1})for(int sz:new int[]{-1,1}) {
+                BlockPos farPoint=new BlockPos(70*sx,63,70*sz);
+                check(tiles.containsKey(farPoint),"Retention fixture must contain the distant quadrant witness");
+                var distant=frame.cells().stream().filter(c->sourceContains(c,farPoint)).findFirst();
+                check(distant.isPresent(),"Published frame lost distant quadrant "+sx+","+sz);
+                var c=distant.orElseThrow();double u=(farPoint.getX()+.5-c.sourceMin().x)/c.size().x,w=(farPoint.getZ()+.5-c.sourceMin().z)/c.size().z;
+                check(!collision.clearRay(c.point(u,1.5,w),c.point(u,-.5,w)),
+                        "Published distant terrain has no actual affine SAT collision");
+            }
+            for(var cell:frame.cells()) {
+                check(cell.collision().equals(List.of(SourceMeshBuilder.UNIT)),"LOD changed exact solid collision");
+                check(cell.bounds().equals(cell.bounds(cell.collision().getFirst())),"Visible affine cell differs from collision envelope");
+            }
+        }
+    }
+    private static void publicationDoesNotBridgeHolesOrOwners() {
+        Map<BlockPos,SourceMeshBuilder.Tile> tiles=new HashMap<>();Map<BlockPos,String> owners=new HashMap<>();
+        SourceMeshBuilder.Tile stone=solid("minecraft:stone");
+        for(int x=32;x<=90;x++)for(int z=-12;z<=12;z++)if(x!=60 && z!=0) {
+            BlockPos p=new BlockPos(x,63,z);tiles.put(p,stone);owners.put(p,x<60?"left":"right");
+        }
+        TerrainMeshFrame frame=published(SourceMeshBuilder.compact(tiles,FOCUS,owners),1024,true);
+        for(var c:frame.cells())for(BlockPos p:BlockPos.iterate(BlockPos.ofFloored(c.sourceMin()),BlockPos.ofFloored(c.sourceMin().add(c.size()).add(-1,-1,-1)))) {
+            check(tiles.containsKey(p),"Coalescing invented a solid over AIR/unknown "+p);
+            check(c.landmarkId().equals(owners.get(p)),"Coalescing crossed source octree ownership");
+        }
+        for(BlockPos p:tiles.keySet())check(frame.cells().stream().anyMatch(c->sourceContains(c,p)),"Exact rectangular publication dropped "+p);
+        // Partial/non-cube geometry must never be stretched into a whole solid rectangle.
+        SourceMeshBuilder.Tile slab=new SourceMeshBuilder.Tile(stone.material(),List.of(new Box(0,0,0,1,.5,1)),0xffffff,0,false,false);
+        List<SourceMeshBuilder.Node> partial=List.of(new SourceMeshBuilder.Node(new BlockPos(40,63,0),1,slab,"left"),
+                new SourceMeshBuilder.Node(new BlockPos(41,63,0),1,slab,"left"));
+        TerrainMeshFrame partialFrame=published(partial,1024,true);
+        check(partialFrame.cells().size()==2 && partialFrame.cells().stream().allMatch(c->c.size().equals(new Vec3d(1,1,1)) && c.collision().equals(slab.collision())),
+                "Partial model/collision was coalesced like a full cube");
+    }
+    private static void heterogeneousPublicationKeepsHorizon() {
+        List<SourceMeshBuilder.Node> nodes=new ArrayList<>();
+        SourceMeshBuilder.Tile a=solid("minecraft:stone"),b=solid("minecraft:dirt");
+        for(int x=-90;x<=90;x++)for(int z=-90;z<=90;z++)nodes.add(new SourceMeshBuilder.Node(new BlockPos(x,63,z),1,((x+z)&1)==0?a:b,""));
+        for(boolean shallow:new boolean[]{true,false}) {
+            TerrainMeshFrame frame=published(nodes,shallow?1024:640,shallow);
+            check(frame.cells().size()==(shallow?1024:640),"Heterogeneous fixture should exercise the hard publication budget");
+            for(int sx:new int[]{-1,1})for(int sz:new int[]{-1,1})check(frame.cells().stream().anyMatch(c->c.sourceMin().x*sx>60 && c.sourceMin().z*sz>60),
+                    "Unmergeable terrain publication collapsed to nearest-only locality");
+            for(int x=-4;x<=4;x++)for(int z=-4;z<=4;z++) {
+                BlockPos p=new BlockPos(x,63,z);check(frame.cells().stream().anyMatch(c->sourceContains(c,p)),"Body/support guard lost exact cell "+p);
+            }
+            List<SourceMeshBuilder.Node> reversed=new ArrayList<>(nodes);Collections.reverse(reversed);
+            check(published(reversed,shallow?1024:640,shallow).equals(frame),"Publication must be input-order deterministic");
+        }
+    }
+    private static void negativeCoverageIsBoundedAndExact() {
+        NegativeCoverage negative=new NegativeCoverage();Set<BlockPos> expected=new HashSet<>();
+        for(int x=-20;x<=20;x++)for(int y=-3;y<=3;y++)for(int z=-2;z<=2;z++) {
+            BlockPos p=new BlockPos(x,y,z);check(negative.add(p),"New negative cell not recorded");expected.add(p);
+        }
+        check(new HashSet<>(negative).equals(expected),"Packed negative coverage corrupts coordinates, especially negatives");
+        List<SourceMeshBuilder.Node> base=List.of(new SourceMeshBuilder.Node(new BlockPos(-16,-16,-16),16,solid("minecraft:stone"),"source"));
+        List<SourceMeshBuilder.Node> merged=SourceMeshBuilder.replaceNear(base,List.of(),Set.of(),negative,Vec3d.ZERO);
+        check(SourceMeshBuilder.replaceNear(base,List.of(),expected,negative,Vec3d.ZERO).equals(merged),
+                "Duplicate tile/mask coverage must not falsely erase an unsampled persisted bucket");
+        for(BlockPos p:BlockPos.iterate(-16,-16,-16,-1,-1,-1))check(merged.stream().anyMatch(n->covers(n,p))!=expected.contains(p),
+                "Coarse persisted merge does not precisely subtract packed AIR at "+p);
+        NegativeCoverage full=new NegativeCoverage();
+        for(int i=0;i<NegativeCoverage.MAX_BUCKETS;i++)check(full.add(new BlockPos(i*16,0,0)),"Mask admission stopped early");
+        BlockPos refused=new BlockPos(NegativeCoverage.MAX_BUCKETS*16,0,0);
+        check(!full.canRecord(refused) && !full.add(refused),"Negative mask memory must have a hard bound");
+        BlockPos sameBucket=new BlockPos(1,0,0);check(full.add(sameBucket),"Existing bucket must still accept exact negative bits");
+        check(DiscoveryBudget.evictionPlan(DiscoveryBudget.MAX_TILES+1,Set.of(refused),Vec3d.ZERO,p->true,full::canRecord).isEmpty(),
+                "AIR that cannot retain negative coverage must not be evicted");
+    }
+    private static void admissionAndNegativeCopiesStayBounded() {
+        Map<BlockPos,SourceMeshBuilder.Tile> tiles=new HashMap<>();Set<BlockPos> live=new HashSet<>();
+        NegativeCoverage negative=new NegativeCoverage();SourceMeshBuilder.Tile stone=solid("minecraft:stone");
+        SourceMeshBuilder.Tile air=new SourceMeshBuilder.Tile(new TerrainMeshFrame.Material("minecraft:air",Map.of()),List.of(),0,0,true,false);
+        BlockPos p=new BlockPos(-33,64,-17);negative.add(p);
+        check(DiscoveryBudget.admit(tiles,live,negative,p,stone,false)==DiscoveryBudget.Admission.STALE && tiles.isEmpty(),
+                "Reloaded stored SOLID must not supersede a negative live observation");
+        NegativeCoverage acquired=new NegativeCoverage();acquired.copyFrom(negative);
+        check(DiscoveryBudget.admit(tiles,live,acquired,p,stone,true)==DiscoveryBudget.Admission.UPDATED && !acquired.contains(p) && negative.contains(p),
+                "Fresh solid must replace AIR without mutating another source window's mask");
+        for(int i=1;tiles.size()<DiscoveryBudget.MAX_STAGED_TILES;i++)tiles.put(new BlockPos(i,0,0),stone);
+        BlockPos unseen=new BlockPos(-1000,64,0);
+        check(DiscoveryBudget.admit(tiles,live,acquired,unseen,air,true)==DiscoveryBudget.Admission.FULL && !live.contains(unseen),
+                "Hard admission must bound both staged tiles and live-position tracking");
+        check(DiscoveryBudget.admit(tiles,live,acquired,p,air,true)==DiscoveryBudget.Admission.UPDATED && tiles.get(p).air(),
+                "A live AIR update at a known position must remain admissible under memory pressure");
+        check(DiscoveryBudget.admit(tiles,live,acquired,p,stone,false)==DiscoveryBudget.Admission.UNCHANGED && tiles.get(p).air(),
+                "Staged snapshot ingestion must not overwrite still-retained live AIR either");
+        check(tiles.size()==DiscoveryBudget.MAX_STAGED_TILES,"Admission ceiling grew while saturated");
+    }
+    private static void reflectedSourceKeysAreUnique() {
+        Set<Long> keys=new HashSet<>();
+        for(int x=-90;x<=90;x++)for(int z=-90;z<=90;z++)
+            check(keys.add(SourceMeshBuilder.key("same-source-owner",new Vec3d(x,63,z),1)),
+                    "Reflected source coordinates collided and would be dropped at publication: "+x+","+z);
+    }
+    private static void persistedReservoirKeepsDistantGeometry() {
+        List<SourceMeshBuilder.Node> reservoir=new ArrayList<>();SourceMeshBuilder.Tile stone=solid("minecraft:stone");
+        java.util.function.ToDoubleFunction<SourceMeshBuilder.Node> distance=n->SourceMeshBuilder.distanceSquared(
+                new Box(Vec3d.of(n.position()),Vec3d.of(n.position()).add(n.side(),n.side(),n.side())),FOCUS);
+        int visits=0;
+        for(int x=-90;x<=90;x++)for(int z=-90;z<=90;z++) {
+            reservoir.add(new SourceMeshBuilder.Node(new BlockPos(x,63,z),1,stone,"persisted"));
+            if(++visits%32==0 && reservoir.size()>TerrainGeometryStream.MAX_NODES)
+                reservoir=MeshPublication.coverageNodes(reservoir,TerrainGeometryStream.MAX_NODES,FOCUS,distance);
+            check(reservoir.size()<=TerrainGeometryStream.MAX_NODES+32,"Streaming reservoir transient work grew beyond one batch");
+        }
+        reservoir=MeshPublication.coverageNodes(reservoir,TerrainGeometryStream.MAX_NODES,FOCUS,distance);
+        check(reservoir.size()==TerrainGeometryStream.MAX_NODES,"Persisted source reservoir must remain bounded");
+        for(boolean shallow:new boolean[]{true,false}) {
+            TerrainMeshFrame frame=published(reservoir,shallow?1024:640,shallow);
+            for(int sx:new int[]{-1,1})for(int sz:new int[]{-1,1})check(frame.cells().stream().anyMatch(c->c.sourceMin().x*sx>60 && c.sourceMin().z*sz>60),
+                    "Bounded persisted streaming erased distant quadrant before publication");
+            for(int x=-3;x<=3;x++)for(int z=-3;z<=3;z++) {
+                BlockPos p=new BlockPos(x,63,z);check(frame.cells().stream().anyMatch(c->sourceContains(c,p)),"Persisted reservoir lost the body support guard");
+            }
+        }
+    }
     private static void contract() {
         check(DiscoveryBudget.RENDER_DISTANCE==128,"Render-distance coverage contract is explicit");
         check(DiscoveryBudget.MIN_RETENTION_RADIUS<DiscoveryBudget.EXACT_RETENTION_RADIUS,"Floor sits below exact retention");
@@ -234,6 +407,13 @@ public final class DiscoveryBudgetTest {
         airEvictionKeepsRenderGeometry();
         sustainedCommitsStayBounded();
         sampledCoverageReplacesOnlyProvenCells();
+        publishedSurfaceSpansRenderDistance();
+        publicationDoesNotBridgeHolesOrOwners();
+        heterogeneousPublicationKeepsHorizon();
+        negativeCoverageIsBoundedAndExact();
+        admissionAndNegativeCopiesStayBounded();
+        reflectedSourceKeysAreUnique();
+        persistedReservoirKeepsDistantGeometry();
         contract();
         System.out.println("DiscoveryBudgetTest: "+assertions+" assertions passed");
     }

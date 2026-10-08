@@ -115,6 +115,15 @@ final class SourceMeshBuilder {
     static List<Node> replaceNear(List<Node> base,List<Node> near,Set<BlockPos> sampled,Vec3d center) {
         Map<Long,Integer> buckets=new HashMap<>();
         for(BlockPos p:sampled)buckets.merge(bucket(p),1,Integer::sum);
+        return replaceNear(base,near,sampled,buckets,center);
+    }
+    /** Packed negative coverage is indexed by bucket, never expanded into millions of positions. */
+    static List<Node> replaceNear(List<Node> base,List<Node> near,Set<BlockPos> sampled,NegativeCoverage negative,Vec3d center) {
+        Map<Long,Integer> buckets=negative.bucketCounts();
+        for(BlockPos p:sampled)if(!negative.contains(p))buckets.merge(bucket(p),1,Integer::sum);
+        return replaceNear(base,near,negative.covering(sampled),buckets,center);
+    }
+    private static List<Node> replaceNear(List<Node> base,List<Node> near,Set<BlockPos> sampled,Map<Long,Integer> buckets,Vec3d center) {
         List<Node> result=new ArrayList<>(near);
         for(Node node:base)replace(node,sampled,buckets,result);
         result.sort(Comparator.comparingDouble(n->distanceSquared(nodeBox(n),center)));return List.copyOf(result);
@@ -122,7 +131,7 @@ final class SourceMeshBuilder {
     /** 16-block sampled-volume buckets: nodes never straddle one (sides are powers of two <=16 dividing 16,
      *  aligned), so a zero bucket rejects in O(1) and large nodes aggregate a handful of bucket counts. */
     private static Box nodeBox(Node n){BlockPos p=n.position();return new Box(p.getX(),p.getY(),p.getZ(),(double)p.getX()+n.side(),(double)p.getY()+n.side(),(double)p.getZ()+n.side());}
-    private static long bucket(BlockPos p) {
+    static long bucket(BlockPos p) {
         return ((long)(p.getX()>>4)&0x3FFFFFL)<<42 | ((long)(p.getZ()>>4)&0x3FFFFFL)<<20 | ((long)(p.getY()>>4)&0xFFFFFL);
     }
     private static void replace(Node n,Set<BlockPos> sampled,Map<Long,Integer> buckets,List<Node> result) {
@@ -174,11 +183,16 @@ final class SourceMeshBuilder {
     static long key(String owner,Vec3d source,int side) {
         long h=0xcbf29ce484222325L;
         for(int i=0;i<owner.length();i++)h=(h^owner.charAt(i))*0x100000001b3L;
-        h=(h^Double.doubleToLongBits(source.x))*0x100000001b3L;
-        h=(h^Double.doubleToLongBits(source.y))*0x100000001b3L;
-        h=(h^Double.doubleToLongBits(source.z))*0x100000001b3L;
+        // Hash bytes, not a whole double XOR: two coordinate sign bits otherwise cancel
+        // through odd FNV multiplication and mirrored source cells get identical wire keys.
+        for(double coordinate:new double[]{source.x,source.y,source.z})h=hashDouble(h,coordinate);
         h=(h^side)*0x100000001b3L;
         h^=h>>>30;h*=0xbf58476d1ce4e5b9L;h^=h>>>27;h*=0x94d049bb133111ebL;return h^(h>>>31);
+    }
+    static long hashDouble(long h,double value) {
+        long bits=Double.doubleToLongBits(value);
+        for(int shift=0;shift<64;shift+=8)h=(h^((bits>>>shift)&255))*0x100000001b3L;
+        return h;
     }
     static double distanceSquared(Box b,Vec3d p) {
         double x=Math.max(Math.max(b.minX-p.x,0),p.x-b.maxX),y=Math.max(Math.max(b.minY-p.y,0),p.y-b.maxY),z=Math.max(Math.max(b.minZ-p.z,0),p.z-b.maxZ);
