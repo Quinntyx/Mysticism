@@ -115,13 +115,16 @@ public final class ClientSpiritCache {
         lastMovement = movement == null ? Vec3d.ZERO : movement;
         boolean mirrorChanged = mirrorPos == null || mirrorPos.squareDistance(position) > 0 || basisShift(mirrorBasis, basis) > 0;
         if (!mirrorChanged) return; // per-frame mirror refresh; the predicted render frame stands
+        // Preserve the coherent pre-revision render state (position, basis AND offset as last
+        // rendered) before any compensation, so every tickDelta interpolates between what was on
+        // screen and the compensated revision — not a half-applied mix of both.
+        previousLatentPos=playerLatentPos.clone(); previousLatentBasis=playerLatentBasis.clone();
+        previousContinuityOffset=continuityOffset; frameHistory=observerReady;
         if (observerReady && lastMotionEpoch == mirrorEpoch && lastMovement.lengthSquared() > 1e-12) {
             Vec3d shift = semanticShift(position, playerLatentPos, playerLatentBasis);
             if (shift.lengthSquared() <= MAX_CONTINUITY_SHIFT * MAX_CONTINUITY_SHIFT)
                 continuityOffset = continuityOffset.add(shift);
         }
-        previousLatentPos=playerLatentPos.clone(); previousLatentBasis=playerLatentBasis.clone();
-        previousContinuityOffset=continuityOffset; frameHistory=observerReady;
         playerLatentPos=position.clone(); playerLatentBasis=basis.clone();
         mirrorPos=position.clone(); mirrorBasis=basis.clone(); mirrorEpoch=lastMotionEpoch;
         observerReady=true;

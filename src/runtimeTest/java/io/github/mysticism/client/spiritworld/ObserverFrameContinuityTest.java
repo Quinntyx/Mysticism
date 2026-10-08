@@ -78,6 +78,15 @@ public final class ObserverFrameContinuityTest {
         near(offset.x, .2, 1e-4); near(offset.y, 0, 0); near(offset.z, 0, 0);
         Vec3d after = frame(movedHead, 1).project(object);
         near(after.distanceTo(before), 0, 1e-3);
+        // Sub-tick coherence: EVERY tickDelta renders the pre-revision scene, not just the
+        // tickDelta=1 endpoint — tickDelta=0 replays the exact pre-revision history and the
+        // compensated divergence glides linearly without a partial-offset mix in between.
+        near(frame(movedHead, 0).project(object).distanceTo(before), 0, 1e-3);
+        near(frame(movedHead, .25f).project(object).distanceTo(before), 0, 1e-3);
+        near(frame(movedHead, .5f).project(object).distanceTo(before), 0, 1e-3);
+        near(frame(movedHead, .75f).project(object).distanceTo(before), 0, 1e-3);
+        near(ClientSpiritCache.interpolatedOffset(0).x, 0, 1e-9);
+        near(ClientSpiritCache.interpolatedOffset(.5f).x, .1, 1e-4);
         // The observer semantic point itself stays at its previously rendered position.
         near(frame(movedHead, 1).project(authoritative).distanceTo(movedHead.add(offset)), 0, 1e-6);
     }
