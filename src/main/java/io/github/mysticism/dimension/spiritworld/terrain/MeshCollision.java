@@ -37,11 +37,19 @@ public final class MeshCollision {
             }
         }
         private List<Shape> nearby(Box query) {
-            var result=new LinkedHashSet<Shape>();
             int x0=grid(query.minX),y0=grid(query.minY),z0=grid(query.minZ),x1=grid(query.maxX),y1=grid(query.maxY),z1=grid(query.maxZ);
-            if((long)(x1-x0+1)*(y1-y0+1)*(z1-z0+1)>4096)return List.of(); // caller splits long travel
+            if((long)(x1-x0+1)*(y1-y0+1)*(z1-z0+1)>4096)return exhaustive(query); // Oversized swept query: exact scan, NEVER an empty result.
+            var result=new LinkedHashSet<Shape>();
             for(int x=x0;x<=x1;x++)for(int y=y0;y<=y1;y++)for(int z=z0;z<=z1;z++)
                 for(Shape s:buckets.getOrDefault(new Bucket(x,y,z),List.of()))if(s.bounds.intersects(query))result.add(s);
+            for(Shape s:large)if(s.bounds.intersects(query))result.add(s);
+            return List.copyOf(result);
+        }
+        /** An oversized query (long travel/ray) must disable NOTHING: scan every indexed shape instead of
+         * returning an empty list that would silently let motion tunnel straight through displayed terrain. */
+        private List<Shape> exhaustive(Box query) {
+            var result=new LinkedHashSet<Shape>();
+            for(var shapes:buckets.values())for(Shape s:shapes)if(s.bounds.intersects(query))result.add(s);
             for(Shape s:large)if(s.bounds.intersects(query))result.add(s);
             return List.copyOf(result);
         }
@@ -54,8 +62,18 @@ public final class MeshCollision {
             return Optional.ofNullable(best);
         }
         public boolean clearRay(Vec3d from,Vec3d to) {
-            return sweep(new Box(from.x-1e-4,from.y-1e-4,from.z-1e-4,from.x+1e-4,from.y+1e-4,from.z+1e-4),to.subtract(from)).isEmpty();
+            // Chunked so each segment stays on the bucket grid; a hit in ANY segment blocks the whole ray.
+            Vec3d total=to.subtract(from);double length=total.length();
+            if(length<=1e-9)return !sweep(tinyBody(from),total).isEmpty();
+            int pieces=(int)Math.min(64,Math.max(1,(int)Math.ceil(length/60)));
+            Vec3d piece=total.multiply(1.0/pieces);Vec3d at=from;
+            for(int i=0;i<pieces;i++) {
+                if(!sweep(tinyBody(at),piece).isEmpty())return false;
+                at=at.add(piece);
+            }
+            return true;
         }
+        private static Box tinyBody(Vec3d at){return new Box(at.x-1e-4,at.y-1e-4,at.z-1e-4,at.x+1e-4,at.y+1e-4,at.z+1e-4);}
         private Vec3d depenetrate(Box body) {
             Vec3d moved=Vec3d.ZERO;
             for(int step=0;step<8;step++) {
@@ -96,18 +114,21 @@ public final class MeshCollision {
         Index i=index(player);
         // No fabricated floor. Preparation supplies geometry before entry; packet delay simply has no surfaces yet.
         if(i==null)return wanted;
-        Box body=player.getBoundingBox();
+        return move(i,player.getBoundingBox(),wanted,player.getAbilities().flying,player.getStepHeight(),player.isOnGround());
+    }
+    /** Entity-free movement core shared by server/client players and the runtime regressions: the full
+     * depenetrate/slide/step resolution against one visible frame, so no motion path is untestable. */
+    public static Vec3d move(Index i,Box body,Vec3d wanted,boolean flying,double stepHeight,boolean onGround) {
         if(wanted.length()>256)wanted=wanted.multiply(256/wanted.length());
         Vec3d result=i.depenetrate(body);
         // Bound swept traversal for unusually fast flight/teleports rather than tunnelling through a grid overflow.
         int pieces=Math.min(64,Math.max(1,(int)Math.ceil(wanted.length()/4)));
         Vec3d piece=wanted.multiply(1.0/pieces);
         for(int p=0;p<pieces;p++)result=result.add(i.slide(body.offset(result),piece));
-        if(!player.getAbilities().flying && (player.isOnGround() || wanted.y<0 && result.y>wanted.y+1e-5)
+        if(!flying && (onGround || wanted.y<0 && result.y>wanted.y+1e-5)
                 && result.subtract(wanted).horizontalLengthSquared()>1e-8) {
-            double step=player.getStepHeight();
-            if(step>0) {
-                Vec3d up=i.slide(body,new Vec3d(0,step,0));
+            if(stepHeight>0) {
+                Vec3d up=i.slide(body,new Vec3d(0,stepHeight,0));
                 Vec3d over=i.slide(body.offset(up),new Vec3d(wanted.x,0,wanted.z));
                 Vec3d down=i.slide(body.offset(up).offset(over),new Vec3d(0,wanted.y-up.y,0));
                 Vec3d stepped=up.add(over).add(down);
@@ -120,7 +141,11 @@ public final class MeshCollision {
     public static Vec3d sneak(PlayerEntity p,Vec3d wanted,MovementType type) {
         Index i=index(p);
         if(i==null || p.getAbilities().flying || !p.isSneaking() || !p.isOnGround() || type!=MovementType.SELF && type!=MovementType.PLAYER)return wanted;
-        Box body=p.getBoundingBox();Vec3d down=new Vec3d(0,-Math.max(.6,p.getStepHeight()),0);double x=wanted.x,z=wanted.z;int guard=0;
+        return sneak(i,p.getBoundingBox(),wanted,Math.max(.6,p.getStepHeight()));
+    }
+    /** Entity-free sneak-edge core over one visible frame. */
+    public static Vec3d sneak(Index i,Box body,Vec3d wanted,double ledge) {
+        Vec3d down=new Vec3d(0,-Math.max(.6,ledge),0);double x=wanted.x,z=wanted.z;int guard=0;
         while(x!=0 && !supported(i,body.offset(x,0,0),down) && guard++<128)x=trim(x);
         if(guard>=128)x=0;guard=0;
         while(z!=0 && !supported(i,body.offset(0,0,z),down) && guard++<128)z=trim(z);
@@ -132,8 +157,11 @@ public final class MeshCollision {
     private static double trim(double x){return Math.abs(x)<=.05?0:x-Math.copySign(.05,x);}
     public static Optional<Hit> ground(PlayerEntity player) {
         Index i=index(player);
-        return i==null?Optional.empty():i.sweep(player.getBoundingBox().offset(0,.025,0),new Vec3d(0,-.15,0))
-                .filter(h->h.normal.y>.3);
+        return i==null?Optional.empty():ground(i,player.getBoundingBox());
+    }
+    /** Entity-free ground-contact probe over one visible frame. */
+    public static Optional<Hit> ground(Index i,Box body) {
+        return i.sweep(body.offset(0,.025,0),new Vec3d(0,-.15,0)).filter(h->h.normal.y>.3);
     }
     public static boolean clearRay(ServerPlayerEntity player,Vec3d from,Vec3d to) {
         Index i=index(player);return i!=null && from.distanceTo(to)<=128 && i.clearRay(from,to);
