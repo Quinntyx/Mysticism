@@ -3,6 +3,7 @@ package io.github.mysticism.navigation;
 import io.github.mysticism.activity.TraversalSteering;
 import io.github.mysticism.activity.SpiritActivityService;
 import io.github.mysticism.component.*;
+import io.github.mysticism.dimension.spiritworld.terrain.MeshCollision;
 import io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService;
 import io.github.mysticism.dimension.spiritworld.SpiritBasisEvolver;
 import io.github.mysticism.landmark.*;
@@ -124,7 +125,14 @@ public final class SpiritNavigationService {
         boolean changed = !p.getAbilities().allowFlying || p.getAbilities().flying != deep;
         p.getAbilities().allowFlying = true; p.getAbilities().flying = deep;
         p.setNoGravity(false); p.fallDistance = 0;
-        if (changed) p.sendAbilitiesUpdate();
+        if (changed) {
+            // Every mode switch hands off a stable usable velocity: bounded momentum into flight, and a
+            // zeroed standing velocity when walk acquisition validated ground contact (a residual flight
+            // descent would clip the fresh mesh and bounce out via depenetration — visible rubber banding).
+            p.setVelocity(deep ? WalkFlightHandoff.toFlight(p.getVelocity())
+                    : WalkFlightHandoff.toWalk(p.getVelocity(), MeshCollision.ground(p).isPresent()));
+            p.sendAbilitiesUpdate();
+        }
     }
 
     public static boolean enter(ServerPlayerEntity p) {
@@ -275,8 +283,13 @@ public final class SpiritNavigationService {
             nav.shallow(source.dimension(), id, source.position());
             if (support.isPresent()) { s.unsupported = 0; s.jumping = false; }
             else {
-                if (s.unsupported == 0) s.jumping = delta.y > .01;
-                if (++s.unsupported > 14 || !s.jumping) { enterDeep(p); return nav.deep() && s.semanticReady; }
+                if (s.unsupported == 0) s.jumping = WalkFlightHandoff.takeoffIntent(delta.y);
+                // A settled/stationary pose on a real-but-unowned floor keeps waiting for ownership
+                // publication instead of spontaneously starting flight; only a genuine ascending takeoff
+                // earns the jump grace, and only genuine falling (edge walk, vanished floor) converts now.
+                if (WalkFlightHandoff.leavesGround(s.jumping, ++s.unsupported, delta.y)) {
+                    enterDeep(p); return nav.deep() && s.semanticReady;
+                }
             } // Ascending takeoff gets ordinary jump grace; walking over an edge gets immediate freeflight.
             flight(p, false);
             if (s.semanticReady && !anchoredNow) TraversalSteering.advance(p.getComponent(MysticismEntityComponents.LATENT_POS).get(),
@@ -330,6 +343,9 @@ public final class SpiritNavigationService {
                 && delta.lengthSquared() <= 16)
             TraversalSteering.advance(q, component.get(), delta.x, delta.y, delta.z);
         if (++s.supportTick > 200) {
+            // Expired intent leaves a stable usable hover: an unbounded residual velocity would keep
+            // drifting the carrier while the player decides what to do next. Still deep; no substitute landing.
+            p.setVelocity(Vec3d.ZERO); p.fallDistance = 0;
             endSupportApproach(p, s);
             p.sendMessage(Text.literal("Walk request expired: current support could not be continuously aligned/owned. Still deep; no substitute landing."), true);
             return;
