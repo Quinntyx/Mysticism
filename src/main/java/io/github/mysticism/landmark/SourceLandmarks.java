@@ -32,7 +32,7 @@ public final class SourceLandmarks {
         ServerTickEvents.END_SERVER_TICK.register(server->{Session s=SESSIONS.get(server);if(s!=null)s.tick();});
         ServerLifecycleEvents.SERVER_STOPPING.register(server->{Session s=SESSIONS.remove(server);if(s!=null)s.close();});
         ServerWorldEvents.UNLOAD.register((server,world)->{Session s=SESSIONS.get(server);if(s!=null)s.unload(world.getRegistryKey().getValue().toString());});
-        ServerChunkEvents.CHUNK_UNLOAD.register((world,chunk)->{Session s=SESSIONS.get(world.getServer());if(s!=null&&s.active!=null){String dim=world.getRegistryKey().getValue().toString();Bounds area=new Bounds(chunk.getPos().getStartX(),world.getBottomY(),chunk.getPos().getStartZ(),chunk.getPos().getStartX()+16L,world.getTopY(),chunk.getPos().getStartZ()+16L);if(s.active.dimension.equals(dim)&&s.active.guarded!=null&&s.active.guarded.intersects(area))s.active.cancel(new CancellationException("source chunk unloaded during observation"));}});
+        ServerChunkEvents.CHUNK_UNLOAD.register((world,chunk)->{Session s=SESSIONS.get(world.getServer());if(s!=null){String dim=world.getRegistryKey().getValue().toString();s.surveys.unloaded(dim,chunk.getPos().x,chunk.getPos().z);Bounds area=new Bounds(chunk.getPos().getStartX(),world.getBottomY(),chunk.getPos().getStartZ(),chunk.getPos().getStartX()+16L,world.getTopY(),chunk.getPos().getStartZ()+16L);if(s.active!=null&&s.active.dimension.equals(dim)&&s.active.guarded!=null&&s.active.guarded.intersects(area))s.active.cancel(new CancellationException("source chunk unloaded during observation"));}});
         ServerChunkEvents.CHUNK_LOAD.register((world,chunk)->{
             if(!SourceDimensions.isSource(world.getRegistryKey().getValue().toString()))return;
             Session s=SESSIONS.get(world.getServer());if(s==null)return;
@@ -90,9 +90,9 @@ public final class SourceLandmarks {
         if(!SourceDimensions.isSource(world.getRegistryKey().getValue().toString()))return;
         Session s=SESSIONS.get(world.getServer());if(s!=null){s.invalidate(world.getRegistryKey().getValue().toString(),pos);s.hint(world.getRegistryKey().getValue().toString(),pos.toImmutable());}
     }
-    public static int pending(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.requests.size()+s.hints.size()+(s.active==null?0:1);}
-    /** Bounded pending-hint budget; retention now follows recency instead of freezing on
-     * the first chunks ever seen (render-distance streaming must keep landmarking). */
+    public static int pending(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.requests.size()+s.hints.size()+s.surveys.pending()+(s.active==null?0:1);}
+    /** Recency budget for player/edit/frontier hints. Generation surveys have a separate
+     * residency-bounded lossless queue, so eviction is never lost terrain coverage. */
     public static final int HINT_BUDGET=256;
     /** Recency admission: duplicates refresh to newest, the oldest entry is evicted at capacity. */
     static <T> void admit(LinkedHashSet<T> set,T value,int cap){
@@ -100,12 +100,12 @@ public final class SourceLandmarks {
         if(!set.remove(value)&&set.size()>=cap){var oldest=set.iterator();oldest.next();oldest.remove();}
         set.add(value);
     }
-    /** Survey-to-hint admission. Every distinct surveyed component and peak is retained as a
-     * pending hint: proximity to the chunk-center probe is never a coverage proof, because
+    /** Survey-to-position conversion. Every distinct surveyed component and peak is retained as a
+     * generation probe: proximity to the chunk-center probe is never a coverage proof, because
      * prepare() restricts ownership to the seed biome, so a center window does not landmark
-     * other terrain components. Actual landmark coverage is established only by exact
-     * persisted ownership inside the Ensure pipeline, which merges an already-covered probe
-     * into its prior landmark instead of inventing a duplicate. */
+     * other terrain components. The lossless survey queue retains these positions until
+     * Ensure commits exact ownership, merging an already-covered probe into its prior
+     * landmark instead of inventing a duplicate. */
     static List<BlockPos> surveyHints(List<GenerationSurvey.Probe> probes){
         Objects.requireNonNull(probes);
         List<BlockPos> hints=new ArrayList<>();
@@ -128,7 +128,7 @@ public final class SourceLandmarks {
     }
     private static final class Session {
         final MinecraftServer server;final LandmarkStore store;final ItemEmbeddingIndexState itemIndex;final ExecutorService worker=new ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(4),Thread.ofPlatform().daemon().name("mysticism-source").factory(),new ThreadPoolExecutor.AbortPolicy());
-        final ArrayDeque<SourceOwnership.Request> ownerRequests=new ArrayDeque<>();
+        final ArrayDeque<SourceOwnership.Request> ownerRequests=new ArrayDeque<>();final GenerationSurveyQueue surveys=new GenerationSurveyQueue();boolean surveyTurn=true;
         final ArrayDeque<FrontierRetry> retries=new ArrayDeque<>();final Map<CompletableFuture<?>,String> auxiliary=new IdentityHashMap<>();final ArrayDeque<Operation<?>> requests=new ArrayDeque<>();final LinkedHashSet<Hint> hints=new LinkedHashSet<>();Operation<?> active;String status="Ready";int playerCursor,lastCells;
         Session(MinecraftServer server){this.server=server;store=LandmarkStore.get(server);itemIndex=ItemEmbeddingIndexState.get(server);}
         <T> CompletableFuture<T> computeAndDeliver(String dim,java.util.function.Supplier<T> computation){
@@ -138,10 +138,10 @@ public final class SourceLandmarks {
         void offer(Operation<?> op){if(requests.size()==64){op.future.completeExceptionally(new RejectedExecutionException("source request budget"));return;}if(op instanceof Read)requests.addFirst(op);else requests.addLast(op);}
         void hint(String dim,BlockPos p){admit(hints,new Hint(dim,p.toImmutable()),HINT_BUDGET);}
         /** Generation landmarking beyond the chunk-center probe: derive representative
-         * surface/peak hints from the loaded chunk's actual heightmap and biome grid so
+         * surface/peak probes from the loaded chunk's actual heightmap and biome grid so
          * real terrain across the render distance becomes landmark work, bounded per chunk.
-         * Distinct components are retained unconditionally; distance filtering would drop
-         * them even when the seed-biome center window never landmarks their patch. */
+         * Retain at most MAX_PROBES per loaded chunk outside the evictable recency set;
+         * readiness delays and later chunks cannot strand non-center biome patches. */
         void survey(ServerWorld world,WorldChunk chunk){
             String dimension=world.getRegistryKey().getValue().toString();int bottom=world.getBottomY(),top=world.getTopY();var origin=chunk.getPos();
             List<GenerationSurvey.Probe> probes;
@@ -155,7 +155,7 @@ public final class SourceLandmarks {
                     catch(RuntimeException failure){return null;}
                 }
             });}catch(RuntimeException failure){return;}
-            for(var position:surveyHints(probes))hint(dimension,position);
+            surveys.loaded(dimension,origin.x,origin.z,surveyHints(probes));
         }
         void invalidate(String dim,BlockPos pos){if(active!=null&&active.dimension.equals(dim)&&active.guarded!=null&&active.guarded.contains(pos.getX(),pos.getY(),pos.getZ()))active.cancel(new CancellationException("source edit invalidated snapshot"));}
         void tick(){
@@ -165,13 +165,19 @@ public final class SourceLandmarks {
             if(server.getTicks()%200==0){var players=server.getPlayerManager().getPlayerList();for(int n=0;n<Math.min(2,players.size());n++){var p=players.get(Math.floorMod(playerCursor++,players.size()));if(SourceDimensions.isSource(p.getServerWorld().getRegistryKey().getValue().toString()))hint(p.getServerWorld().getRegistryKey().getValue().toString(),p.getBlockPos());}}
             boolean ready=EmbeddingHelper.isReady()||itemIndex.isPopulated();
             if(active==null&&!requests.isEmpty()&&(requests.peekFirst() instanceof Read||ready))active=requests.removeFirst();
-            if(active==null&&ready&&!hints.isEmpty()){Hint h=hints.iterator().next();hints.remove(h);active=new Ensure(this,h.dimension,h.pos,null,false,new CompletableFuture<>());}
+            if(active==null&&ready){
+                // Alternate lossless generation and recency work; neither may starve the other.
+                var attempt=surveyTurn||hints.isEmpty()?surveys.next(ready):Optional.<GenerationSurveyQueue.Attempt>empty();
+                if(attempt.isPresent()){
+                    var a=attempt.get();var ensure=new Ensure(this,a.chunk().dimension(),a.position(),null,false,new CompletableFuture<>());ensure.surveyAttempt=a;active=ensure;surveyTurn=false;
+                }else if(!hints.isEmpty()){Hint h=hints.iterator().next();hints.remove(h);active=new Ensure(this,h.dimension,h.pos,null,false,new CompletableFuture<>());surveyTurn=true;}
+            }
             if(active==null)return;
             try{if(active.future.isCancelled())active.cancel(new CancellationException());if(!active.done)active.advance();if(active.done){active.release();active=null;status="Ready";}}
             catch(RuntimeException e){status="Deferred: "+e.getMessage();active.cancel(e);active.release();active=null;}
         }
-        void unload(String dim){ownerRequests.removeIf(request->{if(request.dimension.equals(dim)){request.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});retries.removeIf(r->r.dimension.equals(dim));auxiliary.entrySet().removeIf(e->{if(e.getValue().equals(dim)){e.getKey().cancel(false);return true;}return false;});if(active!=null&&active.dimension.equals(dim)){active.cancel(new CancellationException("source dimension unloaded"));active.release();active=null;}requests.removeIf(op->{if(op.dimension.equals(dim)){op.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});hints.removeIf(h->h.dimension.equals(dim));}
-        void close(){ownerRequests.forEach(request->request.cancel(new CancellationException("server stopping")));ownerRequests.clear();auxiliary.keySet().forEach(f->f.cancel(false));auxiliary.clear();retries.clear();if(active!=null){active.cancel(new CancellationException("server stopping"));active.release();}requests.forEach(op->op.cancel(new CancellationException("server stopping")));requests.clear();hints.clear();worker.shutdownNow();}
+        void unload(String dim){surveys.unloaded(dim);ownerRequests.removeIf(request->{if(request.dimension.equals(dim)){request.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});retries.removeIf(r->r.dimension.equals(dim));auxiliary.entrySet().removeIf(e->{if(e.getValue().equals(dim)){e.getKey().cancel(false);return true;}return false;});if(active!=null&&active.dimension.equals(dim)){active.cancel(new CancellationException("source dimension unloaded"));active.release();active=null;}requests.removeIf(op->{if(op.dimension.equals(dim)){op.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});hints.removeIf(h->h.dimension.equals(dim));}
+        void close(){surveys.clear();ownerRequests.forEach(request->request.cancel(new CancellationException("server stopping")));ownerRequests.clear();auxiliary.keySet().forEach(f->f.cancel(false));auxiliary.clear();retries.clear();if(active!=null){active.cancel(new CancellationException("server stopping"));active.release();}requests.forEach(op->op.cancel(new CancellationException("server stopping")));requests.clear();hints.clear();worker.shutdownNow();}
         ServerWorld world(String dimension){return SourceDimensions.isSource(dimension)?server.getWorld(RegistryKey.of(RegistryKeys.WORLD,Identifier.of(dimension))):null;}
     }
     private abstract static class Operation<T> {
@@ -192,10 +198,19 @@ public final class SourceLandmarks {
     }
     record Prepared(Landmark prior,String id,String biome,Landmark.Kind kind,BlockPoint anchor,SourceGeometry geometry,List<DescriptorVectors.WeightedDescriptor> descriptors,Map<String,Double> items,String adjoining){}
     private static final class Ensure extends Operation<Optional<LandmarkMetadata>> {
-        final BlockPos position;final String preferred;final boolean activity;String cursor;boolean catalogEnd;
+        final BlockPos position;final String preferred;final boolean activity;String cursor;boolean catalogEnd;GenerationSurveyQueue.Attempt surveyAttempt;
         final ArrayDeque<LandmarkMetadata> candidates=new ArrayDeque<>();final List<Landmark> parents=new ArrayList<>();final List<GeometryPage> pages=new ArrayList<>();
         final Map<String,Double> importance=new HashMap<>();Region observed;CompletableFuture<Prepared> prepared;CompletableFuture<Vec384f> embedding;Prepared value;Landmark published;long time;int seaLevel;
         Ensure(Session s,String dimension,BlockPos pos,String preferred,boolean activity,CompletableFuture<Optional<LandmarkMetadata>> future){super(s,dimension,new Bounds(pos.getX()-12L,pos.getY()-12L,pos.getZ()-12L,pos.getX()+13L,pos.getY()+13L,pos.getZ()+13L),future);this.position=pos;this.preferred=preferred;this.activity=activity;}
+        @Override void release(){
+            super.release();
+            if(surveyAttempt!=null){
+                // Optional metadata or a nearby AABB alone is not coverage. Only a completed
+                // publication containing the exact AIR/SOLID probe can retire generation work.
+                s.surveys.completed(surveyAttempt,future.isDone()&&!future.isCompletedExceptionally()&&mutation!=null&&mutation.complete()&&published!=null&&published.geometry().sample(position.getX(),position.getY(),position.getZ())!=null);
+                surveyAttempt=null;
+            }
+        }
         void advance(){
             if(mutation!=null){mutation.advance(1,512);if(mutation.complete()){
                 if(history!=null){history.commit();history=null;}
