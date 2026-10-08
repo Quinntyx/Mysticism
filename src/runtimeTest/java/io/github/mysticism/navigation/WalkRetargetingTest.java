@@ -13,6 +13,11 @@ import io.github.mysticism.vector.Vec384f;
  * <li>A pending walk is superseded by any explicit destination change (epoch), never
  * completed against the older destination.</li>
  * <li>A fresh gesture after a retarget may legitimately request a new walk.</li>
+ * <li>Server-driven flight corrections (abilities updates applied by vanilla without an echoed
+ * flight-on packet) advance the recorded gesture state, so correction → cancellation/expiry →
+ * genuine retry works without an intervening flight-on packet.</li>
+ * <li>Accepting an asynchronous capture supersedes older navigation intents at acceptance, and a
+ * delayed capture result supersedes any interim walk.</li>
  * <li>Only an EXPLICIT attunement re-key supersedes a pending walk; background personal
  * drift on a non-explicit target is followed, not treated as a competing destination.</li>
  * </ol>
@@ -39,7 +44,9 @@ public final class WalkRetargetingTest {
     public static void main(String[] args) {
         toggleEdges();
         duplicatePacketsCannotRestart();
+        correctionRetry();
         retargetSupersedesPendingWalk();
+        acceptanceSupersede();
         freshGestureAfterRetarget();
         attunementPolicy();
         System.out.println("WalkRetargetingTest passed: " + assertions + " assertions");
@@ -67,6 +74,32 @@ public final class WalkRetargetingTest {
         check(!tracker.pending(), "No walk intent was resurrected by the stale packet");
     }
 
+    /** P1: a server-driven flight correction (abilities update, applied by vanilla without an
+     * echoed flight-on packet) must not make the next genuine gesture look like a duplicate.
+     * correction → cancellation/expiry → genuine retry, with no intervening flight-on packet. */
+    private static void correctionRetry() {
+        WalkIntentTracker corrected = new WalkIntentTracker();
+        check(corrected.observeToggle(false), "First flight-off gesture accepted");
+        check(corrected.startWalk(), "Walk requested");
+        corrected.serverCorrected(true); // server restores client flight via an abilities update
+        corrected.endWalk(); // cancellation or expiry
+        check(corrected.observeToggle(false), "Genuine retry after a server correction is fresh without an intervening flight-on packet");
+        check(corrected.startWalk(), "Genuine retry after a server correction starts a new walk");
+
+        WalkIntentTracker uncorrected = new WalkIntentTracker();
+        uncorrected.observeToggle(false);
+        uncorrected.startWalk();
+        uncorrected.endWalk();
+        check(!uncorrected.observeToggle(false), "Without a server correction the same-value packet remains a stale retransmission");
+
+        WalkIntentTracker echo = new WalkIntentTracker();
+        echo.observeToggle(false);
+        echo.serverCorrected(true);
+        check(!echo.observeToggle(true), "A packet matching the server-corrected state is still a duplicate");
+        check(echo.observeToggle(false), "The opposite state after a correction is a fresh edge");
+        check(echo.startWalk(), "Fresh edge after a correction starts a walk");
+    }
+
     private static void retargetSupersedesPendingWalk() {
         WalkIntentTracker tracker = new WalkIntentTracker();
         check(gatedStart(tracker, false), "Walk requested");
@@ -81,6 +114,25 @@ public final class WalkRetargetingTest {
         other.bumpDestination();
         other.bumpDestination();
         check(other.superseded(), "Epoch comparison survives multiple destination changes");
+    }
+
+    /** P2: accepting an asynchronous capture is a destination request — older navigation intents
+     * are superseded at acceptance (walk ended immediately, target cleared), never when the
+     * delayed discovery completes, so an older walk cannot commit shallow mode in the meantime. */
+    private static void acceptanceSupersede() {
+        WalkIntentTracker tracker = new WalkIntentTracker();
+        check(tracker.observeToggle(false) && tracker.startWalk(), "Walk pending when the capture is accepted");
+        tracker.bumpDestination(); // capture acceptance bumps the destination epoch
+        tracker.endWalk(); // acceptance ends the walk immediately, not at discovery completion
+        check(!tracker.pending(), "No walk survives capture acceptance to commit shallow mode");
+        // Delayed discovery is still in flight; a walk may be requested in the meantime.
+        check(tracker.observeToggle(true), "Flight-on after acceptance is a fresh gesture");
+        check(tracker.observeToggle(false) && tracker.startWalk(), "Interim walk requested before delayed discovery completes");
+        // The delayed capture result arrives and applies the newer destination.
+        tracker.bumpDestination();
+        check(tracker.superseded(), "Delayed capture result supersedes the interim walk");
+        tracker.endWalk();
+        check(!tracker.superseded() && !tracker.pending(), "Ended interim walk leaves no stale state");
     }
 
     private static void freshGestureAfterRetarget() {

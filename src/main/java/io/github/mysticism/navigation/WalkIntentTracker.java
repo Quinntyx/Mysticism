@@ -53,6 +53,15 @@ public final class WalkIntentTracker {
     public void endWalk() { pending = false; }
     public boolean pending() { return pending; }
 
+    /** Records a server-driven flight correction delivered through an abilities update. Vanilla
+     * applies that correction on the client WITHOUT echoing a flight-on packet, so the recorded
+     * client state must advance here; otherwise the player's next genuine gesture in the corrected
+     * direction is misread as a duplicate and legitimate walk retries are rejected as stale. */
+    public void serverCorrected(boolean flying) {
+        toggleTracked = true;
+        lastToggleFlying = flying;
+    }
+
     /** True when a pending walk was requested before the latest explicit destination change,
      * so completing it would override the newest requested destination. */
     public boolean superseded() { return pending && walkEpoch != destinationEpoch; }

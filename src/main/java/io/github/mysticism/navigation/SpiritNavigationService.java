@@ -125,7 +125,12 @@ public final class SpiritNavigationService {
         boolean changed = !p.getAbilities().allowFlying || p.getAbilities().flying != deep;
         p.getAbilities().allowFlying = true; p.getAbilities().flying = deep;
         p.setNoGravity(false); p.fallDistance = 0;
-        if (changed) p.sendAbilitiesUpdate();
+        if (changed) {
+            p.sendAbilitiesUpdate();
+            // The client applies this correction without echoing a toggle packet; advance the
+            // recorded gesture state so the next genuine client edge is not read as a duplicate.
+            session(p).walk.serverCorrected(deep);
+        }
     }
 
     public static boolean enter(ServerPlayerEntity p) {
@@ -537,6 +542,11 @@ public final class SpiritNavigationService {
             s.capture.cancel(false);
             p.sendMessage(Text.literal("Superseding the older pending source discovery with this capture."), false);
         }
+        // Accepting a capture is a destination request: supersede older navigation intents NOW,
+        // not only when delayed discovery completes, so an older pending walk can never commit
+        // shallow mode against the pre-capture destination in the meantime.
+        state(p).clearTarget();
+        explicitDestinationChange(p);
         var server = p.getServer();
         // Snapshot the source-grid basis before async completion, not a later moving deep basis.
         Basis384f basis = state(p).active() && !state(p).deep() ? p.getComponent(MysticismEntityComponents.LATENT_BASIS).get().clone() : new Basis384f();
