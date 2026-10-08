@@ -70,6 +70,11 @@ tasks.register('runtimeSelfTest', JavaExec) {
         setArgs(sourceSets.runtimeTest.output.classesDirs.files.collect { it.absolutePath })
     }
 }
+tasks.register('printRuntimeTestClasspath') {
+    group = 'verification'
+    description = 'Print the runtimeTest runtime classpath for ad-hoc JavaExec debugging.'
+    doLast { println sourceSets.runtimeTest.runtimeClasspath.asPath }
+}
 tasks.named('check') {
     dependsOn tasks.named('buildSelfTest'), tasks.named('runtimeSelfTest')
 }

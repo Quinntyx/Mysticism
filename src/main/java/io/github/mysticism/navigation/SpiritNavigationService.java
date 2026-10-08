@@ -42,6 +42,7 @@ public final class SpiritNavigationService {
     private SpiritNavigationService() {}
     private static final class Session {
         int unsupported, blendTick, landingTick, supportTick, supportAlignTick;
+        double unsupportedDrop;
         boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, jumping, supportPending;
         Vec384f targetSnapshot, supportTargetSnapshot;
         Basis384f supportFrom, supportGrid;
@@ -58,6 +59,15 @@ public final class SpiritNavigationService {
     private static SpiritNavigation state(ServerPlayerEntity p) { return p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION); }
     private static boolean spirit(ServerPlayerEntity p) { return p.getWorld().getRegistryKey().equals(SpiritTerrainService.WORLD); }
     public static boolean deep(ServerPlayerEntity p) { return spirit(p) && state(p).active() && state(p).deep(); }
+    /** Airborne shallow ticks tolerated before ordinary movement is reclassified as deep freeflight. */
+    public static final int UNSUPPORTED_GRACE_TICKS = 14;
+    /** Largest fall still treated as an ordinary terrain height change rather than walking off an edge. */
+    public static final double ORDINARY_STEP_DROP = 1.0;
+    /** Ascending takeoff keeps the tick grace; an ordinary ≤1 block step descent must stay shallow.
+     * Only a fall deeper than an ordinary height change (or sustained air) is a real edge and flies. */
+    public static boolean ejectsToDeep(boolean jumping, int unsupportedTicks, double dropSinceSupport) {
+        return unsupportedTicks > UNSUPPORTED_GRACE_TICKS || (!jumping && dropSinceSupport > ORDINARY_STEP_DROP);
+    }
 
     public static void init() {
         if (initialized) return; initialized = true;
@@ -273,11 +283,16 @@ public final class SpiritNavigationService {
             // Ownership checks precede initial anchoring; discovery cannot overwrite an established binding.
             if (!s.semanticReady && !source.landmarkId().isEmpty()) { anchorSource(p, s, source); anchoredNow = s.semanticReady; }
             nav.shallow(source.dimension(), id, source.position());
-            if (support.isPresent()) { s.unsupported = 0; s.jumping = false; }
+            if (support.isPresent()) { s.unsupported = 0; s.jumping = false; s.unsupportedDrop = 0; }
             else {
-                if (s.unsupported == 0) s.jumping = delta.y > .01;
-                if (++s.unsupported > 14 || !s.jumping) { enterDeep(p); return nav.deep() && s.semanticReady; }
-            } // Ascending takeoff gets ordinary jump grace; walking over an edge gets immediate freeflight.
+                if (s.unsupported == 0) { s.jumping = delta.y > .01; s.unsupportedDrop = 0; }
+                s.unsupportedDrop += Math.max(0, -delta.y);
+                // Ascending takeoff gets ordinary jump grace; an ordinary step descent briefly loses
+                // mesh ground without ejecting, so traversal across height changes stays shallow.
+                if (ejectsToDeep(s.jumping, ++s.unsupported, s.unsupportedDrop)) {
+                    enterDeep(p); return nav.deep() && s.semanticReady;
+                }
+            } // Walking over a real edge (fall beyond an ordinary step) still becomes deep freeflight.
             flight(p, false);
             if (s.semanticReady && !anchoredNow) TraversalSteering.advance(p.getComponent(MysticismEntityComponents.LATENT_POS).get(),
                     p.getComponent(MysticismEntityComponents.LATENT_BASIS).get(), delta.x, delta.y, delta.z);
