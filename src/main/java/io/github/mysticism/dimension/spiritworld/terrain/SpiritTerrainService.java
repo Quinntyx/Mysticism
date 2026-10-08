@@ -288,7 +288,7 @@ public final class SpiritTerrainService {
                 && s.target.captured.squareDistance(captured)==0 && s.target.sourceBasis.i.squareDistance(sourceBasis.i)==0
                 && s.target.sourceBasis.j.squareDistance(sourceBasis.j)==0 && s.target.sourceBasis.k.squareDistance(sourceBasis.k)==0)return;
         if(s.targetFuture!=null)s.targetFuture.cancel(false);
-        Window target=new Window(dimension,position,captured,sourceBasis,landmarkId);s.target=target;
+        Window target=new Window(dimension,position,captured,sourceBasis,landmarkId);target.alpha=0;s.target=target;
         if(s.targetOwnerFuture!=null)s.targetOwnerFuture.cancel(false);
         s.targetOwnerFuture=SourceLandmarks.ensureSourceLocation(p.getServer(),dimension,BlockPos.ofFloored(position)).whenComplete((found,error)->p.getServer().execute(()->{
             if(!live(p,s) || s.target!=target || error!=null || found==null || found.isEmpty())return;
@@ -319,7 +319,7 @@ public final class SpiritTerrainService {
     public static boolean landingReady(ServerPlayerEntity p,String dimension,String landmarkId,Vec3d position) {
         Session s=session(p);if(s==null || s.shallow || s.target==null || !currentTarget(p,s))return false;Window target=s.target;
         if(!target.id.equals(landmarkId) || !target.dimension.equals(dimension) || !target.origin.equals(position)
-                || !target.ready || !target.confirmedOrigin || !target.proofValid
+                || target.alpha<.99f || !target.ready || !target.confirmedOrigin || !target.proofValid
                 || !target.proofKeys.equals(target.owner.geometryKeys()) || target.semantic.squareDistance(target.captured)>4e-12
                 || q(p).squareDistance(target.semantic)>4e-12)return false;
         Basis384f current=basis(p);
@@ -516,14 +516,14 @@ public final class SpiritTerrainService {
                 var nav=p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION);
                 if(nav.hasShallowTarget() && s.target==null && q(p).squareDistance(p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target())<MeshRepresentatives.RADIUS*MeshRepresentatives.RADIUS)
                     prefetchTarget(p,nav.targetDimension(),nav.targetLandmarkId(),nav.targetPosition(),p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target(),nav.targetBasis());
-                if(c.tick%2==0)publish(p,s,false);
+                c.animate(p,s);if(c.tick%2==0)publish(p,s,false);
             } catch(RuntimeException failure){status(p,s,"Mesh deferred: "+failure.getMessage());}
         }
         // A single repository geometry cursor is advanced globally. A failed region never retries ahead of others forever.
-        c.advanceGeometry();
+        c.advanceNear();c.advanceGeometry();
         if(!players.isEmpty())for(int n=0;n<Math.min(2,players.size());n++) {
             ServerPlayerEntity p=players.get(Math.floorMod(c.playerCursor++,players.size()));Session s=c.sessions.get(p.getUuid());
-            if(s!=null && p.getWorld().getRegistryKey().equals(WORLD))try{c.scan(p,s);}catch(RuntimeException failure){status(p,s,"Selection deferred: "+failure.getMessage());}
+            if(s!=null && p.getWorld().getRegistryKey().equals(WORLD))try{c.maintain(p,s);c.scan(p,s);}catch(RuntimeException failure){status(p,s,"Selection deferred: "+failure.getMessage());}
         }
     }
     private static void status(ServerPlayerEntity p,Session s,String message){if(!Objects.equals(message,s.status)){s.status=message;p.sendMessage(Text.literal(message),true);}}
@@ -541,12 +541,13 @@ public final class SpiritTerrainService {
         List<TerrainMeshFrame.Material> materials=new ArrayList<>();Map<TerrainMeshFrame.Material,Integer> palette=new HashMap<>();
         List<TerrainMeshFrame.Cell> cells=new ArrayList<>();Set<Long> keys=new HashSet<>();
         if((!s.shallow || s.acquiredView) && s.target!=null && s.target!=s.local && currentTarget(p,s)
-                && s.target.proofValid && s.target.proofKeys.equals(s.target.owner.geometryKeys()))append(p,s,s.target,materials,palette,cells,keys,512,observer);
+                && s.target.proofValid && s.target.proofKeys.equals(s.target.owner.geometryKeys())
+                && s.target.semantic.squareDistance(q(p))<MeshRepresentatives.RADIUS*MeshRepresentatives.RADIUS)append(p,s,s.target,materials,palette,cells,keys,512,observer);
         append(p,s,s.local,materials,palette,cells,keys,s.shallow?1024:640,observer);
         // Near shallow view is source-identical, not a pile of unrelated text-similar source regions.
         if(!s.shallow || s.acquiredView) {
             Window closest=s.regions.get(s.closestId);
-            if(closest!=null && closest!=s.local && closest!=s.target)append(p,s,closest,materials,palette,cells,keys,128,observer);
+            if(closest!=null && closest!=s.local && closest!=s.target)append(p,s,closest,materials,palette,cells,keys,512,observer);
             for(Window w:s.regions.values())if(w!=closest && w!=s.local && w!=s.target && !w.id.equals(s.local.id))append(p,s,w,materials,palette,cells,keys,128,observer);
         }
         return new TerrainMeshFrame(revision,s.shallow,s.local.dimension,s.local.origin,s.carrier,materials,MeshStitcher.stitch(cells,materials,s.local.id,s.shallow,p.getPos()));
@@ -596,7 +597,9 @@ public final class SpiritTerrainService {
     private static final class Window {
         final long identity=WINDOW_IDS.incrementAndGet();final String dimension;Vec3d origin;Vec384f semantic,supportEmbedding;final Vec384f captured;final Basis384f sourceBasis;
         boolean proofValid;List<String> proofKeys=List.of();SourceOwnership.Region owners;CompletableFuture<SourceOwnership.Region> ownershipFuture;long nextOwnerRequest;
-        String id;LandmarkMetadata owner;boolean ready,dirty,confirmedOrigin;float alpha=1;int refreshCursor;
+        String id;LandmarkMetadata owner;boolean ready,dirty,confirmedOrigin,replacing,nearReady,retired;float alpha=1;int refreshCursor;
+        TerrainGeometryStream stream;long metadataChecked,observedOwnership=-1;
+        Vec3d nearFocus;CompletableFuture<SourceLandmarks.Region> nearFuture;Iterator<SourceLandmarks.Cell> nearCells;
         final Set<BlockPos> liveTiles=new HashSet<>();
         final Map<BlockPos,SourceMeshBuilder.Tile> tiles=new HashMap<>();List<SourceMeshBuilder.Node> nodes=List.of(),geometryNodes=List.of();long compactedOwnership=-1;
         Window(String dimension,Vec3d origin,Vec384f semantic,Basis384f basis,String id){this.dimension=dimension;this.origin=origin;this.semantic=semantic.clone();captured=semantic.clone();supportEmbedding=semantic.clone();sourceBasis=basis.clone();this.id=id;}
@@ -605,14 +608,17 @@ public final class SpiritTerrainService {
         Window local,target,walkProbe;Vec3d carrier,sourceRequested;boolean shallow=true,entered,anchorDelivered,acquiredView;long revision,created,walkField,walkNextProbe;
         TerrainMeshFrame frame;CompletableFuture<?> ownerFuture,sourceFuture,targetFuture,targetOwnerFuture,walkFuture;Iterator<SourceLandmarks.Cell> ingesting;
         final Map<String,Window> regions=new LinkedHashMap<>();final MeshRepresentatives selection=new MeshRepresentatives();
-        String scanCursor,status,closestId="";int dimensionCursor;boolean scanning;Set<String> selected=Set.of();
+        final Map<String,Window> prepared=new LinkedHashMap<>();
+        String scanCursor,status,closestId="";int dimensionCursor,regionCursor;boolean scanning;Set<String> selected=Set.of();
         Session(Window local,Vec3d carrier){this.local=local;this.carrier=carrier;}
-        void cancel(){if(ownerFuture!=null)ownerFuture.cancel(false);if(sourceFuture!=null)sourceFuture.cancel(false);if(targetFuture!=null)targetFuture.cancel(false);if(targetOwnerFuture!=null)targetOwnerFuture.cancel(false);if(walkFuture!=null)walkFuture.cancel(false);if(local.ownershipFuture!=null)local.ownershipFuture.cancel(false);if(target!=null && target.ownershipFuture!=null)target.ownershipFuture.cancel(false);for(var w:regions.values())if(w.ownershipFuture!=null)w.ownershipFuture.cancel(false);regions.clear();}
+        void cancel(){if(ownerFuture!=null)ownerFuture.cancel(false);if(sourceFuture!=null)sourceFuture.cancel(false);if(targetFuture!=null)targetFuture.cancel(false);if(targetOwnerFuture!=null)targetOwnerFuture.cancel(false);if(walkFuture!=null)walkFuture.cancel(false);cancelWindow(local);if(target!=null)cancelWindow(target);for(var w:regions.values())cancelWindow(w);for(var w:prepared.values())cancelWindow(w);regions.clear();prepared.clear();}
     }
+    private static void cancelWindow(Window w){if(w.ownershipFuture!=null)w.ownershipFuture.cancel(false);if(w.nearFuture!=null)w.nearFuture.cancel(false);w.stream=null;w.nearCells=null;}
     private static final class Context {
         final MinecraftServer server;final LandmarkStore store;final Map<UUID,Session> sessions=new HashMap<>();
         long tick;int playerCursor;LandmarkStore.GeometryRead read;Session readingSession;Window readingWindow;
-        Iterator<io.github.mysticism.landmark.SparseOctree.Cell<BlockSample>> leaves;GeometryPage page;int readTicks,pagesVisited;
+        int geometryCursor,nearCursor;
+
         boolean proving;final Map<BlockPos,BlockPalette.State> proofSamples=new HashMap<>();
         final ArrayDeque<Map.Entry<Session,LandmarkMetadata>> pending=new ArrayDeque<>();
         Context(MinecraftServer server){this.server=server;store=LandmarkStore.get(server);}
@@ -631,16 +637,108 @@ public final class SpiritTerrainService {
                 // A long catalog sweep uses a snapshot q; stale candidates cannot activate outside the CURRENT radius.
                 if(SpiritActivityService.effectiveEmbedding(server,m).vector().squareDistance(q(p))>MeshRepresentatives.RADIUS*MeshRepresentatives.RADIUS)continue;
                 selected.add(m.id());if(s.closestId.isEmpty())s.closestId=m.id();
-                if(m.id().equals(s.local.id) || s.regions.containsKey(m.id()))continue;
+                if(m.id().equals(s.local.id) || s.regions.containsKey(m.id()) || s.prepared.containsKey(m.id()))continue;
                 if(pending.size()<32 && pending.stream().noneMatch(e->e.getKey()==s && e.getValue().id().equals(m.id())))pending.add(Map.entry(s,m));}
-            for(var e:s.regions.entrySet()) {
-                Window w=e.getValue();if(w==s.target)continue;
-                double distance=origin(p,s,w).distanceTo(p.getPos());
-                if(s.frame!=null)for(var cell:s.frame.cells())if(cell.landmarkId().equals(w.id))
-                    distance=Math.min(distance,Math.sqrt(SourceMeshBuilder.distanceSquared(cell.bounds(),p.getPos())));
-                if(!selected.contains(e.getKey()) && (distance>80 || !immediate(p,s,w)))w.alpha=Math.max(0,w.alpha-.2f);else w.alpha=Math.min(1,w.alpha+.2f);
+            s.selected=Set.copyOf(selected);
+            s.regions.entrySet().removeIf(e->{if(e.getValue().alpha>0 || protectedNear(p,s,e.getValue()))return false;cancelWindow(e.getValue());return true;});
+            s.prepared.entrySet().removeIf(e->{if(selected.contains(e.getKey()))return false;cancelWindow(e.getValue());return true;});
+        }
+        private List<Window> windows(Session s) {
+            var all=new LinkedHashSet<Window>();all.add(s.local);if(s.target!=null)all.add(s.target);all.addAll(s.regions.values());all.addAll(s.prepared.values());return List.copyOf(all);
+        }
+        private boolean retained(Session s,Window w){return sessions.containsValue(s) && (s.local==w || s.target==w || s.regions.get(w.id)==w || s.prepared.get(w.id)==w);}
+        private record View(Vec3d root,Vec3d x,Vec3d y,Vec3d z,Vec3d source,Vec3d viewer) {
+            double distance(SourceMeshBuilder.Node node) {
+                BlockPos at=node.position();Vec3d d=new Vec3d(at.getX(),at.getY(),at.getZ()).subtract(source);
+                Vec3d min=root.add(x.multiply(d.x)).add(y.multiply(d.y)).add(z.multiply(d.z));
+                int side=node.side();Vec3d a=x.multiply(side),b=y.multiply(side),c=z.multiply(side);
+                Box bounds=new Box(min.x+Math.min(0,a.x)+Math.min(0,b.x)+Math.min(0,c.x),min.y+Math.min(0,a.y)+Math.min(0,b.y)+Math.min(0,c.y),min.z+Math.min(0,a.z)+Math.min(0,b.z)+Math.min(0,c.z),
+                        min.x+Math.max(0,a.x)+Math.max(0,b.x)+Math.max(0,c.x),min.y+Math.max(0,a.y)+Math.max(0,b.y)+Math.max(0,c.y),min.z+Math.max(0,a.z)+Math.max(0,b.z)+Math.max(0,c.z));
+                return SourceMeshBuilder.distanceSquared(bounds,viewer);
             }
-            s.selected=Set.copyOf(selected);s.regions.entrySet().removeIf(e->e.getValue().alpha<=0);
+            Vec3d focus(Bounds bounds) {
+                Vec3d offset=viewer.subtract(root);double determinant=x.dotProduct(y.crossProduct(z));
+                Vec3d p=Math.abs(determinant)<1e-6?source:source.add(offset.dotProduct(y.crossProduct(z))/determinant,offset.dotProduct(z.crossProduct(x))/determinant,offset.dotProduct(x.crossProduct(y))/determinant);
+                return new Vec3d(MathHelper.clamp(p.x,bounds.minX()+.5,bounds.maxX()-.5),MathHelper.clamp(p.y,bounds.minY()+.5,bounds.maxY()-.5),MathHelper.clamp(p.z,bounds.minZ()+.5,bounds.maxZ()-.5));
+            }
+        }
+        private View view(ServerPlayerEntity p,Session s,Window w) {
+            if(s.shallow && w==s.local)return new View(s.carrier,new Vec3d(1,0,0),new Vec3d(0,1,0),new Vec3d(0,0,1),w.origin,p.getPos());
+            Basis384f b=basis(p);return new View(origin(p,s,w),axis(w.sourceBasis.i,b),axis(w.sourceBasis.j,b),axis(w.sourceBasis.k,b),w.origin,p.getPos());
+        }
+        void maintain(ServerPlayerEntity p,Session s) {
+            var all=windows(s);Window w=all.get(Math.floorMod(s.regionCursor++,all.size()));
+            if(!w.id.isEmpty() && tick-w.metadataChecked>=20) {
+                w.metadataChecked=tick;LandmarkMetadata current=store.metadata(w.id).orElse(null);
+                if(current!=null && current.header().dimension().equals(w.dimension)) {
+                    boolean geometry=w.owner!=null && !w.owner.geometryKeys().equals(current.geometryKeys());
+                    w.owner=current;w.supportEmbedding=SpiritActivityService.effectiveEmbedding(server,current).vector();
+                    w.retired=false;if(geometry){w.replacing=true;w.nearReady=false;w.nearFocus=null;if(w.nearFuture!=null)w.nearFuture.cancel(false);w.nearCells=null;w.stream=null;}
+                    // Physical/source anchors and the user's captured target are never recreated on revision changes.
+                    if(w!=s.target && (!s.shallow || w!=s.local)) {
+                        View v=view(p,s,w);Vec3d focus=v.focus(current.header().bounds());
+                        if(w.stream==null || w.stream.complete && w.stream.focus.squaredDistanceTo(focus)>64)w.stream=new TerrainGeometryStream(current,focus);
+                        if(w.nearFocus==null || w.nearFocus.squaredDistanceTo(focus)>16)requestNear(p,s,w,focus);
+                    }
+                    if(w.observedOwnership!=store.ownershipRevision()) {
+                        w.observedOwnership=store.ownershipRevision();requestOwnership(p,s,w,view(p,s,w).focus(current.header().bounds()));
+                    }
+                } else {w.retired=true;cancelWindow(w);}
+            }
+            if(w.stream!=null && w.stream.changed)install(p,s,w);
+        }
+        void advanceNear() {
+            var waiting=new ArrayList<Map.Entry<Session,Window>>();for(Session s:sessions.values())for(Window w:windows(s))if(w.nearCells!=null)waiting.add(Map.entry(s,w));
+            if(waiting.isEmpty())return;var entry=waiting.get(Math.floorMod(nearCursor++,waiting.size()));Window w=entry.getValue();
+            int budget=128;while(w.nearCells.hasNext() && budget-->0)ingest(server,w,List.of(w.nearCells.next()),1);
+            if(!w.nearCells.hasNext()){w.nearCells=null;w.nearReady=true;w.nodes=compact(server,w,w.nearFocus);w.ready=!w.nodes.isEmpty();}
+        }
+        private void requestNear(ServerPlayerEntity p,Session s,Window w,Vec3d focus) {
+            if(w.nearFuture!=null && !w.nearFuture.isDone())return;
+            w.nearFocus=focus;w.nearReady=false;List<String> keys=List.copyOf(w.owner.geometryKeys());
+            var future=SourceLandmarks.region(server,w.dimension,SourceMeshBuilder.range(focus,16),4096);w.nearFuture=future;
+            future.whenComplete((region,error)->server.execute(()->{
+                if(!live(p,s) || !retained(s,w) || w.nearFuture!=future)return;
+                if(error!=null || region==null || !store.metadata(w.id).map(m->m.geometryKeys().equals(keys)).orElse(false)){w.nearFocus=null;return;}
+                // Existing near samples outside the new bounded sliding window aren't an ever-growing cache.
+                w.tiles.entrySet().removeIf(e->e.getKey().getSquaredDistance(focus)>24*24);w.liveTiles.retainAll(w.tiles.keySet());
+                w.nearCells=region.cells().iterator();
+            }));
+        }
+        private void install(ServerPlayerEntity p,Session s,Window w) {
+            if(w.stream==null || !w.stream.changed)return;
+            View v=view(p,s,w);
+            boolean hidden=!w.geometryNodes.isEmpty() && w.geometryNodes.stream().allMatch(n->v.distance(n)>=64*64);
+            if(w.replacing && !hidden && !protectedNear(p,s,w) && (w.alpha>.01f || !w.nearReady))return;
+            w.geometryNodes=w.stream.snapshot(v::distance);w.nodes=w.tiles.isEmpty()?w.geometryNodes:compact(server,w,w.nearFocus==null?w.origin:w.nearFocus);
+            if(w.owners!=null && w.owners.isCurrent(server))w.nodes=SourceMeshBuilder.splitOwnership(w.nodes,w.owners.owners(),w.owners.bounds(),w.nearFocus==null?w.origin:w.nearFocus);
+            w.ready=!w.nodes.isEmpty();w.replacing=false;
+        }
+        void animate(ServerPlayerEntity p,Session s) {
+            double radius=MeshRepresentatives.RADIUS*MeshRepresentatives.RADIUS;Vec384f now=q(p);
+            for(Window w:s.regions.values()) {
+                boolean protectedBody=protectedNear(p,s,w),eligible=!w.retired && s.selected.contains(w.id) && w.semantic.squareDistance(now)<radius;
+                if(protectedBody && w.alpha>0)w.alpha=Math.max(w.alpha,.99f);
+                else w.alpha=MathHelper.clamp(w.alpha+(eligible && !w.replacing?.05f:-.05f),0,1);
+            }
+            if(s.target!=null && s.target!=s.local) {
+                Window target=s.target;boolean ready=target.ready && currentTarget(p,s) && target.proofValid && target.semantic.squareDistance(now)<radius;
+                target.alpha=MathHelper.clamp(target.alpha+(ready?.05f:-.05f),0,1);
+            }
+            // Prepare before activation. Prefer hidden geometry at the actual opaque horizon; a current in-radius close
+            // representative is admitted with a 20-tick fade, never an impossible fog gate or a body/q teleport.
+            for(var iterator=s.prepared.entrySet().iterator();iterator.hasNext();) {
+                Window w=iterator.next().getValue();if(!w.ready || !s.selected.contains(w.id) || w.semantic.squareDistance(now)>=radius)continue;
+                View v=view(p,s,w);boolean hidden=w.nodes.stream().allMatch(n->v.distance(n)>=64*64);
+                if(!hidden && !w.nearReady)continue;
+                if(!admit(p,s,w.id))continue;
+                w.alpha=0;s.regions.put(w.id,w);iterator.remove();
+            }
+        }
+        private boolean protectedNear(ServerPlayerEntity p,Session s,Window w) {
+            if(w==s.local)return true;
+            if(s.frame!=null)for(var cell:s.frame.cells())if(cell.landmarkId().equals(w.id) && SourceMeshBuilder.distanceSquared(cell.bounds(),p.getPos())<25)return true;
+            return false;
         }
         private boolean immediate(ServerPlayerEntity p,Session s,Window w) {
             if(MeshCollision.ground(p).filter(h->h.cell().landmarkId().equals(w.id)).isPresent())return true;
@@ -651,11 +749,35 @@ public final class SpiritTerrainService {
             int limit=id.equals(s.closestId)?9:8; // One bounded reserved slot that stale projected-near regions cannot occupy.
             if(s.regions.size()<limit)return true;
             for(var iterator=s.regions.entrySet().iterator();iterator.hasNext();) {
-                var e=iterator.next();if(s.selected.contains(e.getKey()) || immediate(p,s,e.getValue()))continue;
-                e.getValue().alpha=Math.max(0,e.getValue().alpha-.5f);
-                if(e.getValue().alpha<=0){iterator.remove();return s.regions.size()<limit;}
+                var e=iterator.next();if(s.selected.contains(e.getKey()) || protectedNear(p,s,e.getValue()))continue;
+                // animate performs the fade; capacity pressure never makes an opaque region disappear in one tick.
+                if(e.getValue().alpha<=0){cancelWindow(e.getValue());iterator.remove();return s.regions.size()<limit;}
             }
             return false;
+        }
+        private ServerPlayerEntity player(Session s){for(var entry:sessions.entrySet())if(entry.getValue()==s)return server.getPlayerManager().getPlayer(entry.getKey());return null;}
+        private void advanceStream() {
+            var work=new ArrayList<Map.Entry<Session,Window>>();
+            for(Session s:sessions.values())for(Window w:windows(s))if(w.stream!=null && !w.stream.complete)work.add(Map.entry(s,w));
+            if(work.isEmpty())return;
+            var entry=work.get(Math.floorMod(geometryCursor++,work.size()));Session s=entry.getKey();Window w=entry.getValue();ServerPlayerEntity p=player(s);
+            if(p==null || !w.stream.current(store.metadata(w.id).orElse(null))){w.stream=null;return;}
+            if(w.stream.cells!=null){w.stream.advance(w.id,view(p,s,w)::distance);install(p,s,w);return;}
+            if(!store.geometryReadAvailable())return;
+            readingSession=s;readingWindow=w;proving=false;
+            read=store.beginGeometryRead(w.id,w.stream.range(w.owner),w.stream.pageIndex);advanceRead();
+        }
+        private void advanceRead() {
+            TerrainGeometryStream stream=readingWindow.stream;ServerPlayerEntity p=player(readingSession);
+            if(stream==null || p==null || !stream.current(store.metadata(readingWindow.id).orElse(null))){read.cancel();read=null;return;}
+            int before=read.nextPageIndex();read.advance(1,256);var pages=read.drain();stream.pageIndex=read.nextPageIndex();
+            boolean complete=read.complete();
+            if(!pages.isEmpty()) {
+                stream.accept(pages.getFirst());read.cancel();read=null;
+                stream.advance(readingWindow.id,view(p,readingSession,readingWindow)::distance);install(p,readingSession,readingWindow);
+            } else if(complete){stream.endPass();read.cancel();read=null;}
+            // Skipped page headers also yield the shared cursor, but a partially decoded page must finish to avoid replay starvation.
+            else if(stream.pageIndex>before){read.cancel();read=null;}
         }
         void advanceGeometry() {
             try {
@@ -665,26 +787,26 @@ public final class SpiritTerrainService {
                         if(p==null || target==null || !target.ready || !target.confirmedOrigin || !currentTarget(p,s))continue;
                         if(target.proofKeys.equals(target.owner.geometryKeys()))continue;
                         if(!store.geometryReadAvailable())return;
-                        read=store.beginGeometryRead(target.id);readingSession=s;readingWindow=target;proving=true;
-                        target.proofValid=false;proofSamples.clear();readTicks=0;pagesVisited=0;break;
+                        read=store.beginGeometryRead(target.id,SourceMeshBuilder.range(target.origin,16));readingSession=s;readingWindow=target;proving=true;
+                        target.proofValid=false;proofSamples.clear();break;
                     }
                     int attempts=pending.size();
                     while(read==null && !pending.isEmpty() && attempts-->0) {
                         var next=pending.removeFirst();Session s=next.getKey();
-                        if(!sessions.containsValue(s))continue;
+                        if(!sessions.containsValue(s) || s.prepared.containsKey(next.getValue().id()) || s.regions.containsKey(next.getValue().id()))continue;
                         LandmarkMetadata m=store.metadata(next.getValue().id()).orElse(null);if(m==null)continue;
-                        ServerPlayerEntity player=sessions.entrySet().stream().filter(e->e.getValue()==s)
-                                .map(e->server.getPlayerManager().getPlayer(e.getKey())).filter(Objects::nonNull).findFirst().orElse(null);
-                        if(player==null || !s.selected.contains(m.id())
-                                || SpiritActivityService.effectiveEmbedding(server,m).vector().squareDistance(q(player))>MeshRepresentatives.RADIUS*MeshRepresentatives.RADIUS)continue;
-                        if(!admit(player,s,m.id())){pending.addLast(next);continue;}
+                        ServerPlayerEntity player=player(s);
+                        if(player==null || !s.selected.contains(m.id()) || SpiritActivityService.effectiveEmbedding(server,m).vector().squareDistance(q(player))>=MeshRepresentatives.RADIUS*MeshRepresentatives.RADIUS)continue;
+                        if(s.prepared.size()>=9){pending.addLast(next);continue;}
                         Window w=new Window(m.header().dimension(),new Vec3d(m.header().anchor().x(),m.header().anchor().y(),m.header().anchor().z()),SpiritActivityService.effectiveEmbedding(server,m).vector(),s.local.sourceBasis,m.id());
-                        w.owner=m;w.supportEmbedding=w.semantic.clone();w.alpha=.2f;
-                        read=store.beginGeometryRead(m.id());readingSession=s;readingWindow=w;readTicks=0;pagesVisited=0;break;
+                        w.owner=m;w.supportEmbedding=w.semantic.clone();w.alpha=0;s.prepared.put(w.id,w);
+                        Vec3d focus=view(player,s,w).focus(m.header().bounds());w.stream=new TerrainGeometryStream(m,focus);requestNear(player,s,w,focus);
+                        break;
                     }
-                    if(read==null)return;
+                    if(read==null){advanceStream();return;}
                 }
-                if(!sessions.containsValue(readingSession) || !read.isCurrent()){read.cancel();read=null;leaves=null;return;}
+                LandmarkMetadata current=store.metadata(readingWindow.id).orElse(null);
+                if(!retained(readingSession,readingWindow) || current==null || !read.metadata().geometryKeys().equals(current.geometryKeys())){read.cancel();read=null;proving=false;proofSamples.clear();return;}
                 if(proving) {
                     read.advance(1,256);
                     for(var geometry:read.drain()) {
@@ -699,7 +821,7 @@ public final class SpiritTerrainService {
                     for(BlockPos point:BlockPos.iterate(MathHelper.floor(required.minX),MathHelper.floor(required.minY),MathHelper.floor(required.minZ),MathHelper.floor(required.maxX),MathHelper.floor(required.maxY),MathHelper.floor(required.maxZ)))sampled &=proofSamples.containsKey(point);
                     // Stop once the exact footprint is known; don't hydrate every distant page of a large cave just to land.
                     if(read.complete() || sampled) {
-                        Window target=readingWindow;boolean valid=read.isCurrent();Box area=body(target.origin);
+                        Window target=readingWindow;boolean valid=current!=null && read.metadata().geometryKeys().equals(current.geometryKeys());Box area=body(target.origin);
                         for(BlockPos point:BlockPos.iterate(MathHelper.floor(area.minX),MathHelper.floor(area.minY),MathHelper.floor(area.minZ),MathHelper.floor(area.maxX),MathHelper.floor(area.maxY),MathHelper.floor(area.maxZ))) {
                             // Ownership must be exact; actual body clearance is checked from the current collision shapes, not block-is-AIR heuristics.
                             if(proofSamples.get(point)==null)valid=false;
@@ -719,26 +841,8 @@ public final class SpiritTerrainService {
                     }
                     return;
                 }
-                if(++readTicks>32 || pagesVisited>=4 || readingWindow.geometryNodes.size()>=128) {
-                    // Bounded geometry window, not a whole-feature cap. Yield even a pathological cold page to other regions.
-                    read.cancel();read=null;leaves=null;readingWindow.ready=!readingWindow.nodes.isEmpty();
-                    readingSession.regions.put(readingWindow.id,readingWindow);return;
-                }
-                if(leaves==null){read.advance(1,256);var pages=read.drain();if(!pages.isEmpty()){pagesVisited++;page=pages.getFirst();leaves=page.knownCells().iterator();}}
-                int work=0;while(leaves!=null && leaves.hasNext() && work++<256) {
-                    var cell=leaves.next();if(cell.value().occupancy()!=BlockSample.Occupancy.SOLID)continue;
-                    if(readingWindow.geometryNodes.size()>=128)continue;
-                    Bounds b=cell.bounds();var at=new BlockPos(Math.toIntExact(b.minX()),Math.toIntExact(b.minY()),Math.toIntExact(b.minZ()));
-                    var tile=SourceMeshBuilder.stored(page.palette().state(cell.value().paletteIndex()),at);
-                    var nodes=new ArrayList<>(readingWindow.geometryNodes);nodes.add(new SourceMeshBuilder.Node(at,Math.toIntExact(b.maxX()-b.minX()),tile,readingWindow.id));
-                    readingWindow.geometryNodes=List.copyOf(nodes);readingWindow.nodes=readingWindow.geometryNodes;
-                    if(readingWindow.owners!=null && readingWindow.owners.isCurrent(server))readingWindow.nodes=SourceMeshBuilder.splitOwnership(readingWindow.geometryNodes,readingWindow.owners.owners(),readingWindow.owners.bounds(),readingWindow.origin);
-                }
-                if(leaves!=null && !leaves.hasNext())leaves=null;
-                // Partial pages are published incrementally; any page count works and other requests advance after completion.
-                readingSession.regions.put(readingWindow.id,readingWindow);
-                if(read.complete() && leaves==null){readingWindow.ready=true;read=null;}
-            } catch(RuntimeException deferred) {if(read!=null)read.cancel();read=null;leaves=null;proving=false;proofSamples.clear();}
+                advanceRead();
+            } catch(RuntimeException deferred) {if(read!=null)read.cancel();read=null;proving=false;proofSamples.clear();}
         }
     }
 }
