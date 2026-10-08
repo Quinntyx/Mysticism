@@ -16,6 +16,8 @@ import io.github.mysticism.vector.Vec384f;
  * <li>Server-driven flight corrections (abilities updates applied by vanilla without an echoed
  * flight-on packet) advance the recorded gesture state, so correction → cancellation/expiry →
  * genuine retry works without an intervening flight-on packet.</li>
+ * <li>A flight-on packet queued before a server correction always requests deep mode and
+ * cancels pending walking, even when its recorded state is classified as a duplicate.</li>
  * <li>Accepting an asynchronous capture supersedes older navigation intents at acceptance, and a
  * delayed capture result supersedes any interim walk.</li>
  * <li>Only an EXPLICIT attunement re-key supersedes a pending walk; background personal
@@ -38,13 +40,14 @@ public final class WalkRetargetingTest {
 
     /** Models the service gate: a walk may start only for a fresh gesture on a non-pending intent. */
     private static boolean gatedStart(WalkIntentTracker tracker, boolean flying) {
-        return tracker.observeToggle(flying) && tracker.startWalk();
+        return tracker.flightRequest(flying) == WalkIntentTracker.FlightRequest.WALK && tracker.startWalk();
     }
 
     public static void main(String[] args) {
         toggleEdges();
         duplicatePacketsCannotRestart();
         correctionRetry();
+        queuedFlightOnCancelsWalk();
         retargetSupersedesPendingWalk();
         acceptanceSupersede();
         freshGestureAfterRetarget();
@@ -98,6 +101,28 @@ public final class WalkRetargetingTest {
         check(!echo.observeToggle(true), "A packet matching the server-corrected state is still a duplicate");
         check(echo.observeToggle(false), "The opposite state after a correction is a fresh edge");
         check(echo.startWalk(), "Fresh edge after a correction starts a walk");
+    }
+
+    /** P2: flight-off → server correction → queued flight-on while walking is still pending.
+     * Use the service's production arbitration, not the raw edge classifier: a matching flight-on
+     * must still dispatch enterDeep, whose normal cleanup ends the walk and terrain acquisition. */
+    private static void queuedFlightOnCancelsWalk() {
+        WalkIntentTracker tracker = new WalkIntentTracker();
+        check(gatedStart(tracker, false), "Flight-off starts pending walking");
+        tracker.serverCorrected(true);
+        check(tracker.pending(), "Server flight restoration alone does not cancel the walk");
+        // correctionRetry separately proves this value is a duplicate in the raw edge classifier.
+        var request = tracker.flightRequest(true);
+        check(request == WalkIntentTracker.FlightRequest.DEEP, "Duplicate flight-on must still dispatch enterDeep");
+        check(tracker.pending(), "Arbitration retains pending state until the service cancels terrain acquisition");
+        if (request == WalkIntentTracker.FlightRequest.DEEP) tracker.endWalk(); // enterDeep cleanup
+        check(!tracker.pending(), "No pending walk remains to commit shallow after the newer flight-on");
+        check(tracker.flightRequest(true) == WalkIntentTracker.FlightRequest.DEEP,
+                "Repeated flight-on remains an idempotent deep request, never a walk");
+        check(!tracker.pending(), "Repeated flight-on cannot resurrect walking");
+        check(gatedStart(tracker, false), "A later genuine flight-off can request walking again");
+        check(!gatedStart(tracker, false), "Duplicate flight-off cannot replace or reset the pending retry");
+        check(tracker.pending() && !tracker.superseded(), "Retry retains the current destination epoch");
     }
 
     private static void retargetSupersedesPendingWalk() {

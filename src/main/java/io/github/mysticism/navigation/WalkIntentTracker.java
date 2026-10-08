@@ -36,6 +36,18 @@ public final class WalkIntentTracker {
         return fresh;
     }
 
+    public enum FlightRequest { DEEP, WALK, IGNORE }
+
+    /** Arbitrates a client packet independently of server correction/packet ordering.
+     * Flight-on always requests deep mode, including when a correction has already recorded
+     * that value: a genuine on packet may have been queued before the client saw the correction.
+     * Only flight-off needs a fresh edge to avoid resurrecting an older walk intent.
+     * The caller must apply DEEP through its normal terrain/support cancellation path. */
+    public FlightRequest flightRequest(boolean flying) {
+        boolean fresh = observeToggle(flying);
+        return flying ? FlightRequest.DEEP : fresh ? FlightRequest.WALK : FlightRequest.IGNORE;
+    }
+
     /** An explicit destination request (target capture, explicit attunement re-key) that
      * supersedes any walk intent requested earlier. */
     public void bumpDestination() { ++destinationEpoch; }

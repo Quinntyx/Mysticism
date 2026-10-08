@@ -232,13 +232,15 @@ public final class SpiritNavigationService {
     public static void onFlightToggle(ServerPlayerEntity p, boolean flying) {
         if (!spirit(p)) return;
         Session s = session(p);
-        boolean fresh = s.walk.observeToggle(flying);
-        if (flying) { if (fresh) enterDeep(p); return; }
+        var request = s.walk.flightRequest(flying);
+        // A queued genuine flight-on may match our last abilities correction. It still cancels
+        // pending walking through enterDeep's terrain/support cleanup, never the duplicate gate.
+        if (request == WalkIntentTracker.FlightRequest.DEEP) { enterDeep(p); return; }
         if (!state(p).active()) enterDeep(p);
         if (!state(p).deep()) { flight(p, false); return; }
         restoreAnchor(p, s);
         flight(p, true); // remains deep/freeflight until the real terrain acquisition commits
-        if (s.walk.pending() || !fresh) return; // repeated packets cannot reset budgets or duplicate requests
+        if (s.walk.pending() || request != WalkIntentTracker.FlightRequest.WALK) return; // repeated packets cannot reset budgets or duplicate requests
         endApproach(p, s); s.blendFrom = null; s.blendTo = null;
         if (!s.walk.startWalk()) return;
         s.supportTick = 0; s.supportFrom = null;
