@@ -15,10 +15,14 @@ public final class EntryRecovery {
     private EntryRecovery() {}
     public enum Action { ABORT, RETURN_TO_SOURCE, RETAIN_CARRIER }
 
-    /** Decision for a failed /spirit enter, given what actually happened before the failure. */
-    public static Action failedEnter(boolean carried, boolean sourceRecoverable, boolean sourceBodyClear) {
-        if (!carried) return Action.ABORT;
-        return sourceRecoverable && sourceBodyClear ? Action.RETURN_TO_SOURCE : Action.RETAIN_CARRIER;
+    /** Candidate decision for a failed /spirit enter, classified from the player's ACTUAL current world.
+     * Fabric world-change callbacks execute inside teleport, so a callback throwing after the transfer
+     * leaves the player in the carrier before teleport returns; a stale post-return flag must never
+     * downgrade an in-carrier player to ABORT. RETURN_TO_SOURCE is a validated attempt — a refused or
+     * failed attempt falls back to RETAIN_CARRIER, never to an exit-less abort. */
+    public static Action failedEnter(boolean currentlyInCarrier, boolean sourceRecoverable) {
+        if (!currentlyInCarrier) return Action.ABORT;
+        return sourceRecoverable ? Action.RETURN_TO_SOURCE : Action.RETAIN_CARRIER;
     }
 
     /** The remembered source pose is only a recovery target when it names a real dimension with a finite position. */

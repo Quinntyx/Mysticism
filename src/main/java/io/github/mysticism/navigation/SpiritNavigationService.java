@@ -146,11 +146,9 @@ public final class SpiritNavigationService {
         Session s = session(p); s.semanticReady = false; s.checkedRestore = true;
         nav.setSemanticReady(false); nav.setLandingApproach(false);
         s.confirmedOwned = false; s.warnedAnchor = false; s.prefetched = false;
-        boolean carried = false;
         try {
             // Source-identical carrier pose: no shared origin, entry search or replacement floor.
             p.teleport(world, source.x, source.y, source.z, p.getYaw(), p.getPitch());
-            carried = spirit(p);
             SpiritTerrainService.setShallow(p, true); flight(p, false);
             p.setVelocity(Vec3d.ZERO); sync(p);
             if (nav.hasShallowTarget()) {
@@ -160,42 +158,50 @@ public final class SpiritNavigationService {
             p.sendMessage(Text.literal("Shallow spirit: walk/jump normally; double-jump flies deep. /spirit leave exits current shallow location."), false);
             return true;
         } catch (RuntimeException failure) {
-            recoverFailedEnter(p, failure, carried, source, dimension);
+            recoverFailedEnter(p, failure, source, dimension);
             return false;
         }
     }
+    /** Recovery classification probes the player's ACTUAL current world: Fabric world-change callbacks
+     * execute INSIDE teleport, so a callback throwing after the transfer leaves the player already in the
+     * spirit carrier while teleport itself reports failure. A post-return flag can be stale and must never
+     * downgrade an in-carrier player to ABORT (which would delete their prepared terrain and force deep
+     * flight); the current world is the only authoritative signal. */
+    static EntryRecovery.Action classifyEntryFailure(boolean currentlyInCarrier, Vec3d source, String dimension) {
+        return EntryRecovery.failedEnter(currentlyInCarrier, EntryRecovery.recoverableSource(dimension, source));
+    }
     /** A partial entry must land in a coherent usable state: back at the remembered source pose, or a retained
      * shallow carrier with live geometry — never inactive flight over missing terrain or an exit-less void fall. */
-    private static void recoverFailedEnter(ServerPlayerEntity p, RuntimeException failure, boolean carried, Vec3d source, String dimension) {
+    private static void recoverFailedEnter(ServerPlayerEntity p, RuntimeException failure, Vec3d source, String dimension) {
         String detail = failure.getMessage() == null ? failure.getClass().getSimpleName() : failure.getMessage();
-        EntryRecovery.Action action = EntryRecovery.Action.ABORT;
-        if (carried && spirit(p)) {
-            if (EntryRecovery.recoverableSource(dimension, source)) {
-                try { if (SpiritTerrainService.returnToSource(p, dimension, source)) action = EntryRecovery.Action.RETURN_TO_SOURCE; }
-                catch (RuntimeException secondary) { /* keep the carrier instead of throwing out of recovery */ }
-            }
-            if (action != EntryRecovery.Action.RETURN_TO_SOURCE) action = EntryRecovery.Action.RETAIN_CARRIER;
-        }
-        switch (action) {
+        switch (classifyEntryFailure(spirit(p), source, dimension)) {
             case RETURN_TO_SOURCE -> {
-                // The world-change handlers deactivate and cancel coherently; make it explicit for ordering.
-                SpiritTerrainService.cancelEnter(p); deactivate(p);
-                p.sendMessage(Text.literal("Spirit entry failed mid-transition (" + detail + "); returned to "
-                        + dimension + " " + MathHelper.floor(source.x) + " " + MathHelper.floor(source.y) + " " + MathHelper.floor(source.z) + "."), false);
+                boolean returned = false;
+                try { returned = SpiritTerrainService.returnToSource(p, dimension, source); }
+                catch (RuntimeException secondary) { /* keep the carrier instead of throwing out of recovery */ }
+                if (returned) {
+                    // The world-change handlers deactivate and cancel coherently; make it explicit for ordering.
+                    SpiritTerrainService.cancelEnter(p); deactivate(p);
+                    p.sendMessage(Text.literal("Spirit entry failed mid-transition (" + detail + "); returned to "
+                            + dimension + " " + MathHelper.floor(source.x) + " " + MathHelper.floor(source.y) + " " + MathHelper.floor(source.z) + "."), false);
+                    return;
+                }
+                retainCarrier(p, detail);
             }
-            case RETAIN_CARRIER -> {
-                // The source pose is unusable; retain the already-built carrier mesh and shallow binding so the
-                // player keeps real geometry and a working /spirit leave instead of falling through the void.
-                flight(p, false); sync(p);
-                p.sendMessage(Text.literal("Spirit entry failed mid-transition (" + detail
-                        + "); shallow carrier retained — /spirit leave exits."), false);
-            }
+            case RETAIN_CARRIER -> retainCarrier(p, detail);
             case ABORT -> {
-                // Failure before the carrier teleport: no spirit-world state exists to recover.
+                // The player's current world is the source world: no spirit state exists to recover.
                 SpiritTerrainService.cancelEnter(p); deactivate(p);
                 p.sendMessage(Text.literal("Spirit entry failed: " + detail), false);
             }
         }
+    }
+    /** The source pose is unusable; retain the already-built carrier mesh and shallow binding so the
+     * player keeps real geometry and a working /spirit leave instead of falling through the void. */
+    private static void retainCarrier(ServerPlayerEntity p, String detail) {
+        flight(p, false); sync(p);
+        p.sendMessage(Text.literal("Spirit entry failed mid-transition (" + detail
+                + "); shallow carrier retained — /spirit leave exits."), false);
     }
     private static void anchorSource(ServerPlayerEntity p, Session s, SpiritTerrainService.SourcePosition source) {
         anchorSource(p, source, p.getComponent(MysticismEntityComponents.LATENT_BASIS).get());

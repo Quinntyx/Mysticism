@@ -28,21 +28,31 @@ public final class EntryFailureRecoveryTest {
         return found;
     }
 
-    private static void decisionMatrix() {
-        // Failure before the carrier teleport: abort cleanly, nothing to recover inside the carrier.
-        for (boolean recoverable : new boolean[]{true, false}) for (boolean clear : new boolean[]{true, false})
-            check(EntryRecovery.failedEnter(false, recoverable, clear) == EntryRecovery.Action.ABORT,
-                    "Pre-teleport failure must abort, never teleport or retain");
-        check(EntryRecovery.failedEnter(true, true, true) == EntryRecovery.Action.RETURN_TO_SOURCE,
-                "Mid-transition failure with a clear remembered pose returns to the source");
-        check(EntryRecovery.failedEnter(true, true, false) == EntryRecovery.Action.RETAIN_CARRIER,
-                "Obstructed remembered pose must retain the carrier, never suffocate the player");
-        check(EntryRecovery.failedEnter(true, false, true) == EntryRecovery.Action.RETAIN_CARRIER,
-                "Unrecoverable remembered pose must retain the carrier, never strand flight");
-        check(EntryRecovery.failedEnter(true, false, false) == EntryRecovery.Action.RETAIN_CARRIER,
-                "Unrecoverable and obstructed still retains the usable carrier");
+    private static void decisionMatrix() throws Exception {
+        // Failure classification uses the player's ACTUAL current world. Fabric world-change callbacks
+        // execute INSIDE teleport: a callback throwing after the transfer leaves the player already in
+        // the spirit carrier while teleport itself reports failure (P1). Such a player must never be
+        // classified ABORT, which would delete their prepared terrain and force deep flight.
+        check(EntryRecovery.failedEnter(true, true) == EntryRecovery.Action.RETURN_TO_SOURCE,
+                "In-carrier player with a recoverable remembered pose must attempt the validated return");
+        check(EntryRecovery.failedEnter(true, false) == EntryRecovery.Action.RETAIN_CARRIER,
+                "In-carrier player with an unusable remembered pose must retain the usable carrier");
+        for (boolean recoverable : new boolean[]{true, false})
+            check(EntryRecovery.failedEnter(false, recoverable) == EntryRecovery.Action.ABORT,
+                    "A player whose current world is the source world has no spirit state to recover");
+        // The production classification seam must delegate to the same policy (no divergent rule).
+        Vec3d pose = new Vec3d(1.5, 64, -2.5);
+        check(SpiritNavigationService.classifyEntryFailure(true, pose, "minecraft:overworld")
+                == EntryRecovery.Action.RETURN_TO_SOURCE,
+                "Production classification keeps the return attempt for an in-carrier player");
+        check(SpiritNavigationService.classifyEntryFailure(false, pose, "minecraft:overworld")
+                == EntryRecovery.Action.ABORT,
+                "Production classification aborts only when the current world is the source world");
+        check(SpiritNavigationService.classifyEntryFailure(true, pose, "not a dimension")
+                == EntryRecovery.Action.RETAIN_CARRIER,
+                "Production classification retains the carrier when the remembered pose is unusable");
 
-        check(EntryRecovery.recoverableSource("minecraft:overworld", new Vec3d(1.5, 64, -2.5)), "Real source pose is recoverable");
+        check(EntryRecovery.recoverableSource("minecraft:overworld", pose), "Real source pose is recoverable");
         check(!EntryRecovery.recoverableSource("", new Vec3d(0, 64, 0)), "Empty dimension is not a recovery target");
         check(!EntryRecovery.recoverableSource(null, new Vec3d(0, 64, 0)), "Null dimension is not a recovery target");
         check(!EntryRecovery.recoverableSource("not a dimension", new Vec3d(0, 64, 0)), "Unparseable dimension is not a recovery target");
@@ -52,6 +62,23 @@ public final class EntryFailureRecoveryTest {
         check(EntryRecovery.RETRY_INTERVAL_TICKS > 0 && EntryRecovery.REBUILD_FAILURE_LIMIT > 1
                 && EntryRecovery.REBUILD_BACKOFF_FAILURES > 0 && EntryRecovery.REBUILD_BACKOFF_FAILURES < EntryRecovery.REBUILD_FAILURE_LIMIT,
                 "Self-heal cadence constants must form a bounded backoff");
+
+        // P1 wiring contract: recovery must not accept a carried/post-return flag parameter at all —
+        // a boolean flag sampled before teleport returns is exactly the stale-signal bug. The only
+        // allowed signature probes the player's current world inside the recovery path itself.
+        ClassLoader loader = EntryFailureRecoveryTest.class.getClassLoader();
+        Class<?> navigation = Class.forName("io.github.mysticism.navigation.SpiritNavigationService", false, loader);
+        var recover = navigation.getDeclaredMethod("recoverFailedEnter",
+                ServerPlayerEntity.class, RuntimeException.class, Vec3d.class, String.class);
+        check(Modifier.isStatic(recover.getModifiers()) && !Modifier.isPublic(recover.getModifiers()),
+                "recoverFailedEnter stays a package-private current-world probe");
+        for (var parameter : recover.getParameterTypes())
+            check(parameter != boolean.class && parameter != Boolean.class,
+                "recoverFailedEnter must never take a stale carried flag");
+        var classify = navigation.getDeclaredMethod("classifyEntryFailure", boolean.class, Vec3d.class, String.class);
+        int classifyModifiers = classify.getModifiers();
+        check(Modifier.isStatic(classifyModifiers) && !Modifier.isPublic(classifyModifiers) && classify.getReturnType() == EntryRecovery.Action.class,
+                "classifyEntryFailure stays the package-private current-world classification seam");
     }
 
     private static void bindingCoherence() {
