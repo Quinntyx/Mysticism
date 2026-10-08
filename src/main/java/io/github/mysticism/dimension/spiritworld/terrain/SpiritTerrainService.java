@@ -87,7 +87,9 @@ public final class SpiritTerrainService {
         }
     }
     /** Rebuild derived meshes from the existing current-profile per-player navigation binding, never a global saved frame. */
-    public static boolean restore(ServerPlayerEntity player) {
+    public static boolean restore(ServerPlayerEntity player) {return restore(player,true);}
+    /** announce=false is for bounded navigation self-heal retries; a silent repeated failure must not spam chat. */
+    public static boolean restore(ServerPlayerEntity player,boolean announce) {
         if(!player.getWorld().getRegistryKey().equals(WORLD))return false;
         var nav=player.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION);
         if(!nav.active() || nav.sourceDimension().isEmpty())return false;
@@ -108,7 +110,22 @@ public final class SpiritTerrainService {
             if(owner==null)discoverOwner(player,s);requestSource(player,s,w.origin,32);publish(player,s,true);
             if(nav.hasShallowTarget())prefetchTarget(player,nav.targetDimension(),nav.targetLandmarkId(),nav.targetPosition(),player.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target(),nav.targetBasis());
             return true;
-        } catch(RuntimeException failure){cancelEnter(player);player.sendMessage(Text.literal("Spirit mesh restore deferred: "+failure.getMessage()),false);return false;}
+        } catch(RuntimeException failure){cancelEnter(player);if(announce)player.sendMessage(Text.literal("Spirit mesh restore deferred: "+failure.getMessage()),false);return false;}
+    }
+    /** True while a player stands inside the spirit carrier with no live terrain session to rebuild from. */
+    public static boolean needsRestore(ServerPlayerEntity player) {
+        return player.getWorld().getRegistryKey().equals(WORLD) && session(player)==null;
+    }
+    /** Coherent partial-entry recovery: validated return to the remembered source pose, never a substitute exit. */
+    public static boolean returnToSource(ServerPlayerEntity player,String dimension,Vec3d pose) {
+        if(!player.getWorld().getRegistryKey().equals(WORLD))return false;
+        ServerWorld world=world(player.getServer(),dimension);
+        if(world==null || !Double.isFinite(pose.x) || !Double.isFinite(pose.y) || !Double.isFinite(pose.z))return false;
+        // The remembered chunk may have unloaded since the failure; an unloaded chunk is not an obstruction.
+        world.getChunk(MathHelper.floor(pose.x)>>4,MathHelper.floor(pose.z)>>4);
+        if(!clearBody(world,pose))return false;
+        player.teleport(world,pose.x,pose.y,pose.z,player.getYaw(),player.getPitch());
+        player.setVelocity(Vec3d.ZERO);player.fallDistance=0;return true;
     }
     public static void cancelEnter(ServerPlayerEntity player) {
         Context c=SERVERS.get(player.getServer());if(c==null)return;

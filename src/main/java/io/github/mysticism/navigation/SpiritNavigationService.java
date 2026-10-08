@@ -45,6 +45,8 @@ public final class SpiritNavigationService {
         boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, supportPending;
         /** Feet height of the last mesh-supported shallow tick; NaN until support is first measured. */
         double supportY = Double.NaN;
+        /** Bounded self-heal state for a lost carrier session (entry-failure recovery). */
+        long restoreNextTick; int restoreFailures;
         Vec384f targetSnapshot, supportTargetSnapshot;
         Basis384f supportFrom, supportGrid;
         long supportWindow;
@@ -131,7 +133,11 @@ public final class SpiritNavigationService {
 
     public static boolean enter(ServerPlayerEntity p) {
         init();
-        if (spirit(p)) return false;
+        if (spirit(p)) {
+            // A silent rejection feeds the enter/leave command loop after a partial failure; state the coherent exit.
+            p.sendMessage(Text.literal("Already in the spirit world; /spirit leave exits the current shallow location."), false);
+            return false;
+        }
         var server = p.getServer(); var world = server.getWorld(SpiritTerrainService.WORLD);
         if (world == null) { p.sendMessage(Text.literal("Spirit dimension unavailable."), false); return false; }
         Vec3d source = p.getPos(); String dimension = p.getWorld().getRegistryKey().getValue().toString();
@@ -156,9 +162,54 @@ public final class SpiritNavigationService {
             p.sendMessage(Text.literal("Shallow spirit: walk/jump normally; double-jump flies deep. /spirit leave exits current shallow location."), false);
             return true;
         } catch (RuntimeException failure) {
-            SpiritTerrainService.cancelEnter(p); deactivate(p);
-            p.sendMessage(Text.literal("Spirit entry failed: " + failure.getMessage()), false); return false;
+            recoverFailedEnter(p, failure, source, dimension);
+            return false;
         }
+    }
+    /** Recovery classification probes the player's ACTUAL current world: Fabric world-change callbacks
+     * execute INSIDE teleport, so a callback throwing after the transfer leaves the player already in the
+     * spirit carrier while teleport itself reports failure. A post-return flag can be stale and must never
+     * downgrade an in-carrier player to ABORT (which would delete their prepared terrain and force deep
+     * flight); the current world is the only authoritative signal. */
+    static EntryRecovery.Action classifyEntryFailure(boolean currentlyInCarrier, Vec3d source, String dimension) {
+        return EntryRecovery.failedEnter(currentlyInCarrier, EntryRecovery.recoverableSource(dimension, source));
+    }
+    /** A partial entry must land in a coherent usable state: back at the remembered source pose, or a retained
+     * shallow carrier with live geometry — never inactive flight over missing terrain or an exit-less void fall. */
+    private static void recoverFailedEnter(ServerPlayerEntity p, RuntimeException failure, Vec3d source, String dimension) {
+        String detail = failure.getMessage() == null ? failure.getClass().getSimpleName() : failure.getMessage();
+        switch (classifyEntryFailure(spirit(p), source, dimension)) {
+            case RETURN_TO_SOURCE -> {
+                EntryRecovery.reconcileSourceReturn(
+                        () -> SpiritTerrainService.returnToSource(p, dimension, source),
+                        () -> spirit(p),
+                        () -> {
+                            // A return callback may already have deactivated us before throwing. Cleanup is
+                            // idempotent; never regrant carrier flight after saved abilities were cleared.
+                            completeSourceRecovery(p);
+                            p.sendMessage(Text.literal("Spirit entry failed mid-transition (" + detail + "); left the spirit carrier."), false);
+                        },
+                        () -> retainCarrier(p, detail));
+            }
+            case RETAIN_CARRIER -> retainCarrier(p, detail);
+            case ABORT -> {
+                // The player's current world is the source world: no spirit state exists to recover.
+                SpiritTerrainService.cancelEnter(p); deactivate(p);
+                p.sendMessage(Text.literal("Spirit entry failed: " + detail), false);
+            }
+        }
+    }
+    private static void completeSourceRecovery(ServerPlayerEntity p) {
+        // teleport can throw before returnToSource resets motion, even though transfer already succeeded.
+        p.setVelocity(Vec3d.ZERO); p.fallDistance = 0;
+        SpiritTerrainService.cancelEnter(p); deactivate(p);
+    }
+    /** The source pose is unusable; retain the already-built carrier mesh and shallow binding so the
+     * player keeps real geometry and a working /spirit leave instead of falling through the void. */
+    private static void retainCarrier(ServerPlayerEntity p, String detail) {
+        flight(p, false); sync(p);
+        p.sendMessage(Text.literal("Spirit entry failed mid-transition (" + detail
+                + "); shallow carrier retained — /spirit leave exits."), false);
     }
     private static void anchorSource(ServerPlayerEntity p, Session s, SpiritTerrainService.SourcePosition source) {
         anchorSource(p, source, p.getComponent(MysticismEntityComponents.LATENT_BASIS).get());
@@ -264,6 +315,7 @@ public final class SpiritNavigationService {
     public static boolean update(ServerPlayerEntity p, Vec3d delta) {
         if (!spirit(p)) { if (state(p).active() || state(p).hasSavedAbilities()) deactivate(p); return false; }
         var nav = state(p); Session s = session(p); restoreAnchor(p, s);
+        if (!ensureTerrainSession(p, s)) return false; // Recovery returned the player to the source world this tick.
         if (nav.hasShallowTarget() && !s.prefetched) {
             SpiritTerrainService.prefetchTarget(p, nav.targetDimension(), nav.targetLandmarkId(), nav.targetPosition(),
                     p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target(), nav.targetBasis()); s.prefetched = true;
@@ -318,6 +370,31 @@ public final class SpiritNavigationService {
         }
         if (attemptLanding(p, s, delta)) return false; // Approach advanced q once, without ordinary basis steering.
         return nav.deep();
+    }
+    /** A cancelled/unbuilt carrier session must self-heal from the per-player binding; a session that cannot be
+     * rebuilt returns the player to the remembered source pose instead of stranding flight over missing terrain
+     * with permanently failing walk requests and an exit-less command loop. */
+    private static boolean ensureTerrainSession(ServerPlayerEntity p, Session s) {
+        var nav = state(p);
+        if (!nav.active() || !SpiritTerrainService.needsRestore(p)) { s.restoreFailures = 0; return true; }
+        long now = p.getServer().getTicks();
+        if (now < s.restoreNextTick) return true;
+        s.restoreNextTick = now + EntryRecovery.RETRY_INTERVAL_TICKS;
+        if (SpiritTerrainService.restore(p, false)) { s.restoreFailures = 0; return true; }
+        ++s.restoreFailures;
+        if (s.restoreFailures < EntryRecovery.REBUILD_FAILURE_LIMIT
+                || !EntryRecovery.recoverableSource(nav.sourceDimension(), nav.sourcePosition())) return true;
+        boolean leftCarrier = EntryRecovery.reconcileSourceReturn(
+                () -> SpiritTerrainService.returnToSource(p, nav.sourceDimension(), nav.sourcePosition()),
+                () -> spirit(p),
+                () -> {
+                    completeSourceRecovery(p);
+                    s.restoreFailures = 0; s.restoreNextTick = 0;
+                    p.sendMessage(Text.literal("Spirit terrain could not be rebuilt; left the spirit carrier."), false);
+                },
+                () -> s.restoreFailures = EntryRecovery.REBUILD_BACKOFF_FAILURES);
+        // A callback throwing after transfer must not resume carrier integration in the source world.
+        return !leftCarrier;
     }
     private static void restoreAnchor(ServerPlayerEntity p, Session s) {
         if (s.checkedRestore) return; s.checkedRestore = true;
