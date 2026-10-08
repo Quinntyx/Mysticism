@@ -19,6 +19,8 @@ import java.util.concurrent.*;
  * No generation, source writes, joins, model inference or catalogue hydration on tick. */
 public final class SourceLandmarks {
     public static final String ALGORITHM="source-octree-v2";
+    /** Movement reads may jump ahead of at most this many discovery ops between discovery ticks. */
+    static final int DISCOVERY_FAIR_SHARE=5,READ_BUDGET=64,DISCOVERY_BUDGET=64;
     public record Cell(BlockPoint position,BlockPalette.State material,String biome,boolean sky) {
         public boolean air(){return Set.of("minecraft:air","minecraft:cave_air","minecraft:void_air").contains(material.blockId());}
     }
@@ -88,7 +90,7 @@ public final class SourceLandmarks {
         if(!SourceDimensions.isSource(world.getRegistryKey().getValue().toString()))return;
         Session s=SESSIONS.get(world.getServer());if(s!=null){s.invalidate(world.getRegistryKey().getValue().toString(),pos);s.hint(world.getRegistryKey().getValue().toString(),pos.toImmutable());}
     }
-    public static int pending(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.requests.size()+s.hints.size()+(s.active==null?0:1);}
+    public static int pending(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.schedule.readPending()+s.schedule.discoveryPending()+s.schedule.backgroundPending()+s.hints.size()+(s.active==null?0:1);}
     public static int lastSampledCells(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.lastCells;}
     public static String status(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?"Stopped":s.status;}
     private static Session session(MinecraftServer server){if(!server.isOnThread())throw new IllegalStateException("source server thread");Session s=SESSIONS.get(server);if(s==null)throw new IllegalStateException("source service not initialized");return s;}
@@ -104,15 +106,29 @@ public final class SourceLandmarks {
         }
     }
     private static final class Session {
-        final MinecraftServer server;final LandmarkStore store;final ItemEmbeddingIndexState itemIndex;final ExecutorService worker=new ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(4),Thread.ofPlatform().daemon().name("mysticism-source").factory(),new ThreadPoolExecutor.AbortPolicy());
+        final MinecraftServer server;final LandmarkStore store;final ItemEmbeddingIndexState itemIndex;final ExecutorService worker=new ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(16),Thread.ofPlatform().daemon().name("mysticism-source").factory(),new ThreadPoolExecutor.AbortPolicy());
         final ArrayDeque<SourceOwnership.Request> ownerRequests=new ArrayDeque<>();
-        final ArrayDeque<FrontierRetry> retries=new ArrayDeque<>();final Map<CompletableFuture<?>,String> auxiliary=new IdentityHashMap<>();final ArrayDeque<Operation<?>> requests=new ArrayDeque<>();final LinkedHashSet<Hint> hints=new LinkedHashSet<>();Operation<?> active;String status="Ready";int playerCursor,lastCells;
+        final ArrayDeque<FrontierRetry> retries=new ArrayDeque<>();final Map<CompletableFuture<?>,String> auxiliary=new IdentityHashMap<>();final SourceSchedule<Operation<?>> schedule=new SourceSchedule<>(DISCOVERY_FAIR_SHARE,op->op instanceof Read,op->op.background);final LinkedHashSet<Hint> hints=new LinkedHashSet<>();Operation<?> active;String status="Ready";int playerCursor,lastCells;
         Session(MinecraftServer server){this.server=server;store=LandmarkStore.get(server);itemIndex=ItemEmbeddingIndexState.get(server);}
         <T> CompletableFuture<T> computeAndDeliver(String dim,java.util.function.Supplier<T> computation){
             var out=new CompletableFuture<T>();if(auxiliary.size()>=64){out.completeExceptionally(new RejectedExecutionException("source auxiliary budget"));return out;}auxiliary.put(out,dim);
             try{CompletableFuture.supplyAsync(computation,worker).whenComplete((value,error)->server.execute(()->{auxiliary.remove(out);if(SESSIONS.get(server)!=this)out.cancel(false);else if(error!=null)out.completeExceptionally(error);else out.complete(value);}));}catch(RuntimeException failure){auxiliary.remove(out);out.completeExceptionally(failure);}return out;
         }
-        void offer(Operation<?> op){if(requests.size()==64){op.future.completeExceptionally(new RejectedExecutionException("source request budget"));return;}if(op instanceof Read)requests.addFirst(op);else requests.addLast(op);}
+        /** Requested ops keep movement-critical reads in their own lane; hint cascade work
+         * is background and can never delay a walk/support/target answer. */
+        void offer(Operation<?> op){
+            if(op instanceof Read){
+                if(schedule.readPending()>=READ_BUDGET){op.future.completeExceptionally(new RejectedExecutionException("source read budget"));return;}
+                schedule.read(op);return;
+            }
+            if(schedule.discoveryPending()>=DISCOVERY_BUDGET){op.future.completeExceptionally(new RejectedExecutionException("source request budget"));return;}
+            schedule.discover(op);
+        }
+        /** Worker submission that tolerates a saturated bounded queue by retrying next tick
+         * instead of cancelling the whole discovery operation. */
+        <T> CompletableFuture<T> spawn(java.util.function.Supplier<T> task){
+            try{return CompletableFuture.supplyAsync(task,worker);}catch(RejectedExecutionException busy){return null;}
+        }
         void hint(String dim,BlockPos p){if(hints.size()<128)hints.add(new Hint(dim,p));}
         void invalidate(String dim,BlockPos pos){if(active!=null&&active.dimension.equals(dim)&&active.guarded!=null&&active.guarded.contains(pos.getX(),pos.getY(),pos.getZ()))active.cancel(new CancellationException("source edit invalidated snapshot"));}
         void tick(){
@@ -121,18 +137,34 @@ public final class SourceLandmarks {
             if(server.getTicks()%5==0&&!retries.isEmpty()){try{if(retries.peekFirst().advance(this))retries.removeFirst();}catch(RuntimeException stale){retries.removeFirst();}}
             if(server.getTicks()%200==0){var players=server.getPlayerManager().getPlayerList();for(int n=0;n<Math.min(2,players.size());n++){var p=players.get(Math.floorMod(playerCursor++,players.size()));if(SourceDimensions.isSource(p.getServerWorld().getRegistryKey().getValue().toString()))hint(p.getServerWorld().getRegistryKey().getValue().toString(),p.getBlockPos());}}
             boolean ready=EmbeddingHelper.isReady()||itemIndex.isPopulated();
-            if(active==null&&!requests.isEmpty()&&(requests.peekFirst() instanceof Read||ready))active=requests.removeFirst();
-            if(active==null&&ready&&!hints.isEmpty()){Hint h=hints.iterator().next();hints.remove(h);active=new Ensure(this,h.dimension,h.pos,null,false,new CompletableFuture<>());}
-            if(active==null)return;
+            active=schedule.pick(active,op->admissible(op,ready));
+            if(active==null){
+                if(ready&&!hints.isEmpty()&&schedule.backgroundPending()<DISCOVERY_BUDGET){Hint h=hints.iterator().next();hints.remove(h);
+                    Ensure cascade=new Ensure(this,h.dimension,h.pos,null,false,new CompletableFuture<>());cascade.background=true;schedule.background(cascade);}
+                return;
+            }
             try{if(active.future.isCancelled())active.cancel(new CancellationException());if(!active.done)active.advance();if(active.done){active.release();active=null;status="Ready";}}
             catch(RuntimeException e){status="Deferred: "+e.getMessage();active.cancel(e);active.release();active=null;}
+            // An op that can only wait for real embedding readiness must never hold the pipeline.
+            if(active instanceof Ensure ensure&&ensure.needsEngine&&!EmbeddingHelper.isReady()){
+                schedule.discoveryLane.addFirst(active);active=null;status="Deferred: waiting for real embedding readiness";
+            }
         }
-        void unload(String dim){ownerRequests.removeIf(request->{if(request.dimension.equals(dim)){request.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});retries.removeIf(r->r.dimension.equals(dim));auxiliary.entrySet().removeIf(e->{if(e.getValue().equals(dim)){e.getKey().cancel(false);return true;}return false;});if(active!=null&&active.dimension.equals(dim)){active.cancel(new CancellationException("source dimension unloaded"));active.release();active=null;}requests.removeIf(op->{if(op.dimension.equals(dim)){op.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});hints.removeIf(h->h.dimension.equals(dim));}
-        void close(){ownerRequests.forEach(request->request.cancel(new CancellationException("server stopping")));ownerRequests.clear();auxiliary.keySet().forEach(f->f.cancel(false));auxiliary.clear();retries.clear();if(active!=null){active.cancel(new CancellationException("server stopping"));active.release();}requests.forEach(op->op.cancel(new CancellationException("server stopping")));requests.clear();hints.clear();worker.shutdownNow();}
+        void unload(String dim){ownerRequests.removeIf(request->{if(request.dimension.equals(dim)){request.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});retries.removeIf(r->r.dimension.equals(dim));auxiliary.entrySet().removeIf(e->{if(e.getValue().equals(dim)){e.getKey().cancel(false);return true;}return false;});if(active!=null&&active.dimension.equals(dim)){active.cancel(new CancellationException("source dimension unloaded"));active.release();active=null;}for(var lane:List.of(schedule.readLane,schedule.discoveryLane,schedule.backgroundLane))lane.removeIf(op->{if(op.dimension.equals(dim)){op.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});hints.removeIf(h->h.dimension.equals(dim));}
+        void close(){ownerRequests.forEach(request->request.cancel(new CancellationException("server stopping")));ownerRequests.clear();auxiliary.keySet().forEach(f->f.cancel(false));auxiliary.clear();retries.clear();if(active!=null){active.cancel(new CancellationException("server stopping"));active.release();}for(var lane:List.of(schedule.readLane,schedule.discoveryLane,schedule.backgroundLane)){lane.forEach(op->op.cancel(new CancellationException("server stopping")));lane.clear();}hints.clear();worker.shutdownNow();}
+        /** Reads always run. A discovery op that can only wait for the real embedding engine
+         * never blocks other discovery; everything else waits on model/index readiness. */
+        private boolean admissible(Operation<?> op,boolean ready){
+            if(op instanceof Read)return true;
+            if(op instanceof Ensure ensure&&ensure.needsEngine)return EmbeddingHelper.isReady();
+            return ready;
+        }
         ServerWorld world(String dimension){return SourceDimensions.isSource(dimension)?server.getWorld(RegistryKey.of(RegistryKeys.WORLD,Identifier.of(dimension))):null;}
     }
     private abstract static class Operation<T> {
         final Session s;String dimension;Bounds bounds,guarded;final CompletableFuture<T> future;boolean done;
+        /** Hint-cascade discovery runs only when no reads and no requested discovery is admissible. */
+        boolean background;
         GeneratedSourceReader reader;CompletableFuture<Region> snapshot;CompletableFuture<Landmark> hydrated;LandmarkStore.GeometryRead geometryRead;LandmarkStore.PendingMutation mutation;CompletableFuture<?> work;Runnable resume;
         LandmarkExtractionService.TopologyPlan history;
         Operation(Session s,String dimension,Bounds bounds,CompletableFuture<T> future){this.s=s;this.dimension=dimension;this.bounds=bounds;this.guarded=bounds;this.future=future;}
@@ -141,7 +173,8 @@ public final class SourceLandmarks {
         void pause(){if(resume==null)resume=SpiritActivityService.pauseLandmarkMutations(s.server);}
         void cancel(Throwable failure){done=true;if(reader!=null)reader.cancel();if(geometryRead!=null)geometryRead.cancel();if(work!=null)work.cancel(false);if(mutation!=null&&!mutation.complete())mutation.cancel();if(history!=null)history.cancel();future.completeExceptionally(failure);}
         void release(){if(resume!=null){resume.run();resume=null;}}
-        boolean observe(){if(snapshot!=null)return snapshot.isDone();if(reader==null){ServerWorld world=s.world(dimension);if(world==null)throw new IllegalStateException("source world unavailable");reader=new GeneratedSourceReader(world,bounds,s.worker);}s.status="Source read";boolean complete=reader.advance(512);s.lastCells=reader.lastSampled;if(complete){snapshot=reader.resultAsync();work=snapshot;}return false;}
+        boolean observe(){if(snapshot!=null)return snapshot.isDone();if(reader==null){ServerWorld world=s.world(dimension);if(world==null)throw new IllegalStateException("source world unavailable");reader=new GeneratedSourceReader(world,bounds,s.worker);}s.status="Source read";boolean complete=reader.advance(512);s.lastCells=reader.lastSampled;if(complete){var next=reader.resultAsync();if(next==null)return false; // saturated worker; retry completion next tick
+            snapshot=next;work=snapshot;}return false;}
     }
     private static final class Read extends Operation<Region> {
         Read(Session s,String dimension,Bounds bounds,CompletableFuture<Region> future){super(s,dimension,bounds,future);}
@@ -153,6 +186,9 @@ public final class SourceLandmarks {
         final ArrayDeque<LandmarkMetadata> candidates=new ArrayDeque<>();final List<Landmark> parents=new ArrayList<>();final List<GeometryPage> pages=new ArrayList<>();
         final Map<String,Double> importance=new HashMap<>();Region observed;CompletableFuture<Prepared> prepared;CompletableFuture<Vec384f> embedding;Prepared value;Landmark published;long time;int seaLevel;
         Ensure(Session s,String dimension,BlockPos pos,String preferred,boolean activity,CompletableFuture<Optional<LandmarkMetadata>> future){super(s,dimension,new Bounds(pos.getX()-12L,pos.getY()-12L,pos.getZ()-12L,pos.getX()+13L,pos.getY()+13L,pos.getZ()+13L),future);this.position=pos;this.preferred=preferred;this.activity=activity;}
+        /** Set when this operation can only proceed once the real embedding engine is ready;
+         * the scheduler then parks it instead of letting it hold the pipeline indefinitely. */
+        boolean needsEngine;
         void advance(){
             if(mutation!=null){mutation.advance(1,512);if(mutation.complete()){
                 if(history!=null){history.commit();history=null;}
@@ -164,17 +200,17 @@ public final class SourceLandmarks {
             // Pause only at topology reads/staging; never while waiting for model readiness.
             if(prepared==null){
                 if(hydrated!=null){if(!hydrated.isDone())return;parents.add(hydrated.getNow(null));hydrated=null;return;}
-                if(geometryRead!=null){geometryRead.advance(1,512);pages.addAll(geometryRead.drain());if(pages.size()>512)throw new IllegalArgumentException("source parent page budget");if(geometryRead.complete()){if(!geometryRead.isCurrent())throw new IllegalStateException("stale source geometry");var meta=geometryRead.metadata();var immutable=List.copyOf(pages);hydrated=CompletableFuture.supplyAsync(()->LandmarkNbt.hydrate(meta,immutable),s.worker);work=hydrated;pages.clear();geometryRead=null;}return;}
+                if(geometryRead!=null){geometryRead.advance(1,512);pages.addAll(geometryRead.drain());if(pages.size()>512)throw new IllegalArgumentException("source parent page budget");if(geometryRead.complete()){if(!geometryRead.isCurrent())throw new IllegalStateException("stale source geometry");var meta=geometryRead.metadata();var immutable=List.copyOf(pages);var next=s.spawn(()->LandmarkNbt.hydrate(meta,immutable));if(next==null)return;hydrated=next;work=hydrated;pages.clear();geometryRead=null;}return;}
                 if(!candidates.isEmpty()){if(!s.store.geometryReadAvailable())return;var m=candidates.removeFirst();importance.put(m.id(),SpiritActivityService.importance(s.server,m));guarded=guarded.union(m.header().bounds());geometryRead=s.store.beginGeometryRead(m.id());return;}
                 if(!catalogEnd){var page=s.store.sourceRangePage(dimension,bounds,cursor,4,4);cursor=page.nextId();catalogEnd=page.end();candidates.addAll(page.landmarks());if(parents.size()+candidates.size()>64)throw new IllegalArgumentException("local overlap operation budget");return;}
-                List<Landmark> snapshot=List.copyOf(parents);prepared=CompletableFuture.supplyAsync(()->prepare(observed,snapshot,position,preferred,activity,time,seaLevel,Map.copyOf(importance)),s.worker);work=prepared;return;
+                List<Landmark> snapshot=List.copyOf(parents);var next=s.spawn(()->prepare(observed,snapshot,position,preferred,activity,time,seaLevel,Map.copyOf(importance)));if(next==null)return;prepared=next;work=prepared;return;
             }
             if(!prepared.isDone())return;if(value==null){value=prepared.getNow(null);if(value==null){complete(Optional.empty());return;}}
             if(embedding==null){
                 ArrayList<DescriptorVectors.WeightedVector> fallback=new ArrayList<>();var index=s.itemIndex;
                 if(index.isPopulated())for(var item:value.items.entrySet()){Vec384f v=index.getVec(item.getKey());if(v!=null)fallback.add(new DescriptorVectors.WeightedVector(v,item.getValue()));}
                 Vec384f backup=fallback.isEmpty()?null:DescriptorVectors.compose(fallback);
-                if(!EmbeddingHelper.isReady()&&backup==null){s.status="Waiting for real embedding/index readiness";return;}
+                if(!EmbeddingHelper.isReady()&&backup==null){needsEngine=true;return;}
                 embedding=EmbeddingHelper.isReady()?EmbeddingHelper.composeDescriptors(value.descriptors).handle((v,e)->{if(e==null)return v;if(backup!=null)return backup.clone();throw new CompletionException(e);}):CompletableFuture.completedFuture(backup);work=embedding;return;
             }
             if(!embedding.isDone())return;
@@ -236,7 +272,7 @@ public final class SourceLandmarks {
         void advance(){
             if(mutation!=null){mutation.advance(1,512);if(mutation.complete()){if(history!=null){history.commit();history=null;}LandmarkExtractionService.COMMITTED_TOPOLOGY.invoker().committed(s.server,parents.stream().map(Landmark::id).toList(),parents.stream().map(l->s.store.resolve(l.id())).distinct().toList());complete(true);}return;}
             if(hydrated!=null){if(!hydrated.isDone())return;parents.add(hydrated.getNow(null));hydrated=null;return;}
-            if(geometryRead!=null){geometryRead.advance(1,512);pages.addAll(geometryRead.drain());if(pages.size()>512)throw new IllegalArgumentException("transfer page budget");if(geometryRead.complete()){if(!geometryRead.isCurrent())throw new IllegalStateException("stale transfer geometry");var meta=geometryRead.metadata();var immutable=List.copyOf(pages);hydrated=CompletableFuture.supplyAsync(()->LandmarkNbt.hydrate(meta,immutable),s.worker);work=hydrated;pages.clear();geometryRead=null;}return;}
+            if(geometryRead!=null){geometryRead.advance(1,512);pages.addAll(geometryRead.drain());if(pages.size()>512)throw new IllegalArgumentException("transfer page budget");if(geometryRead.complete()){if(!geometryRead.isCurrent())throw new IllegalStateException("stale transfer geometry");var meta=geometryRead.metadata();var immutable=List.copyOf(pages);var next=s.spawn(()->LandmarkNbt.hydrate(meta,immutable));if(next==null)return;hydrated=next;work=hydrated;pages.clear();geometryRead=null;}return;}
             if(parents.size()<2){if(!s.store.geometryReadAvailable())return;String id=parents.isEmpty()?receiverId:donorId;var m=s.store.metadata(id);if(m.isEmpty()||!SourceDimensions.isSource(m.get().header().dimension()) || s.store.resolve(receiverId).equals(s.store.resolve(donorId))){complete(false);return;}dimension=m.get().header().dimension();guarded=guarded==null?m.get().header().bounds():guarded.union(m.get().header().bounds());geometryRead=s.store.beginGeometryRead(m.get().id());return;}
             if(resume==null){try{pause();}catch(IllegalStateException busy){return;}}
             if(prepared==null){Landmark receiver=parents.getFirst(),donor=parents.getLast();if(!receiver.dimension().equals(donor.dimension())){complete(false);return;}
@@ -246,7 +282,7 @@ public final class SourceLandmarks {
                     merge=false; // stronger nearby activity can acquire one real adjacent cell
                 }
                 if(merge){var proof=new LandmarkRepository.VerifiedConnectivity(parents.stream().map(l->new LandmarkRepository.RevisionRef(l.id(),l.revision())).toList(),"activity convergence; worker-verified physical source adjacency");history=LandmarkExtractionService.prepareTopology(s.server,new LandmarkExtractionService.TopologyChange(LandmarkExtractionService.TopologyKind.MERGE,proof.fragments(),List.of(),proof));}
-                prepared=CompletableFuture.supplyAsync(()->exchange(receiver,donor,bounds,merge,allowSteal&&!merge),s.worker);work=prepared;return;
+                var next=s.spawn(()->exchange(receiver,donor,bounds,merge,allowSteal&&!merge));if(next==null)return;prepared=next;work=prepared;return;
             }
             if(!prepared.isDone())return;value=prepared.getNow(null);if(value==null){if(history!=null){history.cancel();history=null;}complete(false);return;}
             var refs=parents.stream().map(l->new LandmarkRepository.RevisionRef(l.id(),l.revision())).toList();

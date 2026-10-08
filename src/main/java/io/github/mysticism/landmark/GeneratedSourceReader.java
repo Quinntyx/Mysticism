@@ -19,6 +19,7 @@ final class GeneratedSourceReader {
     final SourceLandmarks.Cell[] cells; final List<ChunkPos> chunks=new ArrayList<>();
     final Executor executor; int chunkIndex,cellIndex,lastSampled; boolean cancelled;
     CompletableFuture<List<SourceLandmarks.Cell>> disk;List<SourceLandmarks.Cell> diskRows;int diskCursor;
+    LimitedCollector collector;CompletableFuture<?> scan;
     GeneratedSourceReader(ServerWorld world,Bounds bounds,Executor executor) {
         this.world=world;this.dimension=world.getRegistryKey().getValue().toString();this.bounds=bounds;this.executor=executor;
         long volume=Math.multiplyExact(Math.multiplyExact(bounds.maxX()-bounds.minX(),bounds.maxY()-bounds.minY()),bounds.maxZ()-bounds.minZ());
@@ -43,9 +44,9 @@ final class GeneratedSourceReader {
         if(live==null) {
             // Capture world-specific immutable dimensions on server thread BEFORE the callback.
             int bottom=world.getBottomY(),height=world.getHeight();Bounds region=bounds;
-            var scanner=new LimitedCollector();
-            disk=world.getChunkManager().getChunkIoWorker().scanChunk(cp,scanner)
-                .thenApplyAsync(v->Arrays.stream(decode(scanner.getRoot(),cp,region,bottom,height)).filter(Objects::nonNull).toList(),executor);
+            if(scan==null){collector=new LimitedCollector();scan=world.getChunkManager().getChunkIoWorker().scanChunk(cp,collector);}
+            // Decode attachment tolerates a saturated worker: retry next tick, never cancel the observation.
+            if(disk==null){try{disk=scan.thenApplyAsync(v->Arrays.stream(decode(collector.getRoot(),cp,region,bottom,height)).filter(Objects::nonNull).toList(),executor);}catch(RejectedExecutionException busy){return false;}}
             return false;
         }
         Bounds slice=new Bounds(Math.max(bounds.minX(),cp.getStartX()),bounds.minY(),Math.max(bounds.minZ(),cp.getStartZ()),Math.min(bounds.maxX(),cp.getStartX()+16L),bounds.maxY(),Math.min(bounds.maxZ(),cp.getStartZ()+16L));
@@ -62,7 +63,8 @@ final class GeneratedSourceReader {
         if(cellIndex==volume){chunkIndex++;cellIndex=0;}
         return chunkIndex==chunks.size();
     }
-    CompletableFuture<SourceLandmarks.Region> resultAsync(){var copy=cells.clone();return CompletableFuture.supplyAsync(()->new SourceLandmarks.Region(dimension,bounds,Arrays.stream(copy).filter(Objects::nonNull).toList(),Arrays.stream(copy).allMatch(Objects::nonNull)),executor);}
+    /** Null only on a saturated worker; the caller retries next tick. */
+    CompletableFuture<SourceLandmarks.Region> resultAsync(){var copy=cells.clone();try{return CompletableFuture.supplyAsync(()->new SourceLandmarks.Region(dimension,bounds,Arrays.stream(copy).filter(Objects::nonNull).toList(),Arrays.stream(copy).allMatch(Objects::nonNull)),executor);}catch(RejectedExecutionException busy){return null;}}
     private static int index(Bounds b,BlockPoint p){return (int)((p.x()-b.minX())+(b.maxX()-b.minX())*((p.z()-b.minZ())+(b.maxZ()-b.minZ())*(p.y()-b.minY())));}
     void cancel(){cancelled=true;if(disk!=null)disk.cancel(false);}
     @SuppressWarnings({"rawtypes","unchecked"}) private static String name(Property p,Comparable value){return p.name(value);}
