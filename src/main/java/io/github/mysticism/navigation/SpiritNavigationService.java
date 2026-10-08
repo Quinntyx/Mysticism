@@ -39,9 +39,15 @@ public final class SpiritNavigationService {
     }
     private static LandingSafety landingSafety;
     public static void installLandingSafety(LandingSafety safety) { landingSafety = Objects.requireNonNull(safety); }
+    /** How far below a descending actor an approach may discover the support it will land on, so
+     * guarded source-grid alignment and descent proof prewarming run BEFORE actual contact. */
+    private static final double WALK_APPROACH_DEPTH = 24;
     private SpiritNavigationService() {}
     private static final class Session {
         int unsupported, blendTick, landingTick, supportTick, supportAlignTick;
+        /** Guarded alignment pace for the current support approach; halved when the terrain
+         * transition guard refuses a step so the arrival re-plans instead of freezing. */
+        float supportPace = SupportApproachAlignment.INITIAL_PACE;
         boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, jumping, supportPending;
         Vec384f targetSnapshot, supportTargetSnapshot;
         Basis384f supportFrom, supportGrid;
@@ -231,6 +237,7 @@ public final class SpiritNavigationService {
         if (s.supportPending) return; // repeated packets cannot reset budgets or duplicate requests
         endApproach(p, s); s.blendFrom = null; s.blendTo = null;
         s.supportPending = true; s.supportTick = 0; s.supportFrom = null;
+        s.supportAlignTick = 0; s.supportPace = SupportApproachAlignment.INITIAL_PACE;
         s.supportId = ""; s.supportDimension = "";
         s.supportTargetSnapshot = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target();
         state(p).setSupportApproach(true); sync(p);
@@ -240,6 +247,7 @@ public final class SpiritNavigationService {
         if (s.supportPending) SpiritTerrainService.cancelCurrentSupport(p);
         s.supportPending = false; s.supportTargetSnapshot = null; s.supportFrom = null; s.supportGrid = null;
         s.supportId = ""; s.supportDimension = ""; s.supportTick = 0; s.supportAlignTick = 0;
+        s.supportPace = SupportApproachAlignment.INITIAL_PACE;
         if (state(p).supportApproach()) { state(p).setSupportApproach(false); sync(p); }
     }
 
@@ -341,8 +349,14 @@ public final class SpiritNavigationService {
             return;
         }
         var found = SpiritTerrainService.currentSupport(p);
-        if (found.isEmpty()) return; // Terrain starts/reuses bounded exact source-cell proof, never a join.
-        var support = found.get(); Basis384f destination = support.sourceBasis();
+        // Alignment must not wait for actual contact: the transition guard can only rotate rendered
+        // terrain while near-surface cells stay clear of the body, so the guarded source-grid blend
+        // runs against the SAME owned support discovered below a descending actor and the arrival
+        // completes the moment real contact exists. This discovery carries no acquisition authority.
+        var support = found.isPresent() ? found.get()
+                : SpiritTerrainService.approachSupport(p, WALK_APPROACH_DEPTH).orElse(null);
+        if (support == null) return; // Terrain starts/reuses bounded exact source-cell proof, never a join.
+        Basis384f destination = support.sourceBasis();
         if (s.supportFrom == null) {
             s.supportFrom = component.get().clone(); s.supportGrid = destination.clone(); s.supportAlignTick = 0;
             s.supportWindow = support.windowIdentity(); s.supportId = support.landmarkId(); s.supportDimension = support.sourceDimension();
@@ -354,18 +368,27 @@ public final class SpiritNavigationService {
         }
         Basis384f before = component.get();
         boolean aligned = basisError(before, destination) < 1e-8f;
-        Basis384f proposed = aligned ? before : TraversalSteering.blend(s.supportFrom, destination, (s.supportAlignTick + 1) / 40f);
-        if (before.i.squareDistance(proposed.i) > .01f || before.j.squareDistance(proposed.j) > .01f
-                || before.k.squareDistance(proposed.k) > .01f) {
-            endSupportApproach(p, s);
-            p.sendMessage(Text.literal("Source-grid alignment would be discontinuous; remaining deep on current geometry."), true);
-            return;
+        if (!aligned) {
+            Basis384f proposed = TraversalSteering.blend(s.supportFrom, destination,
+                    SupportApproachAlignment.fraction(s.supportAlignTick, s.supportPace));
+            // Reject a singular/antipodal interpolation jump rather than forcing the final basis.
+            if (SupportApproachAlignment.discontinuous(before, proposed)) {
+                endSupportApproach(p, s);
+                p.sendMessage(Text.literal("Source-grid alignment would be discontinuous; remaining deep on current geometry."), true);
+                return;
+            }
+            if (!SpiritTerrainService.canAlign(p, proposed)) {
+                // A refused step must re-plan, never freeze: re-anchor at the live basis and halve
+                // the pace so the retry's swept motion fits under the transition guard. Freezing
+                // here deadlocked every approach taken with a rotated deep basis until expiry.
+                s.supportFrom = before.clone(); s.supportAlignTick = 0;
+                s.supportPace = SupportApproachAlignment.paceOnHold(s.supportPace);
+                return;
+            }
+            component.set(proposed); ++s.supportAlignTick;
+            if (basisError(component.get(), destination) >= 1e-8f) return;
         }
-        // q already represents ACTUAL movement in the previous frame. Validate the joint current-q /
-        // proposed-basis scene before application. No attraction to sourceCoordinate or user target.
-        if (!SpiritTerrainService.canAlign(p, proposed)) return;
-        if (!aligned) { component.set(proposed); ++s.supportAlignTick; }
-        if (basisError(component.get(), destination) >= 1e-8f) return;
+        if (found.isEmpty()) return; // Grid prepared while descending; real contact still commits the arrival.
         // This real terrain operation rechecks current contact, window identity, ownership revision,
         // source body/floor clearance and whole-frame continuity, and never sets q/basis/body position.
         if (!SpiritTerrainService.acquireCurrentSupport(p, support)) return;

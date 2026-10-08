@@ -192,15 +192,26 @@ public final class SpiritTerrainService {
     private record WalkCandidate(Window field,WalkSupport support) {}
     /** Current visible contact only; no target attraction, q replacement or remembered-entry rebinding. */
     public static Optional<WalkSupport> currentSupport(ServerPlayerEntity p) {return walkCandidate(p).map(WalkCandidate::support);}
-    private static Optional<WalkCandidate> walkCandidate(ServerPlayerEntity p) {
+    /** Approach-only support discovery BELOW a descending actor, over the same owned/producing
+     * geometry rules as acquisition contact. This grants alignment/prewarm authority ONLY: the
+     * returned support is never acquired directly, and the unchanged contact query plus
+     * acquireCurrentSupport still validate the real arrival at the body's actual position. */
+    public static Optional<WalkSupport> approachSupport(ServerPlayerEntity p,double depth) {
+        return walkCandidate(p,depth,false).map(WalkCandidate::support);
+    }
+    private static Optional<WalkCandidate> walkCandidate(ServerPlayerEntity p) {return walkCandidate(p,.15,true);}
+    private static Optional<WalkCandidate> walkCandidate(ServerPlayerEntity p,double depth,boolean requireBody) {
         Session s=session(p);
         if(s==null || s.shallow || !MysticismEntityComponents.SPIRIT_NAVIGATION.get(p).semanticReady())return Optional.empty();
-        var hit=MeshCollision.ground(p);if(hit.isEmpty())return Optional.empty();
+        var hit=MeshCollision.ground(p,depth);if(hit.isEmpty())return Optional.empty();
         var cell=hit.get().cell();Window w=windowFor(s,cell);if(w==null)return Optional.empty();
-        Vec3d contact=p.getPos().add(0,.025-.15*hit.get().time(),0).subtract(hit.get().normal().multiply(.001));
+        Vec3d contact=p.getPos().add(0,.025-depth*hit.get().time(),0).subtract(hit.get().normal().multiply(.001));
         Optional<String> owner=exactOwner(p,s,w,sourceContact(cell,contact));if(owner.isEmpty())return Optional.empty();
         if(!owner.get().equals(ownerId(p,w)))return Optional.empty();
-        Vec3d feet=sourcePoint(cell,p.getPos());if(!ownedBody(p,s,w,feet,owner.get()))return Optional.empty();
+        // Contact validation uses the body's exact feet; approach discovery maps the predicted
+        // landing contact instead, so descent proof prewarming centers on where the body will rest.
+        Vec3d feet=sourcePoint(cell,requireBody?p.getPos():contact);
+        if(requireBody && !ownedBody(p,s,w,feet,owner.get()))return Optional.empty();
         Vec3d offset=feet.subtract(w.origin);Vec384f coordinate=w.semantic.clone()
                 .add(w.sourceBasis.i.clone().mul((float)(offset.x/SCALE)))
                 .add(w.sourceBasis.j.clone().mul((float)(offset.y/SCALE)))
@@ -226,8 +237,17 @@ public final class SpiritTerrainService {
                 && probe.origin.squaredDistanceTo(hint.sourcePosition())<4) {probe.owners=field.owners;return;}
         Context context=SERVERS.get(p.getServer());if(context==null || context.tick<s.walkNextProbe)return;s.walkNextProbe=context.tick+20;
         if(s.walkFuture!=null)s.walkFuture.cancel(false);
+        Window previous=s.walkProbe;
         probe=new Window(hint.sourceDimension(),hint.sourcePosition(),hint.sourceCoordinate(),hint.sourceBasis(),hint.landmarkId());
         probe.owner=LandmarkStore.get(p.getServer()).metadata(probe.id).orElse(null);probe.owners=field.owners;
+        // Cached source proof is absolute-positioned and geometry-revision checked. A descent
+        // re-centers the probe constantly; discarding completed proof each time starved the arrival
+        // until the actor stood perfectly still. Carry matching proof; the acquisition still
+        // revalidates every body/floor sample from these tiles at the real contact position.
+        if(previous!=null && previous.id.equals(probe.id) && previous.owner!=null && owner.isPresent()
+                && previous.owner.geometryKeys().equals(owner.get().geometryKeys())) {
+            probe.tiles.putAll(previous.tiles);probe.ready=previous.ready;
+        }
         s.walkProbe=probe;s.walkField=field.identity;Window expected=probe;
         var future=SourceLandmarks.region(p.getServer(),probe.dimension,SourceMeshBuilder.range(probe.origin,12),1728);s.walkFuture=future;
         future.whenComplete((region,error)->p.getServer().execute(()->{

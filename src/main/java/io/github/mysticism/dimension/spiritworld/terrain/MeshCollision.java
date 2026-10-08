@@ -131,9 +131,16 @@ public final class MeshCollision {
     private static boolean supported(Index i,Box body,Vec3d down){return i.sweep(body,down).filter(h->h.normal.y>.3).isPresent();}
     private static double trim(double x){return Math.abs(x)<=.05?0:x-Math.copySign(.05,x);}
     public static Optional<Hit> ground(PlayerEntity player) {
-        Index i=index(player);
-        return i==null?Optional.empty():i.sweep(player.getBoundingBox().offset(0,.025,0),new Vec3d(0,-.15,0))
-                .filter(h->h.normal.y>.3);
+        Index i=index(player);return i==null?Optional.empty():ground(player.getBoundingBox(),i,.15);
+    }
+    /** Support discovery below a descending actor runs the SAME contact query with a deeper reach,
+     * so a walk approach can prepare (align/prewarm) before the body actually settles. */
+    public static Optional<Hit> ground(PlayerEntity player,double depth) {
+        Index i=index(player);return i==null?Optional.empty():ground(player.getBoundingBox(),i,depth);
+    }
+    /** Downward support contact against one index; shared by resting contact and approach discovery. */
+    public static Optional<Hit> ground(Box body,Index index,double depth) {
+        return index.sweep(body.offset(0,.025,0),new Vec3d(0,-depth,0)).filter(h->h.normal.y>.3);
     }
     public static boolean clearRay(ServerPlayerEntity player,Vec3d from,Vec3d to) {
         Index i=index(player);return i!=null && from.distanceTo(to)<=128 && i.clearRay(from,to);
