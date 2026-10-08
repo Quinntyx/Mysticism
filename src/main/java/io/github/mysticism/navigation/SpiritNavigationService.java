@@ -59,6 +59,19 @@ public final class SpiritNavigationService {
     private static boolean spirit(ServerPlayerEntity p) { return p.getWorld().getRegistryKey().equals(SpiritTerrainService.WORLD); }
     public static boolean deep(ServerPlayerEntity p) { return spirit(p) && state(p).active() && state(p).deep(); }
 
+    /** Vanilla exempts creative flight from the moved-wrongly snap-back because the client owns its
+     *  flight prediction. Deep spirit flight is creative-like flight through per-player ROTATING
+     *  observer-local geometry whose authoritative mesh frame necessarily lags client prediction
+     *  (publication cadence plus network latency), so divergent collision outcomes are expected and
+     *  a divergent move must be accepted like vanilla creative movement, never rubber-banded back.
+     *  Shallow walking on static source-identical terrain keeps ordinary vanilla validation. */
+    public static boolean flightPredictionTolerance(boolean spiritWorld, boolean active, boolean deep) {
+        return spiritWorld && active && deep;
+    }
+    public static boolean flightPredictionTolerance(ServerPlayerEntity p) {
+        return spirit(p) && state(p).active() && state(p).deep();
+    }
+
     public static void init() {
         if (initialized) return; initialized = true;
         ServerEntityWorldChangeEvents.AFTER_PLAYER_CHANGE_WORLD.register((p, from, to) -> {

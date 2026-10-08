@@ -20,7 +20,7 @@ public final class MeshCollision {
     private record Bucket(int x,int y,int z) {}
     private record Shape(TerrainMeshFrame.Cell cell,Box local,Box bounds) {}
     public static final class Index {
-        final TerrainMeshFrame frame;
+        public final TerrainMeshFrame frame;
         final Map<Bucket,List<Shape>> buckets=new HashMap<>();
         final List<Shape> large=new ArrayList<>();
         public Index(TerrainMeshFrame frame) {
@@ -56,7 +56,8 @@ public final class MeshCollision {
         public boolean clearRay(Vec3d from,Vec3d to) {
             return sweep(new Box(from.x-1e-4,from.y-1e-4,from.z-1e-4,from.x+1e-4,from.y+1e-4,from.z+1e-4),to.subtract(from)).isEmpty();
         }
-        private Vec3d depenetrate(Box body) {
+        /** Minimal-penetration escape, displacement bounded to `limit` per move. Public for runtime regressions. */
+        public Vec3d depenetrate(Box body,double limit) {
             Vec3d moved=Vec3d.ZERO;
             for(int step=0;step<8;step++) {
                 Vec3d correction=null;
@@ -65,8 +66,9 @@ public final class MeshCollision {
                     if(depth!=null && (correction==null || depth.lengthSquared()<correction.lengthSquared()))correction=depth;
                 }
                 if(correction==null)break;
-                if(correction.length()>4)correction=correction.normalize().multiply(4);
-                moved=moved.add(correction);if(moved.length()>4)break;
+                if(correction.length()>limit)correction=correction.normalize().multiply(limit);
+                moved=moved.add(correction);
+                if(moved.length()>limit){moved=moved.normalize().multiply(limit);break;}
             }
             return moved;
         }
@@ -96,18 +98,22 @@ public final class MeshCollision {
         Index i=index(player);
         // No fabricated floor. Preparation supplies geometry before entry; packet delay simply has no surfaces yet.
         if(i==null)return wanted;
-        Box body=player.getBoundingBox();
+        return predicted(i,player.getBoundingBox(),wanted,player.getAbilities().flying,player.isOnGround(),player.getStepHeight());
+    }
+    /** Movement core shared by live server/prediction and runtime regressions. Flying bodies are
+     *  pushed by rotating observer-local geometry between frame publications; depenetration eases
+     *  out of embedding instead of violently teleporting the player (free-flight rubber banding). */
+    public static Vec3d predicted(Index i,Box body,Vec3d wanted,boolean flying,boolean onGround,double stepHeight) {
         if(wanted.length()>256)wanted=wanted.multiply(256/wanted.length());
-        Vec3d result=i.depenetrate(body);
+        Vec3d result=i.depenetrate(body,flying?.5:4);
         // Bound swept traversal for unusually fast flight/teleports rather than tunnelling through a grid overflow.
         int pieces=Math.min(64,Math.max(1,(int)Math.ceil(wanted.length()/4)));
         Vec3d piece=wanted.multiply(1.0/pieces);
         for(int p=0;p<pieces;p++)result=result.add(i.slide(body.offset(result),piece));
-        if(!player.getAbilities().flying && (player.isOnGround() || wanted.y<0 && result.y>wanted.y+1e-5)
+        if(!flying && (onGround || wanted.y<0 && result.y>wanted.y+1e-5)
                 && result.subtract(wanted).horizontalLengthSquared()>1e-8) {
-            double step=player.getStepHeight();
-            if(step>0) {
-                Vec3d up=i.slide(body,new Vec3d(0,step,0));
+            if(stepHeight>0) {
+                Vec3d up=i.slide(body,new Vec3d(0,stepHeight,0));
                 Vec3d over=i.slide(body.offset(up),new Vec3d(wanted.x,0,wanted.z));
                 Vec3d down=i.slide(body.offset(up).offset(over),new Vec3d(0,wanted.y-up.y,0));
                 Vec3d stepped=up.add(over).add(down);
