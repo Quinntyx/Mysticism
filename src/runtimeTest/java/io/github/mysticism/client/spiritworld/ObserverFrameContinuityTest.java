@@ -133,6 +133,100 @@ public final class ObserverFrameContinuityTest {
         check(frame(HEAD, 1).project(object).distanceTo(before) > 1e-6, "basis revision still pivots distant geometry");
     }
 
+    /** Actual shader refresh -> predictor publication -> sub-tick render ordering, without a GPU. */
+    private static void shaderRefreshThenPredictorPreservesRevisionHistory() {
+        beginSession();
+        Vec3d firstMovement = new Vec3d(.4, 0, 0);
+        Vec384f firstMirror = ClientSpiritCache.playerLatentPos.clone();
+        predict(firstMirror, IDENTITY, firstMovement, true);
+        Vec3d head = HEAD.add(firstMovement);
+        Vec384f previous = ClientSpiritCache.playerLatentPos.clone();
+        Basis384f previousBasis = ClientSpiritCache.playerLatentBasis.clone();
+        Vec384f authoritative = previous.clone().add(scaled(0, (float)(.2 / SCALE)));
+        Basis384f rotated = IDENTITY.clone();
+        BasisIntegrator384f.step(rotated, Vec384f.ZERO(), axis(1), 1, 0, 0, .05f);
+        Vec3d movement = new Vec3d(.3, 0, 0);
+        Vec3d before = new SpiritGlyphFrame(previous, previousBasis, head).project(axis(1));
+        // ShaderManager.updateSession calls refreshObserver earlier at END_CLIENT_TICK and
+        // again at WorldRenderEvents.START. Neither refresh may consume a revision/history.
+        ClientSpiritCache.refreshObserver(authoritative, rotated);
+        ClientSpiritCache.refreshObserver(authoritative, rotated);
+        predict(authoritative, rotated, movement, true);
+        near(frame(head, 0).project(axis(1)).distanceTo(before), 0, 1e-3);
+        near(ClientSpiritCache.interpolatedBasis(0).i.squareDistance(previousBasis.i), 0, 1e-9);
+        near(ClientSpiritCache.interpolatedOffset(0).length(), 0, 0);
+        near(ClientSpiritCache.interpolatedOffset(1).x, .2, 1e-4);
+        Vec384f expectedEnd = authoritative.clone();
+        TraversalSteering.advance(expectedEnd, rotated, movement.x, movement.y, movement.z);
+        near(ClientSpiritCache.playerLatentPos.squareDistance(expectedEnd), 0, 1e-12);
+        for (float fraction : new float[]{0, .25f, .5f, .75f, 1}) {
+            SpiritGlyphFrame expected = new SpiritGlyphFrame(previous.clone().converge(expectedEnd, fraction),
+                    TraversalSteering.blend(previousBasis, rotated, fraction), head.add(movement.multiply(fraction)),
+                    new Vec3d(.2 * fraction, 0, 0));
+            near(frame(head.add(movement.multiply(fraction)), fraction).project(axis(1))
+                    .distanceTo(expected.project(axis(1))), 0, 1e-3);
+            // A render-time refresh must not rewind the tick or roll interpolation history.
+            ClientSpiritCache.refreshObserver(authoritative, rotated);
+            near(frame(head.add(movement.multiply(fraction)), fraction).project(axis(1))
+                    .distanceTo(expected.project(axis(1))), 0, 1e-3);
+        }
+        check(ClientSpiritCache.interpolatedBasis(.5f).i.squareDistance(previousBasis.i) > 1e-8,
+                "basis correction interpolates rather than freezing");
+        check(ClientSpiritCache.interpolatedBasis(.5f).i.squareDistance(rotated.i) > 1e-8,
+                "basis correction interpolates rather than snapping");
+        // Next unchanged mirror rolls history once and keeps both prediction and accumulated offset.
+        Vec384f predicted = ClientSpiritCache.playerLatentPos.clone();
+        predict(authoritative, rotated, Vec3d.ZERO, true);
+        near(ClientSpiritCache.interpolatedPos(0).squareDistance(predicted), 0, 1e-12);
+        near(ClientSpiritCache.interpolatedPos(1).squareDistance(predicted), 0, 1e-12);
+        near(ClientSpiritCache.interpolatedOffset(0).x, .2, 1e-4);
+        near(ClientSpiritCache.interpolatedOffset(1).x, .2, 1e-4);
+        near(authoritative.squareDistance(previous.clone().add(scaled(0, (float)(.2 / SCALE)))), 0, 0);
+        near(rotated.i.squareDistance(ClientSpiritCache.playerLatentBasis.i), 0, 1e-12);
+    }
+
+    /** Start/stop revisions must use CURRENT movement, not ShaderManager's previous tick delta. */
+    private static void shaderRefreshUsesCurrentMovement() {
+        for (boolean deep : new boolean[]{true, false}) {
+            beginSession();
+            ClientSpiritCache.updateNavigation(true, deep, "minecraft:overworld", new Vec3d(1, 2, 3), EPOCH);
+            Vec384f original = ClientSpiritCache.playerLatentPos.clone();
+            Vec3d before = frame(HEAD, 1).project(axis(1));
+            Vec384f authoritative = original.clone().add(scaled(0, (float)(.2 / SCALE)));
+            Vec3d movement = new Vec3d(.4, 0, 0);
+            ClientSpiritCache.refreshObserver(authoritative, IDENTITY); // prior movement was zero
+            predict(authoritative, IDENTITY, movement, deep);
+            near(ClientSpiritCache.interpolatedOffset(1).x, .2, 1e-4);
+            for (float fraction : new float[]{0, .25f, .5f, .75f, 1})
+                near(frame(HEAD.add(movement.multiply(fraction)), fraction).project(axis(1)).distanceTo(before), 0, 1e-3);
+
+            beginSession();
+            ClientSpiritCache.updateNavigation(true, deep, "minecraft:overworld", new Vec3d(1, 2, 3), EPOCH);
+            original = ClientSpiritCache.playerLatentPos.clone();
+            predict(original, IDENTITY, movement, deep);
+            Vec3d movedHead = HEAD.add(movement);
+            before = frame(movedHead, 1).project(axis(1));
+            authoritative = ClientSpiritCache.playerLatentPos.clone().add(scaled(0, (float)(.2 / SCALE)));
+            ClientSpiritCache.refreshObserver(authoritative, IDENTITY); // prior movement was nonzero
+            predict(authoritative, IDENTITY, Vec3d.ZERO, deep);
+            near(ClientSpiritCache.interpolatedOffset(1).length(), 0, 0);
+            check(frame(movedHead, 1).project(axis(1)).distanceTo(before) > .1,
+                    "stopping revision is visible, not compensated using stale movement");
+
+            beginSession();
+            authoritative = ClientSpiritCache.playerLatentPos.clone().add(scaled(0, (float)(.2 / SCALE)));
+            ClientSpiritCache.updateNavigation(true, deep, "minecraft:overworld", new Vec3d(1, 2, 3), EPOCH + 1);
+            ClientSpiritCache.refreshObserver(authoritative, IDENTITY);
+            predict(authoritative, IDENTITY, movement, deep);
+            near(ClientSpiritCache.interpolatedOffset(1).length(), 0, 0);
+        }
+    }
+
+    private static void predict(Vec384f authoritative, Basis384f basis, Vec3d movement, boolean deep) {
+        ClientLatentPredictor.advanceFrame(authoritative, basis, authoritative, movement,
+                deep, true, false, false, true);
+    }
+
     /** clear() resets continuity state; the 3-arg frame constructor offsets projection. */
     private static void frameConstructionAndReset() {
         beginSession();
@@ -140,7 +234,11 @@ public final class ObserverFrameContinuityTest {
         ClientSpiritCache.updateObserver(ClientSpiritCache.playerLatentPos.clone().add(scaled(0, (float)(.1 / SCALE))),
                 IDENTITY, new Vec3d(.4, 0, 0));
         check(ClientSpiritCache.interpolatedOffset(1).x > .05, "compensation recorded before reset");
+        // A refresh staged between frames must not survive disconnect/session clear.
+        ClientSpiritCache.refreshObserver(scaled(0, .02f), IDENTITY);
         ClientSpiritCache.clear();
+        ClientSpiritCache.beginTick(Vec3d.ZERO);
+        near(ClientSpiritCache.playerLatentPos.length(), 0, 0);
         near(ClientSpiritCache.interpolatedOffset(0).length(), 0, 0);
         check(!ClientSpiritCache.observerReady(), "clear releases observer readiness");
 
@@ -168,6 +266,8 @@ public final class ObserverFrameContinuityTest {
         stationaryAndTransitionRevisionsSnap();
         basisRevisionPivotsAroundObserver();
         frameConstructionAndReset();
+        shaderRefreshThenPredictorPreservesRevisionHistory();
+        shaderRefreshUsesCurrentMovement();
         System.out.println("Observer frame continuity: " + checks + " checks passed (moving frame revisions stay render-continuous; no live client)");
     }
 }

@@ -2,6 +2,8 @@ package io.github.mysticism.client.spiritworld;
 
 import io.github.mysticism.activity.TraversalSteering;
 import io.github.mysticism.component.MysticismEntityComponents;
+import io.github.mysticism.vector.Basis384f;
+import io.github.mysticism.vector.Vec384f;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -42,28 +44,32 @@ public final class ClientLatentPredictor {
                     && lastEpoch == nav.motionEpoch() && lastDeep == nav.deep() && nav.semanticReady();
             Vec3d delta = continuous ? now.subtract(lastPos) : Vec3d.ZERO;
             if (delta.lengthSquared() > 16) delta = Vec3d.ZERO;
-            // Roll render history, then publish the authoritative mirror. A sync that arrives while
-            // moving is kept render-continuous (see ClientSpiritCache.updateObserver) instead of
-            // snapping every projected glyph/peer; navigation transitions still snap by design.
-            ClientSpiritCache.beginTick();
-            ClientSpiritCache.updateObserver(q, basis, delta);
-            // Predicted render-frame advance between authoritative syncs. Components are never
-            // mutated client-side, so a later sync replaces only the mirror and the continuity
-            // offset compensates the divergence, keeping motion continuous while moving.
-            if (delta.lengthSquared() > 0) {
-                var renderPos = ClientSpiritCache.playerLatentPos;
-                var renderBasis = ClientSpiritCache.playerLatentBasis;
-                if (nav.deep() && nav.supportApproach()) TraversalSteering.advance(renderPos, renderBasis, delta.x, delta.y, delta.z);
-                else if (nav.deep() && nav.landingApproach()) TraversalSteering.approachStep(renderPos, target, delta.x, delta.y, delta.z);
-                else if (nav.deep()) TraversalSteering.deepStep(renderPos, renderBasis, target, delta.x, delta.y, delta.z, nav.hasShallowTarget());
-                else if (!nav.landmarkId().isEmpty()) TraversalSteering.advance(renderPos, renderBasis, delta.x, delta.y, delta.z);
-            }
+            advanceFrame(q, basis, target, delta, nav.deep(), nav.supportApproach(),
+                    nav.landingApproach(), nav.hasShallowTarget(), !nav.landmarkId().isEmpty());
             lastPos = now; lastPlayer = mc.player; lastWorld = mc.world;
             lastEpoch = nav.motionEpoch(); lastDeep = nav.deep();
         } else {
             clear();
             // Refresh even at rest: touch blends and authoritative vector/profile updates are not movement.
-            ClientSpiritCache.updateObserver(q, basis, Vec3d.ZERO);
+            ClientSpiritCache.refreshObserver(q, basis);
+            ClientSpiritCache.beginTick(Vec3d.ZERO);
+        }
+    }
+
+    /** Tick publication shared with CPU regressions; no component or renderer mutation. */
+    static void advanceFrame(Vec384f q, Basis384f basis, Vec384f target, Vec3d delta,
+                             boolean deep, boolean supportApproach, boolean landingApproach,
+                             boolean hasShallowTarget, boolean hasLandmark) {
+        ClientSpiritCache.refreshObserver(q, basis);
+        ClientSpiritCache.beginTick(delta);
+        // Predict only the render frame. Synced components remain authoritative and untouched.
+        if (delta.lengthSquared() > 0) {
+            var renderPos = ClientSpiritCache.playerLatentPos;
+            var renderBasis = ClientSpiritCache.playerLatentBasis;
+            if (deep && supportApproach) TraversalSteering.advance(renderPos, renderBasis, delta.x, delta.y, delta.z);
+            else if (deep && landingApproach) TraversalSteering.approachStep(renderPos, target, delta.x, delta.y, delta.z);
+            else if (deep) TraversalSteering.deepStep(renderPos, renderBasis, target, delta.x, delta.y, delta.z, hasShallowTarget);
+            else if (hasLandmark) TraversalSteering.advance(renderPos, renderBasis, delta.x, delta.y, delta.z);
         }
     }
 }
