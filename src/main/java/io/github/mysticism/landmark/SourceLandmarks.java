@@ -33,7 +33,10 @@ public final class SourceLandmarks {
         ServerTickEvents.END_SERVER_TICK.register(server->{Session s=SESSIONS.get(server);if(s!=null)s.tick();});
         ServerLifecycleEvents.SERVER_STOPPING.register(server->{Session s=SESSIONS.remove(server);if(s!=null)s.close();});
         ServerWorldEvents.UNLOAD.register((server,world)->{Session s=SESSIONS.get(server);if(s!=null)s.unload(world.getRegistryKey().getValue().toString());});
-        ServerChunkEvents.CHUNK_UNLOAD.register((world,chunk)->{Session s=SESSIONS.get(world.getServer());if(s!=null&&s.active!=null){String dim=world.getRegistryKey().getValue().toString();Bounds area=new Bounds(chunk.getPos().getStartX(),world.getBottomY(),chunk.getPos().getStartZ(),chunk.getPos().getStartX()+16L,world.getTopY(),chunk.getPos().getStartZ()+16L);if(s.active.dimension.equals(dim)&&s.active.guarded!=null&&s.active.guarded.intersects(area))s.active.cancel(new CancellationException("source chunk unloaded during observation"));}});
+        ServerChunkEvents.CHUNK_UNLOAD.register((world,chunk)->{Session s=SESSIONS.get(world.getServer());if(s==null)return;String dim=world.getRegistryKey().getValue().toString();Bounds area=new Bounds(chunk.getPos().getStartX(),world.getBottomY(),chunk.getPos().getStartZ(),chunk.getPos().getStartX()+16L,world.getTopY(),chunk.getPos().getStartZ()+16L);
+            if(s.active!=null&&s.active.dimension.equals(dim)&&s.active.guarded!=null&&s.active.guarded.intersects(area))s.active.cancel(new CancellationException("source chunk unloaded during observation"));
+            // A parked observation must not resume over a chunk that no longer exists.
+            s.cancelQueued(op->!(op instanceof Read)&&op.dimension.equals(dim)&&op.guarded!=null&&op.guarded.intersects(area),"source chunk unloaded before queued observation");});
         ServerChunkEvents.CHUNK_LOAD.register((world,chunk)->{
             if(!SourceDimensions.isSource(world.getRegistryKey().getValue().toString()))return;
             Session s=SESSIONS.get(world.getServer());if(s==null)return;
@@ -130,14 +133,18 @@ public final class SourceLandmarks {
             try{return CompletableFuture.supplyAsync(task,worker);}catch(RejectedExecutionException busy){return null;}
         }
         void hint(String dim,BlockPos p){if(hints.size()<128)hints.add(new Hint(dim,p));}
-        void invalidate(String dim,BlockPos pos){if(active!=null&&active.dimension.equals(dim)&&active.guarded!=null&&active.guarded.contains(pos.getX(),pos.getY(),pos.getZ()))active.cancel(new CancellationException("source edit invalidated snapshot"));}
+        void invalidate(String dim,BlockPos pos){
+            if(active!=null&&active.dimension.equals(dim)&&active.guarded!=null&&active.guarded.contains(pos.getX(),pos.getY(),pos.getZ()))active.cancel(new CancellationException("source edit invalidated snapshot"));
+            // Parked observations must not resume and publish stale source geometry after an edit.
+            cancelQueued(op->!(op instanceof Read)&&op.dimension.equals(dim)&&op.guarded!=null&&op.guarded.contains(pos.getX(),pos.getY(),pos.getZ()),"source edit invalidated queued observation");
+        }
         void tick(){
             lastCells=0;
             if(!ownerRequests.isEmpty()){var request=ownerRequests.peekFirst();try{request.advance();}catch(RuntimeException failure){request.cancel(failure);}if(request.done)ownerRequests.removeFirst();}
             if(server.getTicks()%5==0&&!retries.isEmpty()){try{if(retries.peekFirst().advance(this))retries.removeFirst();}catch(RuntimeException stale){retries.removeFirst();}}
             if(server.getTicks()%200==0){var players=server.getPlayerManager().getPlayerList();for(int n=0;n<Math.min(2,players.size());n++){var p=players.get(Math.floorMod(playerCursor++,players.size()));if(SourceDimensions.isSource(p.getServerWorld().getRegistryKey().getValue().toString()))hint(p.getServerWorld().getRegistryKey().getValue().toString(),p.getBlockPos());}}
             boolean ready=EmbeddingHelper.isReady()||itemIndex.isPopulated();
-            active=schedule.pick(active,op->admissible(op,ready));
+            active=schedule.pick(active,op->admissible(op,ready),op->parkable(op));
             if(active==null){
                 if(ready&&!hints.isEmpty()&&schedule.backgroundPending()<DISCOVERY_BUDGET){Hint h=hints.iterator().next();hints.remove(h);
                     Ensure cascade=new Ensure(this,h.dimension,h.pos,null,false,new CompletableFuture<>());cascade.background=true;schedule.background(cascade);}
@@ -150,14 +157,25 @@ public final class SourceLandmarks {
                 schedule.discoveryLane.addFirst(active);active=null;status="Deferred: waiting for real embedding readiness";
             }
         }
-        void unload(String dim){ownerRequests.removeIf(request->{if(request.dimension.equals(dim)){request.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});retries.removeIf(r->r.dimension.equals(dim));auxiliary.entrySet().removeIf(e->{if(e.getValue().equals(dim)){e.getKey().cancel(false);return true;}return false;});if(active!=null&&active.dimension.equals(dim)){active.cancel(new CancellationException("source dimension unloaded"));active.release();active=null;}for(var lane:List.of(schedule.readLane,schedule.discoveryLane,schedule.backgroundLane))lane.removeIf(op->{if(op.dimension.equals(dim)){op.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});hints.removeIf(h->h.dimension.equals(dim));}
-        void close(){ownerRequests.forEach(request->request.cancel(new CancellationException("server stopping")));ownerRequests.clear();auxiliary.keySet().forEach(f->f.cancel(false));auxiliary.clear();retries.clear();if(active!=null){active.cancel(new CancellationException("server stopping"));active.release();}for(var lane:List.of(schedule.readLane,schedule.discoveryLane,schedule.backgroundLane)){lane.forEach(op->op.cancel(new CancellationException("server stopping")));lane.clear();}hints.clear();worker.shutdownNow();}
+        void unload(String dim){ownerRequests.removeIf(request->{if(request.dimension.equals(dim)){request.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});retries.removeIf(r->r.dimension.equals(dim));auxiliary.entrySet().removeIf(e->{if(e.getValue().equals(dim)){e.getKey().cancel(false);return true;}return false;});if(active!=null&&active.dimension.equals(dim)){active.cancel(new CancellationException("source dimension unloaded"));active.release();active=null;}cancelQueued(op->op.dimension.equals(dim),"source dimension unloaded");hints.removeIf(h->h.dimension.equals(dim));}
+        void close(){ownerRequests.forEach(request->request.cancel(new CancellationException("server stopping")));ownerRequests.clear();auxiliary.keySet().forEach(f->f.cancel(false));auxiliary.clear();retries.clear();if(active!=null){active.cancel(new CancellationException("server stopping"));active.release();}cancelQueued(op->true,"server stopping");hints.clear();worker.shutdownNow();}
         /** Reads always run. A discovery op that can only wait for the real embedding engine
          * never blocks other discovery; everything else waits on model/index readiness. */
         private boolean admissible(Operation<?> op,boolean ready){
             if(op instanceof Read)return true;
             if(op instanceof Ensure ensure&&ensure.needsEngine)return EmbeddingHelper.isReady();
             return ready;
+        }
+        /** A parked op must never hold an exclusive resource: the store's single geometry read,
+         * the activity mutation pause, or a staged store mutation. Parking such an op would
+         * livelock every op (requested or not) waiting for that resource, since the owner could
+         * never resume to release it. Resource owners finish their stage before yielding. */
+        private static boolean parkable(Operation<?> op){
+            return op.geometryRead==null&&op.resume==null&&!(op.mutation!=null&&!op.mutation.complete());
+        }
+        /** Cancel matching queued ops and release their resources (never resume them). */
+        private void cancelQueued(java.util.function.Predicate<Operation<?>> matches,String reason){
+            schedule.cancelIf(matches,op->{op.cancel(new CancellationException(reason));op.release();});
         }
         ServerWorld world(String dimension){return SourceDimensions.isSource(dimension)?server.getWorld(RegistryKey.of(RegistryKeys.WORLD,Identifier.of(dimension))):null;}
     }

@@ -40,10 +40,12 @@ final class SourceSchedule<T> {
     int discoveryPending(){return discoveryLane.size();}
     int backgroundPending(){return backgroundLane.size();}
     /** Decide the op to advance this tick. A running non-read op is parked back into its
-     * own lane (front, resuming in place) when reads wait and the fair share allows. */
-    T pick(T current,Predicate<T> admissible){
-        Objects.requireNonNull(admissible);
-        if(current!=null&&!readOp.test(current)&&!readLane.isEmpty()&&debt<fairShare){
+     * own lane (front, resuming in place) when reads wait, the fair share allows, AND the op
+     * holds no exclusive resource: a parked op can never hold the store's single geometry
+     * read or the activity mutation pause, which would livelock the ops waiting on them. */
+    T pick(T current,Predicate<T> admissible,Predicate<T> parkable){
+        Objects.requireNonNull(admissible);Objects.requireNonNull(parkable);
+        if(current!=null&&!readOp.test(current)&&parkable.test(current)&&!readLane.isEmpty()&&debt<fairShare){
             (backgroundOp.test(current)?backgroundLane:discoveryLane).addFirst(current);
             current=null;
         }
@@ -62,6 +64,14 @@ final class SourceSchedule<T> {
         T parked=removeAdmissible(backgroundLane,admissible);
         if(parked!=null)debt=0;
         return parked;
+    }
+    /** Cancel and remove every queued op matching the predicate, in all lanes, invoking the
+     * action exactly once per matched op (used for guarded invalidation and shutdown, so a
+     * parked op can never resume stale work or retain the activity mutation pause). */
+    void cancelIf(Predicate<T> matches,java.util.function.Consumer<T> action){
+        Objects.requireNonNull(matches);Objects.requireNonNull(action);
+        for(var lane:List.of(readLane,discoveryLane,backgroundLane))
+            for(Iterator<T> it=lane.iterator();it.hasNext();){T op=it.next();if(matches.test(op)){it.remove();action.accept(op);}}
     }
     private T firstAdmissible(ArrayDeque<T> lane,Predicate<T> admissible){
         for(T op:lane)if(admissible.test(op))return op;
