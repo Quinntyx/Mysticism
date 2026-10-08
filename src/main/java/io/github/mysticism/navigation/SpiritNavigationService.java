@@ -3,6 +3,7 @@ package io.github.mysticism.navigation;
 import io.github.mysticism.activity.TraversalSteering;
 import io.github.mysticism.activity.SpiritActivityService;
 import io.github.mysticism.component.*;
+import io.github.mysticism.dimension.spiritworld.terrain.MeshCollision;
 import io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService;
 import io.github.mysticism.dimension.spiritworld.SpiritBasisEvolver;
 import io.github.mysticism.landmark.*;
@@ -41,7 +42,8 @@ public final class SpiritNavigationService {
     public static void installLandingSafety(LandingSafety safety) { landingSafety = Objects.requireNonNull(safety); }
     private SpiritNavigationService() {}
     private static final class Session {
-        int unsupported, blendTick, landingTick, supportTick, supportAlignTick;
+        int unsupported, blendTick, landingTick, supportTick, supportAlignTick, supportStall, acquireFailures;
+        long acquireRetry;
         boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, supportPending;
         /** Feet height of the last mesh-supported shallow tick; NaN until support is first measured. */
         double supportY = Double.NaN;
@@ -285,6 +287,7 @@ public final class SpiritNavigationService {
         if (s.supportPending) return; // repeated packets cannot reset budgets or duplicate requests
         endApproach(p, s); s.blendFrom = null; s.blendTo = null;
         s.supportPending = true; s.supportTick = 0; s.supportFrom = null;
+        s.supportStall = 0; s.acquireFailures = 0; s.acquireRetry = 0;
         s.supportId = ""; s.supportDimension = "";
         s.supportTargetSnapshot = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target();
         state(p).setSupportApproach(true); sync(p);
@@ -294,22 +297,22 @@ public final class SpiritNavigationService {
         if (s.supportPending) SpiritTerrainService.cancelCurrentSupport(p);
         s.supportPending = false; s.supportTargetSnapshot = null; s.supportFrom = null; s.supportGrid = null;
         s.supportId = ""; s.supportDimension = ""; s.supportTick = 0; s.supportAlignTick = 0;
+        s.supportStall = 0; s.acquireFailures = 0; s.acquireRetry = 0;
         if (state(p).supportApproach()) { state(p).setSupportApproach(false); sync(p); }
     }
 
     /** Landing envelope: how far below the last supported feet height a jump/step-down may fall and
      * still be expected to land back on its supporting projected terrain (one carrier step height).
      * Beyond it the body has genuinely left its support and shallow walking must yield to freeflight. */
-    static final double LANDING_ENVELOPE = .6;
+    static final double LANDING_ENVELOPE = WalkPolicy.LANDING_ENVELOPE;
     /** Bounded air budget for any continuous unsupported shallow interval, however it arose. */
-    static final int AIR_GRACE_TICKS = 60;
+    static final int AIR_GRACE_TICKS = WalkPolicy.AIR_GRACE_TICKS;
     /** Pure per-tick shallow support decision: keep walking shallow only while the carrier is still
      * inside its last support's landing envelope or the collision mesh still physically holds it.
      * A momentary ground-contact detection miss while standing/clamped, an ordinary jump ascent and
      * its landing, and small step-downs all HOLD instead of alternating shallow/deep flight states. */
     static boolean holdShallow(boolean onGround, double feetY, double supportY, int unsupportedTicks) {
-        boolean envelope = !Double.isNaN(supportY) && feetY >= supportY - LANDING_ENVELOPE;
-        return (envelope || onGround) && unsupportedTicks <= AIR_GRACE_TICKS;
+        return WalkPolicy.landingEnvelopeHold(onGround, feetY, supportY, unsupportedTicks);
     }
     /** Called once by the evolver. True permits ordinary deep movement integration. */
     public static boolean update(ServerPlayerEntity p, Vec3d delta) {
@@ -325,7 +328,20 @@ public final class SpiritNavigationService {
             if (p.getAbilities().flying) { enterDeep(p); return nav.deep() && s.semanticReady; }
             var mapping = SpiritTerrainService.sourcePosition(p);
             var support = SpiritTerrainService.support(p);
-            if (mapping.isEmpty()) { enterDeep(p); return nav.deep() && s.semanticReady; }
+            boolean grounded = MeshCollision.ground(p).isPresent();
+            boolean pending = SpiritTerrainService.ownershipPending(p);
+            if (mapping.isEmpty()) {
+                // Physical ground with ownership still publishing is shallow walking, not takeoff.
+                // Entry and ownership refreshes must keep the player attached to their source locality
+                // instead of flapping into free flight and back (jitter/rubber banding).
+                if (!(grounded && pending)) { enterDeep(p); return nav.deep() && s.semanticReady; }
+                flight(p, false);
+                if (s.semanticReady) TraversalSteering.advance(p.getComponent(MysticismEntityComponents.LATENT_POS).get(),
+                        p.getComponent(MysticismEntityComponents.LATENT_BASIS).get(), delta.x, delta.y, delta.z);
+                s.unsupported = 0;
+                if (p.getServer().getTicks() % 4 == 0) sync(p);
+                return false;
+            }
             var source = mapping.get(); boolean anchoredNow = false;
             String id = source.landmarkId();
             // Permit the initial unowned frame to catch up with asynchronous ownership publication.
@@ -342,14 +358,20 @@ public final class SpiritNavigationService {
             // Ownership checks precede initial anchoring; discovery cannot overwrite an established binding.
             if (!s.semanticReady && !source.landmarkId().isEmpty()) { anchorSource(p, s, source); anchoredNow = s.semanticReady; }
             nav.shallow(source.dimension(), id, source.position());
-            if (support.isPresent()) { s.unsupported = 0; s.supportY = p.getPos().y; }
-            else if (!holdShallow(p.isOnGround(), p.getPos().y, s.supportY, ++s.unsupported)) {
+            var walkPhase = WalkPolicy.phase(support.isPresent(), grounded, pending, id.isEmpty());
+            if (walkPhase != WalkPolicy.SupportPhase.AIRBORNE) {
+                // Fully owned floors AND ownership-pending mesh ground keep the carrier attached to
+                // its source locality instead of flapping into free flight and back (jitter).
+                s.unsupported = 0;
+                if (grounded || support.isPresent()) s.supportY = p.getPos().y;
+            } else if (!holdShallow(p.isOnGround(), p.getPos().y, s.supportY, ++s.unsupported)) {
+                // The physical landing envelope is the ONLY airborne decision: ordinary jumps, landings
+                // and small step-downs stay shallow while the carrier remains over supporting projected
+                // terrain; an edge walk-off converts at the envelope breach, and the bounded air budget
+                // caps any continuous unsupported interval. The superseded rising-latch heuristic must
+                // not compete with this decision (see EntryFailureRecoveryTest).
                 enterDeep(p); return nav.deep() && s.semanticReady;
             }
-            // Ordinary jumps, landings, small step-downs and momentary ground-detection dropouts stay
-            // shallow while the carrier remains inside its last support's landing envelope; only a real
-            // departure from supported projected terrain (edge walk-off, fall past the envelope) or the
-            // bounded air budget converts to deep freeflight. supportY is the last supported feet height.
             flight(p, false);
             if (s.semanticReady && !anchoredNow) TraversalSteering.advance(p.getComponent(MysticismEntityComponents.LATENT_POS).get(),
                     p.getComponent(MysticismEntityComponents.LATENT_BASIS).get(), delta.x, delta.y, delta.z);
@@ -420,14 +442,30 @@ public final class SpiritNavigationService {
         s.landingFrom = null; s.landingTick = 0;
         if (state(p).landingApproach()) { state(p).setLandingApproach(false); sync(p); }
     }
-    /** Current support, independent of captured destinations. q advances ONLY by real physical movement. */
+    /** Current support, independent of captured destinations. Physical movement drives q; the only
+     * non-movement q change is the bounded validated slide below that closes alignment residual. */
     private static void attemptSupport(ServerPlayerEntity p, Session s, Vec3d delta) {
         var nav = state(p); var component = p.getComponent(MysticismEntityComponents.LATENT_BASIS);
         var q = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
+        // During a walk request q integrates along the DESTINATION source grid once known: after the
+        // basis blend completes (b == source grid) this keeps the tracked coordinate error at exactly
+        // zero regardless of frame staleness, and before that it keeps q on the grid the player asked
+        // to walk on, so alignment never freezes an integration-induced mismatch into the gate.
         if (s.semanticReady && Double.isFinite(delta.x) && Double.isFinite(delta.y) && Double.isFinite(delta.z)
                 && delta.lengthSquared() <= 16)
-            TraversalSteering.advance(q, component.get(), delta.x, delta.y, delta.z);
-        if (++s.supportTick > 200) {
+            TraversalSteering.advance(q, WalkPolicy.integrationBasis(component.get(), s.supportGrid), delta.x, delta.y, delta.z);
+        var found = SpiritTerrainService.currentSupport(p);
+        if (found.isEmpty()) {
+            // A descent/hover without ground must not cancel the request, but a persistent lack of
+            // current support ends it instead of silently burning the whole budget in flight.
+            if (++s.supportStall > WalkPolicy.STALL_CANCEL_TICKS) {
+                endSupportApproach(p, s);
+                p.sendMessage(Text.literal("Walk request cancelled: no current source-owned support below; still deep in flight."), true);
+            }
+            return;
+        }
+        s.supportStall = 0;
+        if (++s.supportTick > WalkPolicy.MAX_PENDING_TICKS) {
             endSupportApproach(p, s);
             p.sendMessage(Text.literal("Walk request expired: current support could not be continuously aligned/owned. Still deep; no substitute landing."), true);
             return;
@@ -438,8 +476,6 @@ public final class SpiritNavigationService {
             p.sendMessage(Text.literal("Walk request cancelled after attunement changed; captured target was not altered by landing."), true);
             return;
         }
-        var found = SpiritTerrainService.currentSupport(p);
-        if (found.isEmpty()) return; // Terrain starts/reuses bounded exact source-cell proof, never a join.
         var support = found.get(); Basis384f destination = support.sourceBasis();
         if (s.supportFrom == null) {
             s.supportFrom = component.get().clone(); s.supportGrid = destination.clone(); s.supportAlignTick = 0;
@@ -464,9 +500,33 @@ public final class SpiritNavigationService {
         if (!SpiritTerrainService.canAlign(p, proposed)) return;
         if (!aligned) { component.set(proposed); ++s.supportAlignTick; }
         if (basisError(component.get(), destination) >= 1e-8f) return;
-        // This real terrain operation rechecks current contact, window identity, ownership revision,
-        // source body/floor clearance and whole-frame continuity, and never sets q/basis/body position.
-        if (!SpiritTerrainService.acquireCurrentSupport(p, support)) return;
+        // Basis is aligned. Movement during the request can leave a bounded q/coordinate residual;
+        // close it with a small validated slide each tick so acquisition stays reachable while the
+        // player stands still. Nothing moves once the residual is inside the acquisition gate.
+        double worldError = WalkPolicy.worldErrorSquared(support.sourceCoordinate().sub(q), component.get());
+        if (WalkPolicy.displacementFatal(worldError)) {
+            endSupportApproach(p, s);
+            p.sendMessage(Text.literal("Current support is semantically displaced from your coordinate; remaining deep."), true);
+            return;
+        }
+        if (WalkPolicy.slideNeeded(worldError)) {
+            Vec384f original = q.clone(), candidate = WalkPolicy.slidToward(q, support.sourceCoordinate());
+            q.converge(candidate, 1);
+            boolean clear;
+            try { clear = SpiritTerrainService.canAlign(p, component.get()); }
+            finally { q.converge(original, 1); } // restore the ORIGINAL value/reference even on throw
+            if (!clear) return; // held this tick; the slide resumes when the body is clear
+            q.converge(candidate, 1);
+        }
+        if (p.getServer().getTicks() < s.acquireRetry) return; // bounded retry pressure, never a busy loop
+        if (!SpiritTerrainService.acquireCurrentSupport(p, support)) {
+            s.acquireRetry = p.getServer().getTicks() + WalkPolicy.ACQUIRE_RETRY_TICKS;
+            if (++s.acquireFailures > WalkPolicy.MAX_ACQUIRE_FAILURES) {
+                endSupportApproach(p, s);
+                p.sendMessage(Text.literal("Walk request expired: current support could not be continuously aligned/owned. Still deep; no substitute landing."), true);
+            }
+            return;
+        }
         var mapped = SpiritTerrainService.sourcePosition(p);
         if (mapped.isEmpty() || !mapped.get().landmarkId().equals(support.landmarkId())
                 || !mapped.get().dimension().equals(support.sourceDimension())) {
