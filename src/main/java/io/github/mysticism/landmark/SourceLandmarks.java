@@ -90,6 +90,28 @@ public final class SourceLandmarks {
     }
     public static int pending(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.requests.size()+s.hints.size()+(s.active==null?0:1);}
     public static int lastSampledCells(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.lastCells;}
+    /** Fair lane picker for the serialized source pipeline. Terrain/mesh Reads keep priority and
+     * bypass readiness, but continued discovery reads may never starve ownership generation or
+     * landing-target preparation: after a bounded read streak, a ready non-read request is served.
+     * A readiness-gated non-read head never blocks waiting Reads. Pure and testable. */
+    static final class FairLane<T> {
+        private final int readsPerYield;int readStreak;
+        FairLane(int readsPerYield){this.readsPerYield=Math.max(1,readsPerYield);}
+        /** Removes and returns the next operation to run, or null when nothing may start. */
+        T pick(ArrayDeque<T> queue,java.util.function.Predicate<T> isRead,boolean ready){
+            if(queue.isEmpty())return null;
+            T gated=null; // first non-read in FIFO order
+            for(T op:queue)if(!isRead.test(op)){gated=op;break;}
+            if(isRead.test(queue.peekFirst())){
+                if(gated!=null && ready && readStreak>=readsPerYield){queue.remove(gated);readStreak=0;return gated;}
+                readStreak++;return queue.removeFirst();
+            }
+            if(ready){readStreak=0;return queue.removeFirst();}
+            // Gated head cannot run; reads never wait for model readiness.
+            for(T op:queue)if(isRead.test(op)){queue.remove(op);readStreak++;return op;}
+            return null;
+        }
+    }
     public static String status(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?"Stopped":s.status;}
     private static Session session(MinecraftServer server){if(!server.isOnThread())throw new IllegalStateException("source server thread");Session s=SESSIONS.get(server);if(s==null)throw new IllegalStateException("source service not initialized");return s;}
     private static void checkBounds(Bounds b,int maxCells){long volume=Math.multiplyExact(Math.multiplyExact(b.maxX()-b.minX(),b.maxY()-b.minY()),b.maxZ()-b.minZ());if(maxCells<1||maxCells>32768||volume>maxCells||b.minX()<Integer.MIN_VALUE||b.maxX()>Integer.MAX_VALUE||b.minY()<Integer.MIN_VALUE||b.maxY()>Integer.MAX_VALUE||b.minZ()<Integer.MIN_VALUE||b.maxZ()>Integer.MAX_VALUE)throw new IllegalArgumentException("source query bounds");}
@@ -107,6 +129,7 @@ public final class SourceLandmarks {
         final MinecraftServer server;final LandmarkStore store;final ItemEmbeddingIndexState itemIndex;final ExecutorService worker=new ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(4),Thread.ofPlatform().daemon().name("mysticism-source").factory(),new ThreadPoolExecutor.AbortPolicy());
         final ArrayDeque<SourceOwnership.Request> ownerRequests=new ArrayDeque<>();
         final ArrayDeque<FrontierRetry> retries=new ArrayDeque<>();final Map<CompletableFuture<?>,String> auxiliary=new IdentityHashMap<>();final ArrayDeque<Operation<?>> requests=new ArrayDeque<>();final LinkedHashSet<Hint> hints=new LinkedHashSet<>();Operation<?> active;String status="Ready";int playerCursor,lastCells;
+        final FairLane<Operation<?>> lane=new FairLane<>(2);
         Session(MinecraftServer server){this.server=server;store=LandmarkStore.get(server);itemIndex=ItemEmbeddingIndexState.get(server);}
         <T> CompletableFuture<T> computeAndDeliver(String dim,java.util.function.Supplier<T> computation){
             var out=new CompletableFuture<T>();if(auxiliary.size()>=64){out.completeExceptionally(new RejectedExecutionException("source auxiliary budget"));return out;}auxiliary.put(out,dim);
@@ -121,7 +144,7 @@ public final class SourceLandmarks {
             if(server.getTicks()%5==0&&!retries.isEmpty()){try{if(retries.peekFirst().advance(this))retries.removeFirst();}catch(RuntimeException stale){retries.removeFirst();}}
             if(server.getTicks()%200==0){var players=server.getPlayerManager().getPlayerList();for(int n=0;n<Math.min(2,players.size());n++){var p=players.get(Math.floorMod(playerCursor++,players.size()));if(SourceDimensions.isSource(p.getServerWorld().getRegistryKey().getValue().toString()))hint(p.getServerWorld().getRegistryKey().getValue().toString(),p.getBlockPos());}}
             boolean ready=EmbeddingHelper.isReady()||itemIndex.isPopulated();
-            if(active==null&&!requests.isEmpty()&&(requests.peekFirst() instanceof Read||ready))active=requests.removeFirst();
+            if(active==null&&!requests.isEmpty())active=lane.pick(requests,op->op instanceof Read,ready);
             if(active==null&&ready&&!hints.isEmpty()){Hint h=hints.iterator().next();hints.remove(h);active=new Ensure(this,h.dimension,h.pos,null,false,new CompletableFuture<>());}
             if(active==null)return;
             try{if(active.future.isCancelled())active.cancel(new CancellationException());if(!active.done)active.advance();if(active.done){active.release();active=null;status="Ready";}}

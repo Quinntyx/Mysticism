@@ -31,8 +31,9 @@ final class SourceDiscovery {
     static final int MAX_INFLIGHT = 2;
     /** Maximum discovered far-field nodes retained per window (compacted, octree-merged). */
     static final int MAX_NODES = 65536;
-    /** Hard cap on scheduled tiles per plan; center-out ordering keeps the near field first. */
-    static final int MAX_TILES = 768;
+    /** Cells within this radius of the viewer keep the full unchanged near allowance; beyond it,
+     * far-field discovery admission shares a reserved bounded budget (see {@link LocalAdmission}). */
+    static final double NEAR_EXACT_RADIUS = 32;
     static final int RETRY_INCOMPLETE_TICKS = 200, RETRY_ERROR_TICKS = 600;
 
     private SourceDiscovery() {}
@@ -86,7 +87,9 @@ final class SourceDiscovery {
         Comparator<Bounds> order = Comparator.comparingDouble((Bounds b) -> center(b).squaredDistanceTo(eye))
                 .thenComparingLong(Bounds::minX).thenComparingLong(Bounds::minY).thenComparingLong(Bounds::minZ);
         tiles.sort(order);
-        return tiles.size() > MAX_TILES ? List.copyOf(tiles.subList(0, MAX_TILES)) : List.copyOf(tiles);
+        // No truncation: the full render-distance box is scheduled. The tile queue is cheap; the
+        // bounded issue rate and node budget are what keep discovery progressive and bounded.
+        return List.copyOf(tiles);
     }
 
     /** True when every cell of the tile lies outside the retained discovery extent. */
@@ -116,6 +119,34 @@ final class SourceDiscovery {
     static List<SourceMeshBuilder.Node> farNodes(Map<BlockPos,SourceMeshBuilder.Tile> observed, Vec3d tileCenter) {
         if (observed.isEmpty()) return List.of();
         return SourceMeshBuilder.compact(observed, tileCenter, Map.of(), true);
+    }
+
+    /** Local-window mesh cell admission: exact near samples keep the unchanged allowance, while a
+     * bounded reserved budget admits distant discovered terrain even when near samples would
+     * otherwise exhaust the whole allowance first. Pure and testable. */
+    static final class LocalAdmission {
+        static final int FAR_ADMISSION = 256;
+        private final int nearLimit, farLimit;
+        private final double nearSquared;
+        int near, far;
+        LocalAdmission(boolean shallow, int nearLimit) {
+            this.nearLimit = nearLimit;
+            this.farLimit = FAR_ADMISSION;
+            this.nearSquared = NEAR_EXACT_RADIUS * NEAR_EXACT_RADIUS;
+        }
+        /** True when the cell (at the given viewer distance) may enter the frame. */
+        boolean admit(double distanceSquared) {
+            if (distanceSquared <= nearSquared) {
+                if (near >= nearLimit) return false;
+                near++;return true;
+            }
+            if (far >= farLimit) return false;
+            far++;return true;
+        }
+        /** Both lanes spent: no remaining cell can be admitted, so scanning may stop. */
+        boolean exhausted() {return near >= nearLimit && far >= farLimit;}
+        int nearAdmitted() {return near;}
+        int farAdmitted() {return far;}
     }
 
     /** Deterministic per-window discovery schedule: pending queue, coverage, retries. Server-thread only. */

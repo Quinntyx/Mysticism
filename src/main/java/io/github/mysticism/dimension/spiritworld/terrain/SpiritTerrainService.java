@@ -640,9 +640,14 @@ public final class SpiritTerrainService {
         boolean aligned=w==s.local && s.shallow;Vec3d root;
         if(aligned)root=s.carrier;else {Vec384f delta=w.semantic.clone().sub(q(p));root=p.getPos().add(delta.dot(current.i)*SCALE,delta.dot(current.j)*SCALE,delta.dot(current.k)*SCALE);}
         Vec3d ax=aligned?new Vec3d(1,0,0):axis(w.sourceBasis.i,current),ay=aligned?new Vec3d(0,1,0):axis(w.sourceBasis.j,current),az=aligned?new Vec3d(0,0,1):axis(w.sourceBasis.k,current);
+        // The local window splits its allowance: exact near samples keep the unchanged budget, while a
+        // bounded reserved lane admits distant discovered terrain that near samples would otherwise starve.
+        boolean local=w==s.local;
+        SourceDiscovery.LocalAdmission admission=local?new SourceDiscovery.LocalAdmission(s.shallow,limit):null;
         int count=0;
         for(var node:w.nodes) {
-            if(count>=limit || cells.size()>=TerrainMeshFrame.MAX_CELLS)break;
+            if(local?admission.exhausted():count>=limit)break;
+            if(cells.size()>=TerrainMeshFrame.MAX_CELLS)break;
             var at=node.position();Vec3d source=new Vec3d(at.getX(),at.getY(),at.getZ()),offset=source.subtract(w.origin);
             Vec3d min=root.add(ax.multiply(offset.x)).add(ay.multiply(offset.y)).add(az.multiply(offset.z));
             int side=node.side();Vec3d ex=ax.multiply(side),ey=ay.multiply(side),ez=az.multiply(side);
@@ -656,8 +661,15 @@ public final class SpiritTerrainService {
             if(material==null){if(materials.size()==TerrainMeshFrame.MAX_MATERIALS)continue;material=materials.size();materials.add(tile.material());palette.put(tile.material(),material);}
             String actualOwner=node.ownerId();long key=SourceMeshBuilder.key(actualOwner.isEmpty()?"unknown:"+w.dimension:actualOwner,source,side);
             if(!keys.add(key))continue;
+            // Admission is decided only for cells that will actually be emitted, so rejected
+            // candidates never consume near or far lane budget.
+            if(local) {
+                if(!admission.admit(distance))continue;
+            } else {
+                count++;
+            }
             float alpha=aligned?1:w.alpha;
-            cells.add(new TerrainMeshFrame.Cell(key,material,actualOwner,source,min,new Vec3d(side,side,side),ex,ey,ez,tile.color(),tile.light(),alpha,tile.collision()));producers.put(key,w);count++;
+            cells.add(new TerrainMeshFrame.Cell(key,material,actualOwner,source,min,new Vec3d(side,side,side),ex,ey,ez,tile.color(),tile.light(),alpha,tile.collision()));producers.put(key,w);
         }
     }
     private static Vec3d axis(Vec384f source,Basis384f observer){return new Vec3d(source.dot(observer.i),source.dot(observer.j),source.dot(observer.k));}

@@ -75,7 +75,8 @@ public final class SourceDiscoverySelfTest {
             boolean found=false;for(var tile:wide)if(tile.contains(probe[0],probe[1],probe[2])){found=true;break;}
             check(found,"render-distance corners are covered ("+probe[0]+","+probe[1]+","+probe[2]+")");
         }
-        equal(SourceDiscovery.MAX_TILES,SourceDiscovery.plan(large,16).size(),"extreme view distances clamp to the scheduled tile budget");
+        equal(SourceDiscovery.plan(large,16).size(),bruteForceTileCount(large,16),"no truncation: every tile intersecting the view box is scheduled");
+        check(SourceDiscovery.plan(large,16).size()>768,"a 16-chunk view schedules beyond the discarded plan-tail cap");
         equal(wide,SourceDiscovery.plan(large,10),"planning is deterministic");
         equal(tiles.size(),SourceDiscovery.plan(new Vec3d(center.x,center.y+64,center.z),2).size(),"vertical recentering replans the same shape");
     }
@@ -84,6 +85,59 @@ public final class SourceDiscoverySelfTest {
         Vec3d center=new Vec3d(0,64,0);
         check(!SourceDiscovery.beyond(new Bounds(0,64,0,32,96,32),center,2),"the containing tile is retained");
         check(SourceDiscovery.beyond(new Bounds(4096,64,4096,4128,96,4128),center,2),"distant tiles expire from retention");
+    }
+
+    private static int bruteForceTileCount(Vec3d center,int viewDistanceChunks) {
+        int horizontal=SourceDiscovery.horizontalRadius(viewDistanceChunks),vertical=SourceDiscovery.verticalRadius(horizontal);
+        long fx=(long)Math.floor(center.x),fy=(long)Math.floor(center.y),fz=(long)Math.floor(center.z);
+        int count=0;
+        for(long tx=Math.floorDiv(fx-horizontal-32,32);tx<=Math.floorDiv(fx+horizontal+32,32);tx++)
+            for(long ty=Math.floorDiv(fy-vertical-32,32);ty<=Math.floorDiv(fy+vertical+32,32);ty++)
+                for(long tz=Math.floorDiv(fz-horizontal-32,32);tz<=Math.floorDiv(fz+horizontal+32,32);tz++) {
+                    Bounds b=new Bounds(tx*32,ty*32,tz*32,tx*32+32,ty*32+32,tz*32+32);
+                    if(b.minX()<=fx+horizontal&&b.maxX()-1>=fx-horizontal&&b.minY()<=fy+vertical&&b.maxY()-1>=fy-vertical
+                            &&b.minZ()<=fz+horizontal&&b.maxZ()-1>=fz-horizontal)count++;
+                }
+        return count;
+    }
+
+    private static void eventualFullCoverage() {
+        // A 16-chunk view schedules far more tiles than the old cap; the bounded issue rate must
+        // eventually issue and cover every one of them.
+        Vec3d center=new Vec3d(7.5,128,-3.25);
+        var all=new SourceDiscovery.Scheduler();
+        all.replan(center,16);
+        int planned=SourceDiscovery.plan(center,16).size();
+        int issued=0;Bounds tile;
+        while(issued<=planned && (tile=all.next(0))!=null){all.pending(tile);all.completed(tile,true,0);issued++;}
+        equal(planned,issued,"eventual full coverage: every scheduled tile is issued");
+        check(all.next(0)==null,"full coverage leaves nothing queued");
+        // Axis-aligned source points at the extent edge are included, never omitted.
+        int horizontal=SourceDiscovery.horizontalRadius(16);
+        boolean edgeCovered=false;for(Bounds b:SourceDiscovery.plan(center,16))if(b.contains((long)Math.floor(center.x)+horizontal-1,128,128))edgeCovered=true;
+        check(edgeCovered,"axis-aligned extent-edge source points are scheduled");
+    }
+
+    private static void localAdmission() {
+        // Near samples keep the exact unchanged allowance; the far lane admits distant discovered
+        // terrain even when near samples would otherwise exhaust the whole mesh budget first.
+        var deep=new SourceDiscovery.LocalAdmission(false,640);
+        for(int n=0;n<640;n++)check(deep.admit(0),"near cells keep the unchanged deep allowance");
+        check(!deep.admit(0),"near lane exhausts exactly at the previous limit");
+        check(deep.admit(33*33.0),"far discovery is admitted after near exhaustion");
+        for(int n=1;n<SourceDiscovery.LocalAdmission.FAR_ADMISSION;n++)check(deep.admit(40*40.0),"the far lane admits its bounded budget");
+        check(!deep.admit(40*40.0),"far admission is bounded");
+        check(deep.exhausted(),"both lanes spent stops scanning");
+        check(!deep.admit(0) && !deep.admit(40*40.0),"spent lanes stay spent");
+        var shallow=new SourceDiscovery.LocalAdmission(true,1024);
+        for(int n=0;n<1024;n++)check(shallow.admit(0),"near cells keep the unchanged shallow allowance");
+        check(!shallow.admit(0),"shallow near lane exhausts exactly at the previous limit");
+        check(shallow.admit(100*100.0),"shallow far lane is separate from near samples");
+        // Lane classification is by distance only: near cells never steal the far budget.
+        var edge=new SourceDiscovery.LocalAdmission(false,1);
+        check(edge.admit(SourceDiscovery.NEAR_EXACT_RADIUS*SourceDiscovery.NEAR_EXACT_RADIUS),"at the exact near radius the cell is near");
+        check(!edge.admit(SourceDiscovery.NEAR_EXACT_RADIUS*SourceDiscovery.NEAR_EXACT_RADIUS),"an exhausted near lane rejects further near cells");
+        check(edge.admit(SourceDiscovery.NEAR_EXACT_RADIUS*SourceDiscovery.NEAR_EXACT_RADIUS+1),"beyond the near radius the far lane admits");
     }
 
     private static void scheduler() {
@@ -195,7 +249,7 @@ public final class SourceDiscoverySelfTest {
     }
 
     public static void main(String[] args) {
-        extents();planning();extentFilter();scheduler();observedNodes();farFieldSupersede();
+        extents();planning();extentFilter();scheduler();eventualFullCoverage();localAdmission();observedNodes();farFieldSupersede();
         System.out.println("SourceDiscoverySelfTest: "+checks+" checks passed");
     }
 }
