@@ -58,16 +58,6 @@ public final class GenerationSurvey {
         return List.copyOf(probes);
     }
 
-    /** Keeps only probes that are not within minChebyshev of a reference position. Used to
-     * avoid re-observing columns already covered by an existing chunk-center probe window. */
-    public static List<Probe> spread(List<Probe> probes,long x,long y,long z,int minChebyshev){
-        if(minChebyshev<0)throw new IllegalArgumentException("minimum chebyshev distance");
-        Objects.requireNonNull(probes);
-        List<Probe> result=new ArrayList<>();
-        for(var probe:probes)if(chebyshev(probe,new Probe(Math.toIntExact(x),Math.toIntExact(y),Math.toIntExact(z),probe.biome(),probe.kind()))>minChebyshev)result.add(probe);
-        return List.copyOf(result);
-    }
-
     private static long chebyshev(Probe a,Probe b){
         return Math.max(Math.max(Math.abs((long)a.x()-b.x()),Math.abs((long)a.y()-b.y())),Math.abs((long)a.z()-b.z()));
     }

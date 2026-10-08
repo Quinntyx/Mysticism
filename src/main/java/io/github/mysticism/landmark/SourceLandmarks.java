@@ -40,7 +40,7 @@ public final class SourceLandmarks {
             var center=new BlockPos(x,chunk.sampleHeightmap(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,x&15,z&15)+1,z);
             s.hint(world.getRegistryKey().getValue().toString(),center);
             if(s.retries.size()<64)s.retries.add(new FrontierRetry(world.getRegistryKey().getValue().toString(),new Bounds(chunk.getPos().getStartX()-1L,world.getBottomY(),chunk.getPos().getStartZ()-1L,chunk.getPos().getStartX()+17L,world.getTopY(),chunk.getPos().getStartZ()+17L)));
-            s.survey(world,chunk,center);
+            s.survey(world,chunk);
         });
     }
     public static CompletableFuture<Optional<LandmarkMetadata>> ensureSourceLocation(MinecraftServer server,String dimension,BlockPos position){return ensure(server,dimension,position,null,false);}
@@ -100,6 +100,18 @@ public final class SourceLandmarks {
         if(!set.remove(value)&&set.size()>=cap){var oldest=set.iterator();oldest.next();oldest.remove();}
         set.add(value);
     }
+    /** Survey-to-hint admission. Every distinct surveyed component and peak is retained as a
+     * pending hint: proximity to the chunk-center probe is never a coverage proof, because
+     * prepare() restricts ownership to the seed biome, so a center window does not landmark
+     * other terrain components. Actual landmark coverage is established only by exact
+     * persisted ownership inside the Ensure pipeline, which merges an already-covered probe
+     * into its prior landmark instead of inventing a duplicate. */
+    static List<BlockPos> surveyHints(List<GenerationSurvey.Probe> probes){
+        Objects.requireNonNull(probes);
+        List<BlockPos> hints=new ArrayList<>();
+        for(var probe:probes)hints.add(new BlockPos(probe.x(),probe.y(),probe.z()));
+        return hints;
+    }
     public static int lastSampledCells(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.lastCells;}
     public static String status(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?"Stopped":s.status;}
     private static Session session(MinecraftServer server){if(!server.isOnThread())throw new IllegalStateException("source server thread");Session s=SESSIONS.get(server);if(s==null)throw new IllegalStateException("source service not initialized");return s;}
@@ -127,8 +139,10 @@ public final class SourceLandmarks {
         void hint(String dim,BlockPos p){admit(hints,new Hint(dim,p.toImmutable()),HINT_BUDGET);}
         /** Generation landmarking beyond the chunk-center probe: derive representative
          * surface/peak hints from the loaded chunk's actual heightmap and biome grid so
-         * real terrain across the render distance becomes landmark work, bounded per chunk. */
-        void survey(ServerWorld world,WorldChunk chunk,BlockPos center){
+         * real terrain across the render distance becomes landmark work, bounded per chunk.
+         * Distinct components are retained unconditionally; distance filtering would drop
+         * them even when the seed-biome center window never landmarks their patch. */
+        void survey(ServerWorld world,WorldChunk chunk){
             String dimension=world.getRegistryKey().getValue().toString();int bottom=world.getBottomY(),top=world.getTopY();var origin=chunk.getPos();
             List<GenerationSurvey.Probe> probes;
             try{probes=GenerationSurvey.survey(origin.getStartX(),origin.getStartZ(),bottom,top,new GenerationSurvey.ColumnView(){
@@ -141,7 +155,7 @@ public final class SourceLandmarks {
                     catch(RuntimeException failure){return null;}
                 }
             });}catch(RuntimeException failure){return;}
-            for(var probe:GenerationSurvey.spread(probes,center.getX(),center.getY(),center.getZ(),10))hint(dimension,new BlockPos(probe.x(),probe.y(),probe.z()));
+            for(var position:surveyHints(probes))hint(dimension,position);
         }
         void invalidate(String dim,BlockPos pos){if(active!=null&&active.dimension.equals(dim)&&active.guarded!=null&&active.guarded.contains(pos.getX(),pos.getY(),pos.getZ()))active.cancel(new CancellationException("source edit invalidated snapshot"));}
         void tick(){

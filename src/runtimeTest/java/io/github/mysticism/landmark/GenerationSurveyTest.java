@@ -101,19 +101,8 @@ public final class GenerationSurveyTest {
         check(first.equals(second),"Survey output must be deterministic for identical terrain");
     }
 
-    private static void spreadDeduplicatesNearbyCenterProbes(){
-        List<Probe> probes=List.of(new Probe(0,0,0,"a",Kind.SURFACE),new Probe(11,0,0,"b",Kind.SURFACE),new Probe(0,12,0,"c",Kind.PEAK));
-        List<Probe> kept=GenerationSurvey.spread(probes,0,0,0,10);
-        check(kept.size()==2,"Only probes beyond the covered window must be kept, got "+kept.size());
-        check(kept.stream().noneMatch(p->p.biome().equals("a")),"Probes inside the existing window must be dropped");
-        check(kept.stream().anyMatch(p->p.biome().equals("b"))&&kept.stream().anyMatch(p->p.biome().equals("c")),"Distinct terrain must survive deduplication");
-        check(GenerationSurvey.spread(List.of(new Probe(10,0,0,"a",Kind.SURFACE)),0,0,0,10).isEmpty(),"Exactly-at-window probes count as covered");
-    }
-
     private static void rejectsBadInput(){
         try{GenerationSurvey.survey(0,0,0,0,view(flat(1),uniform("a")));throw new AssertionError("Empty world limits must be rejected");}
-        catch(IllegalArgumentException expected){}
-        try{GenerationSurvey.spread(List.of(),0,0,0,-1);throw new AssertionError("Negative spread radius must be rejected");}
         catch(IllegalArgumentException expected){}
     }
 
@@ -126,7 +115,6 @@ public final class GenerationSurveyTest {
         missingColumnsAreNeverInvented();
         probesRespectWorldHeightLimits();
         surveyIsDeterministic();
-        spreadDeduplicatesNearbyCenterProbes();
         rejectsBadInput();
         System.out.println("GenerationSurveyTest passed: "+assertions+" assertions");
     }
