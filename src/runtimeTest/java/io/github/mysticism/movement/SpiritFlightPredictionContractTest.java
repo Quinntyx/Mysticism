@@ -1,12 +1,16 @@
 package io.github.mysticism.movement;
 
 import com.google.gson.JsonParser;
+import io.github.mysticism.dimension.spiritworld.terrain.MeshMovementValidation;
 import io.github.mysticism.navigation.SpiritNavigationService;
 import net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket;
 import net.minecraft.server.network.ServerPlayerInteractionManager;
 import net.minecraft.server.network.ServerPlayNetworkHandler;
+import net.minecraft.util.math.Box;
+import net.minecraft.world.WorldView;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.util.UUID;
 
 /** Deep spirit flight must receive vanilla creative-flight movement tolerance: the vanilla
  * "moved wrongly" snap-back in ServerPlayNetworkHandler.onPlayerMove is the rubber band that
@@ -60,19 +64,43 @@ public final class SpiritFlightPredictionContractTest {
                 .getReturnType() == void.class, "onPlayerMove target descriptor changed");
         check(ServerPlayerInteractionManager.class.getDeclaredMethod("isCreative").getReturnType() == boolean.class,
                 "isCreative exemption target descriptor changed");
-        // The vanilla moved-wrongly snap-back still exists behind the exemption (this fix redirects
-        // its creative gate rather than reimplementing movement handling).
+        check(ServerPlayNetworkHandler.class
+                        .getDeclaredMethod("isPlayerNotCollidingWithBlocks", WorldView.class, Box.class,
+                                double.class, double.class, double.class).getReturnType() == boolean.class,
+                "collision gate target descriptor changed");
+        check(ServerPlayNetworkHandler.class.getDeclaredMethod("isPlayerNotCollidingWithBlocks", WorldView.class,
+                Box.class, double.class, double.class, double.class).getParameterCount() == 5,
+                "collision gate arity changed");
+        // The validator is production code, not a placeholder: real record/clear/admission API.
+        MeshMovementValidation.class.getDeclaredMethod("record", UUID.class, io.github.mysticism.dimension.spiritworld.terrain.TerrainMeshFrame.class);
+        MeshMovementValidation.class.getDeclaredMethod("clear", UUID.class);
+        check(MeshMovementValidation.class.getDeclaredMethod("allowsMeshMove", UUID.class, Box.class,
+                net.minecraft.util.math.Vec3d.class, boolean.class).getReturnType() == boolean.class,
+                "mesh movement admission API changed");
+        check(MeshMovementValidation.HISTORY >= 8, "lag-compensation history must cover realistic latency");
+        // Both redirect targets must still exist behind the hooks (this fix redirects vanilla gates
+        // rather than reimplementing movement handling).
         try (var in = ServerPlayNetworkHandler.class.getResourceAsStream("/net/minecraft/server/network/ServerPlayNetworkHandler.class")) {
             check(in != null, "named Minecraft classes available on the regression classpath");
             byte[] bytecode = in.readAllBytes();
-            boolean referencesCreative = false;
-            for (int i = 0; i + 10 < bytecode.length; i++) {
-                if (bytecode[i] == 'i' && new String(bytecode, i, 10, StandardCharsets.US_ASCII).equals("isCreative")) {
-                    referencesCreative = true; break;
-                }
-            }
-            check(referencesCreative, "onPlayerMove still consults the creative exemption gate");
+            check(contains(bytecode, "isCreative"), "onPlayerMove still consults the creative exemption gate");
+            check(contains(bytecode, "isPlayerNotCollidingWithBlocks"), "onPlayerMove still consults the collision gate");
         }
+        try (var in = SpiritFlightPredictionContractTest.class.getResourceAsStream("/io/github/mysticism/mixin/SpiritFlightPredictionMixin.class")) {
+            check(in != null, "mixin class packaged on the regression classpath");
+            byte[] bytecode = in.readAllBytes();
+            check(contains(bytecode, "isCreative"), "mixin still redirects the creative exemption gate");
+            check(contains(bytecode, "isPlayerNotCollidingWithBlocks"), "mixin still redirects the collision gate with mesh validation");
+            check(contains(bytecode, "allowsMeshMove"), "mixin decision must consult mesh movement validation");
+        }
+    }
+    private static boolean contains(byte[] data, String token) {
+        byte[] ascii = token.getBytes(StandardCharsets.US_ASCII);
+        outer: for (int i = 0; i + ascii.length <= data.length; i++) {
+            for (int j = 0; j < ascii.length; j++) if (data[i + j] != ascii[j]) continue outer;
+            return true;
+        }
+        return false;
     }
 
     public static void main(String[] args) throws Exception {

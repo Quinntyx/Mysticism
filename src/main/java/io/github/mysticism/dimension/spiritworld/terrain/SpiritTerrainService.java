@@ -112,9 +112,9 @@ public final class SpiritTerrainService {
     }
     public static void cancelEnter(ServerPlayerEntity player) {
         Context c=SERVERS.get(player.getServer());if(c==null)return;
-        Session s=c.sessions.remove(player.getUuid());if(s!=null)s.cancel();MeshCollision.clear(player.getUuid());
+        Session s=c.sessions.remove(player.getUuid());if(s!=null)s.cancel();MeshCollision.clear(player.getUuid());MeshMovementValidation.clear(player.getUuid());
     }
-    private static void close(MinecraftServer server){Context c=SERVERS.remove(server);if(c!=null){if(c.read!=null)c.read.cancel();c.sessions.forEach((id,s)->{s.cancel();MeshCollision.clear(id);});}}
+    private static void close(MinecraftServer server){Context c=SERVERS.remove(server);if(c!=null){if(c.read!=null)c.read.cancel();c.sessions.forEach((id,s)->{s.cancel();MeshCollision.clear(id);MeshMovementValidation.clear(id);});}}
     private static Session session(ServerPlayerEntity p){Context c=SERVERS.get(p.getServer());return c==null?null:c.sessions.get(p.getUuid());}
     private static Vec384f q(ServerPlayerEntity p){return p.getComponent(MysticismEntityComponents.LATENT_POS).get().clone();}
     private static Basis384f basis(ServerPlayerEntity p){return p.getComponent(MysticismEntityComponents.LATENT_BASIS).get().clone();}
@@ -604,7 +604,7 @@ public final class SpiritTerrainService {
     private static void acceptFrame(ServerPlayerEntity p,Session s,BuiltMesh built) {
         TerrainMeshFrame previous=s.frame;Map<Long,Window> previousProducers=s.frameProducers;long previousRevision=s.revision;
         s.frame=built.frame();s.frameProducers=built.producers();s.revision=s.frame.revision();
-        try {if(p.getWorld().getRegistryKey().equals(WORLD))transport.accept(p,s.frame);}
+        try {if(p.getWorld().getRegistryKey().equals(WORLD))transport.accept(p,s.frame);MeshMovementValidation.record(p.getUuid(),s.frame);}
         catch(RuntimeException failure){s.frame=previous;s.frameProducers=previousProducers;s.revision=previousRevision;throw failure;}
     }
     private static void confirmTargetFade(Session s) {
