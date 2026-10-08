@@ -259,15 +259,25 @@ public final class SpiritTerrainService {
         Session preview=new Session(next,p.getPos());preview.shallow=true;preview.acquiredView=true;preview.revision=s.revision;
         preview.regions.putAll(s.regions);preview.target=s.target;preview.closestId=s.closestId;
         if(!s.local.id.isEmpty() && !s.local.id.equals(next.id))preview.regions.putIfAbsent(s.local.id,s.local);
-        TerrainMeshFrame frame=build(p,preview,s.revision+1);
+        BuiltMesh built=buildMesh(p,preview,s.revision+1,b);TerrainMeshFrame frame=built.frame();
         if(!MeshCollision.bodyClear(frame,p.getBoundingBox()) || !MeshCollision.transitionClear(s.frame,frame,p.getBoundingBox()))return false;
         // All validation precedes publication. No q/basis/position/velocity/attunement mutation.
-        Window previous=s.local;s.local=next;s.carrier=p.getPos();s.shallow=true;s.acquiredView=true;s.anchorDelivered=true;
-        s.regions.clear();s.regions.putAll(preview.regions);s.frame=frame;s.revision=frame.revision();s.ingesting=null;s.sourceRequested=null;
+        Window previous=s.local;Vec3d previousCarrier=s.carrier;
+        boolean previousShallow=s.shallow,previousAcquired=s.acquiredView,previousAnchor=s.anchorDelivered;
+        Map<String,Window> previousRegions=new LinkedHashMap<>(s.regions);
+        s.local=next;s.carrier=p.getPos();s.shallow=true;s.acquiredView=true;s.anchorDelivered=true;
+        s.regions.clear();s.regions.putAll(preview.regions);
+        try {acceptFrame(p,s,built);}
+        catch(RuntimeException failure) {
+            s.local=previous;s.carrier=previousCarrier;s.shallow=previousShallow;s.acquiredView=previousAcquired;s.anchorDelivered=previousAnchor;
+            s.regions.clear();s.regions.putAll(previousRegions);
+            status(p,s,"Walking acquisition held: mesh publication failed.");return false;
+        }
+        s.ingesting=null;s.sourceRequested=null;
         if(s.sourceFuture!=null)s.sourceFuture.cancel(false);if(s.ownerFuture!=null)s.ownerFuture.cancel(false);
         if(previous.ownershipFuture!=null)previous.ownershipFuture.cancel(false);
         s.walkProbe=null;s.walkField=0;if(s.walkFuture!=null)s.walkFuture.cancel(false);
-        transport.accept(p,frame);return true;
+        confirmTargetFade(s);return true;
     }
     public static boolean exit(ServerPlayerEntity p) {
         Optional<SourcePosition> mapped=sourcePosition(p);if(mapped.isEmpty() || !p.getWorld().getRegistryKey().equals(WORLD))return false;
@@ -588,11 +598,14 @@ public final class SpiritTerrainService {
         if(!MeshCollision.transitionClear(s.frame,frame,p.getBoundingBox())) {
             status(p,s,"Terrain transition held: moving surface intersects your body; move clear to continue.");return false;
         }
+        acceptFrame(p,s,built);confirmTargetFade(s);return true;
+    }
+    /** All runtime frame replacements commit provenance together and roll both back on transport failure. */
+    private static void acceptFrame(ServerPlayerEntity p,Session s,BuiltMesh built) {
         TerrainMeshFrame previous=s.frame;Map<Long,Window> previousProducers=s.frameProducers;long previousRevision=s.revision;
-        s.frame=frame;s.frameProducers=built.producers();s.revision=frame.revision();
-        try {if(p.getWorld().getRegistryKey().equals(WORLD))transport.accept(p,frame);}
+        s.frame=built.frame();s.frameProducers=built.producers();s.revision=s.frame.revision();
+        try {if(p.getWorld().getRegistryKey().equals(WORLD))transport.accept(p,s.frame);}
         catch(RuntimeException failure){s.frame=previous;s.frameProducers=previousProducers;s.revision=previousRevision;throw failure;}
-        confirmTargetFade(s);return true;
     }
     private static void confirmTargetFade(Session s) {
         Window target=s.target;if(target==null || target==s.local)return;
@@ -700,12 +713,16 @@ public final class SpiritTerrainService {
             int budget=128;while(w.nearCells.hasNext() && budget-->0)ingest(server,w.nearSamples,List.of(w.nearCells.next()),1);
             if(!w.nearCells.hasNext()) {
                 w.nearCells=null;w.nearReady=w.nearComplete && store.metadata(w.id).map(m->m.geometryKeys().equals(w.nearKeys)).orElse(false);
-                if(w.nearReady) {
-                    // Commit a fully sampled patch atomically; staged cells cannot carve a bounding-box hole during ingestion.
+                Session s=entry.getKey();ServerPlayerEntity p=player(s);
+                boolean covered=w.nearReady && p!=null && retained(s,w)
+                        && (!protectedNear(p,s,w) || replacementCovered(p,s,w));
+                if(covered) {
+                    // Gate BEFORE pruning/compaction as well as stream installation: complete source samples
+                    // need not cover the accepted projected five-block patch under compressed affine geometry.
                     w.tiles.entrySet().removeIf(e->e.getKey().getSquaredDistance(w.nearFocus)>24*24);
                     w.liveTiles.retainAll(w.tiles.keySet());w.tiles.putAll(w.nearSamples.tiles);
                     w.nodes=compact(server,w,w.nearFocus);w.ready=!w.nodes.isEmpty();
-                } else w.nearFocus=null; // Unknown coverage retains old geometry and retries through the existing backoff.
+                } else {w.nearReady=false;w.nearFocus=null;} // Unknown/outside coverage preserves all tiles/nodes, including held-frame support.
                 w.nearSamples=null;
             }
         }
