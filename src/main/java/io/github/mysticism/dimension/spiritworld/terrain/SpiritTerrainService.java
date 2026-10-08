@@ -435,10 +435,23 @@ public final class SpiritTerrainService {
         Map<BlockPos,String> owners=w.owners!=null && w.owners.isCurrent(server)?w.owners.owners():Map.of();
         w.compactedOwnership=w.owners!=null && w.owners.isCurrent(server)?w.owners.ownershipRevision():-1;
         List<SourceMeshBuilder.Node> near=SourceMeshBuilder.compact(w.tiles,center,owners);
-        if(w.geometryNodes.isEmpty() || w.tiles.isEmpty())return near;
+        // Far discovered render-distance coverage stands beside persisted geometry; near tiles supersede
+        // both inside the actually sampled window via replaceNear.
+        List<SourceMeshBuilder.Node> base=w.geometryNodes;
+        if(!w.discoveredNodes.isEmpty()) {
+            if(base.isEmpty())base=w.discoveredNodes;
+            else {var combined=new ArrayList<>(base);combined.addAll(w.discoveredNodes);base=combined;}
+        }
+        if(base.isEmpty())return near;
+        if(w.tiles.isEmpty()) {
+            Vec3d sortCenter=center;
+            List<SourceMeshBuilder.Node> sorted=new ArrayList<>(base); // base may be an immutable discovered list
+            sorted.sort(Comparator.comparingDouble((SourceMeshBuilder.Node n)->nodeDistance(n,sortCenter)).thenComparingLong(n->n.position().asLong()));
+            return List.copyOf(sorted);
+        }
         int minX=Integer.MAX_VALUE,minY=minX,minZ=minX,maxX=Integer.MIN_VALUE,maxY=maxX,maxZ=maxX;
         for(BlockPos p:w.tiles.keySet()){minX=Math.min(minX,p.getX());minY=Math.min(minY,p.getY());minZ=Math.min(minZ,p.getZ());maxX=Math.max(maxX,p.getX());maxY=Math.max(maxY,p.getY());maxZ=Math.max(maxZ,p.getZ());}
-        return SourceMeshBuilder.replaceNear(w.geometryNodes,near,new Bounds(minX,minY,minZ,(long)maxX+1,(long)maxY+1,(long)maxZ+1),center);
+        return SourceMeshBuilder.replaceNear(base,near,new Bounds(minX,minY,minZ,(long)maxX+1,(long)maxY+1,(long)maxZ+1),center);
     }
     private static Window windowFor(Session s,TerrainMeshFrame.Cell cell) {
         // Server-local provenance belongs to the accepted frame, not mutable ownership or latest compaction.
@@ -462,6 +475,65 @@ public final class SpiritTerrainService {
             if(!live(p,s) || s.local!=w || error!=null)return;
             s.ingesting=region.cells().iterator();w.ready=region.complete();
         }));
+    }
+    /** Render/view-distance source discovery: center-out bounded region reads feeding the far field.
+     * The plan follows the player's CURRENT projected source position (shallow carrier mapping or the
+     * deep affine inverse), so flight re-discovers across the render distance instead of a fixed window. */
+    private static void discover(Context c,ServerPlayerEntity p,Session s) {
+        Window w=s.local;Vec3d source=sourceUnder(c,p,s,w);
+        int view=p.getServer().getPlayerManager().getViewDistance();
+        s.viewHorizon=SourceDiscovery.meshHorizon(view);
+        if(w.discoveryCenter==null || w.discoveryCenter.squaredDistanceTo(source)>256 || c.tick-w.discoveryPlanned>=40) {
+            w.discoveryPlanned=c.tick;w.discoveryCenter=source;w.discoveryView=view;
+            for(var expired:w.discovery.replan(source,view))w.discovered.remove(expired);
+            refreshDiscovered(w);
+        }
+        if(c.tick%2==0)issueDiscovery(p,s,w);
+    }
+    /** Unclamped inverse of the window's affine placement: the source point the viewer is over. */
+    private static Vec3d sourceUnder(Context c,ServerPlayerEntity p,Session s,Window w) {
+        var v=c.view(p,s,w);Vec3d offset=p.getPos().subtract(v.root());
+        double determinant=v.x().dotProduct(v.y().crossProduct(v.z()));
+        if(Math.abs(determinant)<1e-6)return w.origin;
+        return w.origin.add(offset.dotProduct(v.y().crossProduct(v.z()))/determinant,
+                offset.dotProduct(v.z().crossProduct(v.x()))/determinant,offset.dotProduct(v.x().crossProduct(v.y()))/determinant);
+    }
+    private static void issueDiscovery(ServerPlayerEntity p,Session s,Window w) {
+        Context c=SERVERS.get(p.getServer());if(c==null)return;
+        while(w.discoveryPending.size()<SourceDiscovery.MAX_INFLIGHT) {
+            Bounds tile=w.discovery.next(c.tick);if(tile==null)return;
+            CompletableFuture<SourceLandmarks.Region> future;
+            try {future=SourceLandmarks.region(p.getServer(),w.dimension,tile,SourceDiscovery.TILE*SourceDiscovery.TILE*SourceDiscovery.TILE);}
+            catch(RuntimeException rejected){return;} // bounded queues are busy; the tile stays queued for the next attempt
+            w.discoveryPending.put(tile,future);w.discovery.pending(tile);
+            future.whenComplete((region,error)->p.getServer().execute(()->{
+                if(w.discoveryPending.remove(tile)!=future)return;
+                if(!live(p,s) || !c.retained(s,w)){w.discovery.cancel(tile);return;}
+                if(error!=null || region==null){w.discovery.failed(tile,c.tick);return;}
+                Vec3d center=new Vec3d(tile.minX()+SourceDiscovery.TILE/2.0,tile.minY()+SourceDiscovery.TILE/2.0,tile.minZ()+SourceDiscovery.TILE/2.0);
+                w.discovered.put(tile,SourceDiscovery.nodes(region.cells(),center));
+                w.discovery.completed(tile,region.complete(),c.tick);
+                refreshDiscovered(w);w.dirty=true; // near-field supersede and mesh horizon pick this up on the normal compaction/publish cadence
+            }));
+        }
+    }
+    /** Retained discovered tiles become one sorted far-field node list under the node budget. */
+    private static void refreshDiscovered(Window w) {
+        Vec3d center=w.discoveryCenter==null?w.origin:w.discoveryCenter;
+        var tiles=new ArrayList<>(w.discovered.entrySet());
+        tiles.sort(Comparator.comparingDouble(e->e.getKey().distanceSquared(new Point3(center.x,center.y,center.z))));
+        List<SourceMeshBuilder.Node> merged=new ArrayList<>();int total=0;
+        for(var e:tiles) {
+            if(total+e.getValue().size()>SourceDiscovery.MAX_NODES){w.discovered.remove(e.getKey());continue;} // farthest tiles lose retention first
+            total+=e.getValue().size();merged.addAll(e.getValue());
+        }
+        Vec3d sortCenter=center;
+        merged.sort(Comparator.comparingDouble((SourceMeshBuilder.Node n)->nodeDistance(n,sortCenter)).thenComparingLong(n->n.position().asLong()));
+        w.discoveredNodes=List.copyOf(merged);
+    }
+    private static double nodeDistance(SourceMeshBuilder.Node n,Vec3d center) {
+        BlockPos at=n.position();
+        return SourceMeshBuilder.distanceSquared(new Box(at.getX(),at.getY(),at.getZ(),at.getX()+n.side(),at.getY()+n.side(),at.getZ()+n.side()),center);
     }
     private static void ingest(MinecraftServer server,Window w,List<SourceLandmarks.Cell> cells,int budget) {
         ServerWorld source=world(server,w.dimension);int n=0;
@@ -504,6 +576,7 @@ public final class SpiritTerrainService {
                     if(sourceWorld!=null)captureLoaded(sourceWorld,s.local,source,64,false);
                     if(s.sourceRequested==null || s.sourceRequested.distanceTo(source)>4)requestSource(p,s,source,16);
                 }
+                discover(c,p,s);
                 if(s.ingesting!=null){int count=0;while(s.ingesting.hasNext() && count++<256){var cell=s.ingesting.next();ingest(server,s.local,List.of(cell),1);}if(!s.ingesting.hasNext())s.ingesting=null;}
                 if(s.local.tiles.size()>32768) {
                     Vec3d center=s.local.origin.add(p.getPos().subtract(s.carrier));
@@ -559,7 +632,7 @@ public final class SpiritTerrainService {
         return new BuiltMesh(new TerrainMeshFrame(revision,s.shallow,s.local.dimension,s.local.origin,s.carrier,materials,stitched),Map.copyOf(producers));
     }
     private static void refreshCompaction(ServerPlayerEntity p,Window w) {
-        if(w.tiles.isEmpty())return;
+        if(w.tiles.isEmpty() && w.discoveredNodes.isEmpty())return;
         long epoch=w.owners!=null && w.owners.isCurrent(p.getServer())?w.owners.ownershipRevision():-1;
         if(w.compactedOwnership!=epoch)w.nodes=compact(p.getServer(),w,w.origin);
     }
@@ -577,7 +650,7 @@ public final class SpiritTerrainService {
                     min.y+Math.min(0,ex.y)+Math.min(0,ey.y)+Math.min(0,ez.y),min.z+Math.min(0,ex.z)+Math.min(0,ey.z)+Math.min(0,ez.z),
                     min.x+Math.max(0,ex.x)+Math.max(0,ey.x)+Math.max(0,ez.x),
                     min.y+Math.max(0,ex.y)+Math.max(0,ey.y)+Math.max(0,ez.y),min.z+Math.max(0,ex.z)+Math.max(0,ey.z)+Math.max(0,ez.z));
-            double distance=SourceMeshBuilder.distanceSquared(bounds,p.getPos());if(distance>128*128)continue;
+            double distance=SourceMeshBuilder.distanceSquared(bounds,p.getPos());int horizon=s.viewHorizon;if(distance>horizon*horizon)continue;
             if(Math.abs(ex.dotProduct(ey.crossProduct(ez)))<1e-6)continue; // collapsed model AND collision disappear together
             var tile=node.tile();Integer material=palette.get(tile.material());
             if(material==null){if(materials.size()==TerrainMeshFrame.MAX_MATERIALS)continue;material=materials.size();materials.add(tile.material());palette.put(tile.material(),material);}
@@ -622,10 +695,15 @@ public final class SpiritTerrainService {
         Vec3d nearFocus;Bounds nearCoverage;List<String> nearKeys=List.of();boolean nearComplete;Window nearSamples;CompletableFuture<SourceLandmarks.Region> nearFuture;Iterator<SourceLandmarks.Cell> nearCells;
         final Set<BlockPos> liveTiles=new HashSet<>();
         final Map<BlockPos,SourceMeshBuilder.Tile> tiles=new HashMap<>();List<SourceMeshBuilder.Node> nodes=List.of(),geometryNodes=List.of();long compactedOwnership=-1;
+        // Render/view-distance discovery state: completed tile nodes retained separately from near-field tiles.
+        final SourceDiscovery.Scheduler discovery=new SourceDiscovery.Scheduler();
+        final Map<Bounds,CompletableFuture<SourceLandmarks.Region>> discoveryPending=new LinkedHashMap<>();
+        final Map<Bounds,List<SourceMeshBuilder.Node>> discovered=new LinkedHashMap<>();
+        List<SourceMeshBuilder.Node> discoveredNodes=List.of();Vec3d discoveryCenter;long discoveryPlanned;int discoveryView;
         Window(String dimension,Vec3d origin,Vec384f semantic,Basis384f basis,String id){this.dimension=dimension;this.origin=origin;this.semantic=semantic.clone();captured=semantic.clone();supportEmbedding=semantic.clone();sourceBasis=basis.clone();this.id=id;}
     }
     private static final class Session {
-        Window local,target,walkProbe;Vec3d carrier,sourceRequested;boolean shallow=true,entered,anchorDelivered,acquiredView;long revision,created,walkField,walkNextProbe;
+        Window local,target,walkProbe;Vec3d carrier,sourceRequested;boolean shallow=true,entered,anchorDelivered,acquiredView;long revision,created,walkField,walkNextProbe;int viewHorizon=128;
         TerrainMeshFrame frame;Map<Long,Window> frameProducers=Map.of();CompletableFuture<?> ownerFuture,sourceFuture,targetFuture,targetOwnerFuture,walkFuture;Iterator<SourceLandmarks.Cell> ingesting;
         final Map<String,Window> regions=new LinkedHashMap<>();final MeshRepresentatives selection=new MeshRepresentatives();
         final Map<String,Window> prepared=new LinkedHashMap<>();
@@ -633,7 +711,7 @@ public final class SpiritTerrainService {
         Session(Window local,Vec3d carrier){this.local=local;this.carrier=carrier;}
         void cancel(){if(ownerFuture!=null)ownerFuture.cancel(false);if(sourceFuture!=null)sourceFuture.cancel(false);if(targetFuture!=null)targetFuture.cancel(false);if(targetOwnerFuture!=null)targetOwnerFuture.cancel(false);if(walkFuture!=null)walkFuture.cancel(false);cancelWindow(local);if(target!=null)cancelWindow(target);for(var w:regions.values())cancelWindow(w);for(var w:prepared.values())cancelWindow(w);regions.clear();prepared.clear();}
     }
-    private static void cancelWindow(Window w){if(w.ownershipFuture!=null)w.ownershipFuture.cancel(false);if(w.nearFuture!=null)w.nearFuture.cancel(false);w.stream=null;w.nearCells=null;w.nearSamples=null;}
+    private static void cancelWindow(Window w){if(w.ownershipFuture!=null)w.ownershipFuture.cancel(false);if(w.nearFuture!=null)w.nearFuture.cancel(false);w.discoveryPending.values().forEach(f->f.cancel(false));w.discoveryPending.clear();w.discovered.clear();w.discoveredNodes=List.of();w.stream=null;w.nearCells=null;w.nearSamples=null;}
     private static final class Context {
         final MinecraftServer server;final LandmarkStore store;final Map<UUID,Session> sessions=new HashMap<>();
         long tick;int playerCursor;LandmarkStore.GeometryRead read;Session readingSession;Window readingWindow;

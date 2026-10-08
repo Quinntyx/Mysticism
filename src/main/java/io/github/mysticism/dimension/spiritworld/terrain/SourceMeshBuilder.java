@@ -78,8 +78,11 @@ final class SourceMeshBuilder {
         int x=MathHelper.floor(origin.x)-side/2,y=MathHelper.floor(origin.y)-side/2,z=MathHelper.floor(origin.z)-side/2;
         return new Bounds(x,y,z,(long)x+side,(long)y+side,(long)z+side);
     }
-    static List<Node> compact(Map<BlockPos,Tile> source,Vec3d fineCenter) {return compact(source,fineCenter,Map.of());}
-    static List<Node> compact(Map<BlockPos,Tile> source,Vec3d fineCenter,Map<BlockPos,String> exactOwners) {
+    static List<Node> compact(Map<BlockPos,Tile> source,Vec3d fineCenter) {return compact(source,fineCenter,Map.of(),false);}
+    static List<Node> compact(Map<BlockPos,Tile> source,Vec3d fineCenter,Map<BlockPos,String> exactOwners) {return compact(source,fineCenter,exactOwners,false);}
+    /** mergeUnowned merges uniform tiles that have no exact owner yet (render-distance discovery
+     * far field). Near-field compaction keeps strict per-owner provenance and never merges these. */
+    static List<Node> compact(Map<BlockPos,Tile> source,Vec3d fineCenter,Map<BlockPos,String> exactOwners,boolean mergeUnowned) {
         Map<Key,Tile> nodes=new HashMap<>();Map<Key,String> owners=new HashMap<>();
         source.forEach((p,t)->{if(!t.air){Key key=new Key(p.getX(),p.getY(),p.getZ(),1);nodes.put(key,t);owners.put(key,exactOwners.getOrDefault(p,""));}});
         for(int side=1;side<16;side*=2) {
@@ -92,7 +95,7 @@ final class SourceMeshBuilder {
                 for(int child=0;child<8;child++) {
                     Key key=new Key(p.x+((child&1)==0?0:side),p.y+((child&2)==0?0:side),p.z+((child&4)==0?0:side),side);
                     Tile t=nodes.get(key);String id=owners.getOrDefault(key,"");
-                    if(t==null || !t.cube || id.isEmpty() || owner!=null && !owner.equals(id) || common!=null && !t.equals(common)){equal=false;break;}
+                    if(t==null || !t.cube || id.isEmpty() && !mergeUnowned || owner!=null && !owner.equals(id) || common!=null && !t.equals(common)){equal=false;break;}
                     common=t;owner=id;
                 }
                 if(!equal)continue;
