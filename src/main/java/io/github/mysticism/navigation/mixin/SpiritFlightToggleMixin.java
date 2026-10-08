@@ -16,6 +16,6 @@ public abstract class SpiritFlightToggleMixin {
     @Shadow public ServerPlayerEntity player;
     @Inject(method = "onUpdatePlayerAbilities", at = @At("TAIL"))
     private void mysticism$flight(UpdatePlayerAbilitiesC2SPacket packet, CallbackInfo ci) {
-        if (packet.isFlying() || SpiritNavigationService.deep(player)) SpiritNavigationService.enterDeep(player);
+        SpiritNavigationService.onFlightToggle(player, packet.isFlying());
     }
 }
