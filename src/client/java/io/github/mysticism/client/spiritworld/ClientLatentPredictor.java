@@ -57,13 +57,10 @@ public final class ClientLatentPredictor {
             if (predicting && !corrected) {
                 Vec3d delta = now.subtract(lastPos);
                 if (delta.lengthSquared() <= 16 && delta.lengthSquared() > 0) {
-                    var qBefore = q.clone(); var basisBefore = basis.clone();
-                    boolean integrated = false;
-                    if (nav.deep() && nav.supportApproach()) { TraversalSteering.advance(q, basis, delta.x, delta.y, delta.z); integrated = true; }
-                    else if (nav.deep() && nav.landingApproach()) { TraversalSteering.approachStep(q, target, delta.x, delta.y, delta.z); integrated = true; }
-                    else if (nav.deep()) { TraversalSteering.deepStep(q, basis, target, delta.x, delta.y, delta.z, nav.hasShallowTarget()); integrated = true; }
-                    else if (!nav.landmarkId().isEmpty()) { TraversalSteering.advance(q, basis, delta.x, delta.y, delta.z); integrated = true; }
-                    if (integrated) ClientPoseSync.noteIntegration(qBefore, q, basisBefore, basis);
+                    if (nav.deep() && nav.supportApproach()) TraversalSteering.advance(q, basis, delta.x, delta.y, delta.z);
+                    else if (nav.deep() && nav.landingApproach()) TraversalSteering.approachStep(q, target, delta.x, delta.y, delta.z);
+                    else if (nav.deep()) TraversalSteering.deepStep(q, basis, target, delta.x, delta.y, delta.z, nav.hasShallowTarget());
+                    else if (!nav.landmarkId().isEmpty()) TraversalSteering.advance(q, basis, delta.x, delta.y, delta.z);
                 }
             }
             ClientPoseSync.beginPrediction(

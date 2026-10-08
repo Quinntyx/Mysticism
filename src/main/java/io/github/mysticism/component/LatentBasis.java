@@ -7,6 +7,7 @@ import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtElement;
 import net.minecraft.network.RegistryByteBuf;
 import net.minecraft.registry.RegistryWrapper;
+import net.minecraft.server.network.ServerPlayerEntity;
 import org.ladysnake.cca.api.v3.component.ComponentV3;
 import org.ladysnake.cca.api.v3.component.sync.AutoSyncedComponent;
 
@@ -21,6 +22,8 @@ public final class LatentBasis implements ComponentV3, AutoSyncedComponent {
 
     // Requires Basis384f to have public constructors.
     private Basis384f basis = new Basis384f();
+    /** Monotonic per-instance wire sequence for sync ordering; not persisted, session-local. */
+    private int syncSequence;
 
     public LatentBasis() {}
 
@@ -75,17 +78,28 @@ public final class LatentBasis implements ComponentV3, AutoSyncedComponent {
 
     /**
      * Client-side authoritative sync application with movement-ordering reconciliation; see
-     * {@link LatentPos#applySyncPacket}. A basis sync whose divergence from the locally integrated
-     * basis is fully explained by unacknowledged movement is held, never applied as a rollback;
-     * every genuine authoritative correction (touch blend, support alignment, anchor) is accepted.
+     * {@link LatentPos#applySyncPacket}. Reordered/stale snapshots are rejected by the wire
+     * sequence from {@link #writeSyncPacket}; a fresh snapshot is held only while its divergence
+     * from the locally integrated basis is explained by unacknowledged in-flight movement.
      */
     @Override
     public void applySyncPacket(RegistryByteBuf buf) {
+        int sequence = buf.readVarInt();
         NbtCompound tag = buf.readNbt();
         if (tag == null) return;
         LatentBasis incoming = new LatentBasis();
         // The read path ignores the registry lookup; the wire format is self-describing bits.
         incoming.readFromNbt(tag, null);
-        this.set(LatentSync.reconcile(this, this.basis, incoming.basis));
+        this.set(LatentSync.reconcile(this, sequence, this.basis, incoming.basis));
+    }
+
+    /** Embeds the monotonic wire sequence before the basis NBT; see {@link LatentPos#writeSyncPacket}. */
+    @Override
+    public void writeSyncPacket(RegistryByteBuf buf, ServerPlayerEntity recipient) {
+        if (this.syncSequence == Integer.MAX_VALUE) this.syncSequence = 0;
+        buf.writeVarInt(++this.syncSequence);
+        NbtCompound tag = new NbtCompound();
+        this.writeToNbt(tag, buf.getRegistryManager());
+        buf.writeNbt(tag);
     }
 }
