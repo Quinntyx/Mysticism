@@ -24,6 +24,16 @@ Both initial source q and newly captured points now call `SpiritActivityService.
 
 The real terrain now exposes matching `Vec3d` prefetch/readiness/acquisition overloads and restores/prewarms with `nav.targetPosition()`. Old `BlockPos` APIs remain for explicit integer debug targets. `LandingSafety` also has an exact-foot `Vec3d ready` overload: the default only delegates for an **exact** legacy centered-XZ/integer-Y point and otherwise fails closed; the actual terrain adapter overrides it. No fractional-foot truncation is hidden in an adapter.
 
+### Natural resting landing
+
+Deep flight no longer hovers forever above available owned terrain. While deep, navigation measures real mesh contact (`MeshCollision.ground`) each movement tick:
+
+- Natural landing arms only after the player has actually been airborne during this deep stretch (`Session.airborne`), so a standing flight toggle is never immediately reversed; any ascending tick resets the rest window.
+- After `NaturalLandingPolicy.REST_TICKS` (10) consecutive resting ticks — near-horizontal ground normal (`>= .99`, matching walk acquisition), no ascending motion — and only when `SpiritTerrainService.currentSupport` is really present, the shared validated support approach begins (`naturalSupport` flagged). It uses the identical `beginSupportApproach`/`attemptSupport`/`acquireCurrentSupport` path as an explicit walk request: no q/basis/position snapping, same cancellation and expiry contract.
+- Unknown/unowned geometry below keeps free flight. A naturally triggered approach that expires reports its own expiry text and re-arms only after the player leaves the ground again (`endSupportApproach` clears the airborne arm), so failures cannot retry-loop while resting. Touch basis blending and a captured-target landing approach are never diverted.
+
+Policy constants live in `NaturalLandingPolicy` (pure, regression-covered); the physical resting-contact premise is regression-covered against the real swept-AABB index, including faded (opacity 0) terrain and steep slopes refusing the `.99` gate.
+
 ### Strict captured landing gate
 
 The earlier held-W bug was real: source-basis-only translation recreated a perpendicular residual and repeatedly cancelled alignment. Existing shared `approachStep` instead uses bounded movement-driven convergence of **all** residual components: <=movement/96 and <=25% of the residual per step. No stationary drift, q replacement, normalization or captured-target update. Captured-target deep translation also eases before the alignment band while retaining full movement-dependent basis pursuit.
