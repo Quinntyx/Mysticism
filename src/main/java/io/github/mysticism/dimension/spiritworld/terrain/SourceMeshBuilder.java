@@ -19,7 +19,9 @@ import java.util.*;
 final class SourceMeshBuilder {
     static final Box UNIT=new Box(0,0,0,1,1,1);
     record Tile(TerrainMeshFrame.Material material,List<Box> collision,int color,int light,boolean air,boolean cube) {}
-    record Node(BlockPos position,int side,Tile tile) {}
+    record Node(BlockPos position,int side,Tile tile,String ownerId) {
+        Node(BlockPos position,int side,Tile tile){this(position,side,tile,"");}
+    }
     record Key(int x,int y,int z,int side) {}
     static Tile read(ServerWorld world,BlockPos position) {
         if(!world.isChunkLoaded(position))return null;
@@ -76,31 +78,54 @@ final class SourceMeshBuilder {
         int x=MathHelper.floor(origin.x)-side/2,y=MathHelper.floor(origin.y)-side/2,z=MathHelper.floor(origin.z)-side/2;
         return new Bounds(x,y,z,(long)x+side,(long)y+side,(long)z+side);
     }
-    static List<Node> compact(Map<BlockPos,Tile> source,Vec3d fineCenter) {
-        Map<Key,Tile> nodes=new HashMap<>();
-        source.forEach((p,t)->{if(!t.air)nodes.put(new Key(p.getX(),p.getY(),p.getZ(),1),t);});
+    static List<Node> compact(Map<BlockPos,Tile> source,Vec3d fineCenter) {return compact(source,fineCenter,Map.of());}
+    static List<Node> compact(Map<BlockPos,Tile> source,Vec3d fineCenter,Map<BlockPos,String> exactOwners) {
+        Map<Key,Tile> nodes=new HashMap<>();Map<Key,String> owners=new HashMap<>();
+        source.forEach((p,t)->{if(!t.air){Key key=new Key(p.getX(),p.getY(),p.getZ(),1);nodes.put(key,t);owners.put(key,exactOwners.getOrDefault(p,""));}});
         for(int side=1;side<16;side*=2) {
             Set<Key> parents=new HashSet<>();
             for(Key k:nodes.keySet())if(k.side==side)parents.add(new Key(Math.floorDiv(k.x,side*2)*side*2,Math.floorDiv(k.y,side*2)*side*2,Math.floorDiv(k.z,side*2)*side*2,side*2));
             for(Key p:parents) {
                 Box bounds=new Box(p.x,p.y,p.z,p.x+p.side,p.y+p.side,p.z+p.side);
                 if(distanceSquared(bounds,fineCenter)<49)continue;
-                Tile common=null;boolean equal=true;
+                Tile common=null;String owner=null;boolean equal=true;
                 for(int child=0;child<8;child++) {
-                    Tile t=nodes.get(new Key(p.x+((child&1)==0?0:side),p.y+((child&2)==0?0:side),p.z+((child&4)==0?0:side),side));
-                    if(t==null || !t.cube || common!=null && !t.equals(common)){equal=false;break;}
-                    common=t;
+                    Key key=new Key(p.x+((child&1)==0?0:side),p.y+((child&2)==0?0:side),p.z+((child&4)==0?0:side),side);
+                    Tile t=nodes.get(key);String id=owners.getOrDefault(key,"");
+                    if(t==null || !t.cube || id.isEmpty() || owner!=null && !owner.equals(id) || common!=null && !t.equals(common)){equal=false;break;}
+                    common=t;owner=id;
                 }
                 if(!equal)continue;
-                for(int child=0;child<8;child++)nodes.remove(new Key(p.x+((child&1)==0?0:side),p.y+((child&2)==0?0:side),p.z+((child&4)==0?0:side),side));
-                nodes.put(p,common);
+                for(int child=0;child<8;child++) {
+                    Key key=new Key(p.x+((child&1)==0?0:side),p.y+((child&2)==0?0:side),p.z+((child&4)==0?0:side),side);
+                    nodes.remove(key);owners.remove(key);
+                }
+                nodes.put(p,common);owners.put(p,owner);
             }
         }
         var result=new ArrayList<Node>();
-        nodes.forEach((k,t)->result.add(new Node(new BlockPos(k.x,k.y,k.z),k.side,t)));
+        nodes.forEach((k,t)->result.add(new Node(new BlockPos(k.x,k.y,k.z),k.side,t,owners.getOrDefault(k,""))));
         result.sort(Comparator.comparingDouble((Node n)->distanceSquared(new Box(n.position).expand(n.side-1),fineCenter))
                 .thenComparingLong(n->n.position.asLong()).thenComparingInt(Node::side));
         return result;
+    }
+    /** Refine a persisted coarse leaf only inside the bounded exact-mask window, preserving far geometry. */
+    static List<Node> splitOwnership(List<Node> source,Map<BlockPos,String> owners,Bounds range,Vec3d center) {
+        List<Node> result=new ArrayList<>();for(Node node:source)splitOwner(node,owners,range,result);
+        result.sort(Comparator.comparingDouble(n->distanceSquared(new Box(n.position()).expand(n.side()-1),center)));
+        return List.copyOf(result);
+    }
+    private static void splitOwner(Node node,Map<BlockPos,String> owners,Bounds range,List<Node> result) {
+        BlockPos p=node.position();int side=node.side();Bounds box=new Bounds(p.getX(),p.getY(),p.getZ(),(long)p.getX()+side,(long)p.getY()+side,(long)p.getZ()+side);
+        if(!box.intersects(range)){result.add(node);return;}
+        String owner=null;boolean uniform=range.contains(box);
+        if(uniform)for(BlockPos cell:BlockPos.iterate(p,p.add(side-1,side-1,side-1))) {
+            String id=owners.getOrDefault(cell,"");
+            if(id.isEmpty() || owner!=null && !owner.equals(id)){uniform=false;break;}owner=id;
+        }
+        if(side==1 || uniform){result.add(new Node(p,side,node.tile(),owners.getOrDefault(p,"")));return;}
+        int half=side/2;
+        for(int child=0;child<8;child++)splitOwner(new Node(p.add((child&1)==0?0:half,(child&2)==0?0:half,(child&4)==0?0:half),half,node.tile(),node.ownerId()),owners,range,result);
     }
     static long key(String owner,Vec3d source,int side) {
         long h=0xcbf29ce484222325L;

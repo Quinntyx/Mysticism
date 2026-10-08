@@ -75,7 +75,7 @@ public final class SpiritTerrainService {
             cancelEnter(player);
             var w=new Window(player.getServerWorld().getRegistryKey().getValue().toString(),player.getPos(),q(player),basis(player),"");
             captureLoaded(player.getServerWorld(),w,player.getPos(),1331,true);
-            w.nodes=SourceMeshBuilder.compact(w.tiles,player.getPos());
+            w.nodes=compact(player.getServer(),w,player.getPos());
             Session s=new Session(w,player.getPos());s.created=c.tick;c.sessions.put(player.getUuid(),s);
             s.frame=build(player,s,0); // actual local mesh exists BEFORE dimension teleport, including all known source shapes
             discoverOwner(player,s);requestSource(player,s,player.getPos(),32);
@@ -102,7 +102,7 @@ public final class SpiritTerrainService {
                         .add(w.sourceBasis.j.clone().mul((float)(offset.y/SCALE))).add(w.sourceBasis.k.clone().mul((float)(offset.z/SCALE)));}
             ServerWorld source=world(player.getServer(),w.dimension);
             if(source!=null)captureLoaded(source,w,w.origin,1331,true);
-            w.nodes=SourceMeshBuilder.compact(w.tiles,w.origin);c.sessions.put(player.getUuid(),s);
+            w.nodes=compact(player.getServer(),w,w.origin);s.anchorDelivered=nav.semanticReady();c.sessions.put(player.getUuid(),s);
             if(owner==null)discoverOwner(player,s);requestSource(player,s,w.origin,32);publish(player,s,true);
             if(nav.hasShallowTarget())prefetchTarget(player,nav.targetDimension(),nav.targetLandmarkId(),nav.targetBlock(),player.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target(),nav.targetBasis());
             return true;
@@ -133,13 +133,18 @@ public final class SpiritTerrainService {
     public static Optional<SourcePosition> sourcePosition(ServerPlayerEntity p) {
         Session s=session(p);if(s==null || !s.shallow)return Optional.empty();
         Vec3d at=s.local.origin.add(p.getPos().subtract(s.carrier));
-        if(s.local.owner!=null && !s.local.owner.header().bounds().contains(MathHelper.floor(at.x),MathHelper.floor(at.y),MathHelper.floor(at.z)))return Optional.empty();
         if(!s.local.tiles.containsKey(BlockPos.ofFloored(at)))return Optional.empty();
+        Optional<String> actual=exactOwner(p,s,s.local,at);
+        if(actual.isEmpty()) {
+            // Initial native shallow view does not require a pre-known semantic feature. This grants NO support/exit authority.
+            if(!s.anchorDelivered && (s.local.id.isEmpty() || ownershipPending(p)))return Optional.of(new SourcePosition(s.local.dimension,at,""));
+            return Optional.empty();
+        }
         String retained=ownerId(p,s.local);
-        if(!s.local.id.isEmpty() && retained.isEmpty())return Optional.empty();
+        if(!retained.isEmpty() && !actual.get().equals(retained))return Optional.empty();
         Optional<Support> grounded=support(p);
-        if(grounded.isPresent() && !grounded.get().landmarkId().equals(retained))return Optional.empty();
-        return Optional.of(new SourcePosition(s.local.dimension,at,retained));
+        if(grounded.isPresent() && !grounded.get().landmarkId().equals(actual.get()))return Optional.empty();
+        return Optional.of(new SourcePosition(s.local.dimension,at,actual.get()));
     }
     /** Coordinate-profile frame: raw q is a LOCATION, not a unit text embedding. Never normalize q. */
     public static Optional<ProjectionFrame> projectionFrame(ServerPlayerEntity p) {
@@ -162,19 +167,24 @@ public final class SpiritTerrainService {
     }
     public static Optional<Support> support(ServerPlayerEntity p) {
         Session s=session(p);if(s==null || !p.getWorld().getRegistryKey().equals(WORLD))return Optional.empty();
-        return MeshCollision.ground(p).map(hit->{
-            String id=hit.cell().landmarkId();Window w=id.equals(s.local.id)?s.local:s.regions.get(id);
-            Vec384f embedding=w==null?s.local.supportEmbedding:w.supportEmbedding;
-            if(w!=null && w.owner!=null)embedding=LandmarkStore.get(p.getServer()).metadata(w.id)
-                    .map(m->SpiritActivityService.effectiveEmbedding(p.getServer(),m).vector()).orElse(w.supportEmbedding);
-            Vec3d center=w==null?s.carrier:origin(p,s,w);
-            return new Support(w==null?"":ownerId(p,w),embedding,center,hit.normal());
+        return MeshCollision.ground(p).flatMap(hit->{
+            var cell=hit.cell();Window w=windowFor(s,cell);
+            if(w==null)return Optional.empty();
+            // Invert the SAME deformed cell used by rendering/SAT, then sample inside the producing source voxel.
+            Vec3d contact=p.getPos().add(0,.025-.15*hit.time(),0).subtract(hit.normal().multiply(.001));
+            Vec3d source=sourceContact(cell,contact);Optional<String> id=exactOwner(p,s,w,source);
+            if(id.isEmpty())return Optional.empty();
+            var metadata=LandmarkStore.get(p.getServer()).metadata(id.get());if(metadata.isEmpty())return Optional.empty();
+            var anchor=metadata.get().header().anchor();
+            Vec3d center=cell.point((anchor.x()-cell.sourceMin().x)/cell.size().x,(anchor.y()-cell.sourceMin().y)/cell.size().y,(anchor.z()-cell.sourceMin().z)/cell.size().z);
+            return Optional.of(new Support(metadata.get().id(),SpiritActivityService.effectiveEmbedding(p.getServer(),metadata.get()).vector(),center,hit.normal()));
         });
     }
     /** Exit is exact current shallow mapping, never saved entry/spawn or safe-air substitution. */
     public static boolean exit(ServerPlayerEntity p) {
         Optional<SourcePosition> mapped=sourcePosition(p);if(mapped.isEmpty() || !p.getWorld().getRegistryKey().equals(WORLD))return false;
-        SourcePosition at=mapped.get();ServerWorld world=world(p.getServer(),at.dimension);
+        SourcePosition at=mapped.get();if(at.landmarkId().isEmpty())return false; // Pending native entry view is not permission to materialize.
+        ServerWorld world=world(p.getServer(),at.dimension);
         if(world==null || !clearBody(world,at.position))return false;
         float yaw=p.getYaw(),pitch=p.getPitch();p.teleport(world,at.position.x,at.position.y,at.position.z,yaw,pitch);
         p.setVelocity(Vec3d.ZERO);p.fallDistance=0;cancelEnter(p);return true;
@@ -196,7 +206,7 @@ public final class SpiritTerrainService {
         }));
         s.targetFuture=SourceLandmarks.region(p.getServer(),dimension,SourceMeshBuilder.range(target.origin,12),1728).whenComplete((region,error)->p.getServer().execute(()->{
             if(!live(p,s) || s.target!=target || error!=null)return;
-            ingest(p.getServer(),target,region.cells(),1728);target.nodes=SourceMeshBuilder.compact(target.tiles,target.origin);
+            ingest(p.getServer(),target,region.cells(),1728);target.nodes=compact(p.getServer(),target,target.origin);
             target.ready=region.complete();publish(p,s,true);
         }));
     }
@@ -229,7 +239,7 @@ public final class SpiritTerrainService {
         ServerWorld sourceWorld=world(p.getServer(),dimension);
         if(sourceWorld!=null && sourceWorld.isChunkLoaded(position)) {
             captureLoaded(sourceWorld,target,target.origin,1331,true);
-            target.nodes=SourceMeshBuilder.compact(target.tiles,target.origin);publish(p,s,true);
+            target.nodes=compact(p.getServer(),target,target.origin);publish(p,s,true);
             if(!clearBody(sourceWorld,target.origin))return false;
             BlockPos floor=BlockPos.ofFloored(target.origin.add(0,-.05,0));
             if(!sourceWorld.isChunkLoaded(floor) || !contact(sourceWorld.getBlockState(floor).getCollisionShape(sourceWorld,floor),floor,body(target.origin),target.origin.y))return false;
@@ -276,12 +286,68 @@ public final class SpiritTerrainService {
         s.ownerFuture=SourceLandmarks.ensureSourceLocation(p.getServer(),expected.dimension,BlockPos.ofFloored(expected.origin)).whenComplete((found,error)->p.getServer().execute(()->{
             if(!live(p,s) || s.local!=expected || error!=null || found==null || found.isEmpty())return;
             Window w=expected;var m=found.get();w.id=m.id();w.owner=m;w.supportEmbedding=m.header().baseEmbedding().vector();
-            // NAV installs the real late-anchor callback. Changing coordinate gauge must not move existing local surfaces.
-            Vec384f before=q(p);Vec3d source=s.shallow?w.origin.add(p.getPos().subtract(s.carrier)):w.origin;
-            anchorListener.anchor(p,new SourcePosition(w.dimension,source,w.id),w.sourceBasis.clone());
-            w.semantic.add(q(p).sub(before));
-            publish(p,s,true);
+            // Attach ownership without moving geometry. Deliver NAV anchoring only after exact octree ownership is current.
+            Vec3d source=s.shallow?w.origin.add(p.getPos().subtract(s.carrier)):w.origin;
+            requestOwnership(p,s,w,source);notifyAnchor(p,s,w);publish(p,s,true);
         }));
+    }
+    /** NAV may wait on this transient async state instead of treating an invalidated snapshot as walking off a region. */
+    public static boolean ownershipPending(ServerPlayerEntity p) {
+        Session s=session(p);if(s==null)return false;Window w=s.local;
+        Vec3d at=s.shallow?w.origin.add(p.getPos().subtract(s.carrier)):w.origin;
+        return w.owners==null || !w.owners.isCurrent(p.getServer()) || !w.owners.bounds().contains(MathHelper.floor(at.x),MathHelper.floor(at.y),MathHelper.floor(at.z));
+    }
+    private static Optional<String> exactOwner(ServerPlayerEntity p,Session s,Window w,Vec3d source) {
+        BlockPos point=BlockPos.ofFloored(source);
+        if(w.owners!=null && w.owners.isCurrent(p.getServer()) && w.owners.bounds().contains(point.getX(),point.getY(),point.getZ()))return w.owners.ownerAt(point);
+        requestOwnership(p,s,w,source);return Optional.empty();
+    }
+    private static void requestOwnership(ServerPlayerEntity p,Session s,Window w,Vec3d source) {
+        Context c=SERVERS.get(p.getServer());if(c==null || c.tick<w.nextOwnerRequest || w.ownershipFuture!=null && !w.ownershipFuture.isDone())return;
+        w.nextOwnerRequest=c.tick+20;
+        var future=SourceLandmarks.owners(p.getServer(),w.dimension,SourceMeshBuilder.range(source,16),4096);w.ownershipFuture=future;
+        future.whenComplete((region,error)->p.getServer().execute(()->{
+            if(!live(p,s) || w.ownershipFuture!=future)return;
+            if(error!=null || region==null || !region.isCurrent(p.getServer()))return;
+            w.owners=region;
+            if(!w.tiles.isEmpty())w.nodes=compact(p.getServer(),w,source);
+            else if(!w.geometryNodes.isEmpty())w.nodes=SourceMeshBuilder.splitOwnership(w.geometryNodes,region.owners(),region.bounds(),source);
+            notifyAnchor(p,s,w);publish(p,s,true);
+        }));
+    }
+    private static void notifyAnchor(ServerPlayerEntity p,Session s,Window w) {
+        if(w!=s.local || s.anchorDelivered || w.owners==null || !w.owners.isCurrent(p.getServer()))return;
+        Vec3d source=s.shallow?w.origin.add(p.getPos().subtract(s.carrier)):w.origin;
+        String id=w.owners.ownerAt(BlockPos.ofFloored(source)).orElse("");
+        if(id.isEmpty() || !id.equals(ownerId(p,w)))return;
+        Vec384f before=q(p);anchorListener.anchor(p,new SourcePosition(w.dimension,source,id),w.sourceBasis.clone());
+        w.semantic.add(q(p).sub(before));s.anchorDelivered=true;publish(p,s,true);
+    }
+    private static List<SourceMeshBuilder.Node> compact(MinecraftServer server,Window w,Vec3d center) {
+        Map<BlockPos,String> owners=w.owners!=null && w.owners.isCurrent(server)?w.owners.owners():Map.of();
+        w.compactedOwnership=w.owners!=null && w.owners.isCurrent(server)?w.owners.ownershipRevision():-1;
+        return SourceMeshBuilder.compact(w.tiles,center,owners);
+    }
+    private static Window windowFor(Session s,TerrainMeshFrame.Cell cell) {
+        // Actual owner labels can differ from a retained window's identity at a real source boundary.
+        if(!s.shallow && s.target!=null && contains(s.target,cell))return s.target;
+        if(contains(s.local,cell))return s.local;
+        for(Window w:s.regions.values())if(contains(w,cell))return w;
+        // A held visible frame can predate compaction/relabeling; still resolve its SOURCE cell via the exact map.
+        if(cell.landmarkId().equals(s.local.id))return s.local;
+        if(s.target!=null && cell.landmarkId().equals(s.target.id))return s.target;
+        return s.regions.get(cell.landmarkId());
+    }
+    private static boolean contains(Window w,TerrainMeshFrame.Cell cell) {
+        for(var node:w.nodes)if(node.side()==cell.size().x && node.position().getX()==cell.sourceMin().x
+                && node.position().getY()==cell.sourceMin().y && node.position().getZ()==cell.sourceMin().z
+                && node.ownerId().equals(cell.landmarkId()))return true;
+        return false;
+    }
+    private static Vec3d sourceContact(TerrainMeshFrame.Cell c,Vec3d world) {
+        Vec3d v=world.subtract(c.min());double det=c.axisX().dotProduct(c.axisY().crossProduct(c.axisZ()));
+        double x=v.dotProduct(c.axisY().crossProduct(c.axisZ()))/det,y=v.dotProduct(c.axisZ().crossProduct(c.axisX()))/det,z=v.dotProduct(c.axisX().crossProduct(c.axisY()))/det;
+        return c.sourceMin().add(Math.max(0,Math.min(1-1e-6,x))*c.size().x,Math.max(0,Math.min(1-1e-6,y))*c.size().y,Math.max(0,Math.min(1-1e-6,z))*c.size().z);
     }
     private static void requestSource(ServerPlayerEntity p,Session s,Vec3d source,int side) {
         if(s.sourceFuture!=null && !s.sourceFuture.isDone())return;
@@ -338,7 +404,7 @@ public final class SpiritTerrainService {
                     s.local.tiles.entrySet().removeIf(e->e.getKey().getSquaredDistance(center)>32*32);
                     s.local.liveTiles.retainAll(s.local.tiles.keySet());
                 }
-                if(s.local.dirty && c.tick%4==0){Vec3d source=s.local.origin.add(p.getPos().subtract(s.carrier));s.local.nodes=SourceMeshBuilder.compact(s.local.tiles,source);s.local.dirty=false;}
+                if(s.local.dirty && c.tick%4==0){Vec3d source=s.local.origin.add(p.getPos().subtract(s.carrier));s.local.nodes=compact(server,s.local,source);s.local.dirty=false;}
                 // Immediate target prewarm is independent of catalog traversal/cluster locks.
                 var nav=p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION);
                 if(nav.hasShallowTarget() && s.target==null && q(p).squareDistance(p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target())<MeshRepresentatives.RADIUS*MeshRepresentatives.RADIUS)
@@ -364,6 +430,7 @@ public final class SpiritTerrainService {
     }
     private static TerrainMeshFrame build(ServerPlayerEntity p,Session s,long revision) {return build(p,s,revision,basis(p));}
     private static TerrainMeshFrame build(ServerPlayerEntity p,Session s,long revision,Basis384f observer) {
+        refreshCompaction(p,s.local);if(s.target!=null)refreshCompaction(p,s.target);for(Window w:s.regions.values())refreshCompaction(p,w);
         List<TerrainMeshFrame.Material> materials=new ArrayList<>();Map<TerrainMeshFrame.Material,Integer> palette=new HashMap<>();
         List<TerrainMeshFrame.Cell> cells=new ArrayList<>();Set<Long> keys=new HashSet<>();
         if(!s.shallow && s.target!=null && s.target!=s.local && currentTarget(p,s)
@@ -376,6 +443,11 @@ public final class SpiritTerrainService {
             for(Window w:s.regions.values())if(w!=closest && w!=s.local && w!=s.target && !w.id.equals(s.local.id))append(p,s,w,materials,palette,cells,keys,128,observer);
         }
         return new TerrainMeshFrame(revision,s.shallow,s.local.dimension,s.local.origin,s.carrier,materials,MeshStitcher.stitch(cells,materials,s.local.id,s.shallow,p.getPos()));
+    }
+    private static void refreshCompaction(ServerPlayerEntity p,Window w) {
+        if(w.tiles.isEmpty())return;
+        long epoch=w.owners!=null && w.owners.isCurrent(p.getServer())?w.owners.ownershipRevision():-1;
+        if(w.compactedOwnership!=epoch)w.nodes=compact(p.getServer(),w,w.origin);
     }
     private static void append(ServerPlayerEntity p,Session s,Window w,List<TerrainMeshFrame.Material> materials,Map<TerrainMeshFrame.Material,Integer> palette,List<TerrainMeshFrame.Cell> cells,Set<Long> keys,int limit,Basis384f current) {
         boolean aligned=w==s.local && s.shallow;Vec3d root;
@@ -395,10 +467,10 @@ public final class SpiritTerrainService {
             if(Math.abs(ex.dotProduct(ey.crossProduct(ez)))<1e-6)continue; // collapsed model AND collision disappear together
             var tile=node.tile();Integer material=palette.get(tile.material());
             if(material==null){if(materials.size()==TerrainMeshFrame.MAX_MATERIALS)continue;material=materials.size();materials.add(tile.material());palette.put(tile.material(),material);}
-            long key=SourceMeshBuilder.key(w.id,source,side);
+            String actualOwner=node.ownerId();long key=SourceMeshBuilder.key(actualOwner.isEmpty()?"unknown:"+w.dimension:actualOwner,source,side);
             if(!keys.add(key))continue;
             float alpha=aligned?1:w.alpha;
-            cells.add(new TerrainMeshFrame.Cell(key,material,w.id,source,min,new Vec3d(side,side,side),ex,ey,ez,tile.color(),tile.light(),alpha,tile.collision()));count++;
+            cells.add(new TerrainMeshFrame.Cell(key,material,actualOwner,source,min,new Vec3d(side,side,side),ex,ey,ez,tile.color(),tile.light(),alpha,tile.collision()));count++;
         }
     }
     private static Vec3d axis(Vec384f source,Basis384f observer){return new Vec3d(source.dot(observer.i),source.dot(observer.j),source.dot(observer.k));}
@@ -416,19 +488,19 @@ public final class SpiritTerrainService {
     }
     private static final class Window {
         final String dimension;Vec3d origin;Vec384f semantic,supportEmbedding;final Vec384f captured;final Basis384f sourceBasis;
-        boolean proofValid;List<String> proofKeys=List.of();
+        boolean proofValid;List<String> proofKeys=List.of();SourceOwnership.Region owners;CompletableFuture<SourceOwnership.Region> ownershipFuture;long nextOwnerRequest;
         String id;LandmarkMetadata owner;boolean ready,dirty,confirmedOrigin;float alpha=1;int refreshCursor;
         final Set<BlockPos> liveTiles=new HashSet<>();
-        final Map<BlockPos,SourceMeshBuilder.Tile> tiles=new HashMap<>();List<SourceMeshBuilder.Node> nodes=List.of();
+        final Map<BlockPos,SourceMeshBuilder.Tile> tiles=new HashMap<>();List<SourceMeshBuilder.Node> nodes=List.of(),geometryNodes=List.of();long compactedOwnership=-1;
         Window(String dimension,Vec3d origin,Vec384f semantic,Basis384f basis,String id){this.dimension=dimension;this.origin=origin;this.semantic=semantic.clone();captured=semantic.clone();supportEmbedding=semantic.clone();sourceBasis=basis.clone();this.id=id;}
     }
     private static final class Session {
-        Window local,target;Vec3d carrier,sourceRequested;boolean shallow=true,entered;long revision,created;
+        Window local,target;Vec3d carrier,sourceRequested;boolean shallow=true,entered,anchorDelivered;long revision,created;
         TerrainMeshFrame frame;CompletableFuture<?> ownerFuture,sourceFuture,targetFuture,targetOwnerFuture;Iterator<SourceLandmarks.Cell> ingesting;
         final Map<String,Window> regions=new LinkedHashMap<>();final MeshRepresentatives selection=new MeshRepresentatives();
         String scanCursor,status,closestId="";int dimensionCursor;boolean scanning;Set<String> selected=Set.of();
         Session(Window local,Vec3d carrier){this.local=local;this.carrier=carrier;}
-        void cancel(){if(ownerFuture!=null)ownerFuture.cancel(false);if(sourceFuture!=null)sourceFuture.cancel(false);if(targetFuture!=null)targetFuture.cancel(false);if(targetOwnerFuture!=null)targetOwnerFuture.cancel(false);regions.clear();}
+        void cancel(){if(ownerFuture!=null)ownerFuture.cancel(false);if(sourceFuture!=null)sourceFuture.cancel(false);if(targetFuture!=null)targetFuture.cancel(false);if(targetOwnerFuture!=null)targetOwnerFuture.cancel(false);if(local.ownershipFuture!=null)local.ownershipFuture.cancel(false);if(target!=null && target.ownershipFuture!=null)target.ownershipFuture.cancel(false);for(var w:regions.values())if(w.ownershipFuture!=null)w.ownershipFuture.cancel(false);regions.clear();}
     }
     private static final class Context {
         final MinecraftServer server;final LandmarkStore store;final Map<UUID,Session> sessions=new HashMap<>();
@@ -534,13 +606,13 @@ public final class SpiritTerrainService {
                                 var actual=source==null?null:SourceMeshBuilder.read(source,sample.getKey());
                                 target.tiles.put(sample.getKey(),actual!=null?actual:SourceMeshBuilder.stored(sample.getValue(),sample.getKey(),target.tiles));
                             }
-                            target.nodes=SourceMeshBuilder.compact(target.tiles,target.origin);
+                            target.nodes=compact(server,target,target.origin);
                         }
                         if(!read.complete())read.cancel();read=null;proving=false;proofSamples.clear();
                     }
                     return;
                 }
-                if(++readTicks>32 || pagesVisited>=4 || readingWindow.nodes.size()>=128) {
+                if(++readTicks>32 || pagesVisited>=4 || readingWindow.geometryNodes.size()>=128) {
                     // Bounded geometry window, not a whole-feature cap. Yield even a pathological cold page to other regions.
                     read.cancel();read=null;leaves=null;readingWindow.ready=!readingWindow.nodes.isEmpty();
                     readingSession.regions.put(readingWindow.id,readingWindow);return;
@@ -548,10 +620,12 @@ public final class SpiritTerrainService {
                 if(leaves==null){read.advance(1,256);var pages=read.drain();if(!pages.isEmpty()){pagesVisited++;page=pages.getFirst();leaves=page.knownCells().iterator();}}
                 int work=0;while(leaves!=null && leaves.hasNext() && work++<256) {
                     var cell=leaves.next();if(cell.value().occupancy()!=BlockSample.Occupancy.SOLID)continue;
-                    if(readingWindow.nodes.size()>=128)continue;
+                    if(readingWindow.geometryNodes.size()>=128)continue;
                     Bounds b=cell.bounds();var at=new BlockPos(Math.toIntExact(b.minX()),Math.toIntExact(b.minY()),Math.toIntExact(b.minZ()));
                     var tile=SourceMeshBuilder.stored(page.palette().state(cell.value().paletteIndex()),at);
-                    var nodes=new ArrayList<>(readingWindow.nodes);nodes.add(new SourceMeshBuilder.Node(at,Math.toIntExact(b.maxX()-b.minX()),tile));readingWindow.nodes=List.copyOf(nodes);
+                    var nodes=new ArrayList<>(readingWindow.geometryNodes);nodes.add(new SourceMeshBuilder.Node(at,Math.toIntExact(b.maxX()-b.minX()),tile,readingWindow.id));
+                    readingWindow.geometryNodes=List.copyOf(nodes);readingWindow.nodes=readingWindow.geometryNodes;
+                    if(readingWindow.owners!=null && readingWindow.owners.isCurrent(server))readingWindow.nodes=SourceMeshBuilder.splitOwnership(readingWindow.geometryNodes,readingWindow.owners.owners(),readingWindow.owners.bounds(),readingWindow.origin);
                 }
                 if(leaves!=null && !leaves.hasNext())leaves=null;
                 // Partial pages are published incrementally; any page count works and other requests advance after completion.
