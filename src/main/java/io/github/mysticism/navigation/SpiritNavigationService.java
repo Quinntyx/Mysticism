@@ -111,8 +111,20 @@ public final class SpiritNavigationService {
         Session removed = sessions == null ? null : sessions.remove(p.getUuid());
         if (removed != null && removed.capture != null) removed.capture.cancel(false);
         if (removed != null && removed.supportPending) SpiritTerrainService.cancelCurrentSupport(p);
-        // Pending support ownership/alignment is session-local, never resumed from a saved/wire flag.
+        // Pending support ownership/alignment and landing approach are session-local,
+        // never resumed from a saved/wire flag.
         state(p).setSupportApproach(false);
+        state(p).setLandingApproach(false);
+    }
+    /** Repeated entry starts a brand-new movement/semantic lifecycle; no previous visit state survives. */
+    private static Session freshVisit(ServerPlayerEntity p) {
+        Map<UUID, Session> sessions = SERVERS.computeIfAbsent(p.getServer(), s -> new HashMap<>());
+        Session previous = sessions.put(p.getUuid(), new Session());
+        if (previous != null) {
+            if (previous.capture != null) previous.capture.cancel(false);
+            if (previous.supportPending) SpiritTerrainService.cancelCurrentSupport(p);
+        }
+        return sessions.get(p.getUuid());
     }
     private static void sync(ServerPlayerEntity p) { MysticismEntityComponents.SPIRIT_NAVIGATION.sync(p); }
     private static void deactivate(ServerPlayerEntity p) {
@@ -179,8 +191,9 @@ public final class SpiritNavigationService {
         if (!SpiritTerrainService.prepareEnter(p)) { deactivate(p); return false; }
         var mapped = SpiritTerrainService.sourcePosition(p);
         nav.shallow(dimension, mapped.map(SpiritTerrainService.SourcePosition::landmarkId).orElse(""), source);
-        Session s = session(p); s.semanticReady = false; s.checkedRestore = true;
-        nav.setSemanticReady(false); nav.setLandingApproach(false);
+        Session s = freshVisit(p); // stale blend/landing/support/jump state from any prior visit can never leak in
+        s.semanticReady = false; s.checkedRestore = true;
+        nav.setSemanticReady(false); nav.setLandingApproach(false); nav.setSupportApproach(false);
         s.confirmedOwned = false; s.warnedAnchor = false; s.prefetched = false;
         try {
             // Source-identical carrier pose: no shared origin, entry search or replacement floor.
@@ -284,8 +297,13 @@ public final class SpiritNavigationService {
         if (state(p).supportApproach()) { state(p).setSupportApproach(false); sync(p); }
     }
 
-    /** Called once by the evolver. True permits ordinary deep movement integration. */
-    public static boolean update(ServerPlayerEntity p, Vec3d delta) {
+    /** Single-delta compatibility: identical delta for both roles (pre-split caller behavior). */
+    public static boolean update(ServerPlayerEntity p, Vec3d delta) { return update(p, delta, delta); }
+
+    /** Called once by the evolver. True permits ordinary deep movement integration. Never snaps q/pose/basis.
+     * physical drives real-movement navigation decisions (jump takeoff grace, blend cancel);
+     * semantic drives q/basis advancement and must match ClientLatentPredictor epoch filtering. */
+    public static boolean update(ServerPlayerEntity p, Vec3d physical, Vec3d semantic) {
         if (!spirit(p)) { if (state(p).active() || state(p).hasSavedAbilities()) deactivate(p); return false; }
         var nav = state(p); Session s = session(p); restoreAnchor(p, s);
         if (nav.hasShallowTarget() && !s.prefetched) {
@@ -316,25 +334,25 @@ public final class SpiritNavigationService {
             nav.shallow(source.dimension(), id, source.position());
             if (support.isPresent()) { s.unsupported = 0; s.jumping = false; }
             else {
-                if (s.unsupported == 0) s.jumping = WalkFlightHandoff.takeoffIntent(delta.y);
+                if (s.unsupported == 0) s.jumping = WalkFlightHandoff.takeoffIntent(physical.y);
                 // A settled/stationary pose on a real-but-unowned floor keeps waiting for ownership
                 // publication instead of spontaneously starting flight; only a genuine ascending takeoff
                 // earns the jump grace, and only genuine falling (edge walk, vanished floor) converts now.
-                if (WalkFlightHandoff.leavesGround(s.jumping, ++s.unsupported, delta.y)) {
+                if (WalkFlightHandoff.leavesGround(s.jumping, ++s.unsupported, physical.y)) {
                     enterDeep(p); return nav.deep() && s.semanticReady;
                 }
             } // Ascending takeoff gets ordinary jump grace; walking over an edge gets immediate freeflight.
             flight(p, false);
             if (s.semanticReady && !anchoredNow) TraversalSteering.advance(p.getComponent(MysticismEntityComponents.LATENT_POS).get(),
-                    p.getComponent(MysticismEntityComponents.LATENT_BASIS).get(), delta.x, delta.y, delta.z);
+                    p.getComponent(MysticismEntityComponents.LATENT_BASIS).get(), semantic.x, semantic.y, semantic.z);
             if (p.getServer().getTicks() % 4 == 0) sync(p);
             return false;
         }
         flight(p, true);
-        if (s.supportPending) { attemptSupport(p, s, delta); return false; }
+        if (s.supportPending) { attemptSupport(p, s, semantic); return false; }
         if (!s.semanticReady) return false;
         if (s.blendTo != null) {
-            if (delta.lengthSquared() > 1e-5) { s.blendFrom = null; s.blendTo = null; }
+            if (physical.lengthSquared() > 1e-5) { s.blendFrom = null; s.blendTo = null; }
             else {
                 float fraction = ++s.blendTick / 20f;
                 p.getComponent(MysticismEntityComponents.LATENT_BASIS).set(TraversalSteering.blend(s.blendFrom, s.blendTo, fraction));
@@ -342,12 +360,13 @@ public final class SpiritNavigationService {
                 return false;
             }
         }
-        if (attemptLanding(p, s, delta)) return false; // Approach advanced q once, without ordinary basis steering.
+        if (attemptLanding(p, s, semantic)) return false; // Approach advanced q once, without ordinary basis steering.
         return nav.deep();
     }
     private static void restoreAnchor(ServerPlayerEntity p, Session s) {
         if (s.checkedRestore) return; s.checkedRestore = true;
         endSupportApproach(p, s);
+        endApproach(p, s); // a persisted landingApproach flag never resumes as an approach mid-flight
         var nav = state(p); Vec384f q = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
         // Physical pose survives model reset, but discarded q/IDs cannot authorize semantic travel.
         s.semanticReady = nav.active() && nav.semanticReady();

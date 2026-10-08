@@ -2,6 +2,7 @@ package io.github.mysticism.client.spiritworld;
 
 import io.github.mysticism.activity.TraversalSteering;
 import io.github.mysticism.component.MysticismEntityComponents;
+import io.github.mysticism.navigation.MotionAlignment;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -37,16 +38,16 @@ public final class ClientLatentPredictor {
         var target = mc.player.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target();
         if (mc.world.getRegistryKey().getValue().equals(Identifier.of("mysticism", "spirit")) && nav.active()) {
             Vec3d now = mc.player.getPos();
-            // Acquisition/anchor corrections (even <4 blocks) are NOT chosen movement.
-            if (lastPlayer == mc.player && lastWorld == mc.world && lastPos != null
-                    && lastEpoch == nav.motionEpoch() && lastDeep == nav.deep() && nav.semanticReady()) {
-                Vec3d delta = now.subtract(lastPos);
-                if (delta.lengthSquared() <= 16) {
-                    if (nav.deep() && nav.supportApproach()) TraversalSteering.advance(q, basis, delta.x, delta.y, delta.z);
-                    else if (nav.deep() && nav.landingApproach()) TraversalSteering.approachStep(q, target, delta.x, delta.y, delta.z);
-                    else if (nav.deep()) TraversalSteering.deepStep(q, basis, target, delta.x, delta.y, delta.z, nav.hasShallowTarget());
-                    else if (!nav.landmarkId().isEmpty()) TraversalSteering.advance(q, basis, delta.x, delta.y, delta.z);
-                }
+            // Acquisition/anchor corrections (even <4 blocks) are NOT chosen movement, and a delta
+            // crossing a prediction-epoch change is re-anchored, never integrated (shared rule).
+            Vec3d delta = lastPlayer == mc.player && lastWorld == mc.world && lastPos != null
+                    ? MotionAlignment.alignedDelta(lastPos, now, lastEpoch, nav.motionEpoch())
+                    : null;
+            if (delta != null && lastDeep == nav.deep() && nav.semanticReady()) {
+                if (nav.deep() && nav.supportApproach()) TraversalSteering.advance(q, basis, delta.x, delta.y, delta.z);
+                else if (nav.deep() && nav.landingApproach()) TraversalSteering.approachStep(q, target, delta.x, delta.y, delta.z);
+                else if (nav.deep()) TraversalSteering.deepStep(q, basis, target, delta.x, delta.y, delta.z, nav.hasShallowTarget());
+                else if (!nav.landmarkId().isEmpty()) TraversalSteering.advance(q, basis, delta.x, delta.y, delta.z);
             }
             lastPos = now; lastPlayer = mc.player; lastWorld = mc.world;
             lastEpoch = nav.motionEpoch(); lastDeep = nav.deep();
