@@ -2,6 +2,7 @@ package io.github.mysticism.navigation;
 
 import io.github.mysticism.activity.TraversalSteering;
 import io.github.mysticism.client.spiritworld.ClientLatentPredictor;
+import io.github.mysticism.client.spiritworld.PredictionContinuity;
 import io.github.mysticism.component.SpiritNavigation;
 import io.github.mysticism.vector.Basis384f;
 import io.github.mysticism.vector.Vec384f;
@@ -117,11 +118,52 @@ public final class TeleportArrivalReconciliationTest {
         check(!ClientLatentPredictor.integratesMovement(true, true, true, epoch, epoch, true, true, false), "Semantic unreadiness still resets prediction");
     }
 
+    /** The reported race: the synced epoch update is processed ONE CLIENT TICK BEFORE the arrival
+     * position packet. The predictor then records the new epoch against the pre-teleport pose, and a
+     * sub-band arrival passes the matching-epoch gate — unless prediction is re-seeded when the
+     * arrival position is actually applied (SpiritArrivalReseedMixin → PredictionContinuity). */
+    private static void arrivalReseedSurvivesEpochBeforeArrival() {
+        Object player = new Object(), world = new Object();
+        Vec3d pose = new Vec3d(10, 64, 10);
+
+        // Defect demonstration: without the arrival re-seed, the split-tick ordering integrates a
+        // 2-block arrival as chosen movement even though the epoch advance was published first.
+        PredictionContinuity unseeded = new PredictionContinuity();
+        check(unseeded.integrableDelta(player, world, pose, 7, true, true) == null, "Cold start re-baselines");
+        check(unseeded.integrableDelta(player, world, pose.add(0.25, 0, 0), 7, true, true) != null, "Ordinary walking integrates");
+        check(unseeded.integrableDelta(player, world, pose.add(0.25, 0, 0), 8, true, true) == null, "Epoch advance re-baselines (same-tick case closed)");
+        Vec3d defect = unseeded.integrableDelta(player, world, pose.add(2.25, 0, 0), 8, true, true);
+        check(defect != null && Math.abs(defect.x - 2) < 1e-9, "Epoch-before-arrival ordering integrates the 2-block arrival (the reported defect)");
+
+        // Reconciled sequence with the arrival re-seed applied by the client arrival mixin:
+        PredictionContinuity reconciled = new PredictionContinuity();
+        check(reconciled.integrableDelta(player, world, pose, 7, true, true) == null, "Cold start re-baselines");
+        check(reconciled.integrableDelta(player, world, pose.add(0.25, 0, 0), 7, true, true) != null, "Pre-teleport walking integrates");
+        // Tick with the epoch update only (position packet not yet applied): ZERO delta, new epoch
+        // recorded against the pre-teleport pose — the hazard state.
+        check(reconciled.integrableDelta(player, world, pose.add(0.25, 0, 0), 8, true, true) == null, "Epoch-only tick integrates nothing and re-baselines");
+        // Arrival position packet applied client-side → re-seed:
+        reconciled.onArrivalApplied();
+        Vec3d arrival = reconciled.integrableDelta(player, world, pose.add(2.25, 0, 0), 8, true, true);
+        check(arrival == null, "Applied 2-block arrival integrates NOTHING despite the matching epoch");
+        // Ordinary movement resumes on the next tick — no freeze, no suppression of real walking.
+        Vec3d resume = reconciled.integrableDelta(player, world, pose.add(2.5, 0, 0), 8, true, true);
+        check(resume != null && Math.abs(resume.x - 0.25) < 1e-9, "Post-arrival walking integrates normally");
+        // Re-seed is idempotent and safe outside teleports:
+        reconciled.onArrivalApplied();
+        check(reconciled.integrableDelta(player, world, pose.add(2.75, 0, 0), 8, true, true) == null, "Repeated re-seed keeps re-baselining safely");
+        // The re-seed must not mask the epoch gate: a STALE epoch still re-baselines after it.
+        reconciled.onArrivalApplied();
+        check(reconciled.integrableDelta(player, world, pose.add(3.0, 0, 0), 8, true, true) == null, "Re-seeded chain re-baselines once, then resumes");
+        check(reconciled.integrableDelta(player, world, pose.add(3.25, 0, 0), 8, true, true) != null, "Movement after the re-seeded tick integrates");
+    }
+
     public static void main(String[] args) {
         arrivalDeltaIsNotSemanticTravel();
         predictionEpochAdvancesOnEveryArrival();
         predictionEpochPersists();
         predictorGateDropsStaleArrivalDelta();
+        arrivalReseedSurvivesEpochBeforeArrival();
         System.out.println("TeleportArrivalReconciliationTest: " + checks + " checks passed");
     }
 }

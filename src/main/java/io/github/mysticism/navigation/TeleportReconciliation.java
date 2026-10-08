@@ -17,7 +17,11 @@ import net.minecraft.util.math.Vec3d;
  *       only discarded LARGE teleports: a 0–4 block /tp inside the spirit world was integrated as
  *       real movement and advanced the latent position (both server evolver and client predictor);</li>
  *   <li>the client predictor kept its pre-teleport last pose; without an epoch advance its arrival
- *       delta would be integrated as semantic travel for the sub-4-block window.</li>
+ *       delta would be integrated as semantic travel for the sub-4-block window — and an epoch
+ *       advance alone is insufficient, because the epoch update can be processed one client tick
+ *       before the arrival position packet. The predictor therefore ALSO re-seeds when the arrival
+ *       position is actually applied client-side (SpiritArrivalReseedMixin), covering both
+ *       processing orders.</li>
  * </ul>
  * Both hooks run on the server thread inside {@code ServerPlayNetworkHandler.requestTeleport}, the
  * single funnel every player teleport passes through (vanilla /tp, /spreadplayers, /spectate, mod
@@ -28,8 +32,10 @@ public final class TeleportReconciliation {
 
     /** Called BEFORE vanilla publishes the arrival position packet. Advancing the synced prediction
      * epoch here means the component update is written to the connection before PlayerPositionLook,
-     * so the client predictor provably drops its stale pre-teleport pose on the arrival tick instead
-     * of racing the position packet. */
+     * closing the same-tick processing case. It cannot close the split-tick case (the epoch update
+     * may be processed one client tick before the position packet, recording the new epoch against
+     * the pre-teleport pose); the deterministic guarantee is the client-side re-seed when the arrival
+     * position is actually applied (SpiritArrivalReseedMixin → PredictionContinuity). */
     public static void beforeSpiritTeleport(ServerPlayerEntity player) {
         if (!inSpirit(player)) return;
         var nav = player.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION);
