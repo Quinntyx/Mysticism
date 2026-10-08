@@ -42,7 +42,9 @@ public final class SpiritNavigationService {
     private SpiritNavigationService() {}
     private static final class Session {
         int unsupported, blendTick, landingTick, supportTick, supportAlignTick;
-        boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, jumping, supportPending;
+        boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, supportPending;
+        /** Feet height of the last mesh-supported shallow tick; NaN until support is first measured. */
+        double supportY = Double.NaN;
         Vec384f targetSnapshot, supportTargetSnapshot;
         Basis384f supportFrom, supportGrid;
         long supportWindow;
@@ -145,6 +147,7 @@ public final class SpiritNavigationService {
             // Source-identical carrier pose: no shared origin, entry search or replacement floor.
             p.teleport(world, source.x, source.y, source.z, p.getYaw(), p.getPitch());
             SpiritTerrainService.setShallow(p, true); flight(p, false);
+            s.supportY = source.y; // entry pose is the supported carrier pose; envelope measured from here
             p.setVelocity(Vec3d.ZERO); sync(p);
             if (nav.hasShallowTarget()) {
                 SpiritTerrainService.prefetchTarget(p, nav.targetDimension(), nav.targetLandmarkId(), nav.targetPosition(),
@@ -213,7 +216,7 @@ public final class SpiritNavigationService {
         var nav = state(p); boolean changed = !nav.active() || !nav.deep();
         // Flight safety never waits for a model. Only semantic travel/landing/touch require a real anchor.
         nav.enterDeep(); SpiritTerrainService.setShallow(p, false); flight(p, true);
-        s.unsupported = 0; s.jumping = false;
+        s.unsupported = 0;
         if (changed) sync(p);
         if (!s.semanticReady && !s.warnedAnchor) {
             p.sendMessage(Text.literal("Free flight active; semantic travel awaits real source discovery."), false); s.warnedAnchor = true;
@@ -243,6 +246,20 @@ public final class SpiritNavigationService {
         if (state(p).supportApproach()) { state(p).setSupportApproach(false); sync(p); }
     }
 
+    /** Landing envelope: how far below the last supported feet height a jump/step-down may fall and
+     * still be expected to land back on its supporting projected terrain (one carrier step height).
+     * Beyond it the body has genuinely left its support and shallow walking must yield to freeflight. */
+    static final double LANDING_ENVELOPE = .6;
+    /** Bounded air budget for any continuous unsupported shallow interval, however it arose. */
+    static final int AIR_GRACE_TICKS = 60;
+    /** Pure per-tick shallow support decision: keep walking shallow only while the carrier is still
+     * inside its last support's landing envelope or the collision mesh still physically holds it.
+     * A momentary ground-contact detection miss while standing/clamped, an ordinary jump ascent and
+     * its landing, and small step-downs all HOLD instead of alternating shallow/deep flight states. */
+    static boolean holdShallow(boolean onGround, double feetY, double supportY, int unsupportedTicks) {
+        boolean envelope = !Double.isNaN(supportY) && feetY >= supportY - LANDING_ENVELOPE;
+        return (envelope || onGround) && unsupportedTicks <= AIR_GRACE_TICKS;
+    }
     /** Called once by the evolver. True permits ordinary deep movement integration. */
     public static boolean update(ServerPlayerEntity p, Vec3d delta) {
         if (!spirit(p)) { if (state(p).active() || state(p).hasSavedAbilities()) deactivate(p); return false; }
@@ -273,11 +290,14 @@ public final class SpiritNavigationService {
             // Ownership checks precede initial anchoring; discovery cannot overwrite an established binding.
             if (!s.semanticReady && !source.landmarkId().isEmpty()) { anchorSource(p, s, source); anchoredNow = s.semanticReady; }
             nav.shallow(source.dimension(), id, source.position());
-            if (support.isPresent()) { s.unsupported = 0; s.jumping = false; }
-            else {
-                if (s.unsupported == 0) s.jumping = delta.y > .01;
-                if (++s.unsupported > 14 || !s.jumping) { enterDeep(p); return nav.deep() && s.semanticReady; }
-            } // Ascending takeoff gets ordinary jump grace; walking over an edge gets immediate freeflight.
+            if (support.isPresent()) { s.unsupported = 0; s.supportY = p.getPos().y; }
+            else if (!holdShallow(p.isOnGround(), p.getPos().y, s.supportY, ++s.unsupported)) {
+                enterDeep(p); return nav.deep() && s.semanticReady;
+            }
+            // Ordinary jumps, landings, small step-downs and momentary ground-detection dropouts stay
+            // shallow while the carrier remains inside its last support's landing envelope; only a real
+            // departure from supported projected terrain (edge walk-off, fall past the envelope) or the
+            // bounded air budget converts to deep freeflight. supportY is the last supported feet height.
             flight(p, false);
             if (s.semanticReady && !anchoredNow) TraversalSteering.advance(p.getComponent(MysticismEntityComponents.LATENT_POS).get(),
                     p.getComponent(MysticismEntityComponents.LATENT_BASIS).get(), delta.x, delta.y, delta.z);
@@ -301,6 +321,7 @@ public final class SpiritNavigationService {
     }
     private static void restoreAnchor(ServerPlayerEntity p, Session s) {
         if (s.checkedRestore) return; s.checkedRestore = true;
+        if (Double.isNaN(s.supportY)) s.supportY = p.getPos().y;
         endSupportApproach(p, s);
         var nav = state(p); Vec384f q = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
         // Physical pose survives model reset, but discarded q/IDs cannot authorize semantic travel.
@@ -377,7 +398,7 @@ public final class SpiritNavigationService {
             return;
         }
         var at = mapped.get(); nav.shallow(at.dimension(), at.landmarkId(), at.position());
-        s.confirmedOwned = true; s.unsupported = 0; s.jumping = false; endSupportApproach(p, s);
+        s.confirmedOwned = true; s.unsupported = 0; endSupportApproach(p, s);
         SpiritBasisEvolver.resetMotion(p); flight(p, false);
         MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p); sync(p);
         p.sendMessage(Text.literal("Shallow: walking on the current source-owned landmark. Captured attunement retained."), true);

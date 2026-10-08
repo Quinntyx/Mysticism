@@ -56,7 +56,9 @@ public final class MeshCollision {
         public boolean clearRay(Vec3d from,Vec3d to) {
             return sweep(new Box(from.x-1e-4,from.y-1e-4,from.z-1e-4,from.x+1e-4,from.y+1e-4,from.z+1e-4),to.subtract(from)).isEmpty();
         }
-        private Vec3d depenetrate(Box body) {
+        // Package-private for the MeshLandingContactTest regression, which replays the real
+        // depenetrate+slide integration instead of a mirrored approximation.
+        Vec3d depenetrate(Box body) {
             Vec3d moved=Vec3d.ZERO;
             for(int step=0;step<8;step++) {
                 Vec3d correction=null;
@@ -70,7 +72,7 @@ public final class MeshCollision {
             }
             return moved;
         }
-        private Vec3d slide(Box body,Vec3d wanted) {
+        Vec3d slide(Box body,Vec3d wanted) {
             Vec3d moved=Vec3d.ZERO,remaining=wanted;
             for(int i=0;i<4 && remaining.lengthSquared()>1e-12;i++) {
                 var hit=sweep(body.offset(moved),remaining);
