@@ -3,6 +3,7 @@ package io.github.mysticism.dimension.spiritworld.terrain;
 import io.github.mysticism.activity.SpiritActivityService;
 import io.github.mysticism.component.MysticismEntityComponents;
 import io.github.mysticism.navigation.SpiritNavigationService;
+import io.github.mysticism.navigation.WalkTargetAcquisition;
 import io.github.mysticism.landmark.*;
 import io.github.mysticism.landmark.extract.LandmarkProfiles;
 import io.github.mysticism.vector.*;
@@ -217,6 +218,43 @@ public final class SpiritTerrainService {
     public static void cancelCurrentSupport(ServerPlayerEntity p) {
         Session s=session(p);if(s==null)return;if(s.walkFuture!=null)s.walkFuture.cancel(false);
         s.walkProbe=null;s.walkFuture=null;s.walkField=0;s.walkNextProbe=0;
+        if(s.walkDiscoveryFuture!=null)s.walkDiscoveryFuture.cancel(false);s.walkDiscoveryFuture=null;
+    }
+    /** True while a pending walk's discovered source target is still being extracted/published. */
+    public static boolean walkTargetPending(ServerPlayerEntity p) {
+        Session s=session(p);return s!=null && s.walkDiscoveryFuture!=null && !s.walkDiscoveryFuture.isDone();
+    }
+    /** A pending walk acquires a real discovered source target at the current contact instead of
+     * rejecting available terrain as unknown. Real bounded extraction pipeline, throttled, one
+     * in flight; the discovered landmark is attached without overwriting an established binding. */
+    public static void discoverWalkTarget(ServerPlayerEntity p) {
+        if(!p.getServer().isOnThread())return;
+        Context c=SERVERS.get(p.getServer());if(c==null)return;
+        Session s=c.sessions.get(p.getUuid());
+        if(s==null || s.shallow || !p.getWorld().getRegistryKey().equals(WORLD))return;
+        boolean inFlight=s.walkDiscoveryFuture!=null && !s.walkDiscoveryFuture.isDone();
+        if(WalkTargetAcquisition.discovery(inFlight,c.tick-s.walkDiscoveryTick)==WalkTargetAcquisition.Discovery.WAIT)return;
+        s.walkDiscoveryTick=c.tick;
+        Vec3d contact=MeshCollision.ground(p)
+                .map(hit->sourceContact(hit.cell(),p.getPos().add(0,.025-.15*hit.time(),0).subtract(hit.normal().multiply(.001))))
+                .orElse(p.getPos()); // airborne seed: exact source cell under the current carrier
+        Window expected=s.local;
+        var future=SourceLandmarks.ensureSourceLocation(p.getServer(),expected.dimension,BlockPos.ofFloored(contact));
+        s.walkDiscoveryFuture=future;
+        future.whenComplete((found,error)->p.getServer().execute(()->{
+            if(!live(p,s) || s.walkDiscoveryFuture!=future)return;
+            s.walkDiscoveryFuture=null;
+            if(error!=null || found==null || found.isEmpty() || s.local!=expected)return;
+            var m=found.get();
+            var decision=WalkTargetAcquisition.attach(expected.id,m.id(),
+                    expected.owner==null?List.of():expected.owner.geometryKeys(),m.geometryKeys());
+            if(decision==WalkTargetAcquisition.Attach.BIND_NEW) {
+                expected.id=m.id();expected.owner=m;expected.supportEmbedding=m.header().baseEmbedding().vector();
+            } else if(decision==WalkTargetAcquisition.Attach.REFRESH_REVISION) {
+                expected.owner=m;expected.supportEmbedding=SpiritActivityService.effectiveEmbedding(p.getServer(),m).vector();
+            }
+            requestOwnership(p,s,expected,contact);notifyAnchor(p,s,expected);publish(p,s,true);
+        }));
     }
     private static void ensureWalkProof(ServerPlayerEntity p,Session s,Window field,WalkSupport hint) {
         Window probe=s.walkProbe;var owner=LandmarkStore.get(p.getServer()).metadata(hint.landmarkId());
@@ -277,6 +315,7 @@ public final class SpiritTerrainService {
         if(s.sourceFuture!=null)s.sourceFuture.cancel(false);if(s.ownerFuture!=null)s.ownerFuture.cancel(false);
         if(previous.ownershipFuture!=null)previous.ownershipFuture.cancel(false);
         s.walkProbe=null;s.walkField=0;if(s.walkFuture!=null)s.walkFuture.cancel(false);
+        if(s.walkDiscoveryFuture!=null)s.walkDiscoveryFuture.cancel(false);s.walkDiscoveryFuture=null;
         confirmTargetFade(s);return true;
     }
     public static boolean exit(ServerPlayerEntity p) {
@@ -625,13 +664,13 @@ public final class SpiritTerrainService {
         Window(String dimension,Vec3d origin,Vec384f semantic,Basis384f basis,String id){this.dimension=dimension;this.origin=origin;this.semantic=semantic.clone();captured=semantic.clone();supportEmbedding=semantic.clone();sourceBasis=basis.clone();this.id=id;}
     }
     private static final class Session {
-        Window local,target,walkProbe;Vec3d carrier,sourceRequested;boolean shallow=true,entered,anchorDelivered,acquiredView;long revision,created,walkField,walkNextProbe;
-        TerrainMeshFrame frame;Map<Long,Window> frameProducers=Map.of();CompletableFuture<?> ownerFuture,sourceFuture,targetFuture,targetOwnerFuture,walkFuture;Iterator<SourceLandmarks.Cell> ingesting;
+        Window local,target,walkProbe;Vec3d carrier,sourceRequested;boolean shallow=true,entered,anchorDelivered,acquiredView;long revision,created,walkField,walkNextProbe,walkDiscoveryTick;
+        TerrainMeshFrame frame;Map<Long,Window> frameProducers=Map.of();CompletableFuture<?> ownerFuture,sourceFuture,targetFuture,targetOwnerFuture,walkFuture;CompletableFuture<Optional<LandmarkMetadata>> walkDiscoveryFuture;Iterator<SourceLandmarks.Cell> ingesting;
         final Map<String,Window> regions=new LinkedHashMap<>();final MeshRepresentatives selection=new MeshRepresentatives();
         final Map<String,Window> prepared=new LinkedHashMap<>();
         String scanCursor,status,closestId="";int dimensionCursor,regionCursor;boolean scanning;Set<String> selected=Set.of();
         Session(Window local,Vec3d carrier){this.local=local;this.carrier=carrier;}
-        void cancel(){if(ownerFuture!=null)ownerFuture.cancel(false);if(sourceFuture!=null)sourceFuture.cancel(false);if(targetFuture!=null)targetFuture.cancel(false);if(targetOwnerFuture!=null)targetOwnerFuture.cancel(false);if(walkFuture!=null)walkFuture.cancel(false);cancelWindow(local);if(target!=null)cancelWindow(target);for(var w:regions.values())cancelWindow(w);for(var w:prepared.values())cancelWindow(w);regions.clear();prepared.clear();}
+        void cancel(){if(ownerFuture!=null)ownerFuture.cancel(false);if(sourceFuture!=null)sourceFuture.cancel(false);if(targetFuture!=null)targetFuture.cancel(false);if(targetOwnerFuture!=null)targetOwnerFuture.cancel(false);if(walkFuture!=null)walkFuture.cancel(false);if(walkDiscoveryFuture!=null)walkDiscoveryFuture.cancel(false);cancelWindow(local);if(target!=null)cancelWindow(target);for(var w:regions.values())cancelWindow(w);for(var w:prepared.values())cancelWindow(w);regions.clear();prepared.clear();}
     }
     private static void cancelWindow(Window w){if(w.ownershipFuture!=null)w.ownershipFuture.cancel(false);if(w.nearFuture!=null)w.nearFuture.cancel(false);w.stream=null;w.nearCells=null;w.nearSamples=null;}
     private static final class Context {
