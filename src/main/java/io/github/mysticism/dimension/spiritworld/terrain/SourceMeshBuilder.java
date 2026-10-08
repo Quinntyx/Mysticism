@@ -109,13 +109,24 @@ final class SourceMeshBuilder {
                 .thenComparingLong(n->n.position.asLong()).thenComparingInt(Node::side));
         return result;
     }
+    /** Replace only an actually sampled source patch; retain the producing region's far surfaces. */
+    static List<Node> replaceNear(List<Node> base,List<Node> near,Bounds cut,Vec3d center) {
+        List<Node> result=new ArrayList<>(near);for(Node node:base)outside(node,cut,result);
+        result.sort(Comparator.comparingDouble(n->distanceSquared(nodeBox(n),center)));return List.copyOf(result);
+    }
+    private static Box nodeBox(Node n){BlockPos p=n.position();return new Box(p.getX(),p.getY(),p.getZ(),(double)p.getX()+n.side(),(double)p.getY()+n.side(),(double)p.getZ()+n.side());}
+    private static void outside(Node n,Bounds cut,List<Node> result) {
+        BlockPos p=n.position();int side=n.side();Bounds box=new Bounds(p.getX(),p.getY(),p.getZ(),(long)p.getX()+side,(long)p.getY()+side,(long)p.getZ()+side);
+        if(!box.intersects(cut)){result.add(n);return;}if(cut.contains(box)||side==1)return;
+        int half=side/2;for(int child=0;child<8;child++)outside(new Node(p.add((child&1)==0?0:half,(child&2)==0?0:half,(child&4)==0?0:half),half,n.tile(),n.ownerId()),cut,result);
+    }
     /** Refine a persisted coarse leaf only inside the bounded exact-mask window, preserving far geometry. */
     static List<Node> splitOwnership(List<Node> source,Map<BlockPos,String> owners,Bounds range,Vec3d center) {
-        List<Node> result=new ArrayList<>();for(Node node:source)splitOwner(node,owners,range,result);
-        result.sort(Comparator.comparingDouble(n->distanceSquared(new Box(n.position()).expand(n.side()-1),center)));
+        List<Node> result=new ArrayList<>();for(Node node:source)splitOwner(node,owners,range,center,result);
+        result.sort(Comparator.comparingDouble(n->distanceSquared(nodeBox(n),center)));
         return List.copyOf(result);
     }
-    private static void splitOwner(Node node,Map<BlockPos,String> owners,Bounds range,List<Node> result) {
+    private static void splitOwner(Node node,Map<BlockPos,String> owners,Bounds range,Vec3d center,List<Node> result) {
         BlockPos p=node.position();int side=node.side();Bounds box=new Bounds(p.getX(),p.getY(),p.getZ(),(long)p.getX()+side,(long)p.getY()+side,(long)p.getZ()+side);
         if(!box.intersects(range)){result.add(node);return;}
         String owner=null;boolean uniform=range.contains(box);
@@ -123,9 +134,10 @@ final class SourceMeshBuilder {
             String id=owners.getOrDefault(cell,"");
             if(id.isEmpty() || owner!=null && !owner.equals(id)){uniform=false;break;}owner=id;
         }
+        if(side>1 && distanceSquared(nodeBox(node),center)<49)uniform=false;
         if(side==1 || uniform){result.add(new Node(p,side,node.tile(),owners.getOrDefault(p,"")));return;}
         int half=side/2;
-        for(int child=0;child<8;child++)splitOwner(new Node(p.add((child&1)==0?0:half,(child&2)==0?0:half,(child&4)==0?0:half),half,node.tile(),node.ownerId()),owners,range,result);
+        for(int child=0;child<8;child++)splitOwner(new Node(p.add((child&1)==0?0:half,(child&2)==0?0:half,(child&4)==0?0:half),half,node.tile(),node.ownerId()),owners,range,center,result);
     }
     static long key(String owner,Vec3d source,int side) {
         long h=0xcbf29ce484222325L;
