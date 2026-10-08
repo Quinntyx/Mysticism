@@ -23,10 +23,9 @@ import io.netty.buffer.Unpooled;
  *
  * <p>Ordering is enforced by a per-component monotonic wire sequence
  * ({@code writeSyncPacket}/{@code applySyncPacket}): reordered or duplicated snapshots are rejected
- * outright (P2), and a fresh snapshot is held only while its divergence stays inside the
- * <em>direct</em> distance from the prediction to the freshest previously received snapshot — never
- * an accumulated per-step budget, which does not bound cumulative divergence under multi-tick deep
- * steering (P1).
+ * outright (P2). A fresh snapshot is held if it lies on the unacknowledged predicted trajectory,
+ * even after a reversal (P1), or inside the direct frontier distance. Neither distance to the
+ * frontier alone nor an accumulated per-step squared budget bounds arbitrary pending movement.
  */
 public final class PoseOrderingTest {
     private static int checks;
@@ -262,6 +261,7 @@ public final class PoseOrderingTest {
             for (int tick = 0; tick < 24; tick++) {
                 TraversalSteering.deepStep(q, basis.get(), target, 0.05, 0, 0, false);
                 pos.set(q);
+                ClientPoseSync.beginPrediction(pos, basis, nav, true);
             }
             Basis384f rotated = basis.get().clone();
             double directLag = basisError(start, rotated);
@@ -304,6 +304,200 @@ public final class PoseOrderingTest {
         }
     }
 
+    /** P1: a newer wire sequence can still carry the outbound pose after a direction reversal. */
+    private static void backtrackingDoesNotAdoptDelayedOutboundPoses() {
+        LatentPos pos = new LatentPos();
+        LatentBasis basis = new LatentBasis();
+        SpiritNavigation nav = new SpiritNavigation();
+        Vec384f origin = Vec384f.ZERO();
+        pos.set(origin);
+        ClientPoseSync.install();
+        try {
+            ClientPoseSync.beginPrediction(pos, basis, nav, true);
+            LatentPos snapshot = new LatentPos();
+            snapshot.set(origin);
+            pos.applySyncPacket(serialized(snapshot, 1));
+
+            // The real predictor publishes after every integrated tick. The server has not yet
+            // acknowledged any of the outbound movement when the player reverses direction.
+            pos.set(advanced(origin, 4));
+            ClientPoseSync.beginPrediction(pos, basis, nav, true);
+            Vec384f returned = advanced(origin, 1);
+            pos.set(returned);
+            ClientPoseSync.beginPrediction(pos, basis, nav, true);
+            // Stationary ticks must not evict real pending movement from the bounded trail.
+            for (int tick = 0; tick < 300; tick++) ClientPoseSync.beginPrediction(pos, basis, nav, true);
+
+            snapshot.set(advanced(origin, 4));
+            pos.applySyncPacket(serialized(snapshot, 2));
+            check(pos.get().squareDistance(returned) == 0,
+                    "fresh delayed +4 snapshot must not overwrite the returned +1 prediction");
+
+            // A server tick can land BETWEEN predicted endpoints, not only exactly at +4.
+            snapshot.set(advanced(origin, 2.5));
+            pos.applySyncPacket(serialized(snapshot, 3));
+            check(pos.get().squareDistance(returned) == 0, "delayed return-leg intermediate pose must be held");
+            snapshot.set(origin);
+            pos.applySyncPacket(serialized(snapshot, 1));
+            check(pos.get().squareDistance(returned) == 0, "reordered snapshot after backtracking must still be rejected");
+
+            // Acknowledgment of the return leg must retire the outbound leg: a fresh jump back
+            // to +4 now has no explanation in pending prediction and remains a real correction.
+            snapshot.set(advanced(origin, 4));
+            pos.applySyncPacket(serialized(snapshot, 4));
+            check(pos.get().squareDistance(snapshot.get()) == 0,
+                    "acknowledged outbound history must not mask a subsequent authoritative correction");
+        } finally {
+            ClientPoseSync.clear();
+            LatentSync.clear();
+        }
+    }
+
+    /** Overshoot can occur in deep steering's basis too; use many real orthonormal small turns. */
+    private static void backtrackingBasisDoesNotAdoptDelayedTurns() {
+        LatentPos pos = new LatentPos();
+        LatentBasis basis = new LatentBasis();
+        SpiritNavigation nav = new SpiritNavigation();
+        ClientPoseSync.install();
+        try {
+            ClientPoseSync.beginPrediction(pos, basis, nav, true);
+            basis.applySyncPacket(serialized(new LatentBasis(basis.get()), 1));
+            for (int tick = 1; tick <= 8; tick++) {
+                basis.set(turned(tick * .05));
+                ClientPoseSync.beginPrediction(pos, basis, nav, true);
+            }
+            for (int tick = 7; tick >= 2; tick--) {
+                basis.set(turned(tick * .05));
+                ClientPoseSync.beginPrediction(pos, basis, nav, true);
+            }
+            Basis384f returned = basis.get().clone();
+            basis.applySyncPacket(serialized(new LatentBasis(turned(.375)), 2));
+            check(basisError(basis.get(), returned) == 0, "delayed outbound intermediate basis must survive a reversal");
+            basis.applySyncPacket(serialized(new LatentBasis(turned(.4)), 3));
+            check(basisError(basis.get(), returned) == 0, "delayed outbound basis endpoint must not roll back a reversed turn");
+            basis.applySyncPacket(serialized(new LatentBasis(turned(.2)), 4));
+            check(basisError(basis.get(), returned) == 0, "delayed basis on the return leg must be held");
+            basis.applySyncPacket(serialized(new LatentBasis(turned(.4)), 5));
+            check(basisError(basis.get(), turned(.4)) == 0, "acknowledged turn history must not mask a fresh basis correction");
+        } finally {
+            ClientPoseSync.clear();
+            LatentSync.clear();
+        }
+    }
+
+    private static Basis384f turned(double radians) {
+        Vec384f i = unit(0, (float) Math.cos(radians)).add(unit(3, (float) Math.sin(radians)));
+        return new Basis384f(i, unit(1, 1), unit(2, 1));
+    }
+
+    /** Matching a revisited pose must not acknowledge the entire loop or the other component. */
+    private static void closedLoopRetainsPendingSuffixAndIndependentBasis() {
+        LatentPos pos = new LatentPos();
+        LatentBasis basis = new LatentBasis();
+        SpiritNavigation nav = new SpiritNavigation();
+        pos.set(Vec384f.ZERO());
+        ClientPoseSync.install();
+        try {
+            ClientPoseSync.beginPrediction(pos, basis, nav, true);
+            LatentPos snapshot = new LatentPos();
+            snapshot.set(Vec384f.ZERO());
+            pos.applySyncPacket(serialized(snapshot, 1));
+            basis.applySyncPacket(serialized(new LatentBasis(basis.get()), 1));
+            // Mutate q in place, just as the production predictor does. History must own copies.
+            TraversalSteering.advance(pos.get(), basis.get(), 4, 0, 0);
+            basis.set(turned(.4));
+            ClientPoseSync.beginPrediction(pos, basis, nav, true);
+            pos.set(Vec384f.ZERO());
+            basis.set(turned(.1));
+            ClientPoseSync.beginPrediction(pos, basis, nav, true);
+            Basis384f returnedBasis = basis.get().clone();
+
+            pos.applySyncPacket(serialized(snapshot, 2));
+            snapshot.set(advanced(Vec384f.ZERO(), 3.5));
+            pos.applySyncPacket(serialized(snapshot, 3));
+            check(pos.get().squareDistance(Vec384f.ZERO()) == 0,
+                    "matching the loop's origin must retain delayed outbound intermediate poses");
+            snapshot.set(advanced(Vec384f.ZERO(), 4));
+            pos.applySyncPacket(serialized(snapshot, 4));
+            check(pos.get().squareDistance(Vec384f.ZERO()) == 0, "delayed loop endpoint must not undo the completed return");
+            basis.applySyncPacket(serialized(new LatentBasis(turned(.4)), 2));
+            check(basisError(basis.get(), returnedBasis) == 0, "position acknowledgment must not retire pending basis history");
+        } finally {
+            ClientPoseSync.clear();
+            LatentSync.clear();
+        }
+    }
+
+    /** The trail is not an inflated scalar radius: off-path corrections still apply and reset it. */
+    private static void offPathCorrectionsResetOnlyTheirOwnTrail() {
+        LatentPos pos = new LatentPos();
+        LatentBasis basis = new LatentBasis();
+        SpiritNavigation nav = new SpiritNavigation();
+        Vec384f origin = Vec384f.ZERO();
+        pos.set(origin);
+        ClientPoseSync.install();
+        try {
+            ClientPoseSync.beginPrediction(pos, basis, nav, true);
+            LatentPos snapshot = new LatentPos();
+            snapshot.set(origin);
+            pos.applySyncPacket(serialized(snapshot, 1));
+            basis.applySyncPacket(serialized(new LatentBasis(basis.get()), 1));
+            pos.set(advanced(origin, 4));
+            basis.set(turned(.4));
+            ClientPoseSync.beginPrediction(pos, basis, nav, true);
+            Vec384f returned = advanced(origin, 1);
+            pos.set(returned);
+            basis.set(turned(.1));
+            ClientPoseSync.beginPrediction(pos, basis, nav, true);
+            Basis384f returnedBasis = basis.get().clone();
+
+            // Divergence is smaller than distance to the outbound pose, but outside the actual
+            // path. Use the LAST native v2 coordinate to catch accidental history truncation.
+            Vec384f corrected = returned.clone().add(unit(EmbeddingSpace.DIMENSIONS - 1, .02f));
+            snapshot.set(corrected);
+            pos.applySyncPacket(serialized(snapshot, 2));
+            check(pos.get().squareDistance(corrected) == 0, "off-path native-coordinate correction must not be hidden by the excursion radius");
+            basis.applySyncPacket(serialized(new LatentBasis(turned(.4)), 2));
+            check(basisError(basis.get(), returnedBasis) == 0, "position correction must not clear pending basis rotations");
+
+            // With the position frontier fully caught up, the discarded pre-correction path must
+            // not hold a new correction that happens to use one of its old points.
+            snapshot.set(advanced(origin, 4));
+            pos.applySyncPacket(serialized(snapshot, 3));
+            check(pos.get().squareDistance(snapshot.get()) == 0, "accepted correction must retire obsolete position history");
+        } finally {
+            ClientPoseSync.clear();
+            LatentSync.clear();
+        }
+    }
+
+    /** Prediction breaks must not carry an old excursion into a new healthy segment. */
+    private static void predictionBreakDiscardsExcursionHistory() {
+        LatentPos pos = new LatentPos();
+        LatentBasis basis = new LatentBasis();
+        SpiritNavigation nav = new SpiritNavigation();
+        pos.set(Vec384f.ZERO());
+        ClientPoseSync.install();
+        try {
+            ClientPoseSync.beginPrediction(pos, basis, nav, true);
+            LatentPos snapshot = new LatentPos();
+            snapshot.set(Vec384f.ZERO());
+            pos.applySyncPacket(serialized(snapshot, 1));
+            pos.set(advanced(Vec384f.ZERO(), 4));
+            ClientPoseSync.beginPrediction(pos, basis, nav, true);
+            pos.set(Vec384f.ZERO());
+            ClientPoseSync.beginPrediction(pos, basis, nav, true);
+            ClientPoseSync.beginPrediction(pos, basis, nav, false);
+            ClientPoseSync.beginPrediction(pos, basis, nav, true);
+            snapshot.set(advanced(Vec384f.ZERO(), 4));
+            pos.applySyncPacket(serialized(snapshot, 2));
+            check(pos.get().squareDistance(snapshot.get()) == 0, "prediction break must discard the previous segment's trail");
+        } finally {
+            ClientPoseSync.clear();
+            LatentSync.clear();
+        }
+    }
+
     /** Teleported poses are corrections: the next syncs are never misjudged as lagging movement. */
     private static void teleportCorrectionsAreNeverHeld() {
         LatentPos pos = new LatentPos();
@@ -314,17 +508,23 @@ public final class PoseOrderingTest {
         try {
             ClientPoseSync.beginPrediction(pos, basis, nav, true);
             Vec384f stale = pos.get().clone();
-            Vec384f moved = advanced(pos.get(), 4);
+            LatentPos rest = new LatentPos();
+            rest.set(stale);
+            pos.applySyncPacket(serialized(rest, 1));
+            Vec384f moved = advanced(stale, 4);
             pos.set(moved);
+            ClientPoseSync.beginPrediction(pos, basis, nav, true);
+            pos.set(advanced(stale, 1));
+            ClientPoseSync.beginPrediction(pos, basis, nav, true);
 
             check(!ClientPoseSync.consumeTeleportCorrection(), "no teleport mark before position-look");
             ClientPoseSync.markTeleport();
             // Without the teleport mark this stale pose would be held as in-flight lag; the pending
             // position-look teleport invalidates the prediction context, so it must be accepted.
             LatentPos teleported = new LatentPos();
-            teleported.set(stale);
-            pos.applySyncPacket(serialized(teleported, 1));
-            check(pos.get().squareDistance(stale) == 0, "teleported pose sync must be accepted while unprocessed");
+            teleported.set(moved);
+            pos.applySyncPacket(serialized(teleported, 2));
+            check(pos.get().squareDistance(moved) == 0, "teleported pose sync must be accepted even when it matches the pending trail");
             check(ClientPoseSync.consumeTeleportCorrection(), "teleport mark is consumed exactly once");
             check(!ClientPoseSync.consumeTeleportCorrection(), "teleport mark does not linger");
         } finally {
@@ -344,14 +544,17 @@ public final class PoseOrderingTest {
             ClientPoseSync.beginPrediction(pos, basis, nav, true);
             // Late anchor discovery re-anchors q with a small offset and resets the motion epoch in
             // the same transaction; the nav sync arrives before the q sync on the wire.
-            Vec384f predicted = pos.get().clone();
+            LatentPos rest = new LatentPos();
+            rest.set(pos.get());
+            pos.applySyncPacket(serialized(rest, 1));
             Vec384f moved = advanced(pos.get(), 4);
             pos.set(moved);
+            ClientPoseSync.beginPrediction(pos, basis, nav, true);
             nav.setSemanticReady(true); // epoch reset accompanies the anchor correction
 
             LatentPos anchored = new LatentPos();
             anchored.set(advanced(unit(0, 1), 0.5));
-            pos.applySyncPacket(serialized(anchored, 1));
+            pos.applySyncPacket(serialized(anchored, 2));
             check(pos.get().squareDistance(anchored.get()) == 0,
                     "anchor correction with reordered epoch transition must never be held as lag");
         } finally {
@@ -429,6 +632,11 @@ public final class PoseOrderingTest {
         predictionHoldsLaggingSyncsAndAcceptsCorrections();
         sameEpochReorderIsNeverAdopted();
         multiTickDeepSteeringUsesComposableBound();
+        backtrackingDoesNotAdoptDelayedOutboundPoses();
+        backtrackingBasisDoesNotAdoptDelayedTurns();
+        closedLoopRetainsPendingSuffixAndIndependentBasis();
+        offPathCorrectionsResetOnlyTheirOwnTrail();
+        predictionBreakDiscardsExcursionHistory();
         teleportCorrectionsAreNeverHeld();
         reorderedEpochTransitionIsAccepted();
         peersAndIdleContextsTakeAuthoritativeValue();

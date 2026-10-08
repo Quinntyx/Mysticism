@@ -9,10 +9,13 @@ package io.github.mysticism.component;
  * sequence is not newer than everything already received — an older snapshot can never carry better
  * authority than a newer one already seen, regardless of its content.
  *
- * <p>For a fresh (ordering-verified) snapshot the only legitimate reason to hold it is in-flight
- * lag: the snapshot was integrated from movement the client predicted before the server received
- * it. The lag budget is the <em>composable direct distance</em> from the current prediction to the
- * freshest previously received snapshot — recomputed on demand, never accumulated from per-step
+ * <p>For a fresh (ordering-verified) snapshot the legitimate reason to hold it is in-flight lag:
+ * the snapshot was integrated from movement the client predicted before the server received it.
+ * {@code ClientPoseSync} first recognizes snapshots on its pending tick trajectory, including
+ * outbound poses delayed until after a direction reversal. Such poses may be farther from the
+ * prediction than the last received pose, so distance alone cannot classify them as corrections.
+ * This core supplies the fallback lag budget: the <em>composable direct distance</em> from the
+ * current prediction to the freshest previously received snapshot — recomputed on demand, never accumulated from per-step
  * distances. Per-step squared sums do not bound cumulative divergence (N same-direction rotations
  * of θ each accumulate ~Nθ² step-wise but ~ (Nθ)² directly), so an accumulated budget under-counts
  * multi-tick steering and lets stale snapshots through as "corrections".
@@ -37,9 +40,9 @@ public final class PoseSyncReconciliation {
      * @param divergence distance between the fresh authoritative snapshot and the locally predicted pose
      * @param lagBound   direct distance from the prediction to the freshest previously received
      *                   snapshot (the unacknowledged in-flight movement it may legitimately lag by)
-     * @return true when the fresh snapshot moved away from the prediction beyond explainable lag
-     *         (a genuine authoritative correction) and must be applied; false when it is still
-     *         inside the acknowledged frontier's lag, where holding the prediction is safe and the
+     * @return true when the fresh snapshot moved away from the prediction beyond this fallback
+     *         bound and must be applied unless explained by the pending trajectory; false when it
+     *         is still inside the acknowledged frontier's lag, where holding the prediction is safe and the
      *         snapshot would only roll it back
      */
     public static boolean acceptPosition(double divergence, double lagBound) {
