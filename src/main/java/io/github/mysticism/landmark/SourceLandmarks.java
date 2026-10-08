@@ -11,6 +11,7 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.world.chunk.WorldChunk;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -36,9 +37,10 @@ public final class SourceLandmarks {
             if(!SourceDimensions.isSource(world.getRegistryKey().getValue().toString()))return;
             Session s=SESSIONS.get(world.getServer());if(s==null)return;
             int x=chunk.getPos().getStartX()+8,z=chunk.getPos().getStartZ()+8;
-            int y=chunk.sampleHeightmap(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,x&15,z&15);
-            s.hint(world.getRegistryKey().getValue().toString(),new BlockPos(x,y+1,z));
+            var center=new BlockPos(x,chunk.sampleHeightmap(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,x&15,z&15)+1,z);
+            s.hint(world.getRegistryKey().getValue().toString(),center);
             if(s.retries.size()<64)s.retries.add(new FrontierRetry(world.getRegistryKey().getValue().toString(),new Bounds(chunk.getPos().getStartX()-1L,world.getBottomY(),chunk.getPos().getStartZ()-1L,chunk.getPos().getStartX()+17L,world.getTopY(),chunk.getPos().getStartZ()+17L)));
+            s.survey(world,chunk,center);
         });
     }
     public static CompletableFuture<Optional<LandmarkMetadata>> ensureSourceLocation(MinecraftServer server,String dimension,BlockPos position){return ensure(server,dimension,position,null,false);}
@@ -89,6 +91,15 @@ public final class SourceLandmarks {
         Session s=SESSIONS.get(world.getServer());if(s!=null){s.invalidate(world.getRegistryKey().getValue().toString(),pos);s.hint(world.getRegistryKey().getValue().toString(),pos.toImmutable());}
     }
     public static int pending(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.requests.size()+s.hints.size()+(s.active==null?0:1);}
+    /** Bounded pending-hint budget; retention now follows recency instead of freezing on
+     * the first chunks ever seen (render-distance streaming must keep landmarking). */
+    public static final int HINT_BUDGET=256;
+    /** Recency admission: duplicates refresh to newest, the oldest entry is evicted at capacity. */
+    static <T> void admit(LinkedHashSet<T> set,T value,int cap){
+        if(cap<1)throw new IllegalArgumentException("hint budget");Objects.requireNonNull(value);
+        if(!set.remove(value)&&set.size()>=cap){var oldest=set.iterator();oldest.next();oldest.remove();}
+        set.add(value);
+    }
     public static int lastSampledCells(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.lastCells;}
     public static String status(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?"Stopped":s.status;}
     private static Session session(MinecraftServer server){if(!server.isOnThread())throw new IllegalStateException("source server thread");Session s=SESSIONS.get(server);if(s==null)throw new IllegalStateException("source service not initialized");return s;}
@@ -113,7 +124,25 @@ public final class SourceLandmarks {
             try{CompletableFuture.supplyAsync(computation,worker).whenComplete((value,error)->server.execute(()->{auxiliary.remove(out);if(SESSIONS.get(server)!=this)out.cancel(false);else if(error!=null)out.completeExceptionally(error);else out.complete(value);}));}catch(RuntimeException failure){auxiliary.remove(out);out.completeExceptionally(failure);}return out;
         }
         void offer(Operation<?> op){if(requests.size()==64){op.future.completeExceptionally(new RejectedExecutionException("source request budget"));return;}if(op instanceof Read)requests.addFirst(op);else requests.addLast(op);}
-        void hint(String dim,BlockPos p){if(hints.size()<128)hints.add(new Hint(dim,p));}
+        void hint(String dim,BlockPos p){admit(hints,new Hint(dim,p.toImmutable()),HINT_BUDGET);}
+        /** Generation landmarking beyond the chunk-center probe: derive representative
+         * surface/peak hints from the loaded chunk's actual heightmap and biome grid so
+         * real terrain across the render distance becomes landmark work, bounded per chunk. */
+        void survey(ServerWorld world,WorldChunk chunk,BlockPos center){
+            String dimension=world.getRegistryKey().getValue().toString();int bottom=world.getBottomY(),top=world.getTopY();var origin=chunk.getPos();
+            List<GenerationSurvey.Probe> probes;
+            try{probes=GenerationSurvey.survey(origin.getStartX(),origin.getStartZ(),bottom,top,new GenerationSurvey.ColumnView(){
+                public int height(int localX,int localZ){
+                    try{return chunk.hasHeightmap(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES)?chunk.sampleHeightmap(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,localX,localZ):Integer.MIN_VALUE;}
+                    catch(RuntimeException failure){return Integer.MIN_VALUE;}
+                }
+                public String biome(int localX,int localZ,int surfaceY){
+                    try{return world.getBiomeForNoiseGen((origin.getStartX()+localX)>>2,Math.max(bottom,Math.min(top-1,surfaceY))>>2,(origin.getStartZ()+localZ)>>2).getKey().map(key->key.getValue().toString()).orElse(null);}
+                    catch(RuntimeException failure){return null;}
+                }
+            });}catch(RuntimeException failure){return;}
+            for(var probe:GenerationSurvey.spread(probes,center.getX(),center.getY(),center.getZ(),10))hint(dimension,new BlockPos(probe.x(),probe.y(),probe.z()));
+        }
         void invalidate(String dim,BlockPos pos){if(active!=null&&active.dimension.equals(dim)&&active.guarded!=null&&active.guarded.contains(pos.getX(),pos.getY(),pos.getZ()))active.cancel(new CancellationException("source edit invalidated snapshot"));}
         void tick(){
             lastCells=0;
