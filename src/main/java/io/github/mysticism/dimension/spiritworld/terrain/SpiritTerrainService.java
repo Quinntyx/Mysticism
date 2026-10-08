@@ -4,6 +4,7 @@ import io.github.mysticism.activity.SpiritActivityService;
 import io.github.mysticism.component.MysticismEntityComponents;
 import io.github.mysticism.navigation.SpiritNavigationService;
 import io.github.mysticism.landmark.*;
+import io.github.mysticism.landmark.extract.LandmarkExtractionService;
 import io.github.mysticism.landmark.extract.LandmarkProfiles;
 import io.github.mysticism.vector.*;
 import net.fabricmc.fabric.api.event.lifecycle.v1.*;
@@ -48,6 +49,12 @@ public final class SpiritTerrainService {
             @Override public boolean ready(ServerPlayerEntity p,String dimension,String id,Vec3d point){return landingReady(p,dimension,id,point);}
         });
         onSourceAnchor(SpiritNavigationService::anchorSource);
+        // Newly committed landmarks are announced to every live session here, so freshly generated
+        // terrain becomes a selectable, preparable navigation target without a catalog sweep delay.
+        LandmarkExtractionService.COMMITTED_TOPOLOGY.register((server,previous,replacement)->{
+            Context c=server==null?null:SERVERS.get(server);if(c==null||replacement==null)return;
+            for(String id:replacement)c.published(id);
+        });
         ServerTickEvents.END_SERVER_TICK.register(SpiritTerrainService::tick);
         ServerEntityWorldChangeEvents.AFTER_PLAYER_CHANGE_WORLD.register((p,from,to)->{
             if(from.getRegistryKey().equals(WORLD) && !to.getRegistryKey().equals(WORLD))cancelEnter(p);
@@ -631,6 +638,8 @@ public final class SpiritTerrainService {
         final Map<String,Window> prepared=new LinkedHashMap<>();
         String scanCursor,status,closestId="";int dimensionCursor,regionCursor;boolean scanning;Set<String> selected=Set.of();
         Session(Window local,Vec3d carrier){this.local=local;this.carrier=carrier;}
+        /** Immediately published landmarks stay selected until the next full sweep re-derives the set. */
+        void unionSelected(String id){var union=new HashSet<>(selected);if(union.add(id))selected=Set.copyOf(union);}
         void cancel(){if(ownerFuture!=null)ownerFuture.cancel(false);if(sourceFuture!=null)sourceFuture.cancel(false);if(targetFuture!=null)targetFuture.cancel(false);if(targetOwnerFuture!=null)targetOwnerFuture.cancel(false);if(walkFuture!=null)walkFuture.cancel(false);cancelWindow(local);if(target!=null)cancelWindow(target);for(var w:regions.values())cancelWindow(w);for(var w:prepared.values())cancelWindow(w);regions.clear();prepared.clear();}
     }
     private static void cancelWindow(Window w){if(w.ownershipFuture!=null)w.ownershipFuture.cancel(false);if(w.nearFuture!=null)w.nearFuture.cancel(false);w.stream=null;w.nearCells=null;w.nearSamples=null;}
@@ -642,10 +651,37 @@ public final class SpiritTerrainService {
         boolean proving;final Map<BlockPos,BlockPalette.State> proofSamples=new HashMap<>();
         final ArrayDeque<Map.Entry<Session,LandmarkMetadata>> pending=new ArrayDeque<>();
         Context(MinecraftServer server){this.server=server;store=LandmarkStore.get(server);}
+        /** A newly committed landmark becomes available to selection immediately: offered to each
+         * live deep session's reservoir, unioned into its selected set and queued for preparation
+         * without waiting for the next full catalog sweep. Consumers still re-verify the CURRENT
+         * radius/selection before any geometry, opacity or landing permission is spent. */
+        void published(String id) {
+            LandmarkMetadata m=store.metadata(id).orElse(null);if(m==null)return;
+            Vec384f vector=SpiritActivityService.effectiveEmbedding(server,m).vector();
+            double importance=SpiritActivityService.importance(server,m);
+            for(var entry:sessions.entrySet()) {
+                Session s=entry.getValue();ServerPlayerEntity p=player(s);
+                if(p==null || !p.getWorld().getRegistryKey().equals(WORLD))continue;
+                boolean known=id.equals(s.local.id) || s.target!=null&&id.equals(s.target.id)
+                        || s.regions.containsKey(id) || s.prepared.containsKey(id);
+                if(vector.squareDistance(q(p))>=MeshRepresentatives.RADIUS*MeshRepresentatives.RADIUS)continue;
+                if(!known) {
+                    if(s.scanning)s.selection.offer(m,vector,importance); // no sweep yet: the imminent fresh sweep offers it
+                    if(pending.size()<32 && pending.stream().noneMatch(e->e.getKey()==s && e.getValue().id().equals(id)))pending.add(Map.entry(s,m));
+                }
+                // A grown landmark's existing window must not fade out while it is current and in radius.
+                s.unionSelected(id);
+            }
+        }
         void scan(ServerPlayerEntity p,Session s) {
             List<ServerWorld> worlds=new ArrayList<>();for(var world:server.getWorlds())if(!world.getRegistryKey().equals(WORLD))worlds.add(world);
             if(worlds.isEmpty())return;
-            if(!s.scanning){s.selection.begin(q(p),basis(p));s.scanning=true;s.dimensionCursor=0;s.scanCursor=null;}
+            Vec384f now=q(p);
+            // A sweep whose origin q drifted out of the selection radius can no longer offer the
+            // current locality (including landmarks published mid-sweep); restart from a fresh cursor.
+            if(s.scanning && s.selection.sweepStale(now))s.scanning=false;
+            if(!s.scanning){s.selection.begin(now,basis(p));s.scanning=true;s.dimensionCursor=0;s.scanCursor=null;}
+            s.selection.retarget(now,basis(p));
             ServerWorld world=worlds.get(Math.min(s.dimensionCursor,worlds.size()-1));
             Bounds all=new Bounds(-30000000,world.getBottomY(),-30000000,30000000,world.getTopY(),30000000);
             var batch=store.sourceRangePage(world.getRegistryKey().getValue().toString(),all,s.scanCursor,8,8);s.scanCursor=batch.nextId();
