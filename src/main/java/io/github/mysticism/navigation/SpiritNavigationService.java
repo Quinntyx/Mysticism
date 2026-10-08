@@ -44,10 +44,12 @@ public final class SpiritNavigationService {
     private static final double WALK_APPROACH_DEPTH = 24;
     private SpiritNavigationService() {}
     private static final class Session {
-        int unsupported, blendTick, landingTick, supportTick, supportAlignTick;
+        int unsupported, blendTick, landingTick, supportTick;
         /** Guarded alignment pace for the current support approach; halved when the terrain
-         * transition guard refuses a step so the arrival re-plans instead of freezing. */
+         * transition guard refuses a step, recovered toward full pace on every accepted step. */
         float supportPace = SupportApproachAlignment.INITIAL_PACE;
+        /** Fraction of the current epoch anchor already blended toward the destination. */
+        float supportProgress;
         boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, jumping, supportPending;
         Vec384f targetSnapshot, supportTargetSnapshot;
         Basis384f supportFrom, supportGrid;
@@ -237,7 +239,7 @@ public final class SpiritNavigationService {
         if (s.supportPending) return; // repeated packets cannot reset budgets or duplicate requests
         endApproach(p, s); s.blendFrom = null; s.blendTo = null;
         s.supportPending = true; s.supportTick = 0; s.supportFrom = null;
-        s.supportAlignTick = 0; s.supportPace = SupportApproachAlignment.INITIAL_PACE;
+        s.supportProgress = 0; s.supportPace = SupportApproachAlignment.INITIAL_PACE;
         s.supportId = ""; s.supportDimension = "";
         s.supportTargetSnapshot = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target();
         state(p).setSupportApproach(true); sync(p);
@@ -246,7 +248,7 @@ public final class SpiritNavigationService {
     private static void endSupportApproach(ServerPlayerEntity p, Session s) {
         if (s.supportPending) SpiritTerrainService.cancelCurrentSupport(p);
         s.supportPending = false; s.supportTargetSnapshot = null; s.supportFrom = null; s.supportGrid = null;
-        s.supportId = ""; s.supportDimension = ""; s.supportTick = 0; s.supportAlignTick = 0;
+        s.supportId = ""; s.supportDimension = ""; s.supportTick = 0; s.supportProgress = 0;
         s.supportPace = SupportApproachAlignment.INITIAL_PACE;
         if (state(p).supportApproach()) { state(p).setSupportApproach(false); sync(p); }
     }
@@ -358,7 +360,7 @@ public final class SpiritNavigationService {
         if (support == null) return; // Terrain starts/reuses bounded exact source-cell proof, never a join.
         Basis384f destination = support.sourceBasis();
         if (s.supportFrom == null) {
-            s.supportFrom = component.get().clone(); s.supportGrid = destination.clone(); s.supportAlignTick = 0;
+            s.supportFrom = component.get().clone(); s.supportGrid = destination.clone(); s.supportProgress = 0;
             s.supportWindow = support.windowIdentity(); s.supportId = support.landmarkId(); s.supportDimension = support.sourceDimension();
         } else if (s.supportWindow != support.windowIdentity() || !s.supportId.equals(support.landmarkId())
                 || !s.supportDimension.equals(support.sourceDimension()) || basisError(s.supportGrid, destination) > 1e-12f) {
@@ -369,8 +371,8 @@ public final class SpiritNavigationService {
         Basis384f before = component.get();
         boolean aligned = basisError(before, destination) < 1e-8f;
         if (!aligned) {
-            Basis384f proposed = TraversalSteering.blend(s.supportFrom, destination,
-                    SupportApproachAlignment.fraction(s.supportAlignTick, s.supportPace));
+            float fraction = SupportApproachAlignment.fraction(s.supportProgress, s.supportPace);
+            Basis384f proposed = TraversalSteering.blend(s.supportFrom, destination, fraction);
             // Reject a singular/antipodal interpolation jump rather than forcing the final basis.
             if (SupportApproachAlignment.discontinuous(before, proposed)) {
                 endSupportApproach(p, s);
@@ -381,11 +383,16 @@ public final class SpiritNavigationService {
                 // A refused step must re-plan, never freeze: re-anchor at the live basis and halve
                 // the pace so the retry's swept motion fits under the transition guard. Freezing
                 // here deadlocked every approach taken with a rotated deep basis until expiry.
-                s.supportFrom = before.clone(); s.supportAlignTick = 0;
+                s.supportFrom = before.clone(); s.supportProgress = 0;
                 s.supportPace = SupportApproachAlignment.paceOnHold(s.supportPace);
                 return;
             }
-            component.set(proposed); ++s.supportAlignTick;
+            // The step passed the terrain guard and the continuity check, so this pace is proven safe
+            // again: recover toward full pace. A permanent ratchet would let three transient refusals
+            // strand the request at 1/320 — interpolation fraction ~0.616 after 197 ticks — and
+            // expire without ever aligning.
+            component.set(proposed); s.supportProgress = fraction;
+            s.supportPace = SupportApproachAlignment.paceOnAccept(s.supportPace);
             if (basisError(component.get(), destination) >= 1e-8f) return;
         }
         if (found.isEmpty()) return; // Grid prepared while descending; real contact still commits the arrival.

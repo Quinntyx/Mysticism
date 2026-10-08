@@ -28,13 +28,21 @@ public final class SupportApproachAlignment {
     private SupportApproachAlignment() {}
 
     /** Blend fraction of the CURRENT epoch anchor toward the destination for the next guarded step. */
-    public static float fraction(int acceptedSteps, float pace) {
-        return Math.min(1f, (acceptedSteps + 1) * pace);
+    public static float fraction(float progress, float pace) {
+        return Math.min(1f, progress + pace);
     }
 
     /** A refused step must never repeat identically: halve the pace so the retry sweeps less. */
     public static float paceOnHold(float pace) {
         return Math.max(pace / 2f, MIN_PACE);
+    }
+
+    /** A step that passed the terrain guard AND the continuity check proves this pace is safe again:
+     * recover toward full pace so transient refusals never permanently cripple the remaining request
+     * budget. Without recovery, three early refusals strand the pace at 1/320 and a 200-tick request
+     * reaches only interpolation fraction ~0.616 — the approach can never align and always expires. */
+    public static float paceOnAccept(float pace) {
+        return Math.min(INITIAL_PACE, pace * 2f);
     }
 
     /** True when applying the proposed basis in one step would be a discontinuous jump. */

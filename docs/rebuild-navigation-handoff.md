@@ -119,10 +119,13 @@ unchanged contact query plus `acquireCurrentSupport`; singular alignments refuse
   guarded rotation and the walk-proof prewarm happen while the near-surface cells are still clear of
   the body; when real contact appears, an already-aligned approach acquires immediately.
 - Refused guarded steps RE-PLAN (`SupportApproachAlignment`): re-anchor at the live basis and halve
-  the pace (bounded at 1/5120) so the retry's swept motion fits under the guard. Each epoch still
-  converges to the EXACT destination basis the strict acquisition gate requires; full pace remains
-  the approved 40-accepted-step schedule. The old schedule's deadlock is encoded as a regression
-  contrast (`SupportApproachAlignmentTest`), plus sweep regressions for pre-contact discovery
+  the pace (bounded at 1/5120) so the retry's swept motion fits under the guard. Every
+  guard-validated, continuity-checked ACCEPTED step recovers the pace toward full (capped at the
+  approved 40-accepted-step schedule), so transient refusals never permanently cripple the remaining
+  request budget — three refusals strand the pace at 1/320 only if nothing is ever accepted again.
+  Each epoch still converges to the EXACT destination basis the strict acquisition gate requires.
+  The old schedule's deadlock and the permanent-ratchet expiry are both encoded as regression
+  contrasts (`SupportApproachAlignmentTest`), plus sweep regressions for pre-contact discovery
   (`ApproachSupportSweepTest`).
 - `ensureWalkProof` carries completed source proof across re-centered probes when landmark and
   geometry revision match (tiles are absolute-positioned; acquisition still revalidates every
