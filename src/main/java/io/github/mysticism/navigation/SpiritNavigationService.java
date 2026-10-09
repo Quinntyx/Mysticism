@@ -46,6 +46,7 @@ public final class SpiritNavigationService {
         Vec384f targetSnapshot, supportTargetSnapshot;
         Basis384f supportFrom, supportGrid;
         long supportWindow;
+        SupportAlignment alignment = new SupportAlignment();
         String supportId = "", supportDimension = "";
         Basis384f blendFrom, blendTo, landingFrom;
         CompletableFuture<?> capture;
@@ -231,6 +232,7 @@ public final class SpiritNavigationService {
         if (s.supportPending) return; // repeated packets cannot reset budgets or duplicate requests
         endApproach(p, s); s.blendFrom = null; s.blendTo = null;
         s.supportPending = true; s.supportTick = 0; s.supportFrom = null;
+        s.alignment = new SupportAlignment();
         s.supportId = ""; s.supportDimension = "";
         s.supportTargetSnapshot = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target();
         state(p).setSupportApproach(true); sync(p);
@@ -240,6 +242,7 @@ public final class SpiritNavigationService {
         if (s.supportPending) SpiritTerrainService.cancelCurrentSupport(p);
         s.supportPending = false; s.supportTargetSnapshot = null; s.supportFrom = null; s.supportGrid = null;
         s.supportId = ""; s.supportDimension = ""; s.supportTick = 0; s.supportAlignTick = 0;
+        s.alignment = new SupportAlignment();
         if (state(p).supportApproach()) { state(p).setSupportApproach(false); sync(p); }
     }
 
@@ -342,7 +345,13 @@ public final class SpiritNavigationService {
         }
         var found = SpiritTerrainService.currentSupport(p);
         if (found.isEmpty()) return; // Terrain starts/reuses bounded exact source-cell proof, never a join.
-        var support = found.get(); Basis384f destination = support.sourceBasis();
+        var support = found.get();
+        // Keep the guarded alignment pivot at the player's live contact. Deep flight accumulates
+        // semantic drift outside the source grid span; without this placement-neutral re-anchor the
+        // drift translates the whole visible scene while the basis blends, sweeping the supporting
+        // floor through the body so canAlign refuses every step and every walk request expires.
+        SpiritTerrainService.anchorSupportPivot(p);
+        Basis384f destination = support.sourceBasis();
         if (s.supportFrom == null) {
             s.supportFrom = component.get().clone(); s.supportGrid = destination.clone(); s.supportAlignTick = 0;
             s.supportWindow = support.windowIdentity(); s.supportId = support.landmarkId(); s.supportDimension = support.sourceDimension();
@@ -354,17 +363,35 @@ public final class SpiritNavigationService {
         }
         Basis384f before = component.get();
         boolean aligned = basisError(before, destination) < 1e-8f;
-        Basis384f proposed = aligned ? before : TraversalSteering.blend(s.supportFrom, destination, (s.supportAlignTick + 1) / 40f);
+        Basis384f proposed = before;
+        float fraction = 1f;
+        if (!aligned) {
+            fraction = s.alignment.nextFraction();
+            proposed = TraversalSteering.blend(s.supportFrom, destination, fraction);
+            if (basisError(proposed, s.supportFrom) < 1e-12f) {
+                // Singular/antipodal blend cannot leave the captured basis; a finer step cannot help.
+                endSupportApproach(p, s);
+                p.sendMessage(Text.literal("Source-grid alignment is singular from this basis; remaining deep. Move, then request walking again."), true);
+                return;
+            }
+        }
         if (before.i.squareDistance(proposed.i) > .01f || before.j.squareDistance(proposed.j) > .01f
                 || before.k.squareDistance(proposed.k) > .01f) {
-            endSupportApproach(p, s);
-            p.sendMessage(Text.literal("Source-grid alignment would be discontinuous; remaining deep on current geometry."), true);
+            // The blend path's angular speed peaks mid-rotation; retry a finer guarded step instead of
+            // cancelling, so large but continuous rotations still reach the source grid. Truly
+            // singular blends never leave supportFrom and are rejected above.
+            if (!aligned) s.alignment.refuse();
             return;
         }
         // q already represents ACTUAL movement in the previous frame. Validate the joint current-q /
         // proposed-basis scene before application. No attraction to sourceCoordinate or user target.
-        if (!SpiritTerrainService.canAlign(p, proposed)) return;
-        if (!aligned) { component.set(proposed); ++s.supportAlignTick; }
+        if (!SpiritTerrainService.canAlign(p, proposed)) {
+            // Retry a finer guarded step next tick instead of repeating the identical refused
+            // proposal until the request deadline; accepted work stays within 40 full-step equivalents.
+            if (!aligned) s.alignment.refuse();
+            return;
+        }
+        if (!aligned) { component.set(proposed); s.alignment.accept(fraction); ++s.supportAlignTick; }
         if (basisError(component.get(), destination) >= 1e-8f) return;
         // This real terrain operation rechecks current contact, window identity, ownership revision,
         // source body/floor clearance and whole-frame continuity, and never sets q/basis/body position.
