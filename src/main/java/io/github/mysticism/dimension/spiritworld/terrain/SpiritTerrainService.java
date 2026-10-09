@@ -666,7 +666,13 @@ public final class SpiritTerrainService {
                         || s.regions.containsKey(id) || s.prepared.containsKey(id);
                 if(vector.squareDistance(q(p))>=MeshRepresentatives.RADIUS*MeshRepresentatives.RADIUS)continue;
                 if(!known) {
-                    if(s.scanning)s.selection.offer(m,vector,importance); // no sweep yet: the imminent fresh sweep offers it
+                    // Retarget BEFORE the publication offer: the commit listener runs before this
+                    // tick's scan, so the reservoir still gates against the PREVIOUS observer frame.
+                    // Without retargeting, a landmark inside the player's CURRENT radius but outside
+                    // that previous radius is rejected here, the sweep later completes without it,
+                    // completion overwrites selected and cancels its preparation, and availability
+                    // is delayed until another full sweep.
+                    if(s.scanning){s.selection.retarget(q(p),basis(p));s.selection.offer(m,vector,importance);}
                     if(pending.size()<32 && pending.stream().noneMatch(e->e.getKey()==s && e.getValue().id().equals(id)))pending.add(Map.entry(s,m));
                 }
                 // A grown landmark's existing window must not fade out while it is current and in radius.

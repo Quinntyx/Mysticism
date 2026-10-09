@@ -102,8 +102,35 @@ public final class SelectionAvailabilityTest {
         check(selection.finish().size()<=REPRESENTATIVE_SLOTS+1,"publication bursts stay inside the bounded representative slots");
     }
 
+    /** Integration of the reported review defect: publication arrives while a sweep is in flight
+     * and the sweep COMPLETES right after. Completion recomputes the selected set from the reservoir
+     * and cancels prepared windows outside it, so a landmark offered against the PREVIOUS observer
+     * frame (the commit listener runs before this tick's scan retarget) is rejected, dropped from
+     * selected at completion, and delayed until another full sweep. Retarget-before-offer must keep
+     * it in the reservoir so completion retains it. */
+    private static void publicationImmediatelyBeforeSweepCompletion() {
+        var selection=new MeshRepresentatives();
+        Vec384f sweepStart=vector(0,0,0);
+        selection.begin(sweepStart,IDENTITY);
+        // Catalog region already passed by the in-flight sweep.
+        selection.offer(metadata(new BlockPoint(1,0,0),0),vector(0,0,0),.5);
+        // Observer flies on; publication lands just before sweep completion.
+        Vec384f current=vector(2,0,0),published=vector(3.2,0,0);
+        check(published.squareDistance(sweepStart)>=radiusSquared(),"precondition: published landmark outside the previous observer frame");
+        check(published.squareDistance(current)<radiusSquared(),"precondition: published landmark inside the CURRENT radius");
+        selection.retarget(current,IDENTITY); // the fixed publication path retargets before offering
+        selection.offer(metadata(new BlockPoint(2,0,0),3.2),published,.5);
+        var completed=selection.finish(); // sweep completion recomputes selected from the reservoir
+        check(completed.size()==1 && completed.getFirst().id().equals(LandmarkIds.seed("minecraft:overworld","sel-test",
+                Landmark.Kind.BIOME,"minecraft:plains",new BlockPoint(2,0,0))),
+                "publication immediately before sweep completion survives the completion recompute");
+        // The already-passed catalog region must not reactivate around the abandoned position.
+        check(completed.stream().noneMatch(m->m.header().anchor().x()==1),"passed catalog region stays excluded at completion");
+    }
+
     public static void main(String[] args){
         midSweepDiscoveryBecomesSelectable();
+        publicationImmediatelyBeforeSweepCompletion();
         sweepRestartWhenObserverLeavesSweptLocality();
         staleCandidatesCannotActivateOutsideCurrentRadius();
         publishedOfferKeepsAccumulatedSelection();
