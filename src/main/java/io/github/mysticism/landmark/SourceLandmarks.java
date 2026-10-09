@@ -11,6 +11,7 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.ChunkPos;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -83,6 +84,31 @@ public final class SourceLandmarks {
      * adjoining converged union. Initial cave biome cutoff does not veto this activity path. */
     public static void activity(MinecraftServer server,String landmarkId,String dimension,BlockPos position){
         ensure(server,dimension,position,landmarkId,true); // bounded operation retains the actual event location
+    }
+    /** Backfills discovery of already-loaded source chunks that predate spirit entry. Chunk-load
+     * events only fire on actual loads, so terrain loaded before a session (spawn area, the
+     * entrant's own view distance) never reached the hint pipeline. Loaded-only: missing holders
+     * are skipped, never loaded or generated. Each seed mirrors the CHUNK_LOAD path exactly: the
+     * chunk-center surface hint for the Ensure pipeline, plus a bounded frontier retry so existing
+     * caves can grow into this loaded terrain. Returns the number of hinted seeds. */
+    public static int discoverLoaded(MinecraftServer server,String dimension,BlockPos center,int maxSeeds){
+        if(!server.isOnThread())throw new IllegalStateException("source server thread");
+        Session s=SESSIONS.get(server);
+        if(s==null||!SourceDimensions.isSource(dimension)||maxSeeds<0)return 0;
+        ServerWorld world=s.world(dimension);if(world==null)return 0;
+        var origin=new ChunkPos(center.toImmutable());
+        var plan=LoadedSourceBackfill.plan(origin,LoadedSourceBackfill.RADIUS,maxSeeds,
+            packed->world.getChunkManager().getWorldChunk(ChunkPos.getPackedX(packed),ChunkPos.getPackedZ(packed))!=null);
+        int hinted=0;
+        for(var pos:plan){
+            var chunk=world.getChunkManager().getWorldChunk(pos.x,pos.z);
+            if(chunk==null)continue; // plan is advisory; a concurrently unloaded holder must not resurrect a load
+            int x=pos.getStartX()+8,z=pos.getStartZ()+8;
+            int y=Math.min(chunk.sampleHeightmap(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,8,8)+1,world.getTopY()-1);
+            s.hint(dimension,new BlockPos(x,y,z));hinted++;
+            if(s.retries.size()<32)s.retries.add(new FrontierRetry(dimension,new Bounds(pos.getStartX()-1L,world.getBottomY(),pos.getStartZ()-1L,pos.getStartX()+17L,world.getTopY(),pos.getStartZ()+17L)));
+        }
+        return hinted;
     }
     public static void changed(ServerWorld world,BlockPos pos){
         if(!SourceDimensions.isSource(world.getRegistryKey().getValue().toString()))return;
