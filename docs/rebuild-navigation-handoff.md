@@ -16,6 +16,32 @@ Authority: `docs/spirit-world-approved-design.md`, prior bounded navigation revi
 
 This now has a real implementation for arbitrary representative support. It is **not runtime-confirmed**. A normal successful handoff still depends on the terrain-owned proof/transition becoming ready; nav does not override a refusal. An actor can keep moving during alignment; stationary-only or centimeter-position targeting is not imposed on this path.
 
+### Deep walk locality while moving through the projection
+
+A deep-flying player who requests a walk is still moving: descending, grazing slopes and crossing
+several projected source localities before settling. `DeepWalkAttachment` (pure policy, no Minecraft
+types) now governs which locality the pending request attaches to in `attemptSupport`:
+
+- Only an acquisition-compatible contact may anchor the request: ground normal `y >= .99`, matching
+  walk acquisition's own `current.normal().y < .99` refusal. Steep grazing contacts still pass the
+  generic `MeshCollision.ground` filter (`normal.y > .3`), but locking onto them could never complete
+  acquisition; they now keep the request pending (`WAIT`) instead of wasting the budget on a
+  guaranteed-failure attachment.
+- While the player keeps physically moving (per-tick delta above the shared movement epsilon), a
+  changed contacted locality is `FOLLOW`ed: the request re-attaches to the locality actually under
+  the player (window identity, landmark, source dimension, grid basis) instead of cancelling, so a
+  descent across representative windows no longer produces repeated "support window changed"
+  failures. `FOLLOW` restarts only the bounded 40-step grid alignment from the current basis; the
+  200-tick request budget, attunement gate, discontinuity guard, `canAlign` and the full
+  `acquireCurrentSupport` revalidation are unchanged.
+- Only a locality change under a settled player cancels the request (terrain genuinely changed
+  underfoot; a fresh request must validate the new support), preserving the previous cancel
+  message and semantics. Non-finite deltas count as settled.
+
+Regression coverage: `DeepWalkAttachmentTest` (every decision branch plus both gate boundaries) and
+`DeepWalkContactPremiseTest` (the real swept-AABB mesh index: flat floors attach, 45-degree grazes
+are ground-but-unattachable and never lock or cancel, 8-degree ramps still attach).
+
 ### Effective vectors, frozen snapshots and precise source feet
 
 Both initial source q and newly captured points now call `SpiritActivityService.effectiveEmbedding(server, metadata).vector()`, adding the source-grid offset from the header anchor at 96 blocks/semantic unit. Neither uses the raw header base in navigation anymore. A capture snapshots the effective vector when the async capture completes on the server thread, then clones/stores it once. It never continuously follows activity changes. A real captured ZERO coordinate is not overwritten by initial default-target initialization.

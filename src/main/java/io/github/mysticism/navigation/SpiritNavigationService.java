@@ -343,14 +343,24 @@ public final class SpiritNavigationService {
         var found = SpiritTerrainService.currentSupport(p);
         if (found.isEmpty()) return; // Terrain starts/reuses bounded exact source-cell proof, never a join.
         var support = found.get(); Basis384f destination = support.sourceBasis();
-        if (s.supportFrom == null) {
-            s.supportFrom = component.get().clone(); s.supportGrid = destination.clone(); s.supportAlignTick = 0;
-            s.supportWindow = support.windowIdentity(); s.supportId = support.landmarkId(); s.supportDimension = support.sourceDimension();
-        } else if (s.supportWindow != support.windowIdentity() || !s.supportId.equals(support.landmarkId())
-                || !s.supportDimension.equals(support.sourceDimension()) || basisError(s.supportGrid, destination) > 1e-12f) {
-            endSupportApproach(p, s);
-            p.sendMessage(Text.literal("Actual support window/ownership changed; remaining deep. Request walking on the new support again."), true);
-            return;
+        boolean sameLocality = s.supportFrom != null && s.supportWindow == support.windowIdentity()
+                && s.supportId.equals(support.landmarkId()) && s.supportDimension.equals(support.sourceDimension())
+                && basisError(s.supportGrid, destination) <= 1e-12f;
+        // A moving deep walker is descended/grazing through the projection: only an acquisition-compatible
+        // contact may anchor the request, and a changed locality is FOLLOWED while moving, not cancelled.
+        switch (DeepWalkAttachment.evaluate(s.supportFrom != null, sameLocality,
+                DeepWalkAttachment.moving(delta.x, delta.y, delta.z), support.normal().y)) {
+            case WAIT -> { return; } // Steep/unacquirable grazing contacts never lock or cancel the pending request.
+            case KEEP -> { }
+            case ATTACH, FOLLOW -> { // (Re)attach to the locality actually contacted while moving through the projection.
+                s.supportFrom = component.get().clone(); s.supportGrid = destination.clone(); s.supportAlignTick = 0;
+                s.supportWindow = support.windowIdentity(); s.supportId = support.landmarkId(); s.supportDimension = support.sourceDimension();
+            }
+            case CANCEL -> {
+                endSupportApproach(p, s);
+                p.sendMessage(Text.literal("Actual support window/ownership changed; remaining deep. Request walking on the new support again."), true);
+                return;
+            }
         }
         Basis384f before = component.get();
         boolean aligned = basisError(before, destination) < 1e-8f;
