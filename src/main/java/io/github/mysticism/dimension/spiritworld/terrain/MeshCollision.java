@@ -8,7 +8,8 @@ import net.minecraft.util.math.Vec3d;
 import java.util.*;
 import java.util.function.Function;
 
-/** Swept AABB against visible affine block-shape parallelepipeds, shared by server and prediction. */
+/** Swept SAT against visible affine mesh cells, shared by server and prediction. Grounding, stepping,
+ * sneaking and support all read the actual distorted mesh; vanilla block shapes/flags never stand in. */
 public final class MeshCollision {
     private MeshCollision() {}
     private static volatile Function<UUID,TerrainMeshFrame> client = id -> null;
@@ -56,7 +57,8 @@ public final class MeshCollision {
         public boolean clearRay(Vec3d from,Vec3d to) {
             return sweep(new Box(from.x-1e-4,from.y-1e-4,from.z-1e-4,from.x+1e-4,from.y+1e-4,from.z+1e-4),to.subtract(from)).isEmpty();
         }
-        private Vec3d depenetrate(Box body) {
+        /** Minimal-penetration escape, displacement bounded to `limit`. Public for runtime regressions. */
+        public Vec3d depenetrate(Box body,double limit) {
             Vec3d moved=Vec3d.ZERO;
             for(int step=0;step<8;step++) {
                 Vec3d correction=null;
@@ -65,8 +67,9 @@ public final class MeshCollision {
                     if(depth!=null && (correction==null || depth.lengthSquared()<correction.lengthSquared()))correction=depth;
                 }
                 if(correction==null)break;
-                if(correction.length()>4)correction=correction.normalize().multiply(4);
-                moved=moved.add(correction);if(moved.length()>4)break;
+                if(correction.length()>limit)correction=correction.normalize().multiply(limit);
+                moved=moved.add(correction);
+                if(moved.length()>limit){moved=moved.normalize().multiply(limit);break;}
             }
             return moved;
         }
@@ -98,12 +101,15 @@ public final class MeshCollision {
         if(i==null)return wanted;
         Box body=player.getBoundingBox();
         if(wanted.length()>256)wanted=wanted.multiply(256/wanted.length());
-        Vec3d result=i.depenetrate(body);
+        Vec3d result=i.depenetrate(body,4);
         // Bound swept traversal for unusually fast flight/teleports rather than tunnelling through a grid overflow.
         int pieces=Math.min(64,Math.max(1,(int)Math.ceil(wanted.length()/4)));
         Vec3d piece=wanted.multiply(1.0/pieces);
         for(int p=0;p<pieces;p++)result=result.add(i.slide(body.offset(result),piece));
-        if(!player.getAbilities().flying && (player.isOnGround() || wanted.y<0 && result.y>wanted.y+1e-5)
+        // Grounded is the swept MESH verdict, never the vanilla flag alone: the server-side flag is
+        // the client packet's claim, while step-up must follow the actual distorted terrain below.
+        if(!player.getAbilities().flying && (player.isOnGround() || supported(i,body)
+                || wanted.y<0 && result.y>wanted.y+1e-5)
                 && result.subtract(wanted).horizontalLengthSquared()>1e-8) {
             double step=player.getStepHeight();
             if(step>0) {
@@ -119,22 +125,29 @@ public final class MeshCollision {
     /** Vanilla's carrier-air ledge check would prevent all sneaking; use the real mesh below the future footprint. */
     public static Vec3d sneak(PlayerEntity p,Vec3d wanted,MovementType type) {
         Index i=index(p);
-        if(i==null || p.getAbilities().flying || !p.isSneaking() || !p.isOnGround() || type!=MovementType.SELF && type!=MovementType.PLAYER)return wanted;
+        if(i==null || p.getAbilities().flying || !p.isSneaking() || !p.isOnGround() && !supported(i,p.getBoundingBox())
+                || type!=MovementType.SELF && type!=MovementType.PLAYER)return wanted;
         Box body=p.getBoundingBox();Vec3d down=new Vec3d(0,-Math.max(.6,p.getStepHeight()),0);double x=wanted.x,z=wanted.z;int guard=0;
-        while(x!=0 && !supported(i,body.offset(x,0,0),down) && guard++<128)x=trim(x);
+        while(x!=0 && !supportedBySweep(i,body.offset(x,0,0),down) && guard++<128)x=trim(x);
         if(guard>=128)x=0;guard=0;
-        while(z!=0 && !supported(i,body.offset(0,0,z),down) && guard++<128)z=trim(z);
+        while(z!=0 && !supportedBySweep(i,body.offset(0,0,z),down) && guard++<128)z=trim(z);
         if(guard>=128)z=0;guard=0;
-        while(x!=0 && z!=0 && !supported(i,body.offset(x,0,z),down) && guard++<128){x=trim(x);z=trim(z);}
+        while(x!=0 && z!=0 && !supportedBySweep(i,body.offset(x,0,z),down) && guard++<128){x=trim(x);z=trim(z);}
         if(guard>=128){x=0;z=0;}return new Vec3d(x,wanted.y,z);
     }
-    private static boolean supported(Index i,Box body,Vec3d down){return i.sweep(body,down).filter(h->h.normal.y>.3).isPresent();}
+    private static boolean supportedBySweep(Index i,Box body,Vec3d down){return i.sweep(body,down).filter(h->h.normal.y>.3).isPresent();}
     private static double trim(double x){return Math.abs(x)<=.05?0:x-Math.copySign(.05,x);}
+    /** Actual mesh support contact: a swept probe below the body. Entity-free so the real grounding
+     * behavior is exercisable by the runtimeTest framework without a live player. */
+    public static Optional<Hit> ground(Index index,Box body) {
+        return index.sweep(body.offset(0,.025,0),new Vec3d(0,-.15,0)).filter(h->h.normal.y>.3);
+    }
     public static Optional<Hit> ground(PlayerEntity player) {
         Index i=index(player);
-        return i==null?Optional.empty():i.sweep(player.getBoundingBox().offset(0,.025,0),new Vec3d(0,-.15,0))
-                .filter(h->h.normal.y>.3);
+        return i==null?Optional.empty():ground(i,player.getBoundingBox());
     }
+    /** Mesh-verdict grounded state for movement gates; the vanilla flag is a client claim on the server. */
+    public static boolean supported(Index index,Box body){return ground(index,body).isPresent();}
     public static boolean clearRay(ServerPlayerEntity player,Vec3d from,Vec3d to) {
         Index i=index(player);return i!=null && from.distanceTo(to)<=128 && i.clearRay(from,to);
     }
