@@ -15,7 +15,7 @@ import java.util.concurrent.*;
  * vanilla's async read-only NBT scanner (including pending saves), NEVER getChunk/create/tickets.
  * Detached NBT palettes are decoded on our bounded worker, with no world/registry access there. */
 final class GeneratedSourceReader {
-    final String dimension; final Bounds bounds; final ServerWorld world;
+    final String dimension; final Bounds bounds; final int seaLevel;
     final SourceLandmarks.Cell[] cells; final List<ChunkPos> chunks=new ArrayList<>();
     final Executor executor; int chunkIndex,cellIndex,lastSampled; boolean cancelled;
     CompletableFuture<List<SourceLandmarks.Cell>> disk;List<SourceLandmarks.Cell> diskRows;int diskCursor;
@@ -27,15 +27,16 @@ final class GeneratedSourceReader {
         CompletableFuture<?> scan(ChunkPos pos,LimitedCollector collector);
     }
     GeneratedSourceReader(ServerWorld world,Bounds bounds,Executor executor) {
-        this(world.getRegistryKey().getValue().toString(),bounds,executor,world.getBottomY(),world.getHeight(),new ChunkIo(){
+        this(world.getRegistryKey().getValue().toString(),bounds,executor,world.getBottomY(),world.getHeight(),world.getSeaLevel(),new ChunkIo(){
             @Override public WorldChunk live(ChunkPos pos){return world.getChunkManager().getWorldChunk(pos.x,pos.z);}
             @Override public CompletableFuture<?> scan(ChunkPos pos,LimitedCollector collector){return world.getChunkManager().getChunkIoWorker().scanChunk(pos,collector);}
         });
     }
-    /** Test seam: identical state machine without a live world (disk/unloaded-chunk path only). */
-    GeneratedSourceReader(String dimension,Bounds bounds,Executor executor,int bottom,int height,ChunkIo io) {
-        this.io=io;this.bottom=bottom;this.height=height;
-        this.world=null;this.dimension=dimension;this.bounds=bounds;this.executor=executor;
+    /** Detached metadata + IO seam: production captures sea level on the owner thread,
+     * so Ensure completion never depends on a nullable world retained by a test adapter. */
+    GeneratedSourceReader(String dimension,Bounds bounds,Executor executor,int bottom,int height,int seaLevel,ChunkIo io) {
+        this.io=io;this.bottom=bottom;this.height=height;this.seaLevel=seaLevel;
+        this.dimension=dimension;this.bounds=bounds;this.executor=executor;
         long volume=Math.multiplyExact(Math.multiplyExact(bounds.maxX()-bounds.minX(),bounds.maxY()-bounds.minY()),bounds.maxZ()-bounds.minZ());
         if(volume>32768)throw new IllegalArgumentException("source region volume");
         cells=new SourceLandmarks.Cell[(int)volume];

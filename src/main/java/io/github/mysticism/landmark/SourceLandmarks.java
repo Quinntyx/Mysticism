@@ -112,7 +112,9 @@ public final class SourceLandmarks {
         final MinecraftServer server;final LandmarkStore store;final ItemEmbeddingIndexState itemIndex;final ExecutorService worker=new ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(16),Thread.ofPlatform().daemon().name("mysticism-source").factory(),new ThreadPoolExecutor.AbortPolicy());
         final ArrayDeque<SourceOwnership.Request> ownerRequests=new ArrayDeque<>();
         final ArrayDeque<FrontierRetry> retries=new ArrayDeque<>();final Map<CompletableFuture<?>,String> auxiliary=new IdentityHashMap<>();final SourceSchedule<Operation<?>> schedule=new SourceSchedule<>(DISCOVERY_FAIR_SHARE,op->op instanceof Read,op->op.background);final LinkedHashSet<Hint> hints=new LinkedHashSet<>();Operation<?> active;String status="Ready";int playerCursor,lastCells;
-        Session(MinecraftServer server){this.server=server;store=LandmarkStore.get(server);itemIndex=ItemEmbeddingIndexState.get(server);}
+        /** Owner-thread observation clock, kept separate from detached reader metadata. */
+        final java.util.function.LongSupplier observationClock;
+        Session(MinecraftServer server){this.server=server;observationClock=()->server.getOverworld().getTime();store=LandmarkStore.get(server);itemIndex=ItemEmbeddingIndexState.get(server);}
         <T> CompletableFuture<T> computeAndDeliver(String dim,java.util.function.Supplier<T> computation){
             var out=new CompletableFuture<T>();if(auxiliary.size()>=64){out.completeExceptionally(new RejectedExecutionException("source auxiliary budget"));return out;}auxiliary.put(out,dim);
             try{CompletableFuture.supplyAsync(computation,worker).whenComplete((value,error)->server.execute(()->{auxiliary.remove(out);if(SESSIONS.get(server)!=this)out.cancel(false);else if(error!=null)out.completeExceptionally(error);else out.complete(value);}));}catch(RuntimeException failure){auxiliary.remove(out);out.completeExceptionally(failure);}return out;
@@ -214,7 +216,7 @@ public final class SourceLandmarks {
                 if(published.kind()==Landmark.Kind.CAVE)for(var face:published.geometry().frontiers()){var b=face.missingBounds();s.hint(dimension,new BlockPos((int)b.minX(),(int)b.minY(),(int)b.minZ()));}
                 if(value.adjoining!=null)s.offer(new Transfer(s,published.id(),value.adjoining,activity?bounds:null,true,activity,new CompletableFuture<>()));
             }return;}
-            if(observed==null){if(observe()){observed=snapshot.getNow(null);time=s.server.getOverworld().getTime();seaLevel=reader.world.getSeaLevel();}return;}
+            if(observed==null){if(observe()){observed=snapshot.getNow(null);time=s.observationClock.getAsLong();seaLevel=reader.seaLevel;}return;}
             // Pause only at topology reads/staging; never while waiting for model readiness.
             if(prepared==null){
                 if(hydrated!=null){if(!hydrated.isDone())return;parents.add(hydrated.getNow(null));hydrated=null;return;}

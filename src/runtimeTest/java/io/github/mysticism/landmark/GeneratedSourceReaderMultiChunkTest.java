@@ -49,7 +49,7 @@ public final class GeneratedSourceReaderMultiChunkTest {
         var roots=new HashMap<Long,NbtCompound>();
         roots.put(new ChunkPos(0,0).toLong(),root("minecraft:stone"));
         roots.put(new ChunkPos(2,0).toLong(),root("minecraft:dirt"));
-        var reader=new GeneratedSourceReader("minecraft:overworld",bounds,Runnable::run,-64,384,savedChunks(roots));
+        var reader=new GeneratedSourceReader("minecraft:overworld",bounds,Runnable::run,-64,384,63,savedChunks(roots));
         for(int ticks=0;ticks<64&&!reader.advance(512);ticks++)check(ticks<63,"reader kept advancing across the three chunks");
         check(reader.chunkIndex==3,"all three chunks advanced (chunkIndex="+reader.chunkIndex+")");
         check(reader.scan==null&&reader.collector==null&&reader.disk==null,

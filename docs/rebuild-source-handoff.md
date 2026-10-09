@@ -69,6 +69,30 @@ One active source operation/server, request queue 64, hint queue 128, frontier-r
 
 Live gameplay, new save/reload cycles, actual Nomic inference, multiplayer entry, projected meshes/collision and terrain coupling were **not exercised** in this worktree. Parent performs integrated validation. Source and semantic catalog paging are resumable linear traversal, not spatial/high-dimensional acceleration indexes; large catalogs may take many ticks and cold metadata page reads still happen on the owner thread. A single operation waiting for descriptor inference can also delay later queued source reads. Old immutable generated blob files are not garbage-collected. Raw SourceSelector intentionally does not choose representatives itself. Natural neighboring cave union currently requires semantic convergence too; temporarily separate provisional owners can remain. The worker's individual-feature expansion/page caps can stop growth of very large caves. Source edits revise occupancy/material but do not repartition one historical cave ID into new air-component IDs after a new wall splits its air. Safe-air support recognizes a conservative floor whitelist and may reject otherwise valid modded/slab floors. Stored coarse far material detail requires successful near refinement before full fidelity. Nearby chest sampling covers at most two loaded chests and 16 slots/chest per sample. A full-air observation with no real item fallback must await a working descriptor model.
 
+## Async-discovery Ensure observation repair
+
+The production `GeneratedSourceReader` constructor now captures the source world's
+sea level on the owner thread alongside dimension/height metadata. `Ensure` consumes
+that detached value, rather than dereferencing the null `world` left by constructor
+delegation. No Overworld/default sea-level fallback is used; mountain classification
+keeps the source dimension's actual elevation threshold. The observation clock still
+uses the Overworld tick, and topology preparation remains on the bounded worker.
+
+`SourceEnsureObservationTest` drives the real `Ensure.advance`/`observe` path through
+NBT decoding, pending snapshot completion and actual asynchronous topology preparation.
+Its detached IO/metadata fixture needs no game bootstrap, persistence or model service;
+only the private session holder is allocated without constructors. It verifies yielding
+while the worker is pending, the sampling budget, source sea level/dimension, and real
+mountain ownership geometry (default/Overworld sea levels give a different result).
+
+Cached Gradle 8.13 `--offline --no-daemon --console=plain build` passed in visible tmux:
+build/packaging tests, all seven discovered runtime regression classes (14 Ensure
+checks), common/client compilation, remapping and production-jar verification.
+Contributing async-discovery commits remain ancestors. No gameplay/GPU/multiplayer or
+actual native-model launch was exercised; cold metadata/page IO still has the bounded
+but not hard-wall-clock tick limitations described above. This repair does not certify
+all eleven runtime symptoms or change their independently owned subsystems.
+
 ## Validation actually run
 
 No new tests added and no Gradle run during concurrent rebuild (parent instruction). Scoped Java21 `javac --release 21 -proc:none` compilation of all SOURCE-owned landmark/activity classes against cached mapped Fabric/Yarn 1.21.1 classpath plus the read-only NAV LatentAttunement source. Interactive tmux pane `%463`, script `/tmp/mysticism-source-rebuild-check.sh`; output displayed, not redirected. `git diff --check`. This is compile validation, **not** evidence that live runtime behaviors above have passed.
