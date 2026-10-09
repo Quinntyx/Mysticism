@@ -4,11 +4,13 @@ import io.github.mysticism.client.net.SpiritNetworkingClient;
 import io.github.mysticism.client.spiritworld.*;
 import io.github.mysticism.client.util.Color;
 import io.github.mysticism.embedding.EmbeddingHelper;
+import io.github.mysticism.movement.SpiritMovement;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.util.Identifier;
 import org.slf4j.Logger;
@@ -38,8 +40,21 @@ public class MysticismClient implements ClientModInitializer {
         io.github.mysticism.client.spiritworld.SpiritWorldClient.init();
         ClientLatentPredictor.init();
         SpiritFogVoxels.init();
+        installSpiritFlightInput();
 
         SpiritSkybox.setMode(SpiritSkybox.Mode.FLAT);
+    }
+
+    /**
+     * Spirit deep flight reads the same key state vanilla flight used, under the same camera condition,
+     * so the consistent model in SpiritMovement strips and replaces vanilla's vertical impulse exactly.
+     */
+    private void installSpiritFlightInput() {
+        SpiritMovement.installVerticalInput(player -> {
+            MinecraftClient client = MinecraftClient.getInstance();
+            if (!(player instanceof ClientPlayerEntity spirit) || client.getCameraEntity() != spirit) return 0;
+            return (spirit.input.jumping ? 1 : 0) - (spirit.input.sneaking ? 1 : 0);
+        });
     }
 
     private void onIntegratedServerStarted(MinecraftServer server) {

@@ -10,6 +10,8 @@
     "ActivitySpawnMixin",
     "SpiritMeshSneakMixin",
     "SpiritMeshCollisionMixin",
+    "SpiritTravelMixin",
+    "EntityFlagAccess",
     "SpiritNativeMobMixin",
     "SpiritFlightToggleMixin",
     "DroppedItemSemanticMixin",
