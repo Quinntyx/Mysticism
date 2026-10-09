@@ -86,10 +86,14 @@ public final class MeshCollision {
     private static int grid(double x){return (int)Math.floor(x/8);}
     private static Index index(PlayerEntity player) {
         TerrainMeshFrame frame=player instanceof ServerPlayerEntity server ? SpiritTerrainService.mesh(server).orElse(null) : client.apply(player.getUuid());
+        return index(player.getUuid(),frame,player.getWorld().isClient);
+    }
+    /** Per-player cache resolution shared by live entities and the mesh-isolation regressions. */
+    static Index index(UUID id,TerrainMeshFrame frame,boolean clientWorld) {
         if(frame==null)return null;
-        var cache=player.getWorld().isClient?CLIENT:SERVER;
-        Index index=cache.get(player.getUuid());
-        if(index==null || index.frame!=frame){index=new Index(frame);cache.put(player.getUuid(),index);}
+        var cache=clientWorld?CLIENT:SERVER;
+        Index index=cache.get(id);
+        if(index==null || index.frame!=frame){index=new Index(frame);cache.put(id,index);}
         return index;
     }
     public static Vec3d move(PlayerEntity player,Vec3d wanted) {
