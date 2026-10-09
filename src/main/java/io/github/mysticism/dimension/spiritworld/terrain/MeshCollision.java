@@ -148,6 +148,13 @@ public final class MeshCollision {
     /** Conservative continuous affine-motion guard: the union of endpoint AABBs contains EVERY intermediate
      * vertex under linear affine interpolation. An ambiguous swept/body overlap is held, never sampled through. */
     public static boolean transitionClear(TerrainMeshFrame old,TerrainMeshFrame next,Box body) {
+        return transitionClear(old,next,body,Vec3d.ZERO);
+    }
+    /** Same guard, aware of how far the OBSERVER moved since the old frame was accepted. A cell that
+     * translated exactly with the observer (teleport re-anchor, observer-following re-root) keeps the
+     * accepted relative relationship to the body and cannot sweep through it; only true surface motion,
+     * or geometry appearing near the body, is held. */
+    public static boolean transitionClear(TerrainMeshFrame old,TerrainMeshFrame next,Box body,Vec3d observerDelta) {
         if(old==null)return true;
         Map<Long,TerrainMeshFrame.Cell> previous=new HashMap<>();for(var c:old.cells())previous.put(c.key(),c);
         Box local=body.expand(5),strict=body.expand(-1e-5);
@@ -155,6 +162,9 @@ public final class MeshCollision {
             var before=previous.get(c.key());
             if(before!=null && c.min().equals(before.min()) && c.axisX().equals(before.axisX()) && c.axisY().equals(before.axisY())
                     && c.axisZ().equals(before.axisZ()) && c.collision().equals(before.collision()))continue;
+            if(before!=null && c.axisX().equals(before.axisX()) && c.axisY().equals(before.axisY())
+                    && c.axisZ().equals(before.axisZ()) && c.collision().equals(before.collision())
+                    && rigidWith(c.min().subtract(before.min()),observerDelta))continue;
             if(!c.bounds().intersects(local) && (before==null || !before.bounds().intersects(local)))continue;
             if(before==null) {for(Box b:c.collision())if(penetration(strict,new Shape(c,b,c.bounds(b)))!=null)return false;continue;}
             if(c.collision().isEmpty())continue;
@@ -164,6 +174,11 @@ public final class MeshCollision {
             }
         }
         return true;
+    }
+    /** Exact rigid translation (floating-point tolerant): the cell moved with the observer, not across it. */
+    private static boolean rigidWith(Vec3d motion,Vec3d observerDelta) {
+        return Math.abs(motion.x-observerDelta.x)<1e-6 && Math.abs(motion.y-observerDelta.y)<1e-6
+                && Math.abs(motion.z-observerDelta.z)<1e-6;
     }
     private static Vec3d penetration(Box body,Shape shape) {
         var c=shape.cell;Box b=shape.local;
