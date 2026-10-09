@@ -87,7 +87,9 @@ public final class SpiritTerrainService {
         }
     }
     /** Rebuild derived meshes from the existing current-profile per-player navigation binding, never a global saved frame. */
-    public static boolean restore(ServerPlayerEntity player) {
+    public static boolean restore(ServerPlayerEntity player) {return restore(player,true);}
+    /** announce=false is for bounded navigation self-heal retries; a silent repeated failure must not spam chat. */
+    public static boolean restore(ServerPlayerEntity player,boolean announce) {
         if(!player.getWorld().getRegistryKey().equals(WORLD))return false;
         var nav=player.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION);
         if(!nav.active() || nav.sourceDimension().isEmpty())return false;
@@ -108,7 +110,22 @@ public final class SpiritTerrainService {
             if(owner==null)discoverOwner(player,s);requestSource(player,s,w.origin,32);publish(player,s,true);
             if(nav.hasShallowTarget())prefetchTarget(player,nav.targetDimension(),nav.targetLandmarkId(),nav.targetPosition(),player.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target(),nav.targetBasis());
             return true;
-        } catch(RuntimeException failure){cancelEnter(player);player.sendMessage(Text.literal("Spirit mesh restore deferred: "+failure.getMessage()),false);return false;}
+        } catch(RuntimeException failure){cancelEnter(player);if(announce)player.sendMessage(Text.literal("Spirit mesh restore deferred: "+failure.getMessage()),false);return false;}
+    }
+    /** True while a player stands inside the spirit carrier with no live terrain session to rebuild from. */
+    public static boolean needsRestore(ServerPlayerEntity player) {
+        return player.getWorld().getRegistryKey().equals(WORLD) && session(player)==null;
+    }
+    /** Coherent partial-entry recovery: validated return to the remembered source pose, never a substitute exit. */
+    public static boolean returnToSource(ServerPlayerEntity player,String dimension,Vec3d pose) {
+        if(!player.getWorld().getRegistryKey().equals(WORLD))return false;
+        ServerWorld world=world(player.getServer(),dimension);
+        if(world==null || !Double.isFinite(pose.x) || !Double.isFinite(pose.y) || !Double.isFinite(pose.z))return false;
+        // The remembered chunk may have unloaded since the failure; an unloaded chunk is not an obstruction.
+        world.getChunk(MathHelper.floor(pose.x)>>4,MathHelper.floor(pose.z)>>4);
+        if(!clearBody(world,pose))return false;
+        player.teleport(world,pose.x,pose.y,pose.z,player.getYaw(),player.getPitch());
+        player.setVelocity(Vec3d.ZERO);player.fallDistance=0;return true;
     }
     public static void cancelEnter(ServerPlayerEntity player) {
         Context c=SERVERS.get(player.getServer());if(c==null)return;
@@ -223,8 +240,11 @@ public final class SpiritTerrainService {
         boolean failed=s.walkFuture!=null && s.walkFuture.isCompletedExceptionally();
         if(probe!=null && !failed && s.walkField==field.identity && probe.id.equals(hint.landmarkId())
                 && probe.owner!=null && owner.isPresent() && probe.owner.geometryKeys().equals(owner.get().geometryKeys())
-                && probe.origin.squaredDistanceTo(hint.sourcePosition())<4) {probe.owners=field.owners;return;}
-        Context context=SERVERS.get(p.getServer());if(context==null || context.tick<s.walkNextProbe)return;s.walkNextProbe=context.tick+20;
+                && covered(probe.origin,hint.sourcePosition())) {probe.owners=field.owners;return;}
+        Context context=SERVERS.get(p.getServer());if(context==null)return;
+        // A failed fetch retries immediately; an in-flight probe is reused while the moving hint stays
+        // inside its sampled coverage instead of restarting the whole fetch every few blocks of drift.
+        if(!failed && context.tick<s.walkNextProbe)return;s.walkNextProbe=context.tick+20;
         if(s.walkFuture!=null)s.walkFuture.cancel(false);
         probe=new Window(hint.sourceDimension(),hint.sourcePosition(),hint.sourceCoordinate(),hint.sourceBasis(),hint.landmarkId());
         probe.owner=LandmarkStore.get(p.getServer()).metadata(probe.id).orElse(null);probe.owners=field.owners;
@@ -234,6 +254,10 @@ public final class SpiritTerrainService {
             if(!live(p,s) || s.walkProbe!=expected || s.walkFuture!=future || error!=null || region==null)return;
             ingest(p.getServer(),expected,region.cells(),1728);expected.ready=true; // Acquisition still requires every body/floor sample, not unknown outer cells.
         }));
+    }
+    /** The fetched 12-side region keeps serving a walking/drifting hint until it leaves coverage. */
+    private static boolean covered(Vec3d origin,Vec3d at) {
+        return Math.abs(at.x-origin.x)<=4 && Math.abs(at.y-origin.y)<=4 && Math.abs(at.z-origin.z)<=4;
     }
     public static boolean acquireCurrentSupport(ServerPlayerEntity p) {
         var current=currentSupport(p);return current.isPresent() && acquireCurrentSupport(p,current.get());
