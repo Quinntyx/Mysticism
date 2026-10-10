@@ -1,8 +1,13 @@
 # Nomic v2-MoE embedding contract (schema 2)
 
-## Deployment, not an automatic download
+## Current HTTP deployment (native integration pending), not an automatic download
 
-Mysticism uses an administrator-provisioned **Ollama-compatible** HTTP service. No
+The offline [native-v2 asset loader](embedded-model-assets.md) supports the approved
+local GGUF and existing Ollama cache without a service. It is an asset/backend
+handoff boundary, not an inference implementation: the current initialization
+still uses the HTTP provider below until a real in-process backend is wired in.
+
+Mysticism currently uses an administrator-provisioned **Ollama-compatible** HTTP service. No
 model weights, software, fallback model, hash vectors, or model-pull endpoints are
 used by the mod. The official model exists at
 [Ollama nomic-embed-text-v2-moe](https://ollama.com/library/nomic-embed-text-v2-moe).
@@ -74,11 +79,11 @@ and restart the server to retry failed startup readiness.
 
 Packages are `io.github.mysticism.embedding` and `.vector`.
 
-* `EmbeddingSpace.DIMENSIONS = 256`, `NATIVE_DIMENSIONS = 768`, `SCHEMA = 2`,
+* `EmbeddingSpace.DIMENSIONS = 768`, `NATIVE_DIMENSIONS = 768`, `SCHEMA = 2`,
   `DESCRIPTOR_VERSION = 2`; `FINGERPRINT` is SHA256 of
   `MODEL + "|" + REVISION + "|" + DIMENSIONS + "|" + SEMANTICS`.
   `SEMANTICS` includes the family, tokenizer=model-manifest, mean pooling,
-  `search_document: ` task, first-256 Matryoshka reduction, L2 normalization,
+  `search_document: ` task, full native768 output (no reduction), L2 normalization,
   and descriptor version. Equal dimensions never imply equal semantic space.
 * `EmbeddingHelper.profile(): EmbeddingProfile` returns immutable
   `(model, revision, dimensions, semantics, fingerprint)`.
@@ -88,7 +93,7 @@ Packages are `io.github.mysticism.embedding` and `.vector`.
 * `EmbeddingHelper.getEmbedding(String descriptor): CompletableFuture<Vec384f>`
   accepts **unprefixed**, nonblank canonical text, at most 8192 Java characters.
   The provider sends `search_document: ` itself. Each success is independently
-  owned, finite, nonzero, current-profile, L2-normalized and 256-dimensional.
+  owned, finite, nonzero, current-profile, L2-normalized and 768-dimensional.
   The bounded queue has 256 slots and a copied LRU cache holds 8192 entries.
   Queue rejection, provider exceptions, timeouts and shutdown complete futures;
   caller cancellation does not cancel another caller's shared inference.
@@ -126,8 +131,8 @@ CompletableFuture<Vec384f> semantic = EmbeddingHelper.readiness()
 engine: `profile()`, `checkReady()`, `getEmbedding(String)`, `close()`.
 `EmbeddingService(URI, Duration connectTimeout, Duration requestTimeout)` implements
 `GET /api/tags` and `POST /api/embed`, expects the declared model in the response
-and exactly one native 768-number embedding, then takes the first 256 dimensions
-and normalizes. Already-reduced 256 responses are deliberately rejected, as are
+and exactly one native 768-number embedding, retains all coordinates and
+normalizes. Already-reduced 256 responses are deliberately rejected, as are
 legacy 384 responses. JSON bodies are bounded to 128 KiB. `truncate:false` makes
 actual 512-token overflow explicit; a character limit is not a token estimator.
 Custom providers must preserve the complete current profile, not just shape.
@@ -227,8 +232,8 @@ uses target minus current; convergence clamps its factor to [0,1].
 V2 documents `search_document:` and `search_query:`, **not** `clustering:`. Shared
 item/block/biome/landmark descriptors use the same document space here. KNN and
 three-basis projection are not representative clustering and do not guarantee
-stable landmark layout. Clustering quality at 256 dimensions is not yet validated
-on a Minecraft corpus; native 768 remains the evaluation baseline.
+stable landmark layout. Clustering quality at native 768 dimensions is not yet
+validated on a Minecraft corpus; there is no Matryoshka truncation in this profile.
 
 A downstream cluster owner should use deterministic spherical clustering of
 normalized descriptors: sort canonical IDs, use deterministic initialization
