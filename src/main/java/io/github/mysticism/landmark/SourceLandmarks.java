@@ -196,10 +196,10 @@ public final class SourceLandmarks {
     }
     record Prepared(Landmark prior,String id,String biome,Landmark.Kind kind,BlockPoint anchor,SourceGeometry geometry,List<DescriptorVectors.WeightedDescriptor> descriptors,Map<String,Double> items,String adjoining){}
     private static final class Ensure extends Operation<Optional<LandmarkMetadata>> {
-        final BlockPos position;final String preferred;final boolean activity;String cursor;boolean catalogEnd;GenerationSurveyQueue.Attempt surveyAttempt;
+        final BlockPos position;final String preferred;final boolean activity;final Bounds localBounds;String cursor;boolean catalogEnd;Long sourceRevision;GenerationSurveyQueue.Attempt surveyAttempt;
         final ArrayDeque<LandmarkMetadata> candidates=new ArrayDeque<>();final List<Landmark> parents=new ArrayList<>();final List<GeometryPage> pages=new ArrayList<>();
         final Map<String,Double> importance=new HashMap<>();Region observed;CompletableFuture<Prepared> prepared;CompletableFuture<Vec384f> embedding;Prepared value;Landmark published;long time;int seaLevel;
-        Ensure(Session s,String dimension,BlockPos pos,String preferred,boolean activity,CompletableFuture<Optional<LandmarkMetadata>> future){super(s,dimension,new Bounds(pos.getX()-12L,pos.getY()-12L,pos.getZ()-12L,pos.getX()+13L,pos.getY()+13L,pos.getZ()+13L),future);this.position=pos;this.preferred=preferred;this.activity=activity;}
+        Ensure(Session s,String dimension,BlockPos pos,String preferred,boolean activity,CompletableFuture<Optional<LandmarkMetadata>> future){super(s,dimension,new Bounds(pos.getX()-12L,pos.getY()-12L,pos.getZ()-12L,pos.getX()+13L,pos.getY()+13L,pos.getZ()+13L),future);this.position=pos;this.preferred=preferred;this.activity=activity;localBounds=ownershipWindow(bounds);}
         @Override void release(){
             super.release();
             if(surveyAttempt!=null){
@@ -217,13 +217,17 @@ public final class SourceLandmarks {
                 if(value.adjoining!=null)s.offer(new Transfer(s,published.id(),value.adjoining,activity?bounds:null,true,activity,new CompletableFuture<>()));
             }return;}
             if(observed==null){if(observe()){observed=snapshot.getNow(null);time=s.server.getOverworld().getTime();seaLevel=reader.world.getSeaLevel();}return;}
+            // Reject changes to any candidate's ownership, not just the eventual winner.
+            // Activity-only CAS can change headers but not these exact source masks.
+            if(sourceRevision==null)sourceRevision=s.store.ownershipRevision();
+            if(sourceRevision!=s.store.ownershipRevision())throw new CancellationException("source ownership changed during growth");
             // Pause only at topology reads/staging; never while waiting for model readiness.
             if(prepared==null){
                 if(hydrated!=null){if(!hydrated.isDone())return;parents.add(hydrated.getNow(null));hydrated=null;return;}
-                if(geometryRead!=null){geometryRead.advance(1,512);pages.addAll(geometryRead.drain());if(pages.size()>512)throw new IllegalArgumentException("source parent page budget");if(geometryRead.complete()){if(!geometryRead.isCurrent())throw new IllegalStateException("stale source geometry");var meta=geometryRead.metadata();var immutable=List.copyOf(pages);hydrated=CompletableFuture.supplyAsync(()->LandmarkNbt.hydrate(meta,immutable),s.worker);work=hydrated;pages.clear();geometryRead=null;}return;}
-                if(!candidates.isEmpty()){if(!s.store.geometryReadAvailable())return;var m=candidates.removeFirst();importance.put(m.id(),SpiritActivityService.importance(s.server,m));guarded=guarded.union(m.header().bounds());geometryRead=s.store.beginGeometryRead(m.id());return;}
-                if(!catalogEnd){var page=s.store.sourceRangePage(dimension,bounds,cursor,4,4);cursor=page.nextId();catalogEnd=page.end();candidates.addAll(page.landmarks());if(parents.size()+candidates.size()>64)throw new IllegalArgumentException("local overlap operation budget");return;}
-                List<Landmark> snapshot=List.copyOf(parents);prepared=CompletableFuture.supplyAsync(()->prepare(observed,snapshot,position,preferred,activity,time,seaLevel,Map.copyOf(importance)),s.worker);work=prepared;return;
+                if(geometryRead!=null){geometryRead.advance(1,512);pages.addAll(geometryRead.drain());if(pages.size()>512)throw new IllegalArgumentException("local source parent page budget");if(geometryRead.complete()){if(!geometryRead.isCurrent())throw new IllegalStateException("stale source geometry");var meta=geometryRead.metadata();var immutable=List.copyOf(pages);hydrated=CompletableFuture.supplyAsync(()->localParent(meta,immutable),s.worker);work=hydrated;pages.clear();geometryRead=null;}return;}
+                if(!candidates.isEmpty()){if(!s.store.geometryReadAvailable())return;var m=candidates.removeFirst();importance.put(m.id(),SpiritActivityService.importance(s.server,m));guarded=guarded.union(localBounds);geometryRead=s.store.beginGeometryRead(m.id(),localBounds);return;}
+                if(!catalogEnd){var page=s.store.sourceRangePage(dimension,localBounds,cursor,4,4);cursor=page.nextId();catalogEnd=page.end();candidates.addAll(page.landmarks());if(parents.size()+candidates.size()>64)throw new IllegalArgumentException("local overlap operation budget");return;}
+                List<Landmark> snapshot=List.copyOf(parents);prepared=CompletableFuture.supplyAsync(()->prepareLocal(observed,snapshot,position,preferred,activity,time,seaLevel,Map.copyOf(importance)),s.worker);work=prepared;return;
             }
             if(!prepared.isDone())return;if(value==null){value=prepared.getNow(null);if(value==null){complete(Optional.empty());return;}}
             if(embedding==null){
@@ -239,12 +243,32 @@ public final class SourceLandmarks {
             // Terrain changes move low-importance semantics strongly, high-importance ones slowly.
             if(old!=null){double inertia=SpiritActivityService.importance(s.server,s.store.metadata(old.id()).orElseThrow());vector=DescriptorVectors.compose(List.of(new DescriptorVectors.WeightedVector(old.baseEmbedding().vector(),1),new DescriptorVectors.WeightedVector(vector,0.05+0.5*(1-inertia))));}
             long revision=old==null?0:old.revision()+1;
-            published=new Landmark(value.id,dimension,ALGORITHM,value.kind,value.biome,value.anchor,OwnershipGeometry.bounds(value.anchor,value.geometry),LandmarkProfiles.wrap(vector),old==null?.08:old.baseImportance(),old==null?new ActivityMetadata(0,time):old.activity(),old==null?new Ownership(List.of()):old.ownership(),value.geometry,revision,"native 3D source observation; generated-only IO");
+            published=new Landmark(value.id,dimension,ALGORITHM,value.kind,value.biome,value.anchor,old==null?OwnershipGeometry.bounds(value.anchor,value.geometry):old.bounds().union(OwnershipGeometry.bounds(value.anchor,value.geometry)),LandmarkProfiles.wrap(vector),old==null?.08:old.baseImportance(),old==null?new ActivityMetadata(0,time):old.activity(),old==null?new Ownership(List.of()):old.ownership(),value.geometry,revision,"native 3D source observation; generated-only IO");
             if(old!=null)history=SpiritActivityService.prepareSourceUpdate(s.server,old,published);
-            mutation=s.store.stagePut(published,old==null?-1:old.revision());s.status="Source geometry publication";
+            mutation=old==null?s.store.stagePut(published,-1):s.store.stageSourcePatch(published,old.revision(),old.geometry().pages().stream().map(p->"mysticism.landmark.geometry."+p.id()+"."+p.revision()).toList());s.status="Source geometry publication";
         }
     }
+    /** Whole canonical 8-block pages around the observation plus a one-block adjacency halo.
+     * This bounds expanded masks independently of the total landmark's lifetime growth. */
+    static Bounds ownershipWindow(Bounds b){
+        return new Bounds(Math.floorDiv(b.minX()-1,8)*8,Math.floorDiv(b.minY()-1,8)*8,Math.floorDiv(b.minZ()-1,8)*8,
+            (Math.floorDiv(b.maxX(),8)+1)*8,(Math.floorDiv(b.maxY(),8)+1)*8,(Math.floorDiv(b.maxZ(),8)+1)*8);
+    }
+    /** Detached local pages with the full persisted header. Unread pages remain opaque refs
+     * in stageSourcePatch; a local mask is never mistaken for a complete replacement. */
+    static Landmark localParent(LandmarkMetadata metadata,List<GeometryPage> pages){
+        Set<String> keys=new HashSet<>(metadata.geometryKeys());
+        for(var p:pages)if(!keys.contains("mysticism.landmark.geometry."+p.id()+"."+p.revision()))throw new IllegalArgumentException("local page reference mismatch");
+        Landmark h=metadata.header();
+        return new Landmark(h.id(),h.dimension(),h.algorithmVersion(),h.kind(),h.biome(),h.anchor(),h.bounds(),h.baseEmbedding(),h.baseImportance(),h.activity(),h.ownership(),new SourceGeometry(pages,h.geometry().frontiers()),h.revision(),h.provenance());
+    }
     static Prepared prepare(Region region,List<Landmark> parents,BlockPos position,String preferred,boolean activity,long tick,int seaLevel,Map<String,Double> importance){
+        return prepare(region,parents,position,preferred,activity,tick,seaLevel,importance,false);
+    }
+    static Prepared prepareLocal(Region region,List<Landmark> parents,BlockPos position,String preferred,boolean activity,long tick,int seaLevel,Map<String,Double> importance){
+        return prepare(region,parents,position,preferred,activity,tick,seaLevel,importance,true);
+    }
+    private static Prepared prepare(Region region,List<Landmark> parents,BlockPos position,String preferred,boolean activity,long tick,int seaLevel,Map<String,Double> importance,boolean local){
         BlockPoint point=new BlockPoint(position.getX(),position.getY(),position.getZ());Map<BlockPoint,Cell> observed=new HashMap<>();region.cells.forEach(c->observed.put(c.position,c));Cell seed=observed.get(point);if(seed==null)return null;
         Map<String,Map<BlockPoint,OwnershipGeometry.Material>> masks=new HashMap<>();Map<BlockPoint,String> owners=new HashMap<>();
         for(var parent:parents){var mask=OwnershipGeometry.expand(parent.geometry());masks.put(parent.id(),mask);for(var p:mask.keySet())if(owners.put(p,parent.id())!=null)throw new IllegalStateException("conflicting source ownership");}
@@ -269,7 +293,14 @@ public final class SourceLandmarks {
         Map<BlockPoint,OwnershipGeometry.Material> result=prior==null?new HashMap<>():new HashMap<>(masks.get(prior.id()));
         if(prior!=null)for(var c:region.cells)if(result.containsKey(c.position))result.put(c.position,new OwnershipGeometry.Material(c.material,c.air()));
         for(var p:desired){Cell c=observed.get(p);if(c!=null)result.put(p,new OwnershipGeometry.Material(c.material,c.air()));}
-        if(result.isEmpty() || OwnershipGeometry.components(result.keySet()).size()!=1)return null; // no pretend disconnected aggregate
+        if(result.isEmpty())return null;
+        if(local&&prior!=null){
+            // A globally connected parent can have multiple components inside this window
+            // (e.g. two arms of a U). We only add a connected flood, never remove ownership.
+            // It must touch the existing mask; preferred activity cannot create an island.
+            var original=masks.get(prior.id()).keySet();
+            if(!desired.isEmpty()&&Collections.disjoint(desired,original)&&!OwnershipGeometry.adjacent(desired,original))return null;
+        }else if(OwnershipGeometry.components(result.keySet()).size()!=1)return null; // no pretend disconnected aggregate
         BlockPoint anchor=prior==null?point:prior.anchor();String biome=prior==null?seed.biome:prior.biome();String id=prior==null?LandmarkIds.seed(region.dimension,ALGORITHM,kind,biome,anchor):prior.id();long revision=prior==null?0:prior.revision()+1;
         List<FrontierFace> frontiers=new ArrayList<>();for(int[] d:OwnershipGeometry.DIRECTIONS){var direction=d[0]<0?FrontierFace.Direction.WEST:d[0]>0?FrontierFace.Direction.EAST:d[1]<0?FrontierFace.Direction.DOWN:d[1]>0?FrontierFace.Direction.UP:d[2]<0?FrontierFace.Direction.NORTH:FrontierFace.Direction.SOUTH;
             for(var p:desired){if(kind==Landmark.Kind.CAVE&&!result.get(p).air())continue;var n=OwnershipGeometry.next(p,d);if(!observed.containsKey(n)&&!result.containsKey(n)){frontiers.add(new FrontierFace(region.dimension,Bounds.cube(n.x(),n.y(),n.z(),1),direction,revision,"source-coordinate retry"));break;}}}

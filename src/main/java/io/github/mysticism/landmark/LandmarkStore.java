@@ -278,6 +278,36 @@ public final class LandmarkStore extends PersistentState {
         if(old!=null) metadata(value.id()).orElseThrow(()->new IllegalStateException("missing record")); // never bypass corrupt existing versions
         return stage(List.of(value),Set.of(),Map.of(),Map.of(),Map.of());
     }
+    /** Source growth/refinement CAS replacing only fully read local pages. Every old known
+     * voxel on a replaced page must remain owned (its observed material may change). Remote
+     * immutable refs are retained verbatim, never hydrated, expanded or re-encoded. Caller
+     * certifies connected additions and exclusive ownership against all local candidates. */
+    public PendingMutation stageSourcePatch(Landmark local,long expectedRevision,List<String> replacedKeys) {
+        unlocked();
+        LandmarkMetadata old=metadata(local.id()).orElseThrow(()->new IllegalStateException("missing source parent"));
+        if(!old.id().equals(local.id())||old.revision()!=expectedRevision)throw new IllegalStateException("stale source patch");
+        Landmark h=old.header();
+        if(local.revision()!=expectedRevision+1||!local.dimension().equals(h.dimension())||!local.algorithmVersion().equals(h.algorithmVersion())
+            ||!local.bounds().contains(h.bounds()))throw new IllegalArgumentException("source patch identity/bounds");
+        h.baseEmbedding().profile().requireCompatible(local.baseEmbedding().profile());
+        Set<String> replaced=new HashSet<>(replacedKeys);
+        if(replaced.size()!=replacedKeys.size()||!new HashSet<>(old.geometryKeys()).containsAll(replaced))throw new IllegalArgumentException("source patch references");
+        Set<String> keys=new TreeSet<>(old.geometryKeys());keys.removeAll(replaced);
+        Set<String> retainedIds=new HashSet<>();for(String key:keys)retainedIds.add(key.substring(0,key.lastIndexOf('.')));
+        List<PageWrite> writes=new ArrayList<>();
+        for(GeometryPage page:local.geometry().pages()){
+            String key=geometryKey(page);checkKey(key);
+            if(retainedIds.contains(key.substring(0,key.lastIndexOf('.'))))throw new IllegalArgumentException("source patch overwrites an unread page");
+            keys.add(key);writes.add(new PageWrite(key,()->LandmarkNbt.encodeGeometry(page)));
+        }
+        // Codec validation keeps the normal metadata/ref/frontier limits and native profile.
+        var header=LandmarkNbt.decodeMetadata(LandmarkNbt.encodeLandmark(local,local.geometry().pages().stream().map(LandmarkStore::geometryKey).toList())).header();
+        LandmarkMetadata next=new LandmarkMetadata(header,List.copyOf(keys));
+        appendMetadataWrites(writes,List.of(next));
+        pending=new PendingMutation(List.copyOf(writes),List.of(next),Set.of(),Map.of(),Map.of(),Map.of(),profile);
+        pending.validations=replaced.stream().sorted().map(k->new Validation(k,local.bounds(),local.geometry(),false,true)).toList();
+        return pending;
+    }
     /** Activity/claims CAS retaining geometry references, without decoding any geometry leaves. */
     public PendingMutation stageActivity(LandmarkRepository.RevisionRef ref,ActivityMetadata activity,Ownership ownership) {
         unlocked(); LandmarkMetadata old=metadata(ref.id()).orElseThrow(()->new IllegalStateException("missing record"));
@@ -389,7 +419,19 @@ public final class LandmarkStore extends PersistentState {
         keys.forEach(key->writes.add(new PageWrite(key,null))); appendMetadataWrites(writes,values);
         pending=new PendingMutation(List.copyOf(writes),List.copyOf(values),Set.copyOf(removals),Map.copyOf(newAliases),Map.copyOf(retired),Map.copyOf(history),profile); return pending;
     }
-    private record Validation(String key,Bounds bounds,SourceGeometry replacement,boolean disjoint) {}
+    private record Validation(String key,Bounds bounds,SourceGeometry replacement,boolean disjoint,boolean ownershipOnly) {
+        Validation(String key,Bounds bounds,SourceGeometry replacement,boolean disjoint){this(key,bounds,replacement,disjoint,false);}
+    }
+    private static void validateOwnedCell(Bounds owned,SourceGeometry replacement){
+        long covered=0;
+        for(var page:replacement.pages())if(page.bounds().intersects(owned))for(var cell:page.cells().query(owned,GeometryPage.MAX_LEAVES)){
+            Bounds b=cell.bounds();
+            covered=Math.addExact(covered,Math.multiplyExact(Math.multiplyExact(Math.min(b.maxX(),owned.maxX())-Math.max(b.minX(),owned.minX()),
+                Math.min(b.maxY(),owned.maxY())-Math.max(b.minY(),owned.minY())),Math.min(b.maxZ(),owned.maxZ())-Math.max(b.minZ(),owned.minZ())));
+        }
+        long volume=Math.multiplyExact(Math.multiplyExact(owned.maxX()-owned.minX(),owned.maxY()-owned.minY()),owned.maxZ()-owned.minZ());
+        if(covered!=volume)throw new IllegalArgumentException("source patch drops owned cells");
+    }
     public final class PendingMutation {
         private final List<PageWrite> writes;
         private final List<LandmarkMetadata> values;
@@ -429,7 +471,7 @@ public final class LandmarkStore extends PersistentState {
                 worked++;
                 if(v.replacement!=null) {
                     var decoder=validationDecoder;
-                    int count=decoder.advance(maxLeaves-leaves,cell->LandmarkRepository.validatePreservedCell(cell,decoder.palette(),v.replacement));
+                    int count=decoder.advance(maxLeaves-leaves,cell->{if(v.ownershipOnly)validateOwnedCell(cell.bounds(),v.replacement);else LandmarkRepository.validatePreservedCell(cell,decoder.palette(),v.replacement);});
                     leaves+=count; validatedLeaves+=count;
                     if(!decoder.complete()) return worked;
                 } else if(v.disjoint) {
