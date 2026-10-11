@@ -214,6 +214,37 @@ public final class SpiritTerrainService {
             if(!exactOwner(p,s,w,new Vec3d(pos.getX(),pos.getY(),pos.getZ())).filter(id::equals).isPresent())return false;
         return true;
     }
+    public enum WalkSourceStatus { READY, PENDING, UNAVAILABLE }
+    /** Query after currentSupport: a candidate starts/reuses material proof but is not proof readiness.
+     * READY permits bounded alignment, NOT landing; acquisition still rechecks the actual body/floor.
+     * A null contact waits only on its producing window (initial local source if no ground exists).
+     * Once a contact is owned and proved, background/far streaming must not delay walking. */
+    public static WalkSourceStatus currentSupportReadiness(ServerPlayerEntity p, WalkSupport contact) {
+        Session s=session(p);if(s==null || s.shallow)return WalkSourceStatus.UNAVAILABLE;
+        if(contact!=null) {
+            Window probe=s.walkProbe;
+            return proofReadiness(probe!=null && s.walkField==contact.windowIdentity() && probe.id.equals(contact.landmarkId()),
+                    probe!=null && probe.ready, s.walkFuture);
+        }
+        Window field=MeshCollision.ground(p).map(hit->windowFor(s,hit.cell())).orElse(s.local);
+        if(field==null || field.retired || world(p.getServer(),field.dimension)==null)return WalkSourceStatus.UNAVAILABLE;
+        // Stale/absent ownership is still a bounded source wait during retry backoff.
+        // A current unowned mask, unlike a stale mask, is not pending discovery.
+        boolean pending=field.owners==null || !field.owners.isCurrent(p.getServer())
+                || field.ownershipFuture!=null && !field.ownershipFuture.isDone()
+                || field.stream!=null && !field.stream.complete
+                || field.nearCells!=null || field.nearFuture!=null && !field.nearFuture.isDone()
+                || field==s.local && (s.ingesting!=null || s.sourceFuture!=null && !s.sourceFuture.isDone()
+                    || s.ownerFuture!=null && !s.ownerFuture.isDone());
+        return pending ? WalkSourceStatus.PENDING : WalkSourceStatus.UNAVAILABLE;
+    }
+    /** Publication, not future completion alone, makes the actual source samples available. */
+    static WalkSourceStatus proofReadiness(boolean matchesContact, boolean published, CompletableFuture<?> proof) {
+        if(!matchesContact)return WalkSourceStatus.UNAVAILABLE;
+        if(published)return WalkSourceStatus.READY;
+        return proof!=null && !proof.isCompletedExceptionally() && !proof.isCancelled()
+                ? WalkSourceStatus.PENDING : WalkSourceStatus.UNAVAILABLE;
+    }
     public static void cancelCurrentSupport(ServerPlayerEntity p) {
         Session s=session(p);if(s==null)return;if(s.walkFuture!=null)s.walkFuture.cancel(false);
         s.walkProbe=null;s.walkFuture=null;s.walkField=0;s.walkNextProbe=0;
