@@ -528,8 +528,12 @@ public final class SpiritTerrainService {
     private static void status(ServerPlayerEntity p,Session s,String message){if(!Objects.equals(message,s.status)){s.status=message;p.sendMessage(Text.literal(message),true);}}
     private static Vec3d origin(ServerPlayerEntity p,Session s,Window w) {
         if(w==s.local && s.shallow)return s.carrier;
-        Vec384f delta=w.semantic.clone().sub(q(p));Basis384f b=basis(p);
-        return p.getPos().add(delta.dot(b.i)*SCALE,delta.dot(b.j)*SCALE,delta.dot(b.k)*SCALE);
+        return projectedRoot(w.semantic,q(p),basis(p),p.getPos());
+    }
+    /** Observer-local projected placement of a source window: per-player q/basis, never a shared anchor. */
+    static Vec3d projectedRoot(Vec384f windowSemantic,Vec384f observerQ,Basis384f observer,Vec3d viewerPos) {
+        Vec384f delta=windowSemantic.clone().sub(observerQ);
+        return viewerPos.add(delta.dot(observer.i)*SCALE,delta.dot(observer.j)*SCALE,delta.dot(observer.k)*SCALE);
     }
     public static boolean canAlign(ServerPlayerEntity p,Basis384f proposed) {
         Session s=session(p);return s!=null && MeshCollision.transitionClear(s.frame,build(p,s,s.revision+1,proposed),p.getBoundingBox());
@@ -565,7 +569,7 @@ public final class SpiritTerrainService {
     }
     private static void append(ServerPlayerEntity p,Session s,Window w,List<TerrainMeshFrame.Material> materials,Map<TerrainMeshFrame.Material,Integer> palette,List<TerrainMeshFrame.Cell> cells,Set<Long> keys,Map<Long,Window> producers,int limit,Basis384f current) {
         boolean aligned=w==s.local && s.shallow;Vec3d root;
-        if(aligned)root=s.carrier;else {Vec384f delta=w.semantic.clone().sub(q(p));root=p.getPos().add(delta.dot(current.i)*SCALE,delta.dot(current.j)*SCALE,delta.dot(current.k)*SCALE);}
+        if(aligned)root=s.carrier;else root=projectedRoot(w.semantic,q(p),current,p.getPos());
         Vec3d ax=aligned?new Vec3d(1,0,0):axis(w.sourceBasis.i,current),ay=aligned?new Vec3d(0,1,0):axis(w.sourceBasis.j,current),az=aligned?new Vec3d(0,0,1):axis(w.sourceBasis.k,current);
         int count=0;
         for(var node:w.nodes) {
@@ -587,7 +591,8 @@ public final class SpiritTerrainService {
             cells.add(new TerrainMeshFrame.Cell(key,material,actualOwner,source,min,new Vec3d(side,side,side),ex,ey,ez,tile.color(),tile.light(),alpha,tile.collision()));producers.put(key,w);count++;
         }
     }
-    private static Vec3d axis(Vec384f source,Basis384f observer){return new Vec3d(source.dot(observer.i),source.dot(observer.j),source.dot(observer.k));}
+    /** Source-basis column expressed in the CURRENT observer basis: each player projects independently. */
+    static Vec3d axis(Vec384f source,Basis384f observer){return new Vec3d(source.dot(observer.i),source.dot(observer.j),source.dot(observer.k));}
     private static boolean publish(ServerPlayerEntity p,Session s,boolean force) {
         BuiltMesh built=buildMesh(p,s,s.revision+1,basis(p));TerrainMeshFrame frame=built.frame();
         if(!force && s.frame!=null && s.frame.shallow()==frame.shallow() && s.frame.sourceDimension().equals(frame.sourceDimension())
@@ -637,7 +642,7 @@ public final class SpiritTerrainService {
     private static final class Context {
         final MinecraftServer server;final LandmarkStore store;final Map<UUID,Session> sessions=new HashMap<>();
         long tick;int playerCursor;LandmarkStore.GeometryRead read;Session readingSession;Window readingWindow;
-        int geometryCursor,nearCursor;
+        int geometryCursor,nearCursor,proofCursor;
 
         boolean proving;final Map<BlockPos,BlockPalette.State> proofSamples=new HashMap<>();
         final ArrayDeque<Map.Entry<Session,LandmarkMetadata>> pending=new ArrayDeque<>();
@@ -832,7 +837,13 @@ public final class SpiritTerrainService {
         void advanceGeometry() {
             try {
                 if(read==null) {
-                    for(var entry:sessions.entrySet()) {
+                    // Landing-proof reads rotate across sessions: one player's repeatedly unproven
+                    // target can never monopolize the single shared repository reader and starve
+                    // another player's terrain mesh growth.
+                    var rotated=new ArrayList<>(sessions.entrySet());
+                    int start=rotated.isEmpty()?0:Math.floorMod(proofCursor++,rotated.size());
+                    for(int n=0;n<rotated.size() && read==null;n++) {
+                        var entry=rotated.get((start+n)%rotated.size());
                         var s=entry.getValue();var p=server.getPlayerManager().getPlayer(entry.getKey());Window target=s.target;
                         if(p==null || target==null || !target.ready || !target.confirmedOrigin || !currentTarget(p,s))continue;
                         if(target.proofKeys.equals(target.owner.geometryKeys()))continue;
