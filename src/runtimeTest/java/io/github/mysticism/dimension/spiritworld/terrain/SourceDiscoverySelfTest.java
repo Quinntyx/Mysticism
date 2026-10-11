@@ -35,7 +35,8 @@ public final class SourceDiscoverySelfTest {
         check(SourceDiscovery.horizontalRadius(0)==SourceDiscovery.MIN_RADIUS,"no zero/negative view extent");
         equal(SourceDiscovery.TILE,SourceDiscovery.horizontalRadius(1),"one chunk still discovers a full tile");
         equal(160,SourceDiscovery.horizontalRadius(10),"default ten-chunk view discovers its full extent");
-        equal(SourceDiscovery.MAX_RADIUS,SourceDiscovery.horizontalRadius(32),"extent is capped for huge view distances");
+        equal(512,SourceDiscovery.horizontalRadius(32),"full vanilla 32-chunk view is not truncated at 16 chunks");
+        equal(SourceDiscovery.MAX_RADIUS,SourceDiscovery.horizontalRadius(64),"extent is bounded beyond the vanilla slider");
         equal(64,SourceDiscovery.verticalRadius(160),"vertical extent is bounded");
         equal(32,SourceDiscovery.verticalRadius(32),"small views keep at least one tile of height");
         equal(128,SourceDiscovery.meshHorizon(2),"mesh horizon never shrinks below the previous fixed locality");
@@ -121,7 +122,7 @@ public final class SourceDiscoverySelfTest {
     private static void localAdmission() {
         // Near samples keep the exact unchanged allowance; the far lane admits distant discovered
         // terrain even when near samples would otherwise exhaust the whole mesh budget first.
-        var deep=new SourceDiscovery.LocalAdmission(false,640);
+        var deep=new SourceDiscovery.LocalAdmission(640);
         for(int n=0;n<640;n++)check(deep.admit(0),"near cells keep the unchanged deep allowance");
         check(!deep.admit(0),"near lane exhausts exactly at the previous limit");
         check(deep.admit(33*33.0),"far discovery is admitted after near exhaustion");
@@ -129,12 +130,12 @@ public final class SourceDiscoverySelfTest {
         check(!deep.admit(40*40.0),"far admission is bounded");
         check(deep.exhausted(),"both lanes spent stops scanning");
         check(!deep.admit(0) && !deep.admit(40*40.0),"spent lanes stay spent");
-        var shallow=new SourceDiscovery.LocalAdmission(true,1024);
+        var shallow=new SourceDiscovery.LocalAdmission(1024);
         for(int n=0;n<1024;n++)check(shallow.admit(0),"near cells keep the unchanged shallow allowance");
         check(!shallow.admit(0),"shallow near lane exhausts exactly at the previous limit");
         check(shallow.admit(100*100.0),"shallow far lane is separate from near samples");
         // Lane classification is by distance only: near cells never steal the far budget.
-        var edge=new SourceDiscovery.LocalAdmission(false,1);
+        var edge=new SourceDiscovery.LocalAdmission(1);
         check(edge.admit(SourceDiscovery.NEAR_EXACT_RADIUS*SourceDiscovery.NEAR_EXACT_RADIUS),"at the exact near radius the cell is near");
         check(!edge.admit(SourceDiscovery.NEAR_EXACT_RADIUS*SourceDiscovery.NEAR_EXACT_RADIUS),"an exhausted near lane rejects further near cells");
         check(edge.admit(SourceDiscovery.NEAR_EXACT_RADIUS*SourceDiscovery.NEAR_EXACT_RADIUS+1),"beyond the near radius the far lane admits");
@@ -196,9 +197,9 @@ public final class SourceDiscoverySelfTest {
         // Near-field compaction keeps strict per-owner provenance: unowned uniform tiles never merge there.
         var strict=SourceMeshBuilder.compact(observed,tileCenter,Map.of());
         check(strict.size()>nodes.size(),"near-field compaction never merges unowned tiles");
-        var permissive=SourceMeshBuilder.compact(observed,tileCenter,Map.of(),true);
+        var permissive=SourceDiscovery.coalesce(SourceMeshBuilder.compact(observed,tileCenter,Map.of(),true));
         equal(nodes.size(),permissive.size(),"discovery conversion matches the merge-unowned compaction");
-        // Far nodes are ordered center-out so the bounded mesh budget spends cells nearest first.
+        // Retained nodes remain center-out; local frame admission independently spreads its far lane.
         Vec3d farCorner=new Vec3d(192,64,192);
         for(int n=1;n<nodes.size();n++) {
             double a=SourceDiscoverySelfTest.distance(nodes.get(n-1),farCorner),b=SourceDiscoverySelfTest.distance(nodes.get(n),farCorner);
@@ -217,7 +218,7 @@ public final class SourceDiscoverySelfTest {
 
     private static double distance(SourceMeshBuilder.Node n,Vec3d center) {
         BlockPos at=n.position();
-        return SourceMeshBuilder.distanceSquared(new Box(at.getX(),at.getY(),at.getZ(),at.getX()+n.side(),at.getY()+n.side(),at.getZ()+n.side()),center);
+        return SourceMeshBuilder.distanceSquared(SourceMeshBuilder.nodeBox(n),center);
     }
 
     private static boolean blocksAvailable() {
@@ -240,8 +241,8 @@ public final class SourceDiscoverySelfTest {
         check(combined.containsAll(near),"near nodes supersede far discovery inside the sampled window");
         for(var node:near)for(var far:combined) {
             if(node.equals(far))continue;
-            var a=new Bounds(node.position().getX(),node.position().getY(),node.position().getZ(),node.position().getX()+node.side(),node.position().getY()+node.side(),node.position().getZ()+node.side());
-            var b=new Bounds(far.position().getX(),far.position().getY(),far.position().getZ(),far.position().getX()+far.side(),far.position().getY()+far.side(),far.position().getZ()+far.side());
+            var a=new Bounds(node.position().getX(),node.position().getY(),node.position().getZ(),node.position().getX()+(long)node.size().x,node.position().getY()+(long)node.size().y,node.position().getZ()+(long)node.size().z);
+            var b=new Bounds(far.position().getX(),far.position().getY(),far.position().getZ(),far.position().getX()+(long)far.size().x,far.position().getY()+(long)far.size().y,far.position().getZ()+(long)far.size().z);
             check(!a.intersects(b),"no far node overlaps the near sampled window after replacement");
         }
         var outside=combined.stream().filter(n->!near.contains(n)).toList();

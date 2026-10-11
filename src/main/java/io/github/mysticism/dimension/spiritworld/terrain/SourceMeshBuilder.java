@@ -19,8 +19,11 @@ import java.util.*;
 final class SourceMeshBuilder {
     static final Box UNIT=new Box(0,0,0,1,1,1);
     record Tile(TerrainMeshFrame.Material material,List<Box> collision,int color,int light,boolean air,boolean cube) {}
-    record Node(BlockPos position,int side,Tile tile,String ownerId) {
+    /** Mesh batches may be exact rectangular unions; authoritative source ownership remains octree-native. */
+    record Node(BlockPos position,int side,Tile tile,String ownerId,Vec3d size) {
+        Node(BlockPos position,int side,Tile tile,String ownerId){this(position,side,tile,ownerId,new Vec3d(side,side,side));}
         Node(BlockPos position,int side,Tile tile){this(position,side,tile,"");}
+        Node(BlockPos position,Vec3d size,Tile tile,String ownerId){this(position,(int)Math.min(size.x,Math.min(size.y,size.z)),tile,ownerId,size);}
     }
     record Key(int x,int y,int z,int side) {}
     static Tile read(ServerWorld world,BlockPos position) {
@@ -117,11 +120,28 @@ final class SourceMeshBuilder {
         List<Node> result=new ArrayList<>(near);for(Node node:base)outside(node,cut,result);
         result.sort(Comparator.comparingDouble(n->distanceSquared(nodeBox(n),center)));return List.copyOf(result);
     }
-    private static Box nodeBox(Node n){BlockPos p=n.position();return new Box(p.getX(),p.getY(),p.getZ(),(double)p.getX()+n.side(),(double)p.getY()+n.side(),(double)p.getZ()+n.side());}
+    static Box nodeBox(Node n){BlockPos p=n.position();return new Box(p.getX(),p.getY(),p.getZ(),p.getX()+n.size().x,p.getY()+n.size().y,p.getZ()+n.size().z);}
+    private static Bounds nodeBounds(Node n){BlockPos p=n.position();return new Bounds(p.getX(),p.getY(),p.getZ(),p.getX()+(long)n.size().x,p.getY()+(long)n.size().y,p.getZ()+(long)n.size().z);}
+    private static void piece(Node n,long x,long y,long z,long xx,long yy,long zz,List<Node> result) {
+        if(xx>x && yy>y && zz>z)result.add(new Node(new BlockPos((int)x,(int)y,(int)z),new Vec3d(xx-x,yy-y,zz-z),n.tile(),n.ownerId()));
+    }
     private static void outside(Node n,Bounds cut,List<Node> result) {
-        BlockPos p=n.position();int side=n.side();Bounds box=new Bounds(p.getX(),p.getY(),p.getZ(),(long)p.getX()+side,(long)p.getY()+side,(long)p.getZ()+side);
-        if(!box.intersects(cut)){result.add(n);return;}if(cut.contains(box)||side==1)return;
-        int half=side/2;for(int child=0;child<8;child++)outside(new Node(p.add((child&1)==0?0:half,(child&2)==0?0:half,(child&4)==0?0:half),half,n.tile(),n.ownerId()),cut,result);
+        Bounds b=nodeBounds(n);
+        if(!b.intersects(cut)){result.add(n);return;}if(cut.contains(b))return;
+        if(n.size().x==n.size().y && n.size().y==n.size().z && Integer.bitCount((int)n.size().x)==1) {
+            int half=(int)n.size().x/2;
+            for(int child=0;child<8;child++)outside(new Node(n.position().add((child&1)==0?0:half,(child&2)==0?0:half,(child&4)==0?0:half),half,n.tile(),n.ownerId()),cut,result);
+            return; // Preserve the existing power-of-two octree refinement path.
+        }
+        // Exact rectangular subtraction, never fill a hole or extend beyond observed source cells.
+        long x=Math.max(b.minX(),cut.minX()),y=Math.max(b.minY(),cut.minY()),z=Math.max(b.minZ(),cut.minZ());
+        long xx=Math.min(b.maxX(),cut.maxX()),yy=Math.min(b.maxY(),cut.maxY()),zz=Math.min(b.maxZ(),cut.maxZ());
+        piece(n,b.minX(),b.minY(),b.minZ(),x,b.maxY(),b.maxZ(),result);
+        piece(n,xx,b.minY(),b.minZ(),b.maxX(),b.maxY(),b.maxZ(),result);
+        piece(n,x,b.minY(),b.minZ(),xx,y,b.maxZ(),result);
+        piece(n,x,yy,b.minZ(),xx,b.maxY(),b.maxZ(),result);
+        piece(n,x,y,b.minZ(),xx,yy,z,result);
+        piece(n,x,y,zz,xx,yy,b.maxZ(),result);
     }
     /** Refine a persisted coarse leaf only inside the bounded exact-mask window, preserving far geometry. */
     static List<Node> splitOwnership(List<Node> source,Map<BlockPos,String> owners,Bounds range,Vec3d center) {
@@ -130,17 +150,28 @@ final class SourceMeshBuilder {
         return List.copyOf(result);
     }
     private static void splitOwner(Node node,Map<BlockPos,String> owners,Bounds range,Vec3d center,List<Node> result) {
-        BlockPos p=node.position();int side=node.side();Bounds box=new Bounds(p.getX(),p.getY(),p.getZ(),(long)p.getX()+side,(long)p.getY()+side,(long)p.getZ()+side);
+        BlockPos p=node.position();Bounds box=nodeBounds(node);
         if(!box.intersects(range)){result.add(node);return;}
         String owner=null;boolean uniform=range.contains(box);
-        if(uniform)for(BlockPos cell:BlockPos.iterate(p,p.add(side-1,side-1,side-1))) {
+        if(uniform)for(BlockPos cell:BlockPos.iterate(p,new BlockPos((int)box.maxX()-1,(int)box.maxY()-1,(int)box.maxZ()-1))) {
             String id=owners.getOrDefault(cell,"");
             if(id.isEmpty() || owner!=null && !owner.equals(id)){uniform=false;break;}owner=id;
         }
-        if(side>1 && distanceSquared(nodeBox(node),center)<49)uniform=false;
-        if(side==1 || uniform){result.add(new Node(p,side,node.tile(),owners.getOrDefault(p,"")));return;}
-        int half=side/2;
-        for(int child=0;child<8;child++)splitOwner(new Node(p.add((child&1)==0?0:half,(child&2)==0?0:half,(child&4)==0?0:half),half,node.tile(),node.ownerId()),owners,range,center,result);
+        boolean unit=node.size().equals(new Vec3d(1,1,1));
+        if(!unit && distanceSquared(nodeBox(node),center)<49)uniform=false;
+        if(unit || uniform){result.add(new Node(p,node.size(),node.tile(),owners.getOrDefault(p,"")));return;}
+        // Bisect each non-unit dimension. Cubic inputs still split as an octree; mesh prisms
+        // refine exactly at ownership boundaries without attributing an entire slab to one owner.
+        int sx=(int)node.size().x,sy=(int)node.size().y,sz=(int)node.size().z;
+        int hx=Math.max(1,sx/2),hy=Math.max(1,sy/2),hz=Math.max(1,sz/2);
+        for(int x=0;x<sx;x+=hx)for(int y=0;y<sy;y+=hy)for(int z=0;z<sz;z+=hz)
+            splitOwner(new Node(p.add(x,y,z),new Vec3d(Math.min(hx,sx-x),Math.min(hy,sy-y),Math.min(hz,sz-z)),node.tile(),node.ownerId()),owners,range,center,result);
+    }
+    static long key(String owner,Vec3d source,Vec3d size) {
+        long h=key(owner,source,(int)size.x);
+        if(size.x==size.y && size.y==size.z)return h; // Existing cubic keys stay stable.
+        h=(h^Double.doubleToLongBits(size.y))*0x100000001b3L;
+        return (h^Double.doubleToLongBits(size.z))*0x100000001b3L;
     }
     static long key(String owner,Vec3d source,int side) {
         long h=0xcbf29ce484222325L;

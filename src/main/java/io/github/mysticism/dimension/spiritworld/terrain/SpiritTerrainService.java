@@ -481,12 +481,12 @@ public final class SpiritTerrainService {
      * deep affine inverse), so flight re-discovers across the render distance instead of a fixed window. */
     private static void discover(Context c,ServerPlayerEntity p,Session s) {
         Window w=s.local;Vec3d source=sourceUnder(c,p,s,w);
-        int view=p.getServer().getPlayerManager().getViewDistance();
+        int view=SourceDiscovery.effectiveViewDistance(p.getServer().getPlayerManager().getViewDistance(),p.getClientOptions().viewDistance());
         s.viewHorizon=SourceDiscovery.meshHorizon(view);
-        if(w.discoveryCenter==null || w.discoveryCenter.squaredDistanceTo(source)>256 || c.tick-w.discoveryPlanned>=40) {
+        if(w.discoveryCenter==null || view!=w.discoveryView || w.discoveryCenter.squaredDistanceTo(source)>256 || c.tick-w.discoveryPlanned>=40) {
             w.discoveryPlanned=c.tick;w.discoveryCenter=source;w.discoveryView=view;
             for(var expired:w.discovery.replan(source,view))w.discovered.remove(expired);
-            refreshDiscovered(w);
+            refreshDiscovered(w,c.tick);
         }
         if(c.tick%2==0)issueDiscovery(p,s,w);
     }
@@ -513,27 +513,18 @@ public final class SpiritTerrainService {
                 Vec3d center=new Vec3d(tile.minX()+SourceDiscovery.TILE/2.0,tile.minY()+SourceDiscovery.TILE/2.0,tile.minZ()+SourceDiscovery.TILE/2.0);
                 w.discovered.put(tile,SourceDiscovery.nodes(region.cells(),center));
                 w.discovery.completed(tile,region.complete(),c.tick);
-                refreshDiscovered(w);w.dirty=true; // near-field supersede and mesh horizon pick this up on the normal compaction/publish cadence
+                refreshDiscovered(w,c.tick);w.dirty=true; // near-field supersede and mesh horizon pick this up on the normal compaction/publish cadence
             }));
         }
     }
     /** Retained discovered tiles become one sorted far-field node list under the node budget. */
-    private static void refreshDiscovered(Window w) {
+    private static void refreshDiscovered(Window w,long tick) {
         Vec3d center=w.discoveryCenter==null?w.origin:w.discoveryCenter;
-        var tiles=new ArrayList<>(w.discovered.entrySet());
-        tiles.sort(Comparator.comparingDouble(e->e.getKey().distanceSquared(new Point3(center.x,center.y,center.z))));
-        List<SourceMeshBuilder.Node> merged=new ArrayList<>();int total=0;
-        for(var e:tiles) {
-            if(total+e.getValue().size()>SourceDiscovery.MAX_NODES){w.discovered.remove(e.getKey());continue;} // farthest tiles lose retention first
-            total+=e.getValue().size();merged.addAll(e.getValue());
-        }
-        Vec3d sortCenter=center;
-        merged.sort(Comparator.comparingDouble((SourceMeshBuilder.Node n)->nodeDistance(n,sortCenter)).thenComparingLong(n->n.position().asLong()));
-        w.discoveredNodes=List.copyOf(merged);
+        w.discoveredNodes=SourceDiscovery.retain(w.discovered,w.discovery,center,SourceDiscovery.MAX_NODES,tick);
+        w.dirty=true;
     }
     private static double nodeDistance(SourceMeshBuilder.Node n,Vec3d center) {
-        BlockPos at=n.position();
-        return SourceMeshBuilder.distanceSquared(new Box(at.getX(),at.getY(),at.getZ(),at.getX()+n.side(),at.getY()+n.side(),at.getZ()+n.side()),center);
+        return SourceMeshBuilder.distanceSquared(SourceMeshBuilder.nodeBox(n),center);
     }
     private static void ingest(MinecraftServer server,Window w,List<SourceLandmarks.Cell> cells,int budget) {
         ServerWorld source=world(server,w.dimension);int n=0;
@@ -640,36 +631,30 @@ public final class SpiritTerrainService {
         boolean aligned=w==s.local && s.shallow;Vec3d root;
         if(aligned)root=s.carrier;else {Vec384f delta=w.semantic.clone().sub(q(p));root=p.getPos().add(delta.dot(current.i)*SCALE,delta.dot(current.j)*SCALE,delta.dot(current.k)*SCALE);}
         Vec3d ax=aligned?new Vec3d(1,0,0):axis(w.sourceBasis.i,current),ay=aligned?new Vec3d(0,1,0):axis(w.sourceBasis.j,current),az=aligned?new Vec3d(0,0,1):axis(w.sourceBasis.k,current);
-        // The local window splits its allowance: exact near samples keep the unchanged budget, while a
-        // bounded reserved lane admits distant discovered terrain that near samples would otherwise starve.
         boolean local=w==s.local;
-        SourceDiscovery.LocalAdmission admission=local?new SourceDiscovery.LocalAdmission(s.shallow,limit):null;
-        int count=0;
+        SourceDiscovery.LocalAdmission admission=local?new SourceDiscovery.LocalAdmission(limit):null;
+        List<SourceDiscovery.Candidate> candidates=new ArrayList<>();
         for(var node:w.nodes) {
+            var candidate=SourceDiscovery.project(node,w.origin,root,ax,ay,az,p.getPos());
+            if(candidate.distance()>s.viewHorizon*(double)s.viewHorizon)continue;
+            if(Math.abs(candidate.x().dotProduct(candidate.y().crossProduct(candidate.z())))<1e-6)continue;
+            candidates.add(candidate);
+        }
+        if(local)candidates=SourceDiscovery.localOrder(candidates,p.getPos(),s.viewHorizon);
+        int count=0;
+        for(var candidate:candidates) {
             if(local?admission.exhausted():count>=limit)break;
             if(cells.size()>=TerrainMeshFrame.MAX_CELLS)break;
-            var at=node.position();Vec3d source=new Vec3d(at.getX(),at.getY(),at.getZ()),offset=source.subtract(w.origin);
-            Vec3d min=root.add(ax.multiply(offset.x)).add(ay.multiply(offset.y)).add(az.multiply(offset.z));
-            int side=node.side();Vec3d ex=ax.multiply(side),ey=ay.multiply(side),ez=az.multiply(side);
-            Box bounds=new Box(min.x+Math.min(0,ex.x)+Math.min(0,ey.x)+Math.min(0,ez.x),
-                    min.y+Math.min(0,ex.y)+Math.min(0,ey.y)+Math.min(0,ez.y),min.z+Math.min(0,ex.z)+Math.min(0,ey.z)+Math.min(0,ez.z),
-                    min.x+Math.max(0,ex.x)+Math.max(0,ey.x)+Math.max(0,ez.x),
-                    min.y+Math.max(0,ex.y)+Math.max(0,ey.y)+Math.max(0,ez.y),min.z+Math.max(0,ex.z)+Math.max(0,ey.z)+Math.max(0,ez.z));
-            double distance=SourceMeshBuilder.distanceSquared(bounds,p.getPos());int horizon=s.viewHorizon;if(distance>horizon*horizon)continue;
-            if(Math.abs(ex.dotProduct(ey.crossProduct(ez)))<1e-6)continue; // collapsed model AND collision disappear together
-            var tile=node.tile();Integer material=palette.get(tile.material());
-            if(material==null){if(materials.size()==TerrainMeshFrame.MAX_MATERIALS)continue;material=materials.size();materials.add(tile.material());palette.put(tile.material(),material);}
-            String actualOwner=node.ownerId();long key=SourceMeshBuilder.key(actualOwner.isEmpty()?"unknown:"+w.dimension:actualOwner,source,side);
-            if(!keys.add(key))continue;
-            // Admission is decided only for cells that will actually be emitted, so rejected
-            // candidates never consume near or far lane budget.
-            if(local) {
-                if(!admission.admit(distance))continue;
-            } else {
-                count++;
-            }
-            float alpha=aligned?1:w.alpha;
-            cells.add(new TerrainMeshFrame.Cell(key,material,actualOwner,source,min,new Vec3d(side,side,side),ex,ey,ez,tile.color(),tile.light(),alpha,tile.collision()));producers.put(key,w);
+            var node=candidate.node();var tile=node.tile();
+            String actualOwner=node.ownerId();long key=SourceMeshBuilder.key(actualOwner.isEmpty()?"unknown:"+w.dimension:actualOwner,candidate.source(),node.size());
+            if(keys.contains(key))continue;
+            Integer material=palette.get(tile.material());
+            if(material==null && materials.size()==TerrainMeshFrame.MAX_MATERIALS)continue;
+            // Invalid/duplicate/material-rejected candidates never consume either lane or a key.
+            if(local){if(!admission.admit(candidate.distance()))continue;}else count++;
+            if(material==null){material=materials.size();materials.add(tile.material());palette.put(tile.material(),material);}
+            keys.add(key);
+            cells.add(candidate.cell(material,key,aligned?1:w.alpha));producers.put(key,w);
         }
     }
     private static Vec3d axis(Vec384f source,Basis384f observer){return new Vec3d(source.dot(observer.i),source.dot(observer.j),source.dot(observer.k));}
@@ -761,7 +746,7 @@ public final class SpiritTerrainService {
             double distance(SourceMeshBuilder.Node node) {
                 BlockPos at=node.position();Vec3d d=new Vec3d(at.getX(),at.getY(),at.getZ()).subtract(source);
                 Vec3d min=root.add(x.multiply(d.x)).add(y.multiply(d.y)).add(z.multiply(d.z));
-                int side=node.side();Vec3d a=x.multiply(side),b=y.multiply(side),c=z.multiply(side);
+                Vec3d a=x.multiply(node.size().x),b=y.multiply(node.size().y),c=z.multiply(node.size().z);
                 Box bounds=new Box(min.x+Math.min(0,a.x)+Math.min(0,b.x)+Math.min(0,c.x),min.y+Math.min(0,a.y)+Math.min(0,b.y)+Math.min(0,c.y),min.z+Math.min(0,a.z)+Math.min(0,b.z)+Math.min(0,c.z),
                         min.x+Math.max(0,a.x)+Math.max(0,b.x)+Math.max(0,c.x),min.y+Math.max(0,a.y)+Math.max(0,b.y)+Math.max(0,c.y),min.z+Math.max(0,a.z)+Math.max(0,b.z)+Math.max(0,c.z));
                 return SourceMeshBuilder.distanceSquared(bounds,viewer);

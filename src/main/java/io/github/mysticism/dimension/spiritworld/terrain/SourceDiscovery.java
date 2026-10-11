@@ -3,6 +3,7 @@ package io.github.mysticism.dimension.spiritworld.terrain;
 import io.github.mysticism.landmark.Bounds;
 import io.github.mysticism.landmark.SourceLandmarks;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 import java.util.*;
@@ -17,19 +18,19 @@ import java.util.*;
  *
  * <p>Pure geometry/scheduling only: no world access, registry work or threading. The caller
  * (SpiritTerrainService) owns issue rate, ingestion and window lifecycle.</p> */
-final class SourceDiscovery {
+public final class SourceDiscovery {
     /** One bounded SourceLandmarks region volume per tile (checkBounds cap is 32768 cells). */
     static final int TILE = 32;
     static final int MIN_RADIUS = TILE;
     /** Bounded worst case (a 16-chunk view distance). Larger client view distances still discover
      * progressively outward to this extent; nothing depends on the far tail being complete. */
-    static final int MAX_RADIUS = 256;
+    static final int MAX_RADIUS = 32 * 16; // Full vanilla client slider, including 32-chunk views.
     static final int MAX_VERTICAL_RADIUS = 64;
     /** Mesh cull tracks the visible horizon instead of a fixed 128-block locality. */
-    static final int MIN_HORIZON = 128, MAX_HORIZON = 192;
+    static final int MIN_HORIZON = 128, MAX_HORIZON = MAX_RADIUS + 16;
     /** Concurrent region reads per window; SourceLandmarks serializes reads behind one live operation. */
     static final int MAX_INFLIGHT = 2;
-    /** Maximum discovered far-field nodes retained per window (compacted, octree-merged). */
+    /** Maximum discovered far-field mesh nodes retained per window (octree-merged, then exact prism-batched). */
     static final int MAX_NODES = 65536;
     /** Cells within this radius of the viewer keep the full unchanged near allowance; beyond it,
      * far-field discovery admission shares a reserved bounded budget (see {@link LocalAdmission}). */
@@ -38,6 +39,9 @@ final class SourceDiscovery {
 
     private SourceDiscovery() {}
 
+    static int effectiveViewDistance(int serverChunks,int playerChunks) {
+        return Math.max(1,Math.min(serverChunks,playerChunks));
+    }
     static int horizontalRadius(int viewDistanceChunks) {
         int raw = Math.max(1, viewDistanceChunks) * 16;
         return Math.max(MIN_RADIUS, Math.min(MAX_RADIUS, raw));
@@ -47,7 +51,7 @@ final class SourceDiscovery {
         return Math.min(horizontal, MAX_VERTICAL_RADIUS);
     }
 
-    static int meshHorizon(int viewDistanceChunks) {
+    public static int meshHorizon(int viewDistanceChunks) {
         return Math.max(MIN_HORIZON, Math.min(MAX_HORIZON, horizontalRadius(viewDistanceChunks) + 16));
     }
 
@@ -94,7 +98,10 @@ final class SourceDiscovery {
 
     /** True when every cell of the tile lies outside the retained discovery extent. */
     static boolean beyond(Bounds tile, Vec3d center, int viewDistanceChunks) {
-        return center(tile).squaredDistanceTo(center) > Math.pow(retentionRadius(viewDistanceChunks), 2);
+        int horizontal=retentionRadius(viewDistanceChunks),vertical=verticalRadius(horizontalRadius(viewDistanceChunks))+TILE;
+        return tile.minX()>center.x+horizontal || tile.maxX()<center.x-horizontal
+                || tile.minZ()>center.z+horizontal || tile.maxZ()<center.z-horizontal
+                || tile.minY()>center.y+vertical || tile.maxY()<center.y-vertical;
     }
 
     /** Convert observed source cells into far-field octree nodes. Air never produces geometry, and
@@ -118,35 +125,126 @@ final class SourceDiscovery {
     /** Far-field conversion of an observed tile: uniform unowned material merges into octree nodes. */
     static List<SourceMeshBuilder.Node> farNodes(Map<BlockPos,SourceMeshBuilder.Tile> observed, Vec3d tileCenter) {
         if (observed.isEmpty()) return List.of();
-        return SourceMeshBuilder.compact(observed, tileCenter, Map.of(), true);
+        var nodes=new ArrayList<>(coalesce(SourceMeshBuilder.compact(observed, tileCenter, Map.of(), true)));
+        nodes.sort(Comparator.comparingDouble((SourceMeshBuilder.Node n)->SourceMeshBuilder.distanceSquared(SourceMeshBuilder.nodeBox(n),tileCenter))
+                .thenComparingLong(n->n.position().asLong()));
+        return List.copyOf(nodes);
     }
 
-    /** Local-window mesh cell admission: exact near samples keep the unchanged allowance, while a
-     * bounded reserved budget admits distant discovered terrain even when near samples would
-     * otherwise exhaust the whole allowance first. Pure and testable. */
-    static final class LocalAdmission {
-        static final int FAR_ADMISSION = 256;
-        private final int nearLimit, farLimit;
-        private final double nearSquared;
-        int near, far;
-        LocalAdmission(boolean shallow, int nearLimit) {
-            this.nearLimit = nearLimit;
-            this.farLimit = FAR_ADMISSION;
-            this.nearSquared = NEAR_EXACT_RADIUS * NEAR_EXACT_RADIUS;
-        }
-        /** True when the cell (at the given viewer distance) may enter the frame. */
-        boolean admit(double distanceSquared) {
-            if (distanceSquared <= nearSquared) {
-                if (near >= nearLimit) return false;
-                near++;return true;
+    /** Exact mesh-only batching of adjacent equal opaque cubes. Thin layers cannot octree-merge,
+     * but their rectangular unions have precisely the same solid volume, source extent and owner.
+     * Never combine partial shapes, differing material/light/tint/owners, or bridge unknown/air cells. */
+    static List<SourceMeshBuilder.Node> coalesce(List<SourceMeshBuilder.Node> nodes) {
+        List<SourceMeshBuilder.Node> result=nodes;
+        for(int axis=0;axis<3;axis++) {
+            final int dimension=axis;
+            record Row(SourceMeshBuilder.Tile tile,String owner,int a,int b,int width,int height) {}
+            Map<Row,List<SourceMeshBuilder.Node>> rows=new LinkedHashMap<>();
+            List<SourceMeshBuilder.Node> next=new ArrayList<>();
+            for(var n:result) {
+                if(!n.tile().cube() || !n.tile().collision().equals(List.of(SourceMeshBuilder.UNIT))){next.add(n);continue;}
+                int[] p={n.position().getX(),n.position().getY(),n.position().getZ()};
+                int[] size={(int)n.size().x,(int)n.size().y,(int)n.size().z};
+                int a=(axis+1)%3,b=(axis+2)%3;
+                rows.computeIfAbsent(new Row(n.tile(),n.ownerId(),p[a],p[b],size[a],size[b]),ignored->new ArrayList<>()).add(n);
             }
-            if (far >= farLimit) return false;
-            far++;return true;
+            for(var row:rows.values()) {
+                row.sort(Comparator.comparingDouble(n->coordinate(n.position(),dimension)));
+                SourceMeshBuilder.Node merged=null;
+                for(var n:row) {
+                    if(merged!=null && coordinate(merged.position(),axis)+coordinate(merged.size(),axis)==coordinate(n.position(),axis)
+                            && coordinate(merged.size(),axis)+coordinate(n.size(),axis)<=TILE) {
+                        Vec3d size=merged.size().add(axis==0?n.size().x:0,axis==1?n.size().y:0,axis==2?n.size().z:0);
+                        merged=new SourceMeshBuilder.Node(merged.position(),size,merged.tile(),merged.ownerId());
+                    } else {if(merged!=null)next.add(merged);merged=n;}
+                }
+                if(merged!=null)next.add(merged);
+            }
+            result=next;
         }
-        /** Both lanes spent: no remaining cell can be admitted, so scanning may stop. */
-        boolean exhausted() {return near >= nearLimit && far >= farLimit;}
-        int nearAdmitted() {return near;}
-        int farAdmitted() {return far;}
+        result.sort(Comparator.comparingLong((SourceMeshBuilder.Node n)->n.position().asLong())
+                .thenComparingDouble(n->n.size().x).thenComparingDouble(n->n.size().y).thenComparingDouble(n->n.size().z));
+        return List.copyOf(result);
+    }
+    private static double coordinate(BlockPos p,int axis){return axis==0?p.getX():axis==1?p.getY():p.getZ();}
+    private static double coordinate(Vec3d p,int axis){return axis==0?p.x:axis==1?p.y:p.z;}
+
+    /** A candidate projects source extent and collision through exactly the same affine columns. */
+    record Candidate(SourceMeshBuilder.Node node,Vec3d source,Vec3d min,Vec3d x,Vec3d y,Vec3d z,double distance) {
+        TerrainMeshFrame.Cell cell(int material,long key,float alpha) {
+            var tile=node.tile();
+            return new TerrainMeshFrame.Cell(key,material,node.ownerId(),source,min,node.size(),x,y,z,tile.color(),tile.light(),alpha,tile.collision());
+        }
+    }
+    static Candidate project(SourceMeshBuilder.Node node,Vec3d sourceOrigin,Vec3d root,Vec3d ax,Vec3d ay,Vec3d az,Vec3d viewer) {
+        var at=node.position();Vec3d source=new Vec3d(at.getX(),at.getY(),at.getZ()),offset=source.subtract(sourceOrigin);
+        Vec3d min=root.add(ax.multiply(offset.x)).add(ay.multiply(offset.y)).add(az.multiply(offset.z));
+        Vec3d ex=ax.multiply(node.size().x),ey=ay.multiply(node.size().y),ez=az.multiply(node.size().z);
+        Box bounds=new Box(min.x+Math.min(0,ex.x)+Math.min(0,ey.x)+Math.min(0,ez.x),
+                min.y+Math.min(0,ex.y)+Math.min(0,ey.y)+Math.min(0,ez.y),min.z+Math.min(0,ex.z)+Math.min(0,ey.z)+Math.min(0,ez.z),
+                min.x+Math.max(0,ex.x)+Math.max(0,ey.x)+Math.max(0,ez.x),
+                min.y+Math.max(0,ex.y)+Math.max(0,ey.y)+Math.max(0,ez.y),min.z+Math.max(0,ex.z)+Math.max(0,ey.z)+Math.max(0,ez.z));
+        return new Candidate(node,source,min,ex,ey,ez,SourceMeshBuilder.distanceSquared(bounds,viewer));
+    }
+
+    /** Reorder the FAR lane spatially, not by nearest distance. One candidate from every occupied
+     * projected bucket precedes any bucket's second candidate, so dense nearby layers cannot spend
+     * the whole budget before the horizon. Within buckets keep nearest surfaces first. Pure geometry:
+     * palettes/keys and final budget accounting still happen only for actually emitted cells. */
+    static List<Candidate> localOrder(List<Candidate> candidates,Vec3d viewer,int horizon) {
+        record Bucket(int x,int y,int z) {}
+        int stride=Math.max(TILE,Math.ceilDiv(horizon,3));
+        Map<Bucket,ArrayDeque<Candidate>> far=new TreeMap<>(Comparator
+                .comparingLong((Bucket b)->SourceMeshBuilder.key("discovery-bucket",new Vec3d(b.x,b.y,b.z),1))
+                .thenComparingInt(Bucket::x).thenComparingInt(Bucket::y).thenComparingInt(Bucket::z));
+        var sorted=new ArrayList<>(candidates);
+        sorted.sort(Comparator.comparingDouble(Candidate::distance).thenComparingLong(c->c.node().position().asLong())
+                .thenComparingDouble(c->c.node().size().x).thenComparingDouble(c->c.node().size().y).thenComparingDouble(c->c.node().size().z));
+        List<Candidate> result=new ArrayList<>();
+        for(var c:sorted) {
+            if(c.distance()<=NEAR_EXACT_RADIUS*NEAR_EXACT_RADIUS){result.add(c);continue;}
+            Vec3d midpoint=c.min().add(c.x().add(c.y()).add(c.z()).multiply(.5)).subtract(viewer);
+            var bucket=new Bucket(MathHelper.floor(midpoint.x/stride),MathHelper.floor(midpoint.y/stride),MathHelper.floor(midpoint.z/stride));
+            far.computeIfAbsent(bucket,ignored->new ArrayDeque<>()).add(c);
+        }
+        while(!far.isEmpty())for(var it=far.values().iterator();it.hasNext();) {
+            var bucket=it.next();result.add(bucket.removeFirst());if(bucket.isEmpty())it.remove();
+        }
+        return result;
+    }
+
+    /** Local near samples retain their original exact allowance, with a separate bounded far lane. */
+    static final class LocalAdmission {
+        static final int FAR_ADMISSION=256;
+        private final int nearLimit;
+        private int near,far;
+        LocalAdmission(int nearLimit){this.nearLimit=nearLimit;}
+        boolean admit(double distanceSquared) {
+            if(distanceSquared<=NEAR_EXACT_RADIUS*NEAR_EXACT_RADIUS) {
+                if(near>=nearLimit)return false;near++;return true;
+            }
+            if(far>=FAR_ADMISSION)return false;far++;return true;
+        }
+        boolean exhausted(){return near>=nearLimit && far>=FAR_ADMISSION;}
+        int nearAdmitted(){return near;}
+        int farAdmitted(){return far;}
+    }
+
+    /** Eviction and coverage are one lifecycle operation. Bounded node retention prefers nearby tiles;
+     * evicted data must never remain marked covered. A cooldown prevents stationary budget thrash. */
+    static List<SourceMeshBuilder.Node> retain(Map<Bounds,List<SourceMeshBuilder.Node>> discovered,Scheduler scheduler,
+                                              Vec3d center,int budget,long tick) {
+        var tiles=new ArrayList<>(discovered.entrySet());
+        tiles.sort(Comparator.comparingDouble((Map.Entry<Bounds,List<SourceMeshBuilder.Node>> e)->e.getKey().distanceSquared(new io.github.mysticism.landmark.Point3(center.x,center.y,center.z)))
+                .thenComparingLong(e->e.getKey().minX()).thenComparingLong(e->e.getKey().minY()).thenComparingLong(e->e.getKey().minZ()));
+        List<SourceMeshBuilder.Node> merged=new ArrayList<>();int total=0;
+        for(var e:tiles) {
+            if(total+e.getValue().size()>budget){discovered.remove(e.getKey());scheduler.evicted(e.getKey(),tick);continue;}
+            total+=e.getValue().size();merged.addAll(e.getValue());
+        }
+        merged.sort(Comparator.comparingDouble((SourceMeshBuilder.Node n)->SourceMeshBuilder.distanceSquared(SourceMeshBuilder.nodeBox(n),center))
+                .thenComparingLong(n->n.position().asLong()));
+        return List.copyOf(merged);
     }
 
     /** Deterministic per-window discovery schedule: pending queue, coverage, retries. Server-thread only. */
@@ -155,12 +253,19 @@ final class SourceDiscovery {
         private final Set<Bounds> covered = new HashSet<>();
         private final Map<Bounds, Long> retryAt = new HashMap<>();
         private final Set<Bounds> inFlight = new HashSet<>();
+        private final Set<Bounds> budgetEvicted = new HashSet<>();
+        private Vec3d budgetEvictionCenter;
         Vec3d center;
         int viewDistanceChunks;
 
         /** Re-plan around the current source position; retains prior coverage inside the extent and
          * re-queues everything else center-out. Returns tiles whose retention expired (caller drops data). */
         List<Bounds> replan(Vec3d source, int viewChunks) {
+            // Movement promotes previously evicted tiles without waiting for stationary backoff.
+            if(budgetEvictionCenter!=null && (budgetEvictionCenter.squaredDistanceTo(source)>256 || viewChunks!=viewDistanceChunks)) {
+                for(var tile:budgetEvicted)retryAt.remove(tile);
+                budgetEvicted.clear();budgetEvictionCenter=null;
+            }
             center = source;
             viewDistanceChunks = viewChunks;
             List<Bounds> expired = new ArrayList<>();
@@ -169,6 +274,7 @@ final class SourceDiscovery {
                 if (beyond(tile, center, viewChunks)) {expired.add(tile); it.remove();}
             }
             retryAt.keySet().removeIf(tile -> beyond(tile, center, viewChunks));
+            budgetEvicted.removeIf(tile -> beyond(tile, center, viewChunks));
             inFlight.removeIf(tile -> beyond(tile, center, viewChunks));
             queue.clear();
             for (Bounds tile : plan(center, viewChunks)) if (!covered.contains(tile) && !inFlight.contains(tile)) queue.add(tile);
@@ -193,13 +299,19 @@ final class SourceDiscovery {
          * their sampled data but retry after a cooldown. */
         void completed(Bounds tile, boolean complete, long tick) {
             inFlight.remove(tile);
-            if (complete) {covered.add(tile); retryAt.remove(tile);}
+            if (complete) {covered.add(tile); retryAt.remove(tile);budgetEvicted.remove(tile);}
             else retryAt.put(tile, tick + RETRY_INCOMPLETE_TICKS);
         }
 
         void failed(Bounds tile, long tick) {
             inFlight.remove(tile);
             retryAt.put(tile, tick + RETRY_ERROR_TICKS);
+        }
+
+        void evicted(Bounds tile,long tick) {
+            if(budgetEvicted.isEmpty())budgetEvictionCenter=center;
+            covered.remove(tile);budgetEvicted.add(tile);retryAt.put(tile,tick+RETRY_ERROR_TICKS);
+            if(!inFlight.contains(tile) && !queue.contains(tile))queue.addLast(tile);
         }
 
         /** Explicit cancellation (window teardown / retained loss). */
