@@ -103,6 +103,7 @@ public final class AsyncEmbeddingEngineSafetyTest {
             submit.start(); start.countDown(); e.close(); submit.join(2000);
             check(!submit.isAlive(), "Submission/shutdown deadlocked");
             for (var f : futures) get(f.handle((v, error) -> null));
+            check(e.awaitClosed(Duration.ofSeconds(2)), "Shutdown resource cleanup did not finish");
             check(e.inflightSize() == 0 && e.cacheSize() == 0 && p.closed, "Shutdown race leaked");
         }
     }
