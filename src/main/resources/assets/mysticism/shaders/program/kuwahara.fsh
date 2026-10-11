@@ -2,10 +2,13 @@
 uniform sampler2D DiffuseSampler;
 uniform sampler2D DepthSampler;
 uniform int KernelRadius;
+uniform int KuwaharaEnabled;
 in vec2 texCoord;
 out vec4 fragColor;
 
 void main() {
+    // Off is an identity pass, not a radius clamped back up to one.
+    if (KuwaharaEnabled == 0) { fragColor = texture(DiffuseSampler, texCoord); return; }
     int radius = clamp(KernelRadius, 1, 3);
     ivec2 size = textureSize(DiffuseSampler, 0);
     ivec2 center = clamp(ivec2(texCoord * vec2(size)), ivec2(0), size - ivec2(1));

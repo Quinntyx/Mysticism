@@ -418,8 +418,7 @@ public final class SpiritTerrainService {
             if(!live(p,s) || w.ownershipFuture!=future)return;
             if(error!=null || region==null || !region.isCurrent(p.getServer()))return;
             w.owners=region;
-            if(!w.tiles.isEmpty())w.nodes=compact(p.getServer(),w,source);
-            else if(!w.geometryNodes.isEmpty())w.nodes=SourceMeshBuilder.splitOwnership(w.geometryNodes,region.owners(),region.bounds(),source);
+            w.nodes=compact(p.getServer(),w,source);
             notifyAnchor(p,s,w);publish(p,s,true);
         }));
     }
@@ -432,13 +431,10 @@ public final class SpiritTerrainService {
         w.semantic.add(q(p).sub(before));s.anchorDelivered=true;publish(p,s,true);
     }
     private static List<SourceMeshBuilder.Node> compact(MinecraftServer server,Window w,Vec3d center) {
-        Map<BlockPos,String> owners=w.owners!=null && w.owners.isCurrent(server)?w.owners.owners():Map.of();
-        w.compactedOwnership=w.owners!=null && w.owners.isCurrent(server)?w.owners.ownershipRevision():-1;
-        List<SourceMeshBuilder.Node> near=SourceMeshBuilder.compact(w.tiles,center,owners);
-        if(w.geometryNodes.isEmpty() || w.tiles.isEmpty())return near;
-        int minX=Integer.MAX_VALUE,minY=minX,minZ=minX,maxX=Integer.MIN_VALUE,maxY=maxX,maxZ=maxX;
-        for(BlockPos p:w.tiles.keySet()){minX=Math.min(minX,p.getX());minY=Math.min(minY,p.getY());minZ=Math.min(minZ,p.getZ());maxX=Math.max(maxX,p.getX());maxY=Math.max(maxY,p.getY());maxZ=Math.max(maxZ,p.getZ());}
-        return SourceMeshBuilder.replaceNear(w.geometryNodes,near,new Bounds(minX,minY,minZ,(long)maxX+1,(long)maxY+1,(long)maxZ+1),center);
+        boolean current=w.owners!=null && w.owners.isCurrent(server);
+        Map<BlockPos,String> owners=current?w.owners.owners():Map.of();
+        w.compactedOwnership=current?w.owners.ownershipRevision():-1;
+        return SourceMeshBuilder.compose(w.geometryNodes,w.tiles,owners,current?w.owners.bounds():null,center);
     }
     private static Window windowFor(Session s,TerrainMeshFrame.Cell cell) {
         // Server-local provenance belongs to the accepted frame, not mutable ownership or latest compaction.
@@ -563,7 +559,6 @@ public final class SpiritTerrainService {
         return new BuiltMesh(new TerrainMeshFrame(revision,s.shallow,s.local.dimension,s.local.origin,s.carrier,materials,stitched),Map.copyOf(producers));
     }
     private static void refreshCompaction(ServerPlayerEntity p,Window w) {
-        if(w.tiles.isEmpty())return;
         long epoch=w.owners!=null && w.owners.isCurrent(p.getServer())?w.owners.ownershipRevision():-1;
         if(w.compactedOwnership!=epoch)w.nodes=compact(p.getServer(),w,w.origin);
     }
@@ -753,8 +748,7 @@ public final class SpiritTerrainService {
             if(protectedNear(p,s,w) && !replacementCovered(p,s,w))return;
             boolean hidden=!w.geometryNodes.isEmpty() && w.geometryNodes.stream().allMatch(n->v.distance(n)>=64*64);
             if(w.replacing && !hidden && !protectedNear(p,s,w) && (w.alpha>.01f || !w.nearReady))return;
-            w.geometryNodes=w.stream.snapshot(v::distance);w.nodes=w.tiles.isEmpty()?w.geometryNodes:compact(server,w,w.nearFocus==null?w.origin:w.nearFocus);
-            if(w.owners!=null && w.owners.isCurrent(server))w.nodes=SourceMeshBuilder.splitOwnership(w.nodes,w.owners.owners(),w.owners.bounds(),w.nearFocus==null?w.origin:w.nearFocus);
+            w.geometryNodes=w.stream.snapshot(v::distance);w.nodes=compact(server,w,w.nearFocus==null?w.origin:w.nearFocus);
             w.ready=!w.nodes.isEmpty();w.replacing=false;
         }
         void animate(ServerPlayerEntity p,Session s) {

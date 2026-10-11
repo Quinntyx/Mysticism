@@ -105,21 +105,56 @@ final class SourceMeshBuilder {
         }
         var result=new ArrayList<Node>();
         nodes.forEach((k,t)->result.add(new Node(new BlockPos(k.x,k.y,k.z),k.side,t,owners.getOrDefault(k,""))));
-        result.sort(Comparator.comparingDouble((Node n)->distanceSquared(new Box(n.position).expand(n.side-1),fineCenter))
+        result.sort(Comparator.comparingDouble((Node n)->distanceSquared(nodeBox(n),fineCenter))
                 .thenComparingLong(n->n.position.asLong()).thenComparingInt(Node::side));
         return result;
     }
-    /** Replace only an actually sampled source patch; retain the producing region's far surfaces. */
-    static List<Node> replaceNear(List<Node> base,List<Node> near,Bounds cut,Vec3d center) {
-        List<Node> result=new ArrayList<>(near);for(Node node:base)outside(node,cut,result);
-        result.sort(Comparator.comparingDouble(n->distanceSquared(nodeBox(n),center)));return List.copyOf(result);
+    /** Compose in absolute source space. Samples (including AIR) replace only their exact cells;
+     * an empty/missing sample is UNKNOWN, not permission to erase the bounding envelope.
+     * Reapply the completed ownership mask to BOTH persisted and live geometry on every rebuild. */
+    static List<Node> compose(List<Node> base,Map<BlockPos,Tile> samples,Map<BlockPos,String> owners,
+                              Bounds ownershipRange,Vec3d center) {
+        List<Node> near=compact(samples,center,owners);
+        List<Node> result=replaceNear(base,near,samples.keySet(),center);
+        return ownershipRange==null?result:splitOwnership(result,owners,ownershipRange,center);
+    }
+    static List<Node> replaceNear(List<Node> base,List<Node> near,Set<BlockPos> sampled,Vec3d center) {
+        List<Node> result=new ArrayList<>(near);
+        Bounds envelope=null;
+        for(BlockPos cell:sampled) {
+            Bounds unit=Bounds.cube(cell.getX(),cell.getY(),cell.getZ(),1);
+            envelope=envelope==null?unit:envelope.union(unit);
+        }
+        for(Node node:base) {
+            BlockPos p=node.position();int side=node.side();
+            Bounds box=Bounds.cube(p.getX(),p.getY(),p.getZ(),side);
+            // The envelope is ONLY a broad-phase rejection, never an exact replacement mask.
+            if(envelope==null || !box.intersects(envelope)){result.add(node);continue;}
+            List<BlockPos> inside=new ArrayList<>();
+            if((long)side*side*side<=sampled.size()) {
+                for(BlockPos cell:BlockPos.iterate(p,p.add(side-1,side-1,side-1)))
+                    if(sampled.contains(cell))inside.add(cell.toImmutable());
+            } else for(BlockPos cell:sampled)
+                if(box.contains(cell.getX(),cell.getY(),cell.getZ()))inside.add(cell);
+            outsideSamples(node,inside,result);
+        }
+        result.sort(Comparator.comparingDouble((Node n)->distanceSquared(nodeBox(n),center))
+                .thenComparingLong(n->n.position().asLong()).thenComparingInt(Node::side));
+        return List.copyOf(result);
+    }
+    private static void outsideSamples(Node node,List<BlockPos> sampled,List<Node> result) {
+        BlockPos p=node.position();int side=node.side();
+        if(sampled.isEmpty()){result.add(node);return;}
+        if(sampled.size()==(long)side*side*side)return;
+        int half=side/2;
+        List<List<BlockPos>> children=new ArrayList<>(8);
+        for(int child=0;child<8;child++)children.add(new ArrayList<>());
+        for(BlockPos cell:sampled)children.get((cell.getX()>=p.getX()+half?1:0)
+                |(cell.getY()>=p.getY()+half?2:0)|(cell.getZ()>=p.getZ()+half?4:0)).add(cell);
+        for(int child=0;child<8;child++)outsideSamples(new Node(p.add((child&1)==0?0:half,
+                (child&2)==0?0:half,(child&4)==0?0:half),half,node.tile(),node.ownerId()),children.get(child),result);
     }
     private static Box nodeBox(Node n){BlockPos p=n.position();return new Box(p.getX(),p.getY(),p.getZ(),(double)p.getX()+n.side(),(double)p.getY()+n.side(),(double)p.getZ()+n.side());}
-    private static void outside(Node n,Bounds cut,List<Node> result) {
-        BlockPos p=n.position();int side=n.side();Bounds box=new Bounds(p.getX(),p.getY(),p.getZ(),(long)p.getX()+side,(long)p.getY()+side,(long)p.getZ()+side);
-        if(!box.intersects(cut)){result.add(n);return;}if(cut.contains(box)||side==1)return;
-        int half=side/2;for(int child=0;child<8;child++)outside(new Node(p.add((child&1)==0?0:half,(child&2)==0?0:half,(child&4)==0?0:half),half,n.tile(),n.ownerId()),cut,result);
-    }
     /** Refine a persisted coarse leaf only inside the bounded exact-mask window, preserving far geometry. */
     static List<Node> splitOwnership(List<Node> source,Map<BlockPos,String> owners,Bounds range,Vec3d center) {
         List<Node> result=new ArrayList<>();for(Node node:source)splitOwner(node,owners,range,center,result);
@@ -142,10 +177,15 @@ final class SourceMeshBuilder {
     static long key(String owner,Vec3d source,int side) {
         long h=0xcbf29ce484222325L;
         for(int i=0;i<owner.length();i++)h=(h^owner.charAt(i))*0x100000001b3L;
-        h=(h^Double.doubleToLongBits(source.x))*0x100000001b3L;
-        h=(h^Double.doubleToLongBits(source.y))*0x100000001b3L;
-        h=(h^Double.doubleToLongBits(source.z))*0x100000001b3L;
-        h=(h^side)*0x100000001b3L;
+        // Avalanche EACH component before folding the next. Whole-double FNV followed by
+        // one final avalanche cancels high coordinate/sign bits on ordinary integer grids,
+        // causing append() to silently drop distinct source cells as duplicate keys.
+        h=mix(h^Double.doubleToLongBits(source.x));
+        h=mix(h^Double.doubleToLongBits(source.y));
+        h=mix(h^Double.doubleToLongBits(source.z));
+        return mix(h^side);
+    }
+    private static long mix(long h) {
         h^=h>>>30;h*=0xbf58476d1ce4e5b9L;h^=h>>>27;h*=0x94d049bb133111ebL;return h^(h>>>31);
     }
     static double distanceSquared(Box b,Vec3d p) {
