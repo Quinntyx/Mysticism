@@ -95,6 +95,12 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
         return subscriber == null ? overloaded() : subscriber.future;
     }
     public synchronized boolean isReady() { return ready && !closed; }
+    public synchronized EmbeddingReadiness state() {
+        if (closed) return new EmbeddingReadiness(EmbeddingReadiness.Phase.STOPPED, new CancellationException("Embedding shutdown"));
+        if (!readinessTerminal) return new EmbeddingReadiness(EmbeddingReadiness.Phase.INITIALIZING, null);
+        return ready ? new EmbeddingReadiness(EmbeddingReadiness.Phase.READY, null)
+                : new EmbeddingReadiness(EmbeddingReadiness.Phase.FAILED, readinessError);
+    }
 
     public CompletableFuture<Vec384f> embed(String descriptor) {
         if (descriptor == null || descriptor.isBlank() || descriptor.length() > 8192)
@@ -102,7 +108,7 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
         String key = EmbeddingSpace.FINGERPRINT + ":" + descriptor;
         Subscriber<Vec384f> subscriber = null; Vec384f cached = null; Throwable rejection = null;
         synchronized (this) {
-            if (!ready || closed) rejection = new IllegalStateException("Embeddings unavailable; inspect readiness");
+            if (!ready || closed) rejection = new IllegalStateException("Embeddings unavailable; inspect readiness", state().failure());
             else {
                 cached = cache.get(key); if (cached != null) cached = cached.clone();
                 if (cached == null) {
@@ -135,23 +141,45 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
     private void run(String key, String descriptor, Request request) {
         synchronized (this) { if (closed || pending.get(key) != request) return; }
         try {
-            Vec384f value = provider.getEmbedding(descriptor); EmbeddingSpace.requireCurrent(value);
-            if (value.length() == 0) throw new IllegalArgumentException("Provider returned zero embedding");
+            Vec384f value = provider.getEmbedding(descriptor);
+            try {
+                EmbeddingSpace.requireCurrent(value);
+                if (value.length() == 0) throw new IllegalArgumentException("Provider returned zero embedding");
+            } catch (IllegalArgumentException invalid) {
+                throw new EmbeddingModelException("Provider returned an invalid current-model vector", invalid);
+            }
             finish(key, request, new Vec384f(value.norm()), null);
-        } catch (Throwable error) { finish(key, request, null, error); }
+        } catch (Throwable error) { finish(key, request, null, EmbeddingReadiness.unwrap(error)); }
     }
     private void finish(String key, Request request, Vec384f value, Throwable error) {
+        List<Request> invalidated = List.of();
+        boolean deliver;
         synchronized (this) {
-            if (pending.get(key) != request) return;
-            pending.remove(key);
-            if (request.deadline != null) request.deadline.cancel(false);
-            workers.remove(request.task);
-            if (error == null) {
+            deliver = pending.get(key) == request;
+            if (deliver) {
+                pending.remove(key);
+                if (request.deadline != null) request.deadline.cancel(false);
+                workers.remove(request.task);
+            }
+            // A late definitive model error still revokes readiness after its request
+            // deadline. Late successes cannot repopulate caches or redeliver subscribers.
+            if (!closed && error instanceof EmbeddingModelException) {
+                // A successful startup probe cannot authorize a missing/changed model forever.
+                // Fail the generation atomically; no cached result or queued old-model success
+                // can make a fresh discovery look ready. Current persisted anchors are separate.
+                ready = false; readinessError = error; cache.clear();
+                invalidated = List.copyOf(pending.values()); pending.clear();
+                for (var work : invalidated) {
+                    if (work.deadline != null) work.deadline.cancel(false);
+                    workers.remove(work.task);
+                }
+            } else if (deliver && error == null) {
                 cache.put(key, value.clone());
                 while (cache.size() > cacheCapacity) cache.remove(cache.keySet().iterator().next());
             }
         }
-        for (var subscriber : request.subscribers) publish(subscriber, error == null ? value.clone() : null, error);
+        if (deliver) for (var subscriber : request.subscribers) publish(subscriber, error == null ? value.clone() : null, error);
+        for (var work : invalidated) for (var subscriber : work.subscribers) publish(subscriber, null, error);
     }
     public synchronized int cacheSize() { return cache.size(); }
     public synchronized int inflightSize() { return pending.size(); }
@@ -162,7 +190,7 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
             if (closed) return;
             closed = true; ready = false;
             readyCancelled = List.copyOf(readySubscribers); readySubscribers.clear();
-            if (!readinessTerminal) { readinessTerminal = true; readinessError = error; }
+            readinessTerminal = true; readinessError = error;
             if (readyDeadline != null) readyDeadline.cancel(false);
             cancelled = List.copyOf(pending.values()); pending.clear(); cache.clear();
             for (Request request : cancelled) if (request.deadline != null) request.deadline.cancel(false);

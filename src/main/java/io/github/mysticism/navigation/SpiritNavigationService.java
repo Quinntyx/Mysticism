@@ -3,6 +3,8 @@ package io.github.mysticism.navigation;
 import io.github.mysticism.activity.TraversalSteering;
 import io.github.mysticism.activity.SpiritActivityService;
 import io.github.mysticism.component.*;
+import io.github.mysticism.embedding.EmbeddingHelper;
+import io.github.mysticism.embedding.EmbeddingReadiness;
 import io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService;
 import io.github.mysticism.dimension.spiritworld.SpiritBasisEvolver;
 import io.github.mysticism.landmark.*;
@@ -42,7 +44,7 @@ public final class SpiritNavigationService {
     private SpiritNavigationService() {}
     private static final class Session {
         int unsupported, blendTick, landingTick, supportTick, supportAlignTick;
-        boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, jumping, supportPending;
+        boolean attemptedLanding, semanticReady, checkedRestore, prefetched, confirmedOwned, warnedLanding, jumping, supportPending;
         Vec384f targetSnapshot, supportTargetSnapshot;
         Basis384f supportFrom, supportGrid;
         long supportWindow;
@@ -50,6 +52,7 @@ public final class SpiritNavigationService {
         Basis384f blendFrom, blendTo, landingFrom;
         CompletableFuture<?> capture;
         String captureDimension = "";
+        EmbeddingReadiness.Phase announcedModelPhase;
         long captureNonce;
     }
     private static Session session(ServerPlayerEntity p) {
@@ -140,7 +143,7 @@ public final class SpiritNavigationService {
         nav.shallow(dimension, mapped.map(SpiritTerrainService.SourcePosition::landmarkId).orElse(""), source);
         Session s = session(p); s.semanticReady = false; s.checkedRestore = true;
         nav.setSemanticReady(false); nav.setLandingApproach(false);
-        s.confirmedOwned = false; s.warnedAnchor = false; s.prefetched = false;
+        s.confirmedOwned = false; s.announcedModelPhase = null; s.prefetched = false;
         try {
             // Source-identical carrier pose: no shared origin, entry search or replacement floor.
             p.teleport(world, source.x, source.y, source.z, p.getYaw(), p.getPitch());
@@ -215,8 +218,16 @@ public final class SpiritNavigationService {
         nav.enterDeep(); SpiritTerrainService.setShallow(p, false); flight(p, true);
         s.unsupported = 0; s.jumping = false;
         if (changed) sync(p);
-        if (!s.semanticReady && !s.warnedAnchor) {
-            p.sendMessage(Text.literal("Free flight active; semantic travel awaits real source discovery."), false); s.warnedAnchor = true;
+        reportDiscovery(p, s);
+    }
+    private static DiscoveryReadiness discovery(Session s) {
+        return new DiscoveryReadiness(s.semanticReady, EmbeddingHelper.state());
+    }
+    private static void reportDiscovery(ServerPlayerEntity p, Session s) {
+        var readiness = discovery(s);
+        if (!readiness.navigationReady() && s.announcedModelPhase != readiness.model().phase()) {
+            s.announcedModelPhase = readiness.model().phase();
+            p.sendMessage(Text.literal(readiness.flightDescription()), false);
         }
     }
 
@@ -228,6 +239,12 @@ public final class SpiritNavigationService {
         if (!state(p).deep()) { flight(p, false); return; }
         Session s = session(p); restoreAnchor(p, s);
         flight(p, true); // remains deep/freeflight until the real terrain acquisition commits
+        var readiness = discovery(s);
+        if (readiness.terminallyBlocked()) {
+            endSupportApproach(p, s);
+            p.sendMessage(Text.literal("Walk request unavailable: " + EmbeddingReadiness.describe(readiness.model().failure()) + "; free flight remains active."), true);
+            return;
+        }
         if (s.supportPending) return; // repeated packets cannot reset budgets or duplicate requests
         endApproach(p, s); s.blendFrom = null; s.blendTo = null;
         s.supportPending = true; s.supportTick = 0; s.supportFrom = null;
@@ -285,6 +302,7 @@ public final class SpiritNavigationService {
             return false;
         }
         flight(p, true);
+        reportDiscovery(p, s);
         if (s.supportPending) { attemptSupport(p, s, delta); return false; }
         if (!s.semanticReady) return false;
         if (s.blendTo != null) {
@@ -329,6 +347,12 @@ public final class SpiritNavigationService {
         if (s.semanticReady && Double.isFinite(delta.x) && Double.isFinite(delta.y) && Double.isFinite(delta.z)
                 && delta.lengthSquared() <= 16)
             TraversalSteering.advance(q, component.get(), delta.x, delta.y, delta.z);
+        var readiness = discovery(s);
+        if (readiness.terminallyBlocked()) {
+            endSupportApproach(p, s);
+            p.sendMessage(Text.literal("Walk request cancelled: source discovery unavailable: " + EmbeddingReadiness.describe(readiness.model().failure()) + "; free flight remains active."), true);
+            return;
+        }
         if (++s.supportTick > 200) {
             endSupportApproach(p, s);
             p.sendMessage(Text.literal("Walk request expired: current support could not be continuously aligned/owned. Still deep; no substitute landing."), true);
@@ -512,13 +536,20 @@ public final class SpiritNavigationService {
         BlockPos block = BlockPos.ofFloored(foot); // ownership seed only; never the captured feet
         Session s = session(p);
         if (s.capture != null && !s.capture.isDone()) { p.sendMessage(Text.literal("Source discovery already pending."), false); return false; }
+        var readiness = EmbeddingHelper.state();
+        if (readiness.unavailable()) {
+            p.sendMessage(Text.literal("Source discovery unavailable: " + EmbeddingReadiness.describe(readiness.failure())), false);
+            return false;
+        }
         var server = p.getServer();
         // Snapshot the source-grid basis before async completion, not a later moving deep basis.
         Basis384f basis = state(p).active() && !state(p).deep() ? p.getComponent(MysticismEntityComponents.LATENT_BASIS).get().clone() : new Basis384f();
         s.captureDimension = dimension; long nonce = ++s.captureNonce;
+        p.sendMessage(Text.literal(readiness.ready() ? "Capturing generated source landmark asynchronously…" : "Source capture queued for model initialization…"), false);
         s.capture = SourceLandmarks.ensureSourceLocation(server, dimension, block).whenComplete((found, error) -> server.execute(() -> {
             if (!live(p, s) || s.captureNonce != nonce) return;
-            if (error != null || found == null || found.isEmpty()) { p.sendMessage(Text.literal("No captured source landmark available."), false); return; }
+            if (error != null) { p.sendMessage(Text.literal("Source capture failed: " + EmbeddingReadiness.describe(error)), false); return; }
+            if (found == null || found.isEmpty()) { p.sendMessage(Text.literal("No generated source landmark owns this location."), false); return; }
             var metadata = found.get();
             if (!requiredId.isEmpty() && !LandmarkStore.get(server).resolve(requiredId).equals(metadata.id())) {
                 p.sendMessage(Text.literal("Requested landmark does not own the captured source location."), false); return;
@@ -529,7 +560,7 @@ public final class SpiritNavigationService {
             captureTarget(p, dimension, metadata.id(), foot, captured, basis);
             p.sendMessage(Text.literal("Captured " + metadata.id() + " at " + dimension + " " + block.toShortString() + " (vector snapshot)."), false);
         }));
-        p.sendMessage(Text.literal("Capturing generated source landmark asynchronously…"), false); return true;
+        return true;
     }
     /** Caller validates BOTH projected reach/alignment/collision rays before invoking. */
     public static void touch(ServerPlayerEntity actor, ServerPlayerEntity target) {

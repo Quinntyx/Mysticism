@@ -4,7 +4,6 @@ import io.github.mysticism.activity.*;
 import io.github.mysticism.embedding.*;
 import io.github.mysticism.landmark.extract.*;
 import io.github.mysticism.vector.Vec384f;
-import io.github.mysticism.world.state.ItemEmbeddingIndexState;
 import net.fabricmc.fabric.api.event.lifecycle.v1.*;
 import net.minecraft.registry.*;
 import net.minecraft.server.MinecraftServer;
@@ -90,7 +89,7 @@ public final class SourceLandmarks {
     }
     public static int pending(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.requests.size()+s.hints.size()+(s.active==null?0:1);}
     public static int lastSampledCells(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.lastCells;}
-    public static String status(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?"Stopped":s.status;}
+    public static String status(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?"Stopped":s.status+"; "+EmbeddingHelper.state().description();}
     private static Session session(MinecraftServer server){if(!server.isOnThread())throw new IllegalStateException("source server thread");Session s=SESSIONS.get(server);if(s==null)throw new IllegalStateException("source service not initialized");return s;}
     private static void checkBounds(Bounds b,int maxCells){long volume=Math.multiplyExact(Math.multiplyExact(b.maxX()-b.minX(),b.maxY()-b.minY()),b.maxZ()-b.minZ());if(maxCells<1||maxCells>32768||volume>maxCells||b.minX()<Integer.MIN_VALUE||b.maxX()>Integer.MAX_VALUE||b.minY()<Integer.MIN_VALUE||b.maxY()>Integer.MAX_VALUE||b.minZ()<Integer.MIN_VALUE||b.maxZ()>Integer.MAX_VALUE)throw new IllegalArgumentException("source query bounds");}
     private record Hint(String dimension,BlockPos pos){}
@@ -104,15 +103,15 @@ public final class SourceLandmarks {
         }
     }
     private static final class Session {
-        final MinecraftServer server;final LandmarkStore store;final ItemEmbeddingIndexState itemIndex;final ExecutorService worker=new ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(4),Thread.ofPlatform().daemon().name("mysticism-source").factory(),new ThreadPoolExecutor.AbortPolicy());
+        final MinecraftServer server;final LandmarkStore store;final ExecutorService worker=new ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(4),Thread.ofPlatform().daemon().name("mysticism-source").factory(),new ThreadPoolExecutor.AbortPolicy());
         final ArrayDeque<SourceOwnership.Request> ownerRequests=new ArrayDeque<>();
-        final ArrayDeque<FrontierRetry> retries=new ArrayDeque<>();final Map<CompletableFuture<?>,String> auxiliary=new IdentityHashMap<>();final ArrayDeque<Operation<?>> requests=new ArrayDeque<>();final LinkedHashSet<Hint> hints=new LinkedHashSet<>();Operation<?> active;String status="Ready";int playerCursor,lastCells;
-        Session(MinecraftServer server){this.server=server;store=LandmarkStore.get(server);itemIndex=ItemEmbeddingIndexState.get(server);}
+        final ArrayDeque<FrontierRetry> retries=new ArrayDeque<>();final Map<CompletableFuture<?>,String> auxiliary=new IdentityHashMap<>();final EmbeddingWorkQueue<Operation<?>> requests=new EmbeddingWorkQueue<>(64);final LinkedHashSet<Hint> hints=new LinkedHashSet<>();Operation<?> active;String status="Idle";int playerCursor,lastCells;
+        Session(MinecraftServer server){this.server=server;store=LandmarkStore.get(server);}
         <T> CompletableFuture<T> computeAndDeliver(String dim,java.util.function.Supplier<T> computation){
             var out=new CompletableFuture<T>();if(auxiliary.size()>=64){out.completeExceptionally(new RejectedExecutionException("source auxiliary budget"));return out;}auxiliary.put(out,dim);
             try{CompletableFuture.supplyAsync(computation,worker).whenComplete((value,error)->server.execute(()->{auxiliary.remove(out);if(SESSIONS.get(server)!=this)out.cancel(false);else if(error!=null)out.completeExceptionally(error);else out.complete(value);}));}catch(RuntimeException failure){auxiliary.remove(out);out.completeExceptionally(failure);}return out;
         }
-        void offer(Operation<?> op){if(requests.size()==64){op.future.completeExceptionally(new RejectedExecutionException("source request budget"));return;}if(op instanceof Read)requests.addFirst(op);else requests.addLast(op);}
+        void offer(Operation<?> op){requests.offer(op,op instanceof Ensure,op instanceof Read,op.future,op::cancel,EmbeddingHelper.state());}
         void hint(String dim,BlockPos p){if(hints.size()<128)hints.add(new Hint(dim,p));}
         void invalidate(String dim,BlockPos pos){if(active!=null&&active.dimension.equals(dim)&&active.guarded!=null&&active.guarded.contains(pos.getX(),pos.getY(),pos.getZ()))active.cancel(new CancellationException("source edit invalidated snapshot"));}
         void tick(){
@@ -120,15 +119,19 @@ public final class SourceLandmarks {
             if(!ownerRequests.isEmpty()){var request=ownerRequests.peekFirst();try{request.advance();}catch(RuntimeException failure){request.cancel(failure);}if(request.done)ownerRequests.removeFirst();}
             if(server.getTicks()%5==0&&!retries.isEmpty()){try{if(retries.peekFirst().advance(this))retries.removeFirst();}catch(RuntimeException stale){retries.removeFirst();}}
             if(server.getTicks()%200==0){var players=server.getPlayerManager().getPlayerList();for(int n=0;n<Math.min(2,players.size());n++){var p=players.get(Math.floorMod(playerCursor++,players.size()));if(SourceDimensions.isSource(p.getServerWorld().getRegistryKey().getValue().toString()))hint(p.getServerWorld().getRegistryKey().getValue().toString(),p.getBlockPos());}}
-            boolean ready=EmbeddingHelper.isReady()||itemIndex.isPopulated();
-            if(active==null&&!requests.isEmpty()&&(requests.peekFirst() instanceof Read||ready))active=requests.removeFirst();
-            if(active==null&&ready&&!hints.isEmpty()){Hint h=hints.iterator().next();hints.remove(h);active=new Ensure(this,h.dimension,h.pos,null,false,new CompletableFuture<>());}
+            var readiness=EmbeddingHelper.state();
+            requests.settle(readiness); // Failed model probes must terminate queued caller futures, even while a read is active.
+            if(active instanceof Ensure && active.mutation==null && readiness.unavailable()){
+                active.cancel(readiness.failure());active.release();active=null;
+            }
+            if(active==null)active=requests.poll(readiness);
+            if(active==null&&readiness.ready()&&!hints.isEmpty()){Hint h=hints.iterator().next();hints.remove(h);active=new Ensure(this,h.dimension,h.pos,null,false,new CompletableFuture<>());}
             if(active==null)return;
-            try{if(active.future.isCancelled())active.cancel(new CancellationException());if(!active.done)active.advance();if(active.done){active.release();active=null;status="Ready";}}
+            try{if(active.future.isCancelled())active.cancel(new CancellationException());if(!active.done)active.advance();if(active.done){active.release();active=null;status="Idle";}}
             catch(RuntimeException e){status="Deferred: "+e.getMessage();active.cancel(e);active.release();active=null;}
         }
-        void unload(String dim){ownerRequests.removeIf(request->{if(request.dimension.equals(dim)){request.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});retries.removeIf(r->r.dimension.equals(dim));auxiliary.entrySet().removeIf(e->{if(e.getValue().equals(dim)){e.getKey().cancel(false);return true;}return false;});if(active!=null&&active.dimension.equals(dim)){active.cancel(new CancellationException("source dimension unloaded"));active.release();active=null;}requests.removeIf(op->{if(op.dimension.equals(dim)){op.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});hints.removeIf(h->h.dimension.equals(dim));}
-        void close(){ownerRequests.forEach(request->request.cancel(new CancellationException("server stopping")));ownerRequests.clear();auxiliary.keySet().forEach(f->f.cancel(false));auxiliary.clear();retries.clear();if(active!=null){active.cancel(new CancellationException("server stopping"));active.release();}requests.forEach(op->op.cancel(new CancellationException("server stopping")));requests.clear();hints.clear();worker.shutdownNow();}
+        void unload(String dim){ownerRequests.removeIf(request->{if(request.dimension.equals(dim)){request.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});retries.removeIf(r->r.dimension.equals(dim));auxiliary.entrySet().removeIf(e->{if(e.getValue().equals(dim)){e.getKey().cancel(false);return true;}return false;});if(active!=null&&active.dimension.equals(dim)){active.cancel(new CancellationException("source dimension unloaded"));active.release();active=null;}requests.cancelWhere(op->op.dimension.equals(dim),new CancellationException("source dimension unloaded"));hints.removeIf(h->h.dimension.equals(dim));}
+        void close(){ownerRequests.forEach(request->request.cancel(new CancellationException("server stopping")));ownerRequests.clear();auxiliary.keySet().forEach(f->f.cancel(false));auxiliary.clear();retries.clear();if(active!=null){active.cancel(new CancellationException("server stopping"));active.release();}requests.cancelWhere(op->true,new CancellationException("server stopping"));hints.clear();worker.shutdownNow();}
         ServerWorld world(String dimension){return SourceDimensions.isSource(dimension)?server.getWorld(RegistryKey.of(RegistryKeys.WORLD,Identifier.of(dimension))):null;}
     }
     private abstract static class Operation<T> {
@@ -171,11 +174,9 @@ public final class SourceLandmarks {
             }
             if(!prepared.isDone())return;if(value==null){value=prepared.getNow(null);if(value==null){complete(Optional.empty());return;}}
             if(embedding==null){
-                ArrayList<DescriptorVectors.WeightedVector> fallback=new ArrayList<>();var index=s.itemIndex;
-                if(index.isPopulated())for(var item:value.items.entrySet()){Vec384f v=index.getVec(item.getKey());if(v!=null)fallback.add(new DescriptorVectors.WeightedVector(v,item.getValue()));}
-                Vec384f backup=fallback.isEmpty()?null:DescriptorVectors.compose(fallback);
-                if(!EmbeddingHelper.isReady()&&backup==null){s.status="Waiting for real embedding/index readiness";return;}
-                embedding=EmbeddingHelper.isReady()?EmbeddingHelper.composeDescriptors(value.descriptors).handle((v,e)->{if(e==null)return v;if(backup!=null)return backup.clone();throw new CompletionException(e);}):CompletableFuture.completedFuture(backup);work=embedding;return;
+                // A persisted item catalogue is not a live model health check and cannot
+                // replace biome/structural descriptors or swallow a model revision error.
+                embedding=EmbeddingHelper.composeDescriptors(value.descriptors);work=embedding;return;
             }
             if(!embedding.isDone())return;
             if(resume==null){try{pause();}catch(IllegalStateException busy){return;}}
