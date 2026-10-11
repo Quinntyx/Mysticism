@@ -30,13 +30,15 @@ public final class SpiritRenderMathSelfTest {
                 * Math.sin(frequency * (61 * z - 17 * y)));
     }
     private static double integrate(double length, int steps, Vec3d camera, Vec3d ray) {
-        double ds = Math.min(length, SpiritRenderSettings.OPAQUE_RADIUS) / steps;
+        var range = SpiritRenderSettings.DEFAULT_FOG_RANGE;
+        double ds = Math.max(0, Math.min(length, range.opaqueRadius()) - range.visibleRadius()) / steps;
         double transmission = 1, scatter = 0;
         for (int i = 0; i < steps && transmission > .001; i++) {
-            Vec3d position = camera.add(ray.multiply((i + .5) * ds));
+            double start = range.visibleRadius() + i * ds;
+            Vec3d position = camera.add(ray.multiply(start + .5 * ds));
             double medium = density(position.x, position.y, position.z);
             check(medium >= 1 && medium <= 1.5, "extinction floor/ceiling");
-            double segment = Math.exp(-SpiritRenderSettings.MIN_EXTINCTION * medium * ds);
+            double segment = Math.exp(-range.opticalDepth(start, start + ds) * medium);
             scatter += transmission * (1 - segment);
             transmission *= segment;
         }
@@ -44,10 +46,8 @@ public final class SpiritRenderMathSelfTest {
         return transmission;
     }
     private static void settingsAndMedium() {
-        near(SpiritRenderSettings.OPAQUE_RADIUS, 64, 0);
-        check(SpiritRenderSettings.MIN_LOADING_RADIUS >= 80, "terrain loading contract");
-        near(SpiritRenderSettings.HORIZONS.hidden(), 64, 0);
-        near(SpiritRenderSettings.HORIZONS.prefetch(), 80, 0);
+        near(SpiritRenderSettings.DEFAULT_FOG_RANGE.visibleRadius(), 96, 0);
+        near(SpiritRenderSettings.DEFAULT_FOG_RANGE.opaqueRadius(), 192, 0);
         near(SpiritRenderSettings.saturation(-1), 0, 0);
         near(SpiritRenderSettings.saturation(0), 0, 0);
         near(SpiritRenderSettings.saturation(1.25), .5, 0);
@@ -72,11 +72,12 @@ public final class SpiritRenderMathSelfTest {
             for (Vec3d camera : new Vec3d[]{Vec3d.ZERO, new Vec3d(-4096, 57, 4095), new Vec3d(333, -777, 2099)}) {
                 Vec3d ray = new Vec3d(.3, -.2, .5).normalize();
                 near(integrate(0, quality.fogSteps, camera, ray), 1, 0);
-                double near = integrate(32, quality.fogSteps, camera, ray);
-                double far = integrate(64, quality.fogSteps, camera, ray);
-                check(far <= SpiritRenderSettings.MAX_TRANSMITTANCE + 1e-12, "near opaque at 64");
+                double near = integrate(64, quality.fogSteps, camera, ray);
+                double far = integrate(192, quality.fogSteps, camera, ray);
+                check(far <= SpiritRenderSettings.MAX_TRANSMITTANCE + 1e-12, "near opaque at configured horizon");
+                near(near, 1, 0); // The former tiny-locality horizon remains clear.
                 check(near > far, "integrated path grows opacity");
-                near(integrate(80, quality.fogSteps, camera, ray), far, 0);
+                near(integrate(256, quality.fogSteps, camera, ray), far, 0);
             }
         }
     }

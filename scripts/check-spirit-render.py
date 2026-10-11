@@ -22,7 +22,7 @@ def check(condition, message):
 chain = json.loads((ASSETS / "post/kuwahara.json").read_text())
 passes = chain["passes"]
 check(chain["targets"] == ["fogged", "painted", "saturated"], "exact bounded targets")
-check([p["name"] for p in passes] == ["mysticism:spirit_fog", "mysticism:kuwahara", "mysticism:spirit_saturation", "blit"], "fog integrated ONCE before independent painterly and saturation")
+check([p["name"] for p in passes] == ["mysticism:spirit_fog", "mysticism:kuwahara", "mysticism:spirit_saturation", "mysticism:spirit_transition"], "fog integrated ONCE before independent painterly and saturation")
 previous = "minecraft:main"
 for p in passes:
     check(p["intarget"] == previous, "continuous Satin graph")
@@ -31,7 +31,7 @@ for p in passes:
     previous = p["outtarget"]
 check(previous == "minecraft:main", "output composited back to scene")
 
-for name in ["spirit_fog", "kuwahara", "spirit_saturation"]:
+for name in ["spirit_fog", "kuwahara", "spirit_saturation", "spirit_transition"]:
     descriptor = json.loads((ASSETS / f"program/{name}.json").read_text())
     source = (ASSETS / f"program/{name}.fsh").read_text()
     check(descriptor["vertex"] == "blit", "vanilla fullscreen vertex interface")
@@ -55,7 +55,8 @@ check("InverseViewProjection * vec4" in fog and "depth * 2.0 - 1.0" in fog, "non
 check("texelFetch(DepthSampler" in fog, "nearest terrain/glyph depth")
 check("depth >= 0.9999999 ? OpaqueRadius" in fog, "clear sky is marched, not skipped")
 check("i < 64" in fog and "clamp(FogSteps, 8, 64)" in fog, "bounded participating medium integration")
-check("CameraModulo + direction" in fog and "exp(-sigma * stepLength)" in fog, "world-space Beer-Lambert medium")
+check("CameraModulo + offset" in fog and "exp(-opticalDepth * (density(worldSample) + 0.7 * occupied))" in fog, "world-space Beer-Lambert medium")
+check("endDistance - VisibleRadius" in fog and "HorizonOpticalDepth * (b * b * b - a * a * a)" in fog, "clear foreground and exact wider-range optical-depth integral")
 check("return 1.0 +" in fog, "strictly positive density floor")
 check("scattering, 1.0)" in fog, "clear alpha-zero sky still composes visible fog")
 
@@ -105,9 +106,9 @@ for path in CLIENT.glob("*.java"):
 
 validator = shutil.which("glslangValidator")
 if validator:
-    for name in ["spirit_fog", "kuwahara", "spirit_saturation"]:
+    for name in ["spirit_fog", "kuwahara", "spirit_saturation", "spirit_transition"]:
         subprocess.run([validator, "-S", "frag", str(ASSETS / f"program/{name}.fsh")], check=True)
-    print("GLSL 150 fragment validation: 3 passed")
+    print("GLSL 150 fragment validation: 4 passed")
 else:
     print("GLSL validation NOT RUN: glslangValidator not installed")
 print(f"Spirit resource/order contracts: {checks} checks passed (static, no GPU/runtime)")

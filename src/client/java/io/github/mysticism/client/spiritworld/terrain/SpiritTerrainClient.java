@@ -111,7 +111,8 @@ public final class SpiritTerrainClient {
             LAYER.startDrawing();
             try {
                 for(Batch b:gpu) {
-                    if(distanceSquared(b.bounds,camera)>64*64 || context.frustum()!=null && !context.frustum().isVisible(b.bounds))continue;
+                    if(!ShaderManager.fogRange().containsDistanceSquared(distanceSquared(b.bounds,camera))
+                            || context.frustum()!=null && !context.frustum().isVisible(b.bounds))continue;
                     b.buffer.bind();b.buffer.draw(view,context.projectionMatrix(),RenderSystem.getShader());
                 }
             } finally{VertexBuffer.unbind();LAYER.endDrawing();}
