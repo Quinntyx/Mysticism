@@ -2,6 +2,10 @@
 
 ## Normal runtime: in-process CPU inference
 
+See [runtime output pooling](runtime-embedding-pooling.md) for the native output
+math. Embedded mean-pooled sentence output is normalized once at the provider
+boundary; all **768** native coordinates are retained.
+
 IntelliJ's Java 21 Minecraft launch needs **no Ollama process or external server**.
 `EmbeddingHelper` selects `EmbeddedEmbeddingService` by default. JNI, llama.cpp,
 and their Java dependencies are nested in the production mod jar and are on the
