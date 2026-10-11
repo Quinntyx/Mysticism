@@ -25,7 +25,8 @@ public final class PackagingSelfTest {
         descriptorRegressions();
         expectFailure(() -> ProductionJarVerifier.verify(archive(good), "wrong-version"), "Wrong mod version");
         for (String missing : new String[]{"LICENSE_mysticism.txt", "assets/mysticism/lang/en_us.json",
-                "mysticism.client.mixins.json", "io/github/mysticism/client/MysticismClient.class", "META-INF/jars/library.jar"}) {
+                "mysticism.client.mixins.json", "io/github/mysticism/client/MysticismClient.class", "META-INF/jars/library.jar",
+                "io/github/mysticism/embedding/EmbeddedEmbeddingService.class", "META-INF/jars/llama-5.1.0.jar"}) {
             var broken = new LinkedHashMap<>(good);
             broken.remove(missing);
             expectFailure(() -> ProductionJarVerifier.verify(archive(broken), "1.0-test"), "Missing production resource");
@@ -39,6 +40,18 @@ public final class PackagingSelfTest {
                             forbidden.equals(".DS_Store") ? "Finder metadata" :
                                     forbidden.startsWith("../") ? "Unsafe archive path" : "Local model runtime");
         }
+        for (String forbidden : new String[]{"models/v2.gguf", "models/v2.safetensors", "META-INF/jars/slf4j-api-2.jar"}) {
+            var broken = new LinkedHashMap<>(good);
+            broken.put(forbidden, new byte[0]);
+            expectFailure(() -> ProductionJarVerifier.verify(archive(broken), "1.0-test"),
+                    forbidden.endsWith(".jar") ? "Duplicate Minecraft logging" : "Model weights must not be bundled");
+        }
+        var missingNative = new LinkedHashMap<>(good);
+        missingNative.put("META-INF/jars/llama-5.1.0.jar", archive(Map.of("net/ladenthin/llama/LlamaModel.class", classFixture("java/lang/Object", 65))));
+        expectFailure(() -> ProductionJarVerifier.verify(archive(missingNative), "1.0-test"), "Missing production resource");
+        var missingDependency = new LinkedHashMap<>(good);
+        missingDependency.remove("META-INF/jars/jackson-core-fixture.jar");
+        expectFailure(() -> ProductionJarVerifier.verify(archive(missingDependency), "1.0-test"), "Missing nested inference dependency");
         var missingIcon = new LinkedHashMap<>(good);
         missingIcon.put("fabric.mod.json", text(new String(good.get("fabric.mod.json"), StandardCharsets.UTF_8)
                 .replace("\"id\":", "\"icon\":\"assets/mysticism/missing.png\",\"id\":")));
@@ -62,7 +75,7 @@ public final class PackagingSelfTest {
         expectFailure(() -> ProductionJarVerifier.verifyClass(classFixture("java/lang/Object", 66)), "Unsupported/preview class version");
         expectFailure(() -> ProductionJarVerifier.verifyClass(classFixture("ai/djl/Model", 65)), "Local model runtime class reference");
         expectFailure(() -> ProductionJarVerifier.verify(new byte[0], "1.0-test"), "Empty or invalid jar");
-        System.out.println("Packaging self-tests passed (valid jar, stable intermediary names, plus 19 rejection cases)");
+        System.out.println("Packaging self-tests passed (valid jar, stable intermediary names, plus 26 rejection cases)");
         RunnerSelfTest.run();
     }
 
@@ -71,7 +84,9 @@ public final class PackagingSelfTest {
         entries.put("fabric.mod.json", text("""
                 {"id":"mysticism","version":"1.0-test","license":"MIT",
                  "depends":{"java":">=21"},"mixins":["mysticism.client.mixins.json"],
-                 "jars":[{"file":"META-INF/jars/library.jar"}]}
+                 "jars":[{"file":"META-INF/jars/library.jar"},{"file":"META-INF/jars/llama-5.1.0.jar"},
+                 {"file":"META-INF/jars/jackson-core-fixture.jar"},{"file":"META-INF/jars/jackson-databind-fixture.jar"},
+                 {"file":"META-INF/jars/jackson-annotations-fixture.jar"},{"file":"META-INF/jars/jspecify-fixture.jar"}]}
                 """));
         entries.put("LICENSE_mysticism.txt", text("Permission is hereby granted"));
         entries.put("assets/mysticism/lang/en_us.json", text("{}"));
@@ -79,6 +94,15 @@ public final class PackagingSelfTest {
         entries.put("io/github/mysticism/Mysticism.class", classFixture("net/minecraft/class_3218", 65));
         entries.put("io/github/mysticism/client/MysticismClient.class", classFixture("net/minecraft/class_310", 65));
         entries.put("META-INF/jars/library.jar", archive(Map.of("library.properties", text("version=1"))));
+        entries.put("io/github/mysticism/embedding/EmbeddedEmbeddingService.class", classFixture("java/lang/Object", 65));
+        entries.put("io/github/mysticism/embedding/LlamaEmbeddingModel.class", classFixture("net/ladenthin/llama/LlamaModel", 65));
+        var natives = new LinkedHashMap<String, byte[]>();
+        natives.put("net/ladenthin/llama/LlamaModel.class", classFixture("java/lang/Object", 65));
+        for (String resource : new String[]{"Linux/x86_64/libjllama.so", "Linux/aarch64/libjllama.so", "Mac/aarch64/libjllama.dylib", "Windows/x86_64/jllama.dll"})
+            natives.put("net/ladenthin/llama/" + resource, text("fixture only, NOT executable"));
+        entries.put("META-INF/jars/llama-5.1.0.jar", archive(natives));
+        for (String dependency : new String[]{"jackson-core", "jackson-databind", "jackson-annotations", "jspecify"})
+            entries.put("META-INF/jars/" + dependency + "-fixture.jar", archive(Map.of("dependency.properties", text("fixture=true"))));
         return entries;
     }
 
