@@ -1,83 +1,84 @@
-# Nomic v2-MoE embedding contract (schema 2)
+# Fresh native Nomic v2 embeddings
 
-## Current HTTP deployment (native integration pending), not an automatic download
+## Normal runtime: in-process CPU inference
 
-The offline [native-v2 asset loader](embedded-model-assets.md) supports the approved
-local GGUF and existing Ollama cache without a service. It is an asset/backend
-handoff boundary, not an inference implementation: the current initialization
-still uses the HTTP provider below until a real in-process backend is wired in.
+IntelliJ's Java 21 Minecraft launch needs **no Ollama process or external server**.
+`EmbeddingHelper` selects `EmbeddedEmbeddingService` by default. JNI, llama.cpp,
+and their Java dependencies are nested in the production mod jar and are on the
+Gradle development classpath. There is no DJL/PyTorch runtime, installer, dummy
+vector fallback, v1 migration, or dimensional truncation.
 
-Mysticism currently uses an administrator-provisioned **Ollama-compatible** HTTP service. No
-model weights, software, fallback model, hash vectors, or model-pull endpoints are
-used by the mod. The official model exists at
-[Ollama nomic-embed-text-v2-moe](https://ollama.com/library/nomic-embed-text-v2-moe).
-The upstream [v2 model card](https://huggingface.co/nomic-ai/nomic-embed-text-v2-moe)
-documents 768 native dimensions, a 512-token context, multilingual text, and
-256-dimensional Matryoshka embeddings.
+The immutable approved model/tokenizer is the **exact GGUF from the v2-MoE
+manifest**, not a different conversion or a moving Hugging Face/Ollama tag:
 
-On a machine where an administrator has **already installed Ollama**, the
-administrator may explicitly choose to download/provision it with:
+- Model identity: `nomic-embed-text-v2-moe:latest`
+- Manifest SHA256: `ff9c2f10ef5e3722623a1b396e1e04efc27a93112c83e9b7b7b9ca1d05620965`
+- GGUF SHA256: `a5db3381f2e514d3490a3a31fe70eb1a65e95016c85c6c2c23223b810806594f`
+- GGUF length: **957,680,480 bytes**
+- Source: `https://registry.ollama.ai/v2/library/nomic-embed-text-v2-moe/blobs/sha256:a5db3381f2e514d3490a3a31fe70eb1a65e95016c85c6c2c23223b810806594f`
 
-```sh
-# Run the service in its own terminal if it is not already running:
-ollama serve
-```
+Provider construction does no asset IO/native loading. On the embedding worker,
+preparation verifies a configured/cached file, or downloads the pinned blob on
+first use. The download is not inference over HTTP and needs no running service.
+Both length and SHA256 are checked before native loading. Publication is atomic,
+concurrent JVMs share a file lock, incomplete downloads are removed, corrupt
+existing files are **not** replaced, and cancellation/deadlines are enforced.
+Readiness includes an actual model forward pass; an executor/file flag is not
+readiness. Startup does not join preparation. Restart to retry failed readiness.
 
-```sh
-# This command DOES download weights. It is an admin action, never a mod action.
-ollama pull nomic-embed-text-v2-moe:latest
-curl --fail http://127.0.0.1:11434/api/tags
-curl --fail http://127.0.0.1:11434/api/embed \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"nomic-embed-text-v2-moe:latest","input":"search_document: block minecraft:oak_log. minecraft oak log.","truncate":false}'
-```
+Resolution order:
 
-The verified official default manifest digest is
-`ff9c2f10ef5e3722623a1b396e1e04efc27a93112c83e9b7b7b9ca1d05620965`.
-It was verified against the [official registry manifest](https://registry.ollama.ai/v2/library/nomic-embed-text-v2-moe/manifests/latest)
-without downloading weights. If the moving `latest` tag changes, readiness
-**fails** until an administrator deliberately selects an approved revision;
-changing the revision also changes the fingerprint and requires rebuilding.
-Do not overwrite/reload model tags during a server session. Digest checks before
-and after inference reject observed tag changes; an HTTP deployment is trusted
-to actually serve the declared model. Prefer a stable private deployment.
+1. Explicit `mysticism.embedding.modelPath` (exact GGUF; never downloaded/overwritten).
+2. Existing `~/.ollama/models/blobs/sha256-<GGUF SHA256>` (weights only; no Ollama process).
+3. `~/.cache/mysticism/models/sha256-<GGUF SHA256>.gguf` (download if missing, unless disabled).
 
-Java system properties (supply before `-jar`, before mod classes load):
+First use therefore requires internet access **or** a preprovisioned exact file,
+about 958 MB disk space, and sufficient native memory. Build/test never downloads
+model weights. Native runtime selection/CPU support is platform-dependent; no
+fallback model is used on unsupported platforms. JNI extraction uses a private
+temporary directory rather than cleaning a shared system temp root.
 
-| Property | Default | Contract |
+## JVM properties (set before mod classes load)
+
+| Property | Default | Purpose |
 |---|---|---|
-| `mysticism.embedding.endpoint` | `http://127.0.0.1:11434/` | HTTP(S) base URL; path prefixes allowed; no credentials/query/fragment; redirects disabled |
-| `mysticism.embedding.model` | `nomic-embed-text-v2-moe:latest` | Approved v2-MoE model/tag or a compatible alias; **not** a selector for MiniLM/v1.5/other embedding families |
-| `mysticism.embedding.revision` | digest above | Exact full lowercase SHA256 Ollama manifest digest; tokenizer identity is included in that manifest |
-| `mysticism.embedding.connectTimeoutMillis` | `2000` | 1..120000 |
-| `mysticism.embedding.requestTimeoutMillis` | `10000` | 1..120000 per HTTP operation |
-| `mysticism.embedding.deadlineMillis` | `30000` | 1..120000 total queue + inference/readiness deadline |
-| `mysticism.embedding.workers` | `2` | 1..32 |
+| `mysticism.embedding.provider` | `embedded` | `ollama` explicitly opts into legacy HTTP deployment; an endpoint alone cannot select it |
+| `mysticism.embedding.modelPath` | resolution above | Offline/preprovisioned exact GGUF |
+| `mysticism.embedding.download` | `true` | Allow first-use pinned blob download; ignored for an explicit modelPath |
+| `mysticism.embedding.nativeThreads` | up to 4, leaving one CPU | 1..32 native CPU threads; inference on one context is serialized |
+| `mysticism.embedding.workers` | `2` | 1..32 async workers |
+| `mysticism.embedding.deadlineMillis` | `30000` | 1..120000 total queue + inference deadline |
+| `mysticism.embedding.preparationDeadlineMillis` | `900000` embedded / `30000` HTTP | 1..900000 preparation budget, separate from request deadlines |
+| `mysticism.embedding.model` | v2 identity above | Compatibility identity, **not** an arbitrary local model selector |
+| `mysticism.embedding.revision` | manifest above | Full immutable manifest digest |
 
-For example, append these JVM options to your existing Java 21 Fabric server launch:
+An offline IntelliJ VM-options example:
 
 ```text
--Dmysticism.embedding.endpoint=http://127.0.0.1:11434/ -Dmysticism.embedding.model=nomic-embed-text-v2-moe:latest -Dmysticism.embedding.revision=ff9c2f10ef5e3722623a1b396e1e04efc27a93112c83e9b7b7b9ca1d05620965
+-Dmysticism.embedding.modelPath=/absolute/path/to/the-pinned-v2.gguf -Dmysticism.embedding.download=false
 ```
 
-All clients and the server must use the same model/revision/profile properties.
-Clients do not need a local inference service. The model/revision are a
-compatibility contract, not secrets. Remote inference sends descriptors to that
-service; choose a trusted endpoint/network. There is no authentication-header
-configuration. Endpoint changes alone do not change vector identity.
+No options or server process are needed when automatic provisioning is allowed.
+Client/server model and revision must agree, because they determine the vector
+fingerprint. Clients do not execute inference for authoritative server state.
 
-Absent HTTP deployment, missing/wrong model, malformed response, zero/nonfinite
-vectors, context overflow or timeout leave the Minecraft server usable and
-explicitly report unavailable embeddings. Startup never joins inference.
-Readiness is a real digest + embedding health probe, not just an executor flag.
-Requests made before readiness fail immediately; callers can compose readiness.
-Readiness is a startup snapshot, not continuous monitoring. Requests recheck the
-model digest and return exceptional futures on subsequent failures. Reprovision
-and restart the server to retry failed startup readiness.
+For an intentionally remote deployment use `-Dmysticism.embedding.provider=ollama`
+and optionally `-Dmysticism.embedding.endpoint=http://127.0.0.1:11434/`.
+That provider verifies the manifest via `/api/tags`, submits `/api/embed` with
+`truncate:false`, verifies the response identity, and requires all 768 native
+coordinates. It is not an automatic fallback when local preparation fails.
 
-## Public APIs for downstream landmark/activity owners
+## Semantic/lifecycle contract
 
-Packages are `io.github.mysticism.embedding` and `.vector`.
+`EmbeddingSpace` remains schema 2, descriptor version 2, **768 native dimensions**.
+The exact GGUF tokenizer counts `search_document: ` plus descriptor and special
+tokens. More than 512 tokens fails explicitly before inference. Descriptors must
+be nonblank and at most 8192 Java characters; this is a separate input bound, not
+a token estimator. The provider uses mean pooling and L2 normalization, retains
+coordinate 767, and rejects missing/nonfinite/zero/wrong-sized outputs. Model and
+tokenizer identity, pooling, prefix, dimension, normalization, and descriptor
+version participate in the existing fingerprint. Equal dimensions do not imply
+compatible semantics. No v1 migration or first-256 reduction is performed.
 
 * `EmbeddingSpace.DIMENSIONS = 768`, `NATIVE_DIMENSIONS = 768`, `SCHEMA = 2`,
   `DESCRIPTOR_VERSION = 2`; `FINGERPRINT` is SHA256 of
@@ -249,31 +250,30 @@ fallback or prefix that may be applied to v2 vectors.
 
 ## Checks and reproducibility
 
-No new test framework/dependencies are required. Run the pure vector/index/cache/
-weighted/provider/HTTP-stub regressions with Java 21 and existing Gson/DJL jars:
+The canonical Java 21 build runs all discovered current runtime suites and packaging checks:
 
 ```sh
-python3 tools/check-embeddings.py
+./gradlew --no-daemon --console=plain build
 ```
 
-It never installs/resolves dependencies or downloads models. If necessary, point
-`MYSTICISM_TEST_CLASSPATH` at **existing** Gson + DJL API jars. Minecraft NBT/CCA/
-packet regressions and the pure suite can also be run on Loom's runtime classpath:
+The canonical build discovers **all** current main-based runtime suites and runs
+packaging/verifier suites. Embedded tests cover default selection, lifecycle,
+serialized inference/context release, late-load cancellation, actual token-limit
+contract, full-coordinate retention, pinned provenance, local HTTP/file integrity,
+atomic cache reuse and bundled JNI ABI loading. Fixture vectors exist only inside
+tests; these checks are not a real model forward pass or a Minecraft launch.
+
+Real inference is a separate explicit task, not a silently skipped test:
 
 ```sh
-/path/to/existing/gradle --no-daemon -I tools/embedding-tests.gradle \
-  embeddingPipelineRegression embeddingPersistenceRegression build
+# Existing exact GGUF (offline):
+./gradlew --no-daemon --console=plain embeddedInferenceProbe -PembeddingModelPath=/absolute/path/to/exact-v2.gguf
+# Explicitly download the pinned weights into this checkout's ignored build directory:
+./gradlew --no-daemon --console=plain embeddedInferenceProbe -PembeddingProvision=true
 ```
 
-The optional init script only adds test tasks; it does not override dependencies
-or plugin versions and is project-local, deliberately outside chezmoi.
-`gradle test` alone does not execute these standalone main-based regression suites.
-
-Validation environment limitation: the project pins Loom `1.11-SNAPSHOT`, which
-currently requires Gradle >=8.14, while the supplied binary is Gradle 8.13. The
-unmodified configured build fails during plugin resolution. Implementation checks
-used a **temporary, uncommitted** init script mapping Loom to `1.10.5` with the
-existing Gradle 8.13 binary; no Gradle software was installed. This is diagnostic
-compatibility validation, not proof that the original pinned build succeeds.
-Live inference/model quality and a running Minecraft server were not exercised;
-HTTP and migration behavior are covered by deterministic local stubs/real NBT.
+The probe verifies the SHA256/size, runs actual JNI tokenizer/forward passes,
+checks repeated inference, nonidentical descriptor outputs, all 768 coordinates,
+normalization, async readiness, cache ownership and real token-overflow rejection.
+Its endpoint is intentionally unreachable. It reports observed cosine values,
+not Minecraft-corpus quality, gameplay verification, or cross-platform results.
