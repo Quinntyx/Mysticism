@@ -10,6 +10,7 @@ uniform vec3 CameraModulo;
 uniform float OpaqueRadius;
 uniform float MinExtinction;
 uniform int FogSteps;
+uniform int FogEnabled;
 in vec2 texCoord;
 out vec4 fragColor;
 
@@ -42,6 +43,8 @@ float occupancy(vec3 offset) {
 
 void main() {
     vec4 scene = texture(DiffuseSampler, texCoord);
+    // Exact color/alpha bypass; do not reconstruct depth or sample the medium when off.
+    if (FogEnabled == 0) { fragColor = scene; return; }
     // texelFetch avoids interpolation of unrelated near/far surfaces at silhouettes.
     ivec2 size = textureSize(DepthSampler, 0);
     ivec2 pixel = clamp(ivec2(texCoord * vec2(size)), ivec2(0), size - ivec2(1));

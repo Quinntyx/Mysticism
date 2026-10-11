@@ -13,6 +13,7 @@
     {"name": "HasOccupancy", "type": "int", "count": 1, "values": [0]},
     {"name": "OccupancyCameraOffset", "type": "float", "count": 3, "values": [0,0,0]},
     {"name": "MinExtinction", "type": "float", "count": 1, "values": [0.11708060]},
-    {"name": "FogSteps", "type": "int", "count": 1, "values": [40]}
+    {"name": "FogSteps", "type": "int", "count": 1, "values": [40]},
+    {"name": "FogEnabled", "type": "int", "count": 1, "values": [1]}
   ]
 }
