@@ -47,6 +47,7 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
     private ScheduledFuture<?> readyDeadline;
     private Throwable readinessError;
     private boolean closed, ready, readinessTerminal;
+    private final java.util.concurrent.atomic.AtomicBoolean providerClosed = new java.util.concurrent.atomic.AtomicBoolean();
     private static final class Request {
         final List<Subscriber<Vec384f>> subscribers = new ArrayList<>();
         Runnable task;
@@ -55,6 +56,14 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
 
     public AsyncEmbeddingEngine(EmbeddingProvider provider, int threads, int queueCapacity,
                                 int cacheCapacity, Duration deadline) {
+        this(provider, threads, queueCapacity, cacheCapacity, deadline, deadline);
+    }
+    /** Separate bounded preparation budget for first-run local asset provisioning/loading.
+     * Queue + inference deadlines remain short and retain their original semantics. */
+    public AsyncEmbeddingEngine(EmbeddingProvider provider, int threads, int queueCapacity,
+                                int cacheCapacity, Duration deadline, Duration preparationDeadline) {
+        if (preparationDeadline.toMillis() < 1 || preparationDeadline.toMillis() > 900000)
+            throw new IllegalArgumentException("Invalid embedding preparation deadline");
         if (threads < 1 || threads > 32 || queueCapacity < 1 || queueCapacity > 4096
                 || cacheCapacity < 1 || cacheCapacity > 65536 || deadline.isZero() || deadline.isNegative()
                 || deadline.toMillis() < 1 || deadline.toMillis() > 120000)
@@ -66,7 +75,7 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
                 new ThreadPoolExecutor.AbortPolicy());
         timer = new ScheduledThreadPoolExecutor(1, r -> daemon(r, "Mysticism-EmbedDeadline"));
         timer.setRemoveOnCancelPolicy(true);
-        readyDeadline = timer.schedule(() -> finishReadiness(new TimeoutException("Embedding readiness deadline")), deadlineMillis, TimeUnit.MILLISECONDS);
+        readyDeadline = timer.schedule(() -> finishReadiness(new TimeoutException("Embedding readiness deadline")), preparationDeadline.toMillis(), TimeUnit.MILLISECONDS);
         workers.execute(() -> {
             try { provider.checkReady(); finishReadiness(null); }
             catch (Throwable error) { finishReadiness(error); }
@@ -84,6 +93,12 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
             subscribers = List.copyOf(readySubscribers); readySubscribers.clear();
         }
         for (var subscriber : subscribers) publish(subscriber, null, error);
+        if (error != null) {
+            workers.shutdownNow();
+            // Failure/timeout must cancel preparation and release an eventual native context.
+            // Provider cleanup cannot stall the deadline or subscriber delivery threads.
+            CompletableFuture.runAsync(this::closeProvider);
+        }
     }
     public CompletableFuture<Void> readiness() {
         Subscriber<Void> subscriber = null; boolean terminal; Throwable error;
@@ -170,6 +185,9 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
         workers.shutdownNow(); timer.shutdownNow();
         for (var subscriber : readyCancelled) publish(subscriber, null, error);
         for (Request request : cancelled) for (var subscriber : request.subscribers) publish(subscriber, null, error);
-        provider.close();
+        closeProvider();
+    }
+    private void closeProvider() {
+        if (providerClosed.compareAndSet(false, true)) provider.close();
     }
 }
