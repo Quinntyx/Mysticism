@@ -1,5 +1,8 @@
 # Wave 2 client volumetrics handoff
 
+Current composition follow-up: [runtime-postprocess-composition-handoff.md](runtime-postprocess-composition-handoff.md)
+supersedes this historical document's fog-first ordering and constant-extinction model.
+
 ## Parent registrations (not edited here)
 
 Existing `MysticismClient` calls remain valid/idempotent: `SpiritWorldRenderer.init()` now

@@ -21,7 +21,7 @@ import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL30;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 
-/** One scene-depth snapshot, one volumetric integration, then painterly + saturation. */
+/** One scene-depth snapshot: painterly terrain, one volumetric integration, saturation, transition. */
 public final class ShaderManager {
     private static final Logger LOGGER = LoggerFactory.getLogger("Mysticism/SpiritRendering");
     private static final Identifier SPIRIT = Identifier.of("mysticism", "spirit");
@@ -51,6 +51,7 @@ public final class ShaderManager {
             updateSession(client);
             frameReady = false;
             depthReady = false;
+            fogHookSeen = false; // each prepared world frame must actually bypass analytic fog
             meshDepthSeen=false;
             if (sessionWorld == null || !targetActive && effectStrength()<=.001f || failed) return;
             try {
@@ -190,9 +191,10 @@ public final class ShaderManager {
         if (!inSpiritWorld()) return;
         fogHookSeen = true;
         if(effectStrength()<=.001f)return;
-        // During source-scene fade retain source fog; once fully in spirit there is ONLY
-        // participating-medium fog. The transition layer is zero at entry, not an abrupt filter.
-        if (frameReady && !failed && effectStrength()>=.999f) {
+        // The transformed branch needs unfogged terrain even DURING the crossfade; otherwise
+        // it receives analytic + volumetric fog. OriginalSampler already holds the source scene
+        // with its original fog. Transition mixes that snapshot with the completed effect once.
+        if (SpiritRenderSettings.useVolumetricFog(frameReady, failed, effectStrength())) {
             RenderSystem.setShaderFogStart(Float.MAX_VALUE / 4);
             RenderSystem.setShaderFogEnd(Float.MAX_VALUE / 2);
         } else if (!frameReady || failed) {
@@ -279,6 +281,7 @@ public final class ShaderManager {
     private static void release() {
         frameReady = false;
         depthReady = false;
+        fogHookSeen = false;
         SpiritMediumTexture.resetGpu();
         SpiritRenderLayers.clear();
         if (sceneDepth != null) {
