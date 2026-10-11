@@ -496,6 +496,7 @@ public final class SpiritTerrainService {
         var players=server.getPlayerManager().getPlayerList();
         for(var p:players) {
             Session s=c.sessions.get(p.getUuid());if(s==null)continue;
+            s.distortionTick=c.tick;
             if(!p.getWorld().getRegistryKey().equals(WORLD)){if(c.tick-s.created>100)cancelEnter(p);continue;}
             try {
                 if(s.shallow) {
@@ -555,6 +556,9 @@ public final class SpiritTerrainService {
             for(Window w:s.regions.values())if(w!=closest && w!=s.local && w!=s.target && !w.id.equals(s.local.id))append(p,s,w,materials,palette,cells,keys,producers,128,observer);
         }
         var stitched=MeshStitcher.stitch(cells,materials,s.local.id,s.shallow,p.getPos());
+        // Stitch first, then deform per actual producer; one shared frame drives render/collision/support.
+        long seed=p.getUuid().getMostSignificantBits()^Long.rotateLeft(p.getUuid().getLeastSignificantBits(),23);
+        stitched=DeepDistortion.apply(stitched,producers,s.shallow,p.getPos(),s.distortionTick,seed);
         Set<Long> retained=new HashSet<>();for(var cell:stitched)retained.add(cell.key());producers.keySet().retainAll(retained);
         return new BuiltMesh(new TerrainMeshFrame(revision,s.shallow,s.local.dimension,s.local.origin,s.carrier,materials,stitched),Map.copyOf(producers));
     }
@@ -584,7 +588,8 @@ public final class SpiritTerrainService {
             String actualOwner=node.ownerId();long key=SourceMeshBuilder.key(actualOwner.isEmpty()?"unknown:"+w.dimension:actualOwner,source,side);
             if(!keys.add(key))continue;
             float alpha=aligned?1:w.alpha;
-            cells.add(new TerrainMeshFrame.Cell(key,material,actualOwner,source,min,new Vec3d(side,side,side),ex,ey,ez,tile.color(),tile.light(),alpha,tile.collision()));producers.put(key,w);count++;
+            cells.add(new TerrainMeshFrame.Cell(key,material,actualOwner,source,min,new Vec3d(side,side,side),ex,ey,ez,tile.color(),tile.light(),alpha,tile.collision()));
+            producers.put(key,w);count++;
         }
     }
     private static Vec3d axis(Vec384f source,Basis384f observer){return new Vec3d(source.dot(observer.i),source.dot(observer.j),source.dot(observer.k));}
@@ -630,6 +635,7 @@ public final class SpiritTerrainService {
         final Map<String,Window> regions=new LinkedHashMap<>();final MeshRepresentatives selection=new MeshRepresentatives();
         final Map<String,Window> prepared=new LinkedHashMap<>();
         String scanCursor,status,closestId="";int dimensionCursor,regionCursor;boolean scanning;Set<String> selected=Set.of();
+        long distortionTick; // Slow deep-mode semantic distortion phase; render and collision share the same deformed cells.
         Session(Window local,Vec3d carrier){this.local=local;this.carrier=carrier;}
         void cancel(){if(ownerFuture!=null)ownerFuture.cancel(false);if(sourceFuture!=null)sourceFuture.cancel(false);if(targetFuture!=null)targetFuture.cancel(false);if(targetOwnerFuture!=null)targetOwnerFuture.cancel(false);if(walkFuture!=null)walkFuture.cancel(false);cancelWindow(local);if(target!=null)cancelWindow(target);for(var w:regions.values())cancelWindow(w);for(var w:prepared.values())cancelWindow(w);regions.clear();prepared.clear();}
     }
