@@ -129,7 +129,7 @@ public final class SpiritTerrainService {
                 s.local.semantic=q(p).sub(s.local.sourceBasis.i.clone().mul((float)(delta.x/SCALE)))
                         .sub(s.local.sourceBasis.j.clone().mul((float)(delta.y/SCALE))).sub(s.local.sourceBasis.k.clone().mul((float)(delta.z/SCALE)));
             }
-            s.shallow=shallow;publish(p,s,true);
+            s.shallow=shallow;if(shallow)s.shallowTicks=0;publish(p,s,true);
         }
     }
     public static Optional<SourcePosition> sourcePosition(ServerPlayerEntity p) {
@@ -277,7 +277,7 @@ public final class SpiritTerrainService {
         if(s.sourceFuture!=null)s.sourceFuture.cancel(false);if(s.ownerFuture!=null)s.ownerFuture.cancel(false);
         if(previous.ownershipFuture!=null)previous.ownershipFuture.cancel(false);
         s.walkProbe=null;s.walkField=0;if(s.walkFuture!=null)s.walkFuture.cancel(false);
-        confirmTargetFade(s);return true;
+        s.shallowTicks=0;confirmTargetFade(s);return true;
     }
     public static boolean exit(ServerPlayerEntity p) {
         Optional<SourcePosition> mapped=sourcePosition(p);if(mapped.isEmpty() || !p.getWorld().getRegistryKey().equals(WORLD))return false;
@@ -356,9 +356,9 @@ public final class SpiritTerrainService {
         var ground=MeshCollision.ground(p);
         if(ground.isEmpty() || !ground.get().cell().landmarkId().equals(target.id) || origin(p,s,target).distanceTo(p.getPos())>.001)return false;
         // At subpixel/physics epsilon alignment only. Physical carrier is unchanged; source origin is the exact captured pose.
-        Window previous=s.local;Vec3d previousCarrier=s.carrier;
-        s.local=target;s.carrier=p.getPos();s.shallow=true;target.owner=metadata.get();
-        if(!publish(p,s,true)){s.local=previous;s.carrier=previousCarrier;s.shallow=false;return false;}
+        Window previous=s.local;Vec3d previousCarrier=s.carrier;int previousShallowTicks=s.shallowTicks;
+        s.local=target;s.carrier=p.getPos();s.shallow=true;s.shallowTicks=0;target.owner=metadata.get();
+        if(!publish(p,s,true)){s.local=previous;s.carrier=previousCarrier;s.shallow=false;s.shallowTicks=previousShallowTicks;return false;}
         if(s.sourceFuture!=null)s.sourceFuture.cancel(false);s.sourceFuture=null;s.ingesting=null;s.sourceRequested=null;
         if(s.ownerFuture!=null)s.ownerFuture.cancel(false);
         p.setVelocity(Vec3d.ZERO);p.fallDistance=0;return true;
@@ -567,6 +567,8 @@ public final class SpiritTerrainService {
         boolean aligned=w==s.local && s.shallow;Vec3d root;
         if(aligned)root=s.carrier;else {Vec384f delta=w.semantic.clone().sub(q(p));root=p.getPos().add(delta.dot(current.i)*SCALE,delta.dot(current.j)*SCALE,delta.dot(current.k)*SCALE);}
         Vec3d ax=aligned?new Vec3d(1,0,0):axis(w.sourceBasis.i,current),ay=aligned?new Vec3d(0,1,0):axis(w.sourceBasis.j,current),az=aligned?new Vec3d(0,0,1):axis(w.sourceBasis.k,current);
+        Map<String,Vec3d> shallowShifts=new HashMap<>();
+        double shallowStrength=aligned && s.anchorDelivered?Math.min(1,s.shallowTicks/40.0):0;
         int count=0;
         for(var node:w.nodes) {
             if(count>=limit || cells.size()>=TerrainMeshFrame.MAX_CELLS)break;
@@ -584,8 +586,24 @@ public final class SpiritTerrainService {
             String actualOwner=node.ownerId();long key=SourceMeshBuilder.key(actualOwner.isEmpty()?"unknown:"+w.dimension:actualOwner,source,side);
             if(!keys.add(key))continue;
             float alpha=aligned?1:w.alpha;
-            cells.add(new TerrainMeshFrame.Cell(key,material,actualOwner,source,min,new Vec3d(side,side,side),ex,ey,ez,tile.color(),tile.light(),alpha,tile.collision()));producers.put(key,w);count++;
+            TerrainMeshFrame.Cell cell=new TerrainMeshFrame.Cell(key,material,actualOwner,source,min,new Vec3d(side,side,side),ex,ey,ez,tile.color(),tile.light(),alpha,tile.collision());
+            if(shallowStrength>0 && !actualOwner.isEmpty()) {
+                Vec3d shift=shallowShifts.computeIfAbsent(actualOwner,id->shallowShift(p,s,w,id,current));
+                cell=ShallowTerrainProjection.distort(cell,shift,p.getPos(),shallowStrength);
+            }
+            cells.add(cell);producers.put(key,w);count++;
         }
+    }
+    private static Vec3d shallowShift(ServerPlayerEntity p,Session s,Window w,String id,Basis384f observer) {
+        var metadata=LandmarkStore.get(p.getServer()).metadata(id);
+        if(metadata.isEmpty() || !metadata.get().header().dimension().equals(w.dimension))return Vec3d.ZERO;
+        var owner=metadata.get();var anchor=owner.header().anchor();
+        Vec3d offset=w.origin.subtract(anchor.x(),anchor.y(),anchor.z());
+        Vec384f location=SpiritActivityService.effectiveEmbedding(p.getServer(),owner).vector()
+                .add(w.sourceBasis.i.clone().mul((float)(offset.x/SCALE)))
+                .add(w.sourceBasis.j.clone().mul((float)(offset.y/SCALE)))
+                .add(w.sourceBasis.k.clone().mul((float)(offset.z/SCALE)));
+        return ShallowTerrainProjection.displacement(location,q(p),observer,p.getPos(),s.carrier);
     }
     private static Vec3d axis(Vec384f source,Basis384f observer){return new Vec3d(source.dot(observer.i),source.dot(observer.j),source.dot(observer.k));}
     private static boolean publish(ServerPlayerEntity p,Session s,boolean force) {
@@ -629,7 +647,7 @@ public final class SpiritTerrainService {
         TerrainMeshFrame frame;Map<Long,Window> frameProducers=Map.of();CompletableFuture<?> ownerFuture,sourceFuture,targetFuture,targetOwnerFuture,walkFuture;Iterator<SourceLandmarks.Cell> ingesting;
         final Map<String,Window> regions=new LinkedHashMap<>();final MeshRepresentatives selection=new MeshRepresentatives();
         final Map<String,Window> prepared=new LinkedHashMap<>();
-        String scanCursor,status,closestId="";int dimensionCursor,regionCursor;boolean scanning;Set<String> selected=Set.of();
+        String scanCursor,status,closestId="";int dimensionCursor,regionCursor,shallowTicks;boolean scanning;Set<String> selected=Set.of();
         Session(Window local,Vec3d carrier){this.local=local;this.carrier=carrier;}
         void cancel(){if(ownerFuture!=null)ownerFuture.cancel(false);if(sourceFuture!=null)sourceFuture.cancel(false);if(targetFuture!=null)targetFuture.cancel(false);if(targetOwnerFuture!=null)targetOwnerFuture.cancel(false);if(walkFuture!=null)walkFuture.cancel(false);cancelWindow(local);if(target!=null)cancelWindow(target);for(var w:regions.values())cancelWindow(w);for(var w:prepared.values())cancelWindow(w);regions.clear();prepared.clear();}
     }
@@ -752,6 +770,7 @@ public final class SpiritTerrainService {
             w.ready=!w.nodes.isEmpty();w.replacing=false;
         }
         void animate(ServerPlayerEntity p,Session s) {
+            if(s.shallow && s.anchorDelivered && s.shallowTicks<40)s.shallowTicks++;
             double radius=MeshRepresentatives.RADIUS*MeshRepresentatives.RADIUS;Vec384f now=q(p);
             for(Window w:s.regions.values()) {
                 boolean protectedBody=protectedNear(p,s,w),eligible=!w.retired && s.selected.contains(w.id) && w.semantic.squareDistance(now)<radius;
