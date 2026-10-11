@@ -336,14 +336,32 @@ lineage. Never publish topology with a sequence of independent `stagePut` calls.
 `stageActivity()` retains opaque references and CAS-updates activity/claims without leaf
 reconstruction; each retained reference still consumes one bounded advance operation.
 
-Save key is `mysticism.landmarks.v1`. Geometry versions and landmark metadata versions are
-independent immutable PersistentStates, keyed `mysticism.landmark.geometry.<id>.<revision>`
-and `mysticism.landmark.record.<id>.<CAS revision>.<canonical-NBT SHA-256>`. The digest
+Save key is `mysticism.landmarks.source-v2`; the previous v1 catalogue is not imported.
+Compatible native source-v2 discoveries remain authoritative across normal save/load.
+Startup still requires `sourceGeneration=2` and the current pinned native embedding profile;
+an incompatible/missing generation requires actual rediscovery, not fabricated legacy entries.
+
+Geometry versions and landmark metadata versions are independent immutable PersistentStates,
+keyed `mysticism.landmark.geometry.<id>.<revision>.e-<geometryEpoch>` and
+`mysticism.landmark.record.<id>.<CAS revision>.<canonical-NBT SHA-256>`. The optional
+manifest `geometryEpoch` is 32 lowercase UUID hex digits. A fresh-profile reset allocates and
+persists a new epoch, clears old catalogue/alias/retirement/lineage/cache references and
+invalidates active geometry reads. This isolates revision-zero rediscovery from old immutable
+pages without changing source seeds, anchors or octree page IDs, or overwriting/deleting files.
+Existing compatible native source-v2 manifests without an epoch and their bare geometry keys
+remain readable/writable unchanged: this is not v1 profile migration. Namespace/type corruption
+fails rather than silently dropping discoveries. Activity/topology code must use
+`store.geometryReferences(SourceGeometry)` for exact new-publication storage keys, not
+construct keys itself. Bounded readers and topology validation verify page ID/revision even
+when the requested range skips a page; namespaced keys cannot bypass identity checks.
+The metadata digest
 recursively sorts compound keys, preserves list order, and includes typed primitive bytes.
 Cancelled attempts at the same committed CAS revision therefore never reserve or overwrite
 another metadata version, including after save/restart. Legacy revision-only record keys
 remain readable; new writes always use content addressing and verify the referenced digest.
-Geometry versions remain extractor-assigned and immutable: changed masks need new versions.
+Within a generation, geometry versions remain extractor-assigned and immutable: changed
+masks need new versions. Old/unreferenced generations remain on disk for future explicit
+compaction; vanilla PersistentState saves are not cross-file crash transactions.
 Metadata refs are limited to 4096 geometry
 pages, 4096 frontiers, and 256 claims; excessive metadata must be partitioned upstream and
 is rejected, never silently truncated. Metadata is encoded to derive its key during staging;

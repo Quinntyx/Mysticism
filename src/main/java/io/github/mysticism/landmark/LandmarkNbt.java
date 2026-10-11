@@ -81,7 +81,7 @@ public final class LandmarkNbt {
             tree=SparseOctree.empty(getBounds(n,"root"),n.getInt("resolution"),number(n,"maxSide"));
             leaves=list(n,"leaves",NbtElement.COMPOUND_TYPE,GeometryPage.MAX_LEAVES);
         }
-        String key() { return "mysticism.landmark.geometry."+id+"."+revision; }
+        boolean matchesReference(String key) { return geometryReferenceMatches(key,id,revision); }
         Bounds bounds() { return bounds; }
         BlockPalette palette() { return palette; }
         public int advance(int maxLeaves) { return advance(maxLeaves,null); }
@@ -126,10 +126,19 @@ public final class LandmarkNbt {
         LandmarkMetadata metadata=decodeMetadata(n);
         return hydrate(metadata,metadata.geometryKeys().stream().map(geometryLoader).toList());
     }
+    // The optional epoch is storage identity only. Unnamespaced native source-v2 pages
+    // remain readable without rewriting them; this never admits a legacy profile.
+    static boolean isGeometryReference(String key) {
+        return key.matches("mysticism[.]landmark[.]geometry[.]lm-[0-9a-f]{64}[.][0-9]+([.]e-[0-9a-f]{32})?");
+    }
+    static boolean geometryReferenceMatches(String key,String id,long revision) {
+        String base="mysticism.landmark.geometry."+id+"."+revision;
+        return key.equals(base) || key.startsWith(base+".e-") && isGeometryReference(key);
+    }
     public static Landmark hydrate(LandmarkMetadata metadata,List<GeometryPage> pages) {
         Landmark l=metadata.header();
         if(pages.size()!=metadata.geometryKeys().size()) throw new IllegalArgumentException("page count");
-        for(int i=0;i<pages.size();i++) if(!metadata.geometryKeys().get(i).equals("mysticism.landmark.geometry."+pages.get(i).id()+"."+pages.get(i).revision()))
+        for(int i=0;i<pages.size();i++) if(!geometryReferenceMatches(metadata.geometryKeys().get(i),pages.get(i).id(),pages.get(i).revision()))
             throw new IllegalArgumentException("page reference mismatch");
         return new Landmark(l.id(),l.dimension(),l.algorithmVersion(),l.kind(),l.biome(),l.anchor(),l.bounds(),l.baseEmbedding(),l.baseImportance(),l.activity(),l.ownership(),new SourceGeometry(pages,l.geometry().frontiers()),l.revision(),l.provenance());
     }
