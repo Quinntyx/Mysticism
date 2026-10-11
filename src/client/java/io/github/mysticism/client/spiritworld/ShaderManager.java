@@ -38,21 +38,32 @@ public final class ShaderManager {
     private static float transitionFrom;
     private static boolean initialized, failed, frameReady, depthReady, fogHookSeen;
     private static boolean missingHookReported;
-    private static SpiritRenderSettings.Quality quality = initialQuality();
-    private static String status = "starting";
+    private static String failureReason = "shader failed";
+    private static final SpiritVisualControls controls = new SpiritVisualControls(initialQuality());
+    private static SpiritVisualControls.Passes framePasses = controls.settings().passes(0);
 
     private ShaderManager() {}
 
     public static void init() {
         if (initialized) return;
         initialized = true;
+        SpiritVisualCommands.init();
         WorldRenderEvents.START.register(context -> {
             MinecraftClient client = MinecraftClient.getInstance();
             updateSession(client);
             frameReady = false;
             depthReady = false;
             meshDepthSeen=false;
-            if (sessionWorld == null || !targetActive && effectStrength()<=.001f || failed) return;
+            boolean sceneActive = sessionWorld != null && (targetActive || effectStrength() > .001f);
+            boolean waiting = sessionWorld != null && !sceneActive
+                    && sessionWorld.getRegistryKey().getValue().equals(SPIRIT);
+            framePasses = controls.beginFrame(sceneActive, waiting, (System.nanoTime() - enteredAt) * 1.0e-9);
+            if (!framePasses.anyEnabled() || !sceneActive) return;
+            if (failed) {
+                controls.fallback(failureReason + "; " + (framePasses.fog() && fogHookSeen ? "linear fog fallback selected" : "vanilla fog unchanged")
+                        + " (see log; /spiritvisual retry or F3+T)");
+                return;
+            }
             try {
                 Framebuffer main = client.getFramebuffer();
                 if (main.textureWidth <= 0 || main.textureHeight <= 0) return;
@@ -71,19 +82,21 @@ public final class ShaderManager {
                 KUWAHARA_SHADER.setUniformValue("InverseViewProjection", inverseViewProjection);
                 KUWAHARA_SHADER.setUniformValue("CameraModulo", SpiritRenderSettings.wrap(camera.x),
                         SpiritRenderSettings.wrap(camera.y), SpiritRenderSettings.wrap(camera.z));
-                int medium=SpiritMediumTexture.prepare();
+                int medium=framePasses.fog() ? SpiritMediumTexture.prepare() : 0;
                 KUWAHARA_SHADER.setUniformValue("HasOccupancy",medium==0?0:1);
-                if (medium!=0) KUWAHARA_SHADER.setSamplerUniform("OccupancySampler",medium);
+                // Clear Satin's cached texture ID too: off/on or reload may have deleted the old atlas.
+                KUWAHARA_SHADER.setSamplerUniform("OccupancySampler",medium);
                 var offset=SpiritMediumTexture.offset(camera);
                 KUWAHARA_SHADER.setUniformValue("OccupancyCameraOffset",(float)offset.x,(float)offset.y,(float)offset.z);
                 KUWAHARA_SHADER.setUniformValue("NearBubble",(float)SpiritRenderSettings.NEAR_BUBBLE);
                 KUWAHARA_SHADER.setUniformValue("EffectStrength",effectStrength());
                 KUWAHARA_SHADER.setUniformValue("OpaqueRadius", (float) SpiritRenderSettings.OPAQUE_RADIUS);
                 KUWAHARA_SHADER.setUniformValue("MinExtinction", (float) SpiritRenderSettings.MIN_EXTINCTION);
-                KUWAHARA_SHADER.setUniformValue("FogSteps", quality.fogSteps);
-                KUWAHARA_SHADER.setUniformValue("KernelRadius", quality.kernelRadius);
-                KUWAHARA_SHADER.setUniformValue("Saturation", SpiritRenderSettings.saturation(
-                        (System.nanoTime() - enteredAt) * 1.0e-9));
+                KUWAHARA_SHADER.setUniformValue("FogEnabled", framePasses.fog() ? 1 : 0);
+                KUWAHARA_SHADER.setUniformValue("KuwaharaEnabled", framePasses.kuwahara() ? 1 : 0);
+                KUWAHARA_SHADER.setUniformValue("FogSteps", framePasses.fogSteps());
+                KUWAHARA_SHADER.setUniformValue("KernelRadius", framePasses.kernelRadius());
+                KUWAHARA_SHADER.setUniformValue("Saturation", framePasses.saturationValue());
                 frameReady = true;
             } catch (RuntimeException exception) {
                 fail("preparing matrices/framebuffer", exception);
@@ -105,27 +118,38 @@ public final class ShaderManager {
             }
         });
         WorldRenderEvents.END.register(context -> {
+            if (!framePasses.anyEnabled()) return;
             if(!failed && !targetActive && effectStrength()<=.001f && sessionWorld!=null
                     && sessionWorld.getRegistryKey().getValue().equals(SPIRIT)) {
-                status="waiting for navigation/source mesh";
-                try {SpiritEntryScene.hold(MinecraftClient.getInstance());checkGl("holding entry scene");}
+                try {
+                    boolean held = SpiritEntryScene.hold(MinecraftClient.getInstance());
+                    controls.waiting(held);
+                    checkGl("holding entry scene");
+                }
                 catch(RuntimeException error){SpiritEntryScene.clear();fail("holding entry scene",error);}
             }
             if (!failed && !ClientSpiritCache.active() && effectStrength()<=.001f) {
                 try {SpiritEntryScene.capture(MinecraftClient.getInstance());checkGl("capturing source scene");}
                 catch(RuntimeException error) {SpiritEntryScene.clear();fail("source-scene snapshot",error);}
             }
-            if (!frameReady || !depthReady || sessionWorld == null) return;
-            frameReady = false;
-            depthReady = false; // consume the world frame once; never process menus/stale frames
-            if (!fogHookSeen) {
-                status = "fallback: parent must register SpiritBackgroundRendererMixin";
+            if (!frameReady || sessionWorld == null) return;
+            if (!depthReady) {
+                // A prepared shader is not evidence of a rendered frame. Stop suppressing native
+                // fog on subsequent frames if Fabric never supplied the required world-depth event.
+                fail("scene depth snapshot not observed", new IllegalStateException("AFTER_TRANSLUCENT did not supply scene depth"));
+                return;
+            }
+            if (framePasses.fog() && !fogHookSeen) {
+                frameReady = depthReady = false;
+                controls.fallback("fog hook not observed; postprocess skipped, vanilla fog unchanged");
                 if (!missingHookReported) {
                     missingHookReported = true;
-                    LOGGER.error("{}; refusing double-fog postprocess", status);
+                    LOGGER.error("{}; check SpiritBackgroundRendererMixin registration", controls.summary());
                 }
                 return;
             }
+            if (!framePasses.canRender(frameReady, depthReady, failed, fogHookSeen)) return;
+            frameReady = depthReady = false; // consume once; never process menus/stale frames
             MinecraftClient client = MinecraftClient.getInstance();
             Framebuffer main = client.getFramebuffer();
             try {
@@ -141,8 +165,6 @@ public final class ShaderManager {
                 KUWAHARA_SHADER.setSamplerUniform("DepthSampler", sceneDepth.getDepthAttachment());
                 KUWAHARA_SHADER.render(context.tickCounter().getTickDelta(false));
                 checkGl("executing postprocess");
-                status = "volumetric " + quality.name().toLowerCase(java.util.Locale.ROOT)
-                        + (meshDepthSeen ? " + mesh depth" : " (awaiting custom mesh)");
             } catch (RuntimeException exception) {
                 fail("rendering Satin chain", exception);
             } finally {
@@ -158,16 +180,17 @@ public final class ShaderManager {
                 RenderSystem.depthMask(true);
                 RenderSystem.enableDepthTest();
             }
+            if (!failed) controls.markApplied(framePasses, meshDepthSeen);
         });
         ClientTickEvents.END_CLIENT_TICK.register(ShaderManager::updateSession);
-        ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {release();SpiritMediumTexture.clear();SpiritEntryScene.clear();});
-        ClientPlayConnectionEvents.DISCONNECT.register((handler,client)->{release();SpiritMediumTexture.clear();SpiritEntryScene.clear();});
-        SpiritRenderReload.register(Identifier.of("mysticism","spirit_postprocess"),()->{release();SpiritEntryScene.clear();failed=false;});
+        ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {release();SpiritMediumTexture.clear();SpiritEntryScene.clear();controls.inactive();});
+        ClientPlayConnectionEvents.DISCONNECT.register((handler,client)->{release();SpiritMediumTexture.clear();SpiritEntryScene.clear();controls.inactive();});
+        SpiritRenderReload.register(Identifier.of("mysticism","spirit_postprocess"),ShaderManager::retry);
         HudRenderCallback.EVENT.register((draw, counter) -> {
             if (sessionWorld != null && (effectStrength()>.001f || sessionWorld.getRegistryKey().getValue().equals(SPIRIT))
-                    && (!status.startsWith("volumetric") || failed))
+                    && controls.state() != SpiritVisualControls.State.APPLIED)
                 draw.drawTextWithShadow(MinecraftClient.getInstance().textRenderer,
-                        Text.literal("Spirit rendering: " + status), 6, 6, 0xffffcc66);
+                        Text.literal(controls.hudStatus()), 6, 6, 0xffffcc66);
         });
     }
 
@@ -189,31 +212,59 @@ public final class ShaderManager {
     public static void applySpiritFog() {
         if (!inSpiritWorld()) return;
         fogHookSeen = true;
-        if(effectStrength()<=.001f)return;
-        // During source-scene fade retain source fog; once fully in spirit there is ONLY
-        // participating-medium fog. The transition layer is zero at entry, not an abrupt filter.
-        if (frameReady && !failed && effectStrength()>=.999f) {
-            RenderSystem.setShaderFogStart(Float.MAX_VALUE / 4);
-            RenderSystem.setShaderFogEnd(Float.MAX_VALUE / 2);
-        } else if (!frameReady || failed) {
-            float s=effectStrength();
-            RenderSystem.setShaderFogStart(RenderSystem.getShaderFogStart()*(1-s)+(float)SpiritRenderSettings.HORIZONS.visible()*s);
-            RenderSystem.setShaderFogEnd(RenderSystem.getShaderFogEnd()*(1-s)+(float)SpiritRenderSettings.OPAQUE_RADIUS*s);
+        switch (framePasses.fogMode(inSpiritWorld(), effectStrength(), frameReady, failed)) {
+            case VANILLA -> { /* Off or partial transition: do not alter native fog. */ }
+            case VOLUMETRIC -> {
+                RenderSystem.setShaderFogStart(Float.MAX_VALUE / 4);
+                RenderSystem.setShaderFogEnd(Float.MAX_VALUE / 2);
+            }
+            case LINEAR_FALLBACK -> {
+                float s = effectStrength();
+                RenderSystem.setShaderFogStart(RenderSystem.getShaderFogStart() * (1-s)
+                        + (float) SpiritRenderSettings.HORIZONS.visible() * s);
+                RenderSystem.setShaderFogEnd(RenderSystem.getShaderFogEnd() * (1-s)
+                        + (float) SpiritRenderSettings.OPAQUE_RADIUS * s);
+            }
         }
     }
 
     public static void applySpiritFogColor() {
-        if (inSpiritWorld() && effectStrength()>.001f && (!frameReady || failed)) {
+        if (framePasses.fogMode(inSpiritWorld(), effectStrength(), frameReady, failed)
+                == SpiritVisualControls.FogMode.LINEAR_FALLBACK) {
             float s=effectStrength(); float[] c=RenderSystem.getShaderFogColor();
             RenderSystem.setShaderFogColor(c[0]+(.75f-c[0])*s,c[1]+(.68f-c[1])*s,c[2]+(.95f-c[2])*s);
         }
     }
 
+    public static SpiritVisualControls.Settings settings() { return controls.settings(); }
     public static void setQuality(SpiritRenderSettings.Quality value) {
-        quality = java.util.Objects.requireNonNull(value);
+        configure(settings().withQuality(value));
     }
-
-    public static String status() { return status; }
+    public static void setEnabled(boolean value) { configure(settings().withEnabled(value)); }
+    public static void setEffect(SpiritVisualControls.Effect effect, boolean value) {
+        configure(settings().withEffect(effect, value));
+    }
+    private static void configure(SpiritVisualControls.Settings value) {
+        RenderSystem.assertOnRenderThread();
+        boolean wasEnabled = controls.settings().anyEnabled();
+        controls.configure(value);
+        framePasses = value.passes((System.nanoTime() - enteredAt) * 1.0e-9);
+        frameReady = depthReady = false;
+        if (!value.anyEnabled()) {
+            release();
+            SpiritEntryScene.clear();
+        } else if (!wasEnabled) {
+            failed = false; // Explicit off/on permits recovery, not a retry/log loop every frame.
+        }
+    }
+    public static void retry() {
+        RenderSystem.assertOnRenderThread();
+        release();
+        SpiritEntryScene.clear();
+        failed = false;
+        controls.configure(settings());
+    }
+    public static String status() { return controls.status(); }
 
     private static void updateSession(MinecraftClient client) {
         ClientSpiritCache.syncObserver(client);
@@ -224,7 +275,7 @@ public final class ShaderManager {
             long previousEntry=enteredAt;
             release(); sessionWorld=next; transitionAt=System.nanoTime();
             enteredAt=outgoing>0?previousEntry:transitionAt;
-            targetActive=false; transitionFrom=outgoing; failed=false; status="starting";
+            targetActive=false; transitionFrom=outgoing; failed=false; controls.inactive();
             SpiritItemProjectionRenderer.resetSession(); SpiritSemanticEntityRenderer.clear();
         }
         boolean active=next!=null && ClientSpiritCache.active()
@@ -233,6 +284,7 @@ public final class ShaderManager {
             transitionFrom=effectStrength(); transitionAt=System.nanoTime(); targetActive=active;
             if (active) enteredAt=transitionAt;
         }
+        if (next == null) controls.inactive();
         if (!ClientSpiritCache.active() && effectStrength()<=.001f && sceneDepth!=null) release();
     }
 
@@ -270,10 +322,12 @@ public final class ShaderManager {
     }
 
     private static void fail(String phase, RuntimeException exception) {
-        if (!failed) LOGGER.error("Spirit rendering failed while {}; using vanilla linear fog until re-entry/resource reload", phase, exception);
+        if (!failed) LOGGER.error("Spirit rendering failed while {}; postprocess stopped until explicit retry/re-entry/resource reload", phase, exception);
         failed = true;
+        failureReason = phase;
         frameReady = false;
-        status = "fallback: " + phase + " (see log; F3+T to retry)";
+        controls.fallback(phase + "; " + (framePasses.fog() && fogHookSeen ? "linear fog fallback selected (next fog callback)" : "vanilla fog unchanged")
+                + " (see log; /spiritvisual retry or F3+T)");
     }
 
     private static void release() {
