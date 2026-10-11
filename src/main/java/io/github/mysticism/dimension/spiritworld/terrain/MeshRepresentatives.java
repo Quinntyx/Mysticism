@@ -13,6 +13,7 @@ final class MeshRepresentatives {
     private final List<Cluster> clusters=new ArrayList<>();
     private LandmarkMetadata closest;
     private double closestDistance=Double.POSITIVE_INFINITY;
+    private String dimension;
     private Vec384f q;
     private Basis384f basis;
     private static final class Cluster {
@@ -22,11 +23,16 @@ final class MeshRepresentatives {
         Cluster(LandmarkMetadata m,Vec384f v,double importance){seed=m.id();center=v.clone();best=m;bestVector=v.clone();sum=new double[v.data().length];this.importance=importance;}
         void observe(Vec384f v,double w){float[] d=v.data();for(int i=0;i<d.length;i++)sum[i]+=d[i]*w;weight+=w;norm+=v.l2sq()*w;}
     }
-    void begin(Vec384f q,Basis384f basis) {
+    void begin(String dimension,Vec384f q,Basis384f basis) {
+        Objects.requireNonNull(dimension);
+        // Retain hysteresis only within a source namespace, including after explicit target acquisition.
+        if(!dimension.equals(this.dimension))clusters.clear();
+        this.dimension=dimension;
         this.q=q.clone();this.basis=basis.clone();closest=null;closestDistance=Double.POSITIVE_INFINITY;
         for(Cluster c:clusters){Arrays.fill(c.sum,0);c.weight=0;c.norm=0;c.bestSeen=false;c.observed=null;c.observedVector=null;}
     }
     void offer(LandmarkMetadata metadata,Vec384f vector,double importance) {
+        if(!metadata.header().dimension().equals(dimension))return;
         double distance=vector.squareDistance(q);
         if(!Double.isFinite(distance) || distance>=RADIUS*RADIUS)return;
         importance=Math.max(0,Math.min(1,importance));

@@ -111,6 +111,11 @@ public final class LandmarkStore extends PersistentState {
         profile.requireCompatible(value.header().baseEmbedding().profile());
         value.geometryKeys().forEach(LandmarkStore::checkKey); return Optional.of(value);
     }
+    /** Resolve aliases within the declared source namespace, never infer dimension from an ID. */
+    public Optional<LandmarkMetadata> metadata(String id,String dimension) {
+        Objects.requireNonNull(dimension);
+        return metadata(id).filter(m->m.header().dimension().equals(dimension));
+    }
     /** Compatibility lookup is cache-only. Explicit geometry reads are required on cache miss. */
     public Optional<Landmark> find(String id) {
         var metadata=metadata(id); if(metadata.isEmpty()) return Optional.empty();
@@ -158,10 +163,18 @@ public final class LandmarkStore extends PersistentState {
         return semanticRangePage(current,radius,afterId,maxResults,maxScanned,m->m.header().baseEmbedding());
     }
     public SourceRangePage semanticRangePage(LandmarkEmbedding current,double radius,String afterId,int maxResults,int maxScanned,java.util.function.Function<LandmarkMetadata,LandmarkEmbedding> effective) {
+        return semanticRangePageInDimension(null,current,radius,afterId,maxResults,maxScanned,effective);
+    }
+    /** Dimension-scoped semantic discovery. Foreign records advance the seek but never invoke
+     * activity embedding/importance work or enter representative/geometry admission. */
+    public SourceRangePage semanticRangePage(String dimension,LandmarkEmbedding current,double radius,String afterId,int maxResults,int maxScanned,java.util.function.Function<LandmarkMetadata,LandmarkEmbedding> effective) {
+        return semanticRangePageInDimension(Objects.requireNonNull(dimension),current,radius,afterId,maxResults,maxScanned,effective);
+    }
+    private SourceRangePage semanticRangePageInDimension(String dimension,LandmarkEmbedding current,double radius,String afterId,int maxResults,int maxScanned,java.util.function.Function<LandmarkMetadata,LandmarkEmbedding> effective) {
         checkThread();if(!Double.isFinite(radius)||radius<=0||!Double.isFinite(radius*radius)||radius*radius==0||maxResults<1||maxResults>128||maxScanned<1||maxScanned>128)throw new IllegalArgumentException("semantic page budget");
         if(profile!=null)profile.requireCompatible(current.profile());
         String id=afterId==null?(records.isEmpty()?null:records.firstKey()):records.higherKey(afterId),last=afterId;int scanned=0;List<LandmarkMetadata> found=new ArrayList<>();
-        while(id!=null && scanned<maxScanned && found.size()<maxResults){var m=metadata(id).orElseThrow();last=id;scanned++;if(effective.apply(m).distanceSquared(current)<radius*radius)found.add(m);id=records.higherKey(id);}
+        while(id!=null && scanned<maxScanned && found.size()<maxResults){var m=metadata(id).orElseThrow();last=id;scanned++;if((dimension==null||m.header().dimension().equals(dimension)) && effective.apply(m).distanceSquared(current)<radius*radius)found.add(m);id=records.higherKey(id);}
         return new SourceRangePage(found,last,scanned,id==null);
     }
     public List<LandmarkMetadata> semanticRange(LandmarkEmbedding current,double radius,int maxResults,int maxScanned) {
