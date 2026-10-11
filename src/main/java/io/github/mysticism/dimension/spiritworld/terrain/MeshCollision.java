@@ -141,7 +141,7 @@ public final class MeshCollision {
     /** Actual affine SAT body clearance, including a newly acquired source window. */
     public static boolean bodyClear(TerrainMeshFrame frame,Box body) {
         Box strict=body.expand(-1e-5);
-        for(var cell:frame.cells())if(cell.bounds().intersects(strict))
+        for(var cell:frame.cells())if(cell.opacity()>0 && cell.geometryBounds().intersects(strict))
             for(Box collision:cell.collision())if(penetration(strict,new Shape(cell,collision,cell.bounds(collision)))!=null)return false;
         return true;
     }
@@ -155,7 +155,7 @@ public final class MeshCollision {
             var before=previous.get(c.key());
             if(before!=null && c.min().equals(before.min()) && c.axisX().equals(before.axisX()) && c.axisY().equals(before.axisY())
                     && c.axisZ().equals(before.axisZ()) && c.collision().equals(before.collision()))continue;
-            if(!c.bounds().intersects(local) && (before==null || !before.bounds().intersects(local)))continue;
+            if(!c.geometryBounds().intersects(local) && (before==null || !before.geometryBounds().intersects(local)))continue;
             if(before==null) {for(Box b:c.collision())if(penetration(strict,new Shape(c,b,c.bounds(b)))!=null)return false;continue;}
             if(c.collision().isEmpty())continue;
             for(Box collision:c.collision()) {

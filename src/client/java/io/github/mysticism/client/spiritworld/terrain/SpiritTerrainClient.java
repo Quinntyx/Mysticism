@@ -69,18 +69,17 @@ public final class SpiritTerrainClient {
             BufferAllocator allocator=new BufferAllocator(65536);
             try {
                 BufferBuilder builder=new BufferBuilder(allocator,LAYER.getDrawMode(),LAYER.getVertexFormat());
-                Box bounds=null;
+                TerrainVertexConsumer.Bounds emitted=new TerrainVertexConsumer.Bounds();
                 for(var cell:cells) {
-                    Box b=cell.bounds();bounds=bounds==null?b:bounds.union(b);
                     BlockState state=palette.get(cell.material());
-                    VertexConsumer consumer=new AlphaConsumer(builder,cell.opacity());
+                    VertexConsumer consumer=new TerrainVertexConsumer(builder,cell.opacity(),emitted);
                     if(state.getRenderType()==BlockRenderType.MODEL)drawModel(models,state,cell,anchor,consumer,null);
                     else for(Box shape:cell.collision())drawModel(models,Blocks.STONE.getDefaultState(),cell,anchor,consumer,shape);
                 }
                 BuiltBuffer built=builder.endNullable();
                 if(built==null)continue;
                 VertexBuffer vbo=new VertexBuffer(VertexBuffer.Usage.DYNAMIC);
-                try {vbo.bind();vbo.upload(built);gpu.add(new Batch(vbo,bounds));}
+                try {vbo.bind();vbo.upload(built);gpu.add(new Batch(vbo,emitted.world(anchor)));}
                 catch(RuntimeException failure){vbo.close();throw failure;}
                 finally{VertexBuffer.unbind();} // upload owns/closes BuiltBuffer in Yarn 1.21.1
             } finally{allocator.close();}
@@ -134,13 +133,5 @@ public final class SpiritTerrainClient {
             for(int x=x0;x<=x1;x++)for(int y=y0;y<=y1;y++)for(int z=z0;z<=z1;z++) {if(work++>=16384)break outer;medium[x+16*(y+16*z)]=Math.max(medium[x+16*(y+16*z)],.5f*cell.opacity());}
         }
         ShaderManager.setMediumSamples(medium,center);
-    }
-    private record AlphaConsumer(VertexConsumer delegate,float alpha) implements VertexConsumer {
-        @Override public VertexConsumer vertex(float x,float y,float z){delegate.vertex(x,y,z);return this;}
-        @Override public VertexConsumer color(int r,int g,int b,int a){delegate.color(r,g,b,Math.round(a*alpha));return this;}
-        @Override public VertexConsumer texture(float u,float v){delegate.texture(u,v);return this;}
-        @Override public VertexConsumer overlay(int u,int v){delegate.overlay(u,v);return this;}
-        @Override public VertexConsumer light(int u,int v){delegate.light(u,v);return this;}
-        @Override public VertexConsumer normal(float x,float y,float z){delegate.normal(x,y,z);return this;}
     }
 }
