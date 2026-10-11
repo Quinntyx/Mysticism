@@ -31,14 +31,15 @@ public final class SourceLandmarks {
         ServerTickEvents.END_SERVER_TICK.register(server->{Session s=SESSIONS.get(server);if(s!=null)s.tick();});
         ServerLifecycleEvents.SERVER_STOPPING.register(server->{Session s=SESSIONS.remove(server);if(s!=null)s.close();});
         ServerWorldEvents.UNLOAD.register((server,world)->{Session s=SESSIONS.get(server);if(s!=null)s.unload(world.getRegistryKey().getValue().toString());});
-        ServerChunkEvents.CHUNK_UNLOAD.register((world,chunk)->{Session s=SESSIONS.get(world.getServer());if(s!=null&&s.active!=null){String dim=world.getRegistryKey().getValue().toString();Bounds area=new Bounds(chunk.getPos().getStartX(),world.getBottomY(),chunk.getPos().getStartZ(),chunk.getPos().getStartX()+16L,world.getTopY(),chunk.getPos().getStartZ()+16L);if(s.active.dimension.equals(dim)&&s.active.guarded!=null&&s.active.guarded.intersects(area))s.active.cancel(new CancellationException("source chunk unloaded during observation"));}});
+        // Chunk unload is an IO-adapter transition, not source deletion. The reader restarts
+        // partial slices from generated saved NBT. Edits/world unload/stop still invalidate work.
         ServerChunkEvents.CHUNK_LOAD.register((world,chunk)->{
             if(!SourceDimensions.isSource(world.getRegistryKey().getValue().toString()))return;
             Session s=SESSIONS.get(world.getServer());if(s==null)return;
             int x=chunk.getPos().getStartX()+8,z=chunk.getPos().getStartZ()+8;
             int y=chunk.sampleHeightmap(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,x&15,z&15);
             s.hint(world.getRegistryKey().getValue().toString(),new BlockPos(x,y+1,z));
-            if(s.retries.size()<64)s.retries.add(new FrontierRetry(world.getRegistryKey().getValue().toString(),new Bounds(chunk.getPos().getStartX()-1L,world.getBottomY(),chunk.getPos().getStartZ()-1L,chunk.getPos().getStartX()+17L,world.getTopY(),chunk.getPos().getStartZ()+17L)));
+            s.retry(world.getRegistryKey().getValue().toString(),new Bounds(chunk.getPos().getStartX()-1L,world.getBottomY(),chunk.getPos().getStartZ()-1L,chunk.getPos().getStartX()+17L,world.getTopY(),chunk.getPos().getStartZ()+17L));
         });
     }
     public static CompletableFuture<Optional<LandmarkMetadata>> ensureSourceLocation(MinecraftServer server,String dimension,BlockPos position){return ensure(server,dimension,position,null,false);}
@@ -94,13 +95,29 @@ public final class SourceLandmarks {
     private static Session session(MinecraftServer server){if(!server.isOnThread())throw new IllegalStateException("source server thread");Session s=SESSIONS.get(server);if(s==null)throw new IllegalStateException("source service not initialized");return s;}
     private static void checkBounds(Bounds b,int maxCells){long volume=Math.multiplyExact(Math.multiplyExact(b.maxX()-b.minX(),b.maxY()-b.minY()),b.maxZ()-b.minZ());if(maxCells<1||maxCells>32768||volume>maxCells||b.minX()<Integer.MIN_VALUE||b.maxX()>Integer.MAX_VALUE||b.minY()<Integer.MIN_VALUE||b.maxY()>Integer.MAX_VALUE||b.minZ()<Integer.MIN_VALUE||b.maxZ()>Integer.MAX_VALUE)throw new IllegalArgumentException("source query bounds");}
     private record Hint(String dimension,BlockPos pos){}
-    private static final class FrontierRetry {
-        final String dimension;final Bounds bounds;String cursor;boolean end;final ArrayDeque<LandmarkMetadata> headers=new ArrayDeque<>();Iterator<FrontierFace> faces;
+    static final class FrontierRetry {
+        final String dimension;final Bounds bounds;String cursor;boolean end;
+        final ArrayDeque<LandmarkMetadata> headers=new ArrayDeque<>();Iterator<FrontierFace> faces;BlockPos pending;
         FrontierRetry(String dimension,Bounds bounds){this.dimension=dimension;this.bounds=bounds;}
-        boolean advance(Session s){
-            if(faces!=null){for(int n=0;n<8&&faces.hasNext();n++){var b=faces.next().missingBounds();if(bounds.contains(b.minX(),b.minY(),b.minZ()))s.hint(dimension,new BlockPos((int)b.minX(),(int)b.minY(),(int)b.minZ()));}if(!faces.hasNext())faces=null;return false;}
-            if(!headers.isEmpty()){var h=headers.removeFirst().header();if(h.kind()==Landmark.Kind.CAVE)faces=h.geometry().frontiers().iterator();return false;}
-            if(end)return true;var page=s.store.sourceRangePage(dimension,bounds,cursor,2,2);cursor=page.nextId();end=page.end();headers.addAll(page.landmarks());return false;
+        boolean advance(Session s){return advance(s.store,s::hint);}
+        boolean advance(LandmarkStore store,java.util.function.BiPredicate<String,BlockPos> hint){
+            if(faces!=null){
+                for(int n=0;n<8 && (pending!=null || faces.hasNext());n++){
+                    if(pending==null){
+                        var b=faces.next().missingBounds();if(!bounds.intersects(b))continue;
+                        pending=new BlockPos((int)Math.max(bounds.minX(),b.minX()),(int)Math.max(bounds.minY(),b.minY()),(int)Math.max(bounds.minZ(),b.minZ()));
+                    }
+                    // A saturated discovery queue must not consume the only reload retry.
+                    if(!hint.test(dimension,pending))return false;
+                    pending=null;
+                }
+                if(pending==null && !faces.hasNext())faces=null;
+                return false;
+            }
+            if(!headers.isEmpty()){faces=headers.removeFirst().header().geometry().frontiers().iterator();return false;}
+            if(end)return true;
+            var page=store.sourceRangePage(dimension,bounds,cursor,2,2);
+            cursor=page.nextId();end=page.end();headers.addAll(page.landmarks());return false;
         }
     }
     private static final class Session {
@@ -113,7 +130,8 @@ public final class SourceLandmarks {
             try{CompletableFuture.supplyAsync(computation,worker).whenComplete((value,error)->server.execute(()->{auxiliary.remove(out);if(SESSIONS.get(server)!=this)out.cancel(false);else if(error!=null)out.completeExceptionally(error);else out.complete(value);}));}catch(RuntimeException failure){auxiliary.remove(out);out.completeExceptionally(failure);}return out;
         }
         void offer(Operation<?> op){if(requests.size()==64){op.future.completeExceptionally(new RejectedExecutionException("source request budget"));return;}if(op instanceof Read)requests.addFirst(op);else requests.addLast(op);}
-        void hint(String dim,BlockPos p){if(hints.size()<128)hints.add(new Hint(dim,p));}
+        void retry(String dim,Bounds bounds){if(retries.size()<64 && retries.stream().noneMatch(r->r.dimension.equals(dim)&&r.bounds.equals(bounds)))retries.addLast(new FrontierRetry(dim,bounds));}
+        boolean hint(String dim,BlockPos p){Hint hint=new Hint(dim,p.toImmutable());return hints.contains(hint) || hints.size()<128 && hints.add(hint);}
         void invalidate(String dim,BlockPos pos){if(active!=null&&active.dimension.equals(dim)&&active.guarded!=null&&active.guarded.contains(pos.getX(),pos.getY(),pos.getZ()))active.cancel(new CancellationException("source edit invalidated snapshot"));}
         void tick(){
             lastCells=0;
