@@ -1,5 +1,13 @@
 # Nomic v2-MoE embedding contract (schema 2)
 
+> Historical HTTP-migration handoff: its 256-dimensional reduction and old build/
+> integration-status notes are superseded. The current space retains **all 768
+> native v2 coordinates**, with no legacy migration or truncation. See
+> [runtime output pooling](runtime-embedding-pooling.md) for the current output
+> math, actual checks and remaining embedded-provider integration blocker. HTTP
+> deployment below describes the retained provider, not completion of the
+> server-free IntelliJ launch requirement.
+
 ## Deployment, not an automatic download
 
 Mysticism uses an administrator-provisioned **Ollama-compatible** HTTP service. No

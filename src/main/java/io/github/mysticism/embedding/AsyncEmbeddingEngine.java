@@ -136,8 +136,7 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
         synchronized (this) { if (closed || pending.get(key) != request) return; }
         try {
             Vec384f value = provider.getEmbedding(descriptor); EmbeddingSpace.requireCurrent(value);
-            if (value.length() == 0) throw new IllegalArgumentException("Provider returned zero embedding");
-            finish(key, request, new Vec384f(value.norm()), null);
+            finish(key, request, NativeEmbeddingOutput.normalize(value.data()), null);
         } catch (Throwable error) { finish(key, request, null, error); }
     }
     private void finish(String key, Request request, Vec384f value, Throwable error) {

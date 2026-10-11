@@ -74,17 +74,15 @@ public final class EmbeddingService implements EmbeddingProvider {
         JsonArray values=batch.get(0).getAsJsonArray();
         if(values.size()!=EmbeddingSpace.NATIVE_DIMENSIONS)throw new IllegalArgumentException("Expected native Nomic v2 768 dimensions, got "+values.size());
         if(EmbeddingSpace.DIMENSIONS!=EmbeddingSpace.NATIVE_DIMENSIONS)throw new IllegalStateException("Parent must activate native Nomic v2 dimensions/profile before inference");
-        float[] reduced=new float[EmbeddingSpace.NATIVE_DIMENSIONS];
+        double[] nativeOutput=new double[EmbeddingSpace.NATIVE_DIMENSIONS];
         for(int i=0;i<values.size();i++) {
             JsonElement value=values.get(i);
             if(!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber())throw new IllegalArgumentException("Non-numeric embedding");
             double number=value.getAsDouble();
             if(!Double.isFinite(number) || Math.abs(number)>Float.MAX_VALUE)throw new IllegalArgumentException("Nonfinite embedding");
-            reduced[i]=(float)number;
+            nativeOutput[i]=number;
         }
-        Vec384f vector=new Vec384f(reduced);
-        if(vector.length()==0)throw new IllegalArgumentException("Zero embedding");
-        return new Vec384f(vector.norm());
+        return NativeEmbeddingOutput.normalize(nativeOutput);
     }
     private JsonObject request(String path,String body) throws Exception {
         if(closed)throw new IllegalStateException("Embedding provider closed");
