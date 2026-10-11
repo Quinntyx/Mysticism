@@ -36,7 +36,7 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
         return CompletableFuture.failedFuture(new RejectedExecutionException("Embedding callback capacity exhausted; retry later"));
     }
 
-    private final EmbeddingProvider provider;
+    private final EmbeddingProviderSession provider;
     private final ThreadPoolExecutor workers;
     private final ScheduledThreadPoolExecutor timer;
     private final long deadlineMillis;
@@ -60,7 +60,8 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
                 || deadline.toMillis() < 1 || deadline.toMillis() > 120000)
             throw new IllegalArgumentException("Invalid embedding bounds");
         if (!provider.profile().equals(EmbeddingProfile.current())) throw new IllegalArgumentException("Provider profile mismatch");
-        this.provider = provider; this.deadlineMillis = deadline.toMillis(); this.cacheCapacity = cacheCapacity;
+        this.provider = new EmbeddingProviderSession(provider);
+        this.deadlineMillis = deadline.toMillis(); this.cacheCapacity = cacheCapacity;
         workers = new ThreadPoolExecutor(threads, threads, 0, TimeUnit.SECONDS,
                 new ArrayBlockingQueue<>(queueCapacity), r -> daemon(r, "Mysticism-EmbedWorker"),
                 new ThreadPoolExecutor.AbortPolicy());
@@ -68,7 +69,7 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
         timer.setRemoveOnCancelPolicy(true);
         readyDeadline = timer.schedule(() -> finishReadiness(new TimeoutException("Embedding readiness deadline")), deadlineMillis, TimeUnit.MILLISECONDS);
         workers.execute(() -> {
-            try { provider.checkReady(); finishReadiness(null); }
+            try { this.provider.checkReady(); finishReadiness(null); }
             catch (Throwable error) { finishReadiness(error); }
         });
     }
@@ -132,12 +133,14 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
         if (rejection != null) publish(subscriber, null, rejection);
         return subscriber.future;
     }
+    private synchronized boolean isCurrent(String key, Request request) {
+        return !closed && pending.get(key) == request;
+    }
     private void run(String key, String descriptor, Request request) {
-        synchronized (this) { if (closed || pending.get(key) != request) return; }
+        if (!isCurrent(key, request)) return;
         try {
-            Vec384f value = provider.getEmbedding(descriptor); EmbeddingSpace.requireCurrent(value);
-            if (value.length() == 0) throw new IllegalArgumentException("Provider returned zero embedding");
-            finish(key, request, new Vec384f(value.norm()), null);
+            Vec384f value = provider.infer(descriptor, () -> isCurrent(key, request));
+            if (value != null) finish(key, request, value, null);
         } catch (Throwable error) { finish(key, request, null, error); }
     }
     private void finish(String key, Request request, Vec384f value, Throwable error) {

@@ -17,13 +17,13 @@ public final class AsyncEmbeddingEngineSafetyTest {
         catch (ExecutionException | CancellationException expected) { checks++; }
     }
     private static class Provider implements EmbeddingProvider {
-        final CountDownLatch readyGate = new CountDownLatch(1), start = new CountDownLatch(1), gate = new CountDownLatch(1);
+        final CountDownLatch readyGate = new CountDownLatch(1), start = new CountDownLatch(1), gate = new CountDownLatch(1), disposed = new CountDownLatch(1);
         final AtomicInteger calls = new AtomicInteger();
         volatile boolean holdReady, holdWork = true, closed;
         public EmbeddingProfile profile() { return EmbeddingProfile.current(); }
         public void checkReady() throws Exception { if (holdReady) readyGate.await(); }
         public Vec384f getEmbedding(String text) throws Exception { calls.incrementAndGet(); start.countDown(); if (holdWork) gate.await(); return axis(); }
-        public void close() { closed = true; readyGate.countDown(); gate.countDown(); }
+        public void close() { closed = true; readyGate.countDown(); gate.countDown(); disposed.countDown(); }
     }
     private static AsyncEmbeddingEngine engine(Provider p, int queue, long millis) {
         return new AsyncEmbeddingEngine(p, 1, queue, 2, Duration.ofMillis(millis));
@@ -103,6 +103,8 @@ public final class AsyncEmbeddingEngineSafetyTest {
             submit.start(); start.countDown(); e.close(); submit.join(2000);
             check(!submit.isAlive(), "Submission/shutdown deadlocked");
             for (var f : futures) get(f.handle((v, error) -> null));
+            // An active native owner, rather than close(), now performs safe disposal on return.
+            check(p.disposed.await(2, TimeUnit.SECONDS), "Deferred provider disposal did not finish");
             check(e.inflightSize() == 0 && e.cacheSize() == 0 && p.closed, "Shutdown race leaked");
         }
     }
