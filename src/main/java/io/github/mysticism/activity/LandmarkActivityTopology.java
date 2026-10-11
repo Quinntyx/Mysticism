@@ -112,7 +112,7 @@ public final class LandmarkActivityTopology {
             for(var entry:captured.entrySet())if(!entry.getValue().current(state.entries.get(entry.getKey())))throw new IllegalStateException("stale topology history");
             Set<String> childIds=new HashSet<>();for(var child:children){
                 childIds.add(child.id());var actual=store.metadata(child.id()).orElseThrow(()->new IllegalStateException("core split not published"));
-                if(!store.resolve(child.id()).equals(child.id())||!actual.header().equals(header(child))||!actual.geometryKeys().equals(geometryKeys(child)))
+                if(!store.resolve(child.id()).equals(child.id())||!actual.header().equals(header(child))||!actual.geometryKeys().equals(store.geometryReferences(child.geometry())))
                     throw new IllegalStateException("core split result differs/current revision changed");
             }
             for(var ref:parents){
@@ -135,11 +135,6 @@ public final class LandmarkActivityTopology {
     private static Landmark header(Landmark value){
         return new Landmark(value.id(),value.dimension(),value.algorithmVersion(),value.kind(),value.biome(),value.anchor(),value.bounds(),value.baseEmbedding(),value.baseImportance(),value.activity(),value.ownership(),
                 new SourceGeometry(List.of(),value.geometry().frontiers()),value.revision(),value.provenance());
-    }
-    private static List<String> geometryKeys(Landmark value){
-        // Immutable schema-1 page key format documented in landmark/CORE_API.md. Compare
-        // exact versions, never interpret the keys as masks or perform a geometry read.
-        return value.geometry().pages().stream().map(p->"mysticism.landmark.geometry."+p.id()+"."+p.revision()).toList();
     }
     private static void validateBudget(LandmarkActivityState state,Map<String,Snapshot> captured,Map<String,LandmarkActivityState.Influence> outputs){
         long removed=captured.values().stream().filter(v->v.original!=null).count();

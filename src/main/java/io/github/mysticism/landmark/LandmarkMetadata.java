@@ -11,8 +11,9 @@ public record LandmarkMetadata(Landmark header,List<String> geometryKeys) {
             throw new IllegalArgumentException("metadata limits");
         java.util.Set<String> pageIds=new java.util.HashSet<>();
         for(String key:geometryKeys) {
-            if(!key.matches("mysticism[.]landmark[.]geometry[.]lm-[0-9a-f]{64}[.][0-9]+")
-                    || !pageIds.add(key.substring(0,key.lastIndexOf('.')))) throw new IllegalArgumentException("geometry references");
+            if(!LandmarkNbt.isGeometryReference(key)
+                    || !pageIds.add(key.substring(0,key.indexOf('.',"mysticism.landmark.geometry.".length()))))
+                throw new IllegalArgumentException("geometry references");
         }
     }
     public String id() { return header.id(); }
