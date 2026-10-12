@@ -1,7 +1,6 @@
 package io.github.mysticism.command;
 
 import com.mojang.brigadier.CommandDispatcher;
-import io.github.mysticism.component.MysticismEntityComponents;
 import io.github.mysticism.navigation.SpiritNavigationService;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.network.ServerPlayerEntity;
@@ -23,11 +22,9 @@ public final class SpiritCommand {
                 .then(literal("capture").executes(context -> SpiritNavigationService.captureHere(context.getSource().getPlayerOrThrow()) ? 1 : 0)));
     }
     private static int status(ServerPlayerEntity p) {
-        var nav = p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION);
-        p.sendMessage(Text.literal("Spirit " + (!nav.active() ? "inactive" : nav.deep() ? "deep" : "shallow")
-                + "; source " + nav.sourceDimension() + " " + nav.landmarkId() + " " + nav.sourcePosition()
-                + "; target " + (nav.hasShallowTarget() ? nav.targetDimension() + " " + nav.targetLandmarkId()
-                + " " + nav.targetBlock().toShortString() : "concept vector")), false);
+        // Real current navigation progress: mode, semantic readiness, live walk-request state,
+        // retry cooldown, landing approach, captured target and pending discovery.
+        p.sendMessage(Text.literal(SpiritNavigationService.status(p)), false);
         return 1;
     }
 }

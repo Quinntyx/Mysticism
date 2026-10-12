@@ -54,6 +54,8 @@ public final class TeleportReconciliation {
         if (!inSpirit(player)) return;
         player.setVelocity(velocityAfterArrival(player.getWorld().getRegistryKey(), player.getVelocity()));
         player.fallDistance = 0;
+        player.setOnGround(false); // previous contact cannot authorize stepping at the arrival
+        SpiritNavigationService.onTeleportArrival(player);
         // The evolver re-seeds from the CURRENT (arrival) pose: the arrival delta is reconciliation,
         // never semantic travel, and ordinary movement on the next tick integrates normally.
         SpiritBasisEvolver.resetMotion(player);

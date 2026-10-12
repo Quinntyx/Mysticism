@@ -240,6 +240,40 @@ public final class TeleportArrivalReconciliationTest {
         }
     }
 
+    private static void arrivalResetsOnlyArrivingPlayersMovement() {
+        var arriving = new SpiritNavigationService.Session();
+        var other = new SpiritNavigationService.Session();
+        for (var s : new SpiritNavigationService.Session[] {arriving, other}) {
+            s.unsupported = 13; s.unsupportedDrop = .9; s.jumping = true;
+            s.airborne = true; s.restingTicks = 9;
+            s.blendFrom = new Basis384f(); s.blendTo = new Basis384f(); s.blendTick = 15;
+            s.attemptedLanding = true; s.warnedLanding = true;
+            s.semanticReady = true; s.checkedRestore = true;
+            s.targetSnapshot = q(); s.capture = new java.util.concurrent.CompletableFuture<>();
+            s.walkRetry.failed(100);
+        }
+        var captured = arriving.targetSnapshot; var capture = arriving.capture;
+        SpiritNavigationService.resetArrivalMovement(arriving);
+        check(arriving.unsupported == 0 && arriving.unsupportedDrop == 0 && !arriving.jumping,
+                "Arrival drops pre-teleport shallow fall/step history");
+        check(!arriving.airborne && arriving.restingTicks == 0,
+                "Arrival drops pre-teleport contact history, not a natural landing at the old floor");
+        check(arriving.blendFrom == null && arriving.blendTo == null && arriving.blendTick == 0,
+                "Arrival cannot resume a stale pre-teleport touch basis blend");
+        check(!arriving.attemptedLanding && !arriving.warnedLanding,
+                "Arrival may revalidate its new captured-target contact");
+        check(arriving.semanticReady && arriving.checkedRestore && arriving.targetSnapshot == captured
+                        && arriving.capture == capture && !capture.isCancelled(),
+                "Movement reset retains real readiness and the player's captured target/discovery");
+        check(arriving.walkRetry.remaining(100) == 60, "Arrival does not bypass anti-spam cooldown");
+        check(other.unsupported == 13 && other.unsupportedDrop == .9 && other.jumping
+                        && other.airborne && other.restingTicks == 9 && other.blendTo != null
+                        && other.blendTick == 15 && other.attemptedLanding && other.semanticReady,
+                "Arrival cannot mutate another player's movement or readiness");
+        SpiritNavigationService.resetArrivalMovement(arriving);
+        check(arriving.semanticReady && arriving.blendTo == null, "Repeated arrival reset is safe");
+    }
+
     public static void main(String[] args) {
         arrivalDeltaIsNotSemanticTravel();
         predictionEpochAdvancesOnEveryArrival();
@@ -247,6 +281,7 @@ public final class TeleportArrivalReconciliationTest {
         predictorGateDropsStaleArrivalDelta();
         arrivalReseedSurvivesEpochBeforeArrival();
         relativeTeleportDropsClientMomentum();
+        arrivalResetsOnlyArrivingPlayersMovement();
         System.out.println("TeleportArrivalReconciliationTest: " + checks + " checks passed");
     }
 }

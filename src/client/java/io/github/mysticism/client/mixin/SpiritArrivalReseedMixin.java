@@ -27,7 +27,10 @@ public abstract class SpiritArrivalReseedMixin {
         if (client.player != null && client.world != null) {
             var world = client.world.getRegistryKey();
             client.player.setVelocity(TeleportReconciliation.velocityAfterArrival(world, client.player.getVelocity()));
-            if (world.equals(SpiritTerrainService.WORLD)) client.player.fallDistance = 0;
+            if (world.equals(SpiritTerrainService.WORLD)) {
+                client.player.fallDistance = 0;
+                client.player.setOnGround(false);
+            }
         }
         ClientLatentPredictor.onArrivalApplied();
     }

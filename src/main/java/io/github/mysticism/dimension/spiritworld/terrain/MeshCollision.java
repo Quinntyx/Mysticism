@@ -96,25 +96,35 @@ public final class MeshCollision {
         Index i=index(player);
         // No fabricated floor. Preparation supplies geometry before entry; packet delay simply has no surfaces yet.
         if(i==null)return wanted;
-        Box body=player.getBoundingBox();
+        return move(i,player.getBoundingBox(),wanted,player.getAbilities().flying,player.isOnGround(),player.getStepHeight());
+    }
+    /** Shared server/prediction resolution for one tick: pure in (index, pose, request), no player state reads. */
+    public static Vec3d move(Index i,Box body,Vec3d wanted,boolean flying,boolean onGround,float stepHeight) {
         if(wanted.length()>256)wanted=wanted.multiply(256/wanted.length());
         Vec3d result=i.depenetrate(body);
         // Bound swept traversal for unusually fast flight/teleports rather than tunnelling through a grid overflow.
         int pieces=Math.min(64,Math.max(1,(int)Math.ceil(wanted.length()/4)));
         Vec3d piece=wanted.multiply(1.0/pieces);
         for(int p=0;p<pieces;p++)result=result.add(i.slide(body.offset(result),piece));
-        if(!player.getAbilities().flying && (player.isOnGround() || wanted.y<0 && result.y>wanted.y+1e-5)
-                && result.subtract(wanted).horizontalLengthSquared()>1e-8) {
-            double step=player.getStepHeight();
-            if(step>0) {
-                Vec3d up=i.slide(body,new Vec3d(0,step,0));
-                Vec3d over=i.slide(body.offset(up),new Vec3d(wanted.x,0,wanted.z));
-                Vec3d down=i.slide(body.offset(up).offset(over),new Vec3d(0,wanted.y-up.y,0));
-                Vec3d stepped=up.add(over).add(down);
-                if(stepped.horizontalLengthSquared()>result.horizontalLengthSquared()+1e-8)result=stepped;
-            }
+        if(!flying && (onGround || wanted.y<0 && result.y>wanted.y+1e-5)
+                && result.subtract(wanted).horizontalLengthSquared()>1e-8 && stepHeight>0) {
+            // Stepping continues from the already-resolved pose: depenetration and horizontal progress
+            // are never discarded (discarding them re-embeds the body and rubber bands across steps),
+            // and the per-axis horizontal budget is never re-spent, so the step cannot exceed the
+            // originally requested displacement.
+            Vec3d budget=new Vec3d(remaining(result.x,wanted.x),0,remaining(result.z,wanted.z));
+            Box base=body.offset(result);
+            Vec3d up=i.slide(base,new Vec3d(0,stepHeight,0));
+            Vec3d over=i.slide(base.offset(up),budget);
+            Vec3d down=i.slide(base.offset(up).offset(over),new Vec3d(0,wanted.y-result.y-up.y,0));
+            Vec3d stepped=up.add(over).add(down);
+            if(stepped.horizontalLengthSquared()>1e-8)result=result.add(stepped);
         }
         return result;
+    }
+    /** Unspent requested displacement on one axis, never reversing against the request. */
+    private static double remaining(double spent,double wanted) {
+        return wanted>=0?Math.max(0,wanted-spent):Math.min(0,wanted-spent);
     }
     /** Vanilla's carrier-air ledge check would prevent all sneaking; use the real mesh below the future footprint. */
     public static Vec3d sneak(PlayerEntity p,Vec3d wanted,MovementType type) {
@@ -132,8 +142,11 @@ public final class MeshCollision {
     private static double trim(double x){return Math.abs(x)<=.05?0:x-Math.copySign(.05,x);}
     public static Optional<Hit> ground(PlayerEntity player) {
         Index i=index(player);
-        return i==null?Optional.empty():i.sweep(player.getBoundingBox().offset(0,.025,0),new Vec3d(0,-.15,0))
-                .filter(h->h.normal.y>.3);
+        return i==null?Optional.empty():ground(i,player.getBoundingBox());
+    }
+    /** Mesh ground contact probe: the real mesh below the future footprint, within one snap window. */
+    public static Optional<Hit> ground(Index i,Box body) {
+        return i.sweep(body.offset(0,.025,0),new Vec3d(0,-.15,0)).filter(h->h.normal.y>.3);
     }
     public static boolean clearRay(ServerPlayerEntity player,Vec3d from,Vec3d to) {
         Index i=index(player);return i!=null && from.distanceTo(to)<=128 && i.clearRay(from,to);

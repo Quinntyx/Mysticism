@@ -180,7 +180,25 @@ public final class WalkDiscoveryRuntimeTest {
         rollback.failTransport=false;
         check(acquireCurrentSupport(rollback.session,rollback,support),"same discovered target succeeds on publication retry, without rediscovery");
     }
+    private static void naturalContactBeforeDiscovery() {
+        Fixture f = new Fixture(false);
+        check(f.ground().isPresent() && f.candidate().isEmpty(),
+                "Real displayed support can exist before its walking target is discovered");
+        var intent = io.github.mysticism.navigation.NaturalLandingPolicy.evaluate(
+                true, true, false, false, false, true,
+                io.github.mysticism.navigation.NaturalLandingPolicy.REST_TICKS - 1);
+        check(intent == io.github.mysticism.navigation.NaturalLandingPolicy.Action.LAND,
+                "Settled mesh contact starts validation even without a current owned candidate");
+        check(!f.session.shallow && f.published == 0, "Contact intent alone grants no walking authority");
+        check(f.discover(), "Natural contact acquires the real separate source owner");
+        var support = f.support();
+        check(acquireCurrentSupport(f.session, f, support), "Discovered and proven natural support acquires shallow view");
+        check(f.session.local.id.equals(f.b.id()) && f.producer.id.equals(f.a.id()),
+                "Natural acquisition retains independent producer ownership and current source target");
+    }
+
     public static void main(String[] args) {
+        naturalContactBeforeDiscovery();
         crossOwnerAcquisition(false);crossOwnerAcquisition(true);
         candidateInvalidation();acquisitionGuardsAndRollback();
         System.out.println("WalkDiscoveryRuntimeTest: "+checks+" checks passed");
