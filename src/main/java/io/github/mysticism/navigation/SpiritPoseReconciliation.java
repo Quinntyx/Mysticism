@@ -88,6 +88,16 @@ public final class SpiritPoseReconciliation {
         // position and basis syncs arrive in separate packets.
         private boolean awaitingPositionResync = true;
         private boolean awaitingBasisResync = true;
+        private Long modeSignature;
+
+        /** Observe navigation at sync arrival AND at prediction tick. Reset once for a mode/epoch,
+         * not again after its authoritative channels have already arrived between client ticks. */
+        public void observeMode(long signature) {
+            if (modeSignature == null || modeSignature != signature) {
+                modeSignature = signature;
+                reset();
+            }
+        }
 
         /** Mode/epoch changed or prediction was invalidated: the next sync of each channel is adopted fully. */
         public void reset() { awaitingPositionResync = true; awaitingBasisResync = true; }

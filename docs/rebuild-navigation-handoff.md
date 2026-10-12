@@ -97,3 +97,86 @@ Navigation adds fixed-size state/player, one current-support/guard/acquisition q
 This continuation: **no tests, test additions, Gradle/build, smoke, live Fabric/GPU/server/model execution or spawned agents** as instructed. Exact validation: static production-source/API review plus `git diff --check`. Existing historical orbit/archive tests are unchanged and not evidence for this design.
 
 Remaining limitations: runtime convergence/float tolerance, scene/body continuity while walking, async ownership readiness, slab acquisition, reconnect/model-reset reconstruction, mixin boot and server/client prediction need parent’s integrated validation. Impossible/changed/unready ownership or geometry remains deep, with no substitute teleport/floor. Singular alignments are refused. The 200-tick request can expire before slow terrain proof completes. A changed effective placement can invalidate an old frozen capture; nav will not quietly update it. Parent owns merged compile/client compile/basic smoke and final merge.
+
+## Approach/arrival completion (walk-approach-completion continuation)
+
+Runtime defect: the guarded source-grid alignment only STARTED once `currentSupport` existed — i.e.
+once the body was already within the 0.15-block contact band. That is exactly the state where the
+terrain transition guard must refuse any rotation whose swept render motion reaches the body, and
+the old fixed-anchor/(acceptedStep+1)/40 schedule FROZE on the first refused step (a refused step
+re-proposed an identical basis forever). Every walk request taken with a genuinely rotated deep
+basis therefore expired without arriving, and retries failed the same way. Fix, preserving the
+approved contracts (q advances only by real movement; no snapping; acquisition strictly through the
+unchanged contact query plus `acquireCurrentSupport`; singular alignments refused):
+
+- `SpiritTerrainService.approachSupport(player, depth)`: the SAME owned/producing-window/contact
+  rules as acquisition, run with a deeper downward reach (nav uses 24) and without the current-body
+  ownership check (the body is not there yet). It grants alignment/prewarm authority ONLY — nothing
+  is acquired from it, and the real arrival still commits exclusively at validated contact.
+- `MeshCollision.ground(body, index, depth)`: the resting-contact query parameterized by reach; the
+  existing `.15` behavior is byte-identical through the same helper.
+- `attemptSupport` now aligns against the support discovered BELOW a descending actor, so the
+  guarded rotation and the walk-proof prewarm happen while the near-surface cells are still clear of
+  the body; when real contact appears, an already-aligned approach acquires immediately.
+- Refused guarded steps RE-PLAN (`SupportApproachAlignment`): re-anchor at the live basis and halve
+  the pace (bounded at 1/5120) so the retry's swept motion fits under the guard. Every
+  guard-validated, continuity-checked ACCEPTED step recovers the pace toward full (capped at the
+  approved 40-accepted-step schedule), so transient refusals never permanently cripple the remaining
+  request budget — three refusals strand the pace at 1/320 only if nothing is ever accepted again.
+  Each epoch still converges to the EXACT destination basis the strict acquisition gate requires.
+  The old schedule's deadlock and the permanent-ratchet expiry are both encoded as regression
+  contrasts (`SupportApproachAlignmentTest`), plus sweep regressions for pre-contact discovery
+  (`ApproachSupportSweepTest`).
+- `ensureWalkProof` carries completed source proof across re-centered probes when landmark and
+  geometry revision match (tiles are absolute-positioned; acquisition still revalidates every
+  body/floor sample), so descent movement no longer starves readiness until the actor stands still.
+
+## Retained integration: mesh movement and latest-destination arrival
+
+The `feat-runtime-merge-0017` continuation integrates the retained movement parent
+`702a9a22f2a3a44e72aa402d28e260aa911388d1` and approach/retargeting parent
+`460255a3c7fdc121cc8cb47d8e4e41b83e55672a`, preserving their existing changes.
+Additional integration repairs:
+
+- The original swept collision hook was not sufficient: vanilla `onPlayerMove`
+  overwrites the resolved pose with the requested coordinates after `Entity.move`,
+  accepting small horizontal residuals and discarding ordinary vertical residuals.
+  `SpiritMeshMovementAcceptanceMixin` intercepts only that final pose write in the
+  spirit world and retains the actual swept result. Meaningful prediction mismatch
+  corrects to the accepted surface rather than the previous tick's position. The
+  packet correction threshold does **not** authorize even microscopic penetration.
+  Vanilla invalid-packet, speed, thread and teleport guards remain in place;
+  vehicle/no-clip/sleeping cases retain vanilla handling. Command teleports are
+  not intercepted. The mapped Minecraft bytecode and mixin registration/ordinal
+  are tested, but Fabric injection at launch has not been exercised.
+- `MeshCollision.ground(body, index, depth)` now uses the same widened swept-query
+  helper as normal contact (including the SAT tolerance). Contact still uses .15;
+  deeper discovery only plans alignment and cannot itself authorize walking.
+- Local pose reconciliation observes mode/epoch changes on packet arrival and
+  prediction ticks, resetting each channel exactly once. A transition whose
+  authoritative channels arrive between ticks no longer causes another full
+  adoption at the following four-tick sync. Retired/local-outside-spirit component
+  instances lose their prediction hooks; remote/server sync remains untouched.
+- `explicitDestinationChange` itself invalidates pending capture completion before
+  advancing the destination epoch and clears both landing/support approaches.
+  Callers cannot accidentally leave an old callback alive to overwrite a newer
+  request. Existing bounded `WalkIntentTracker`, source proof/ownership validation,
+  refusal replanning and real contact-only acquisition remain authoritative.
+
+Actual validation: cached Gradle 8.13, Java 21,
+`--no-daemon --console=plain build --rerun-tasks`, exit 0. All 13 runtime suites
+were discovered and executed, including `MeshCollisionTunnelingTest`,
+`MeshMovementArrivalTest` (737 checks), `SpiritMeshMovementWiringTest`,
+`SpiritPoseReconciliationTest`, `ApproachSupportSweepTest`,
+`SupportApproachAlignmentTest`, `WalkApproachRetargetingTest`,
+`WalkRetargetingTest`, `FlightCorrectionPayloadTest` and four retained embedding
+suites. Build fixtures validated runner discovery/failure propagation, descriptors,
+metadata and invalid archives; the remapped production jar passed verification.
+Retained build handle: original session `$11` / origin `%2039`, job pane `%2071`,
+run `9cfe9147dc7a46d197d7ab3c82fd5429`. Nonfatal API Guardian annotation/deprecation
+warnings remain. No game/client/server launch, visual inspection, real asynchronous
+world-generation timing, model inference or gameplay measurement was performed.
+Embedding persistence/pipeline tests use fixtures, not model execution; this scope
+changes neither the backend nor native-v2 profile rules. Slow source readiness can
+still exhaust a bounded request and legitimately retain deep flight. Singular,
+unsafe, stale or unowned support remains refused instead of granting walking.

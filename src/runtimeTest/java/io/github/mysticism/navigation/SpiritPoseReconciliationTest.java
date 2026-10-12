@@ -137,6 +137,36 @@ public final class SpiritPoseReconciliationTest {
         check(session2.reconcileBasis(server, null, false) == server, "Post-reset basis sync is adopted");
     }
 
+    private static void modeArrivalBetweenPredictionTicks() {
+        var session = new SpiritPoseReconciliation.Session();
+        var server = vector(1);
+        var basis = new Basis384f();
+        session.observeMode(1);
+        session.reconcilePosition(server, null);
+        session.reconcileBasis(basis, null, false);
+        // The server starts an approach and publishes navigation, basis, then position between
+        // two client ticks. Adoption must happen on ARRIVAL, not one four-tick sync later.
+        session.observeMode(2);
+        check(session.awaitingPositionResync() && session.awaitingBasisResync(), "new approach resets both channels at arrival");
+        check(session.reconcileBasis(basis, new Basis384f(), true) == basis, "alignment basis adopts immediately");
+        session.observeMode(2); // another channel or tick: no duplicate reset
+        check(!session.awaitingBasisResync() && session.awaitingPositionResync(), "split channels retain independent adoption state");
+        check(session.reconcilePosition(server, moved(server, 1)) == server, "approach position adopts immediately");
+        session.observeMode(2); // onEndTick after both packets
+        check(!session.awaitingPositionResync() && !session.awaitingBasisResync(), "prediction tick cannot re-arm already-consumed transition channels");
+        var predicted = moved(server, 1);
+        check(session.reconcilePosition(server, predicted) == predicted, "following four-tick sync preserves in-flight approach prediction instead of snapping twice");
+        session.observeMode(3); // arrival -> shallow walking
+        check(session.awaitingPositionResync() && session.awaitingBasisResync(), "grounded walking starts a new reconciliation epoch");
+        session.reconcilePosition(server, predicted);
+        session.observeMode(3);
+        check(!session.awaitingPositionResync() && session.awaitingBasisResync(), "grounded position arriving before basis is not adopted repeatedly");
+        session.reconcileBasis(basis, basis, false);
+        session.reset(); // physical teleport/external mutation within the same mode
+        session.observeMode(3);
+        check(session.awaitingPositionResync() && session.awaitingBasisResync(), "explicit invalidation survives same-mode observation");
+    }
+
     private static void componentPersistenceUnchanged() {
         LatentPos.SyncReconciler mustNotRun = (incoming, current) -> { throw new AssertionError("Server position sync must not consult prediction"); };
         LatentBasis.SyncReconciler mustNotRunBasis = (incoming, current) -> { throw new AssertionError("Server basis sync must not consult prediction"); };
@@ -288,6 +318,7 @@ public final class SpiritPoseReconciliationTest {
         policy();
         positionSession();
         basisSession();
+        modeArrivalBetweenPredictionTicks();
         componentPersistenceUnchanged();
         clientArrivalReconciliation();
         walkingFlightSawtooth();

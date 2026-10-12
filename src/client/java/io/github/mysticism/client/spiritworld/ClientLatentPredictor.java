@@ -48,6 +48,11 @@ public final class ClientLatentPredictor {
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> clear());
     }
     private static void clear() {
+        if (hookedPlayer != null) {
+            hookedPlayer.getComponent(MysticismEntityComponents.LATENT_POS).setSyncReconciler(null);
+            hookedPlayer.getComponent(MysticismEntityComponents.LATENT_BASIS).setSyncReconciler(null);
+            hookedPlayer = null;
+        }
         lastPos = null; lastPlayer = null; lastWorld = null; lastEpoch = -1; lastDeep = false;
         lastSignature = -1; predictedQ = null; predictedBasis = null; SESSION.reset();
     }
@@ -57,18 +62,21 @@ public final class ClientLatentPredictor {
      */
     private static void ensureHooks(ClientPlayerEntity player) {
         if (hookedPlayer == player) return;
+        clear(); // Retired local player instances must return to plain sync semantics.
         hookedPlayer = player;
         SESSION.reset(); predictedQ = null; predictedBasis = null; lastPos = null; lastSignature = -1;
         player.getComponent(MysticismEntityComponents.LATENT_POS).setSyncReconciler((serverValue, current) -> {
-            if (hookedPlayer != player) return serverValue; // stale instance after respawn: adopt authority
+            if (hookedPlayer != player || !predicting(player)) return serverValue;
+            SESSION.observeMode(signature(player.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION)));
             var predicted = predictedQ != null ? predictedQ : current;
             var result = SESSION.reconcilePosition(serverValue, predicted);
             predictedQ = result;
             return result;
         });
         player.getComponent(MysticismEntityComponents.LATENT_BASIS).setSyncReconciler((serverValue, current) -> {
-            if (hookedPlayer != player) return serverValue;
+            if (hookedPlayer != player || !predicting(player)) return serverValue;
             var nav = player.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION);
+            SESSION.observeMode(signature(nav));
             // Server-owned basis trajectories (support/landing alignment) cannot be reproduced
             // client-side: adopt every sync while they are active.
             boolean serverDriven = nav.active() && nav.deep() && (nav.supportApproach() || nav.landingApproach());
@@ -77,6 +85,10 @@ public final class ClientLatentPredictor {
             predictedBasis = result;
             return result;
         });
+    }
+    private static boolean predicting(ClientPlayerEntity player) {
+        return player.getWorld().getRegistryKey().getValue().equals(Identifier.of("mysticism", "spirit"))
+                && player.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION).active();
     }
     /** Everything that changes which movement stream the prediction integrates. */
     private static long signature(io.github.mysticism.component.SpiritNavigation nav) {
@@ -104,11 +116,16 @@ public final class ClientLatentPredictor {
         }
         ensureHooks(mc.player);
         long current = signature(nav);
+        SESSION.observeMode(current);
         // Re-anchor to authoritative component values on player/world/mode changes or external
         // writes; the transition tick itself advances nothing (matches the epoch guard below).
         if (lastPlayer != mc.player || lastWorld != mc.world || current != lastSignature
                 || q != predictedQ || basis != predictedBasis) {
-            SESSION.reset(); predictedQ = q; predictedBasis = basis;
+            // Mode changes are reset at packet arrival as well as here. Do not re-arm adoption
+            // AFTER both new-mode channels have already arrived; that regressed prediction again
+            // at the following four-tick sync. Only untracked external writes need another reset.
+            if (q != predictedQ || basis != predictedBasis) SESSION.reset();
+            predictedQ = q; predictedBasis = basis;
             lastPlayer = mc.player; lastWorld = mc.world; lastSignature = current;
             lastPos = mc.player.getPos();
             lastEpoch = nav.motionEpoch(); lastDeep = nav.deep();

@@ -67,6 +67,8 @@ public final class LatentCommands {
         // Explicit snapshot, NOT followPersonal(), which would live-follow subsequent observations.
         SpiritNavigationService.cancelCapture(p);
         att.set(att.personal()); p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION).clearTarget();
+        // An explicit concept re-key is a destination request: it supersedes pending walk/landing intents.
+        SpiritNavigationService.explicitDestinationChange(p);
         MysticismEntityComponents.LATENT_ATTUNEMENT.sync(p); MysticismEntityComponents.SPIRIT_NAVIGATION.sync(p);
         src.sendFeedback(() -> Text.literal("Captured personal concept location; no shallow source destination."), false); return 1;
     }
@@ -90,6 +92,8 @@ public final class LatentCommands {
                 SpiritNavigationService.cancelCapture(p);
                 p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).set(vector);
                 p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION).clearTarget();
+                // An explicit concept re-key is a destination request: it supersedes pending walk/landing intents.
+                SpiritNavigationService.explicitDestinationChange(p);
                 MysticismEntityComponents.LATENT_ATTUNEMENT.sync(p); MysticismEntityComponents.SPIRIT_NAVIGATION.sync(p);
             }
             case "basis" -> {
