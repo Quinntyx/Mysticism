@@ -31,7 +31,8 @@ float density(vec3 p) {
                                     * sin(phase.z * 61.0 - phase.y * 17.0));
 }
 
-// Terrain-published occupied voxels, not generated on render/tick. Nearest packed atlas.
+// Current observer-mesh density hints; no source-world reads. Nearest packed atlas.
+// Density is conservative/coarse; scene depth, NOT occupancy, terminates the ray.
 float occupancy(vec3 offset) {
     if (HasOccupancy == 0) return 0.0;
     ivec3 cell = ivec3(floor((offset + OccupancyCameraOffset + vec3(64.0)) / 8.0));

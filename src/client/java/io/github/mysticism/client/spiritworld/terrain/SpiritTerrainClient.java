@@ -25,6 +25,7 @@ public final class SpiritTerrainClient {
     private SpiritTerrainClient() {}
     private static final RenderLayer LAYER=SpiritRenderLayers.texturedMain(SpriteAtlasTexture.BLOCK_ATLAS_TEXTURE);
     private static TerrainMeshFrame frame;
+    private static final SpiritMediumField mediumField=new SpiritMediumField();
     private static boolean initialized,dirty;
     private static String failure;
     private static final List<Batch> gpu=new ArrayList<>();
@@ -46,11 +47,12 @@ public final class SpiritTerrainClient {
         if(frame!=null && incoming.revision()<=frame.revision())return;
         if(client.player!=null && (frame==null || frame.shallow()!=incoming.shallow()))MeshCollision.clearClient();
         frame=incoming;dirty=true;failure=null;
-        publishMedium(client,incoming);
+        // Medium is refreshed from the actual render camera with this mesh, not a packet-time eye pose.
     }
     public static Optional<TerrainMeshFrame> frame(){return Optional.ofNullable(frame);}
     public static Optional<String> failure(){return Optional.ofNullable(failure);}
-    public static void clear(){MeshCollision.clearClient();frame=null;dirty=false;failure=null;closeBuffers();ShaderManager.setMediumSamples(new float[4096],Vec3d.ZERO);}
+    public static void clear(){MeshCollision.clearClient();frame=null;dirty=false;failure=null;closeBuffers();clearMedium();}
+    private static void clearMedium(){mediumField.clear();ShaderManager.clearMediumSamples();}
     private static void closeBuffers(){for(Batch b:gpu)b.buffer.close();gpu.clear();}
     private static void upload(MinecraftClient client) {
         closeBuffers();if(frame==null)return;
@@ -106,35 +108,27 @@ public final class SpiritTerrainClient {
         try {
             if(dirty)upload(client);
             Vec3d camera=context.camera().getPos();Vec3d offset=frame.carrierOrigin().subtract(camera);
+            if(gpu.isEmpty())clearMedium();
+            else mediumField.update(frame,camera).ifPresent(samples->ShaderManager.setMediumSamples(samples.occupancy(),samples.center()));
             Matrix4f view=new Matrix4f(context.positionMatrix()).translate((float)offset.x,(float)offset.y,(float)offset.z);
             client.getFramebuffer().beginWrite(false);RenderSystem.enableDepthTest();RenderSystem.depthMask(true);
             LAYER.startDrawing();
+            boolean drewMesh=false;
             try {
                 for(Batch b:gpu) {
                     if(distanceSquared(b.bounds,camera)>64*64 || context.frustum()!=null && !context.frustum().isVisible(b.bounds))continue;
-                    b.buffer.bind();b.buffer.draw(view,context.projectionMatrix(),RenderSystem.getShader());
+                    b.buffer.bind();b.buffer.draw(view,context.projectionMatrix(),RenderSystem.getShader());drewMesh=true;
                 }
             } finally{VertexBuffer.unbind();LAYER.endDrawing();}
-            ShaderManager.afterMeshDepth();
+            if(drewMesh)ShaderManager.afterMeshDepth();
         } catch(RuntimeException error) {
-            closeBuffers();dirty=false;
+            closeBuffers();dirty=false;clearMedium();
             if(!Objects.equals(failure,error.toString())){failure=error.toString();client.player.sendMessage(net.minecraft.text.Text.literal("Spirit mesh unavailable: "+error.getMessage()),true);}
         } finally {
             GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER,oldDraw);GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER,oldRead);
         }
     }
     private static double distanceSquared(Box b,Vec3d p){double x=Math.max(Math.max(b.minX-p.x,0),p.x-b.maxX),y=Math.max(Math.max(b.minY-p.y,0),p.y-b.maxY),z=Math.max(Math.max(b.minZ-p.z,0),p.z-b.maxZ);return x*x+y*y+z*z;}
-    private static void publishMedium(MinecraftClient client,TerrainMeshFrame f) {
-        if(client.player==null)return;Vec3d center=client.player.getEyePos();float[] medium=new float[4096];int work=0;
-        outer:for(var cell:f.cells())for(Box local:cell.collision()) {
-            Box b=cell.bounds(local);
-            int x0=Math.max(0,(int)Math.floor((b.minX-center.x)/8)+8),x1=Math.min(15,(int)Math.floor((b.maxX-center.x)/8)+8);
-            int y0=Math.max(0,(int)Math.floor((b.minY-center.y)/8)+8),y1=Math.min(15,(int)Math.floor((b.maxY-center.y)/8)+8);
-            int z0=Math.max(0,(int)Math.floor((b.minZ-center.z)/8)+8),z1=Math.min(15,(int)Math.floor((b.maxZ-center.z)/8)+8);
-            for(int x=x0;x<=x1;x++)for(int y=y0;y<=y1;y++)for(int z=z0;z<=z1;z++) {if(work++>=16384)break outer;medium[x+16*(y+16*z)]=Math.max(medium[x+16*(y+16*z)],.5f*cell.opacity());}
-        }
-        ShaderManager.setMediumSamples(medium,center);
-    }
     private record AlphaConsumer(VertexConsumer delegate,float alpha) implements VertexConsumer {
         @Override public VertexConsumer vertex(float x,float y,float z){delegate.vertex(x,y,z);return this;}
         @Override public VertexConsumer color(int r,int g,int b,int a){delegate.color(r,g,b,Math.round(a*alpha));return this;}

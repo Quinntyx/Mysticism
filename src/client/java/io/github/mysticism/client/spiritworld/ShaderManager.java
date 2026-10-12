@@ -71,11 +71,6 @@ public final class ShaderManager {
                 KUWAHARA_SHADER.setUniformValue("InverseViewProjection", inverseViewProjection);
                 KUWAHARA_SHADER.setUniformValue("CameraModulo", SpiritRenderSettings.wrap(camera.x),
                         SpiritRenderSettings.wrap(camera.y), SpiritRenderSettings.wrap(camera.z));
-                int medium=SpiritMediumTexture.prepare();
-                KUWAHARA_SHADER.setUniformValue("HasOccupancy",medium==0?0:1);
-                if (medium!=0) KUWAHARA_SHADER.setSamplerUniform("OccupancySampler",medium);
-                var offset=SpiritMediumTexture.offset(camera);
-                KUWAHARA_SHADER.setUniformValue("OccupancyCameraOffset",(float)offset.x,(float)offset.y,(float)offset.z);
                 KUWAHARA_SHADER.setUniformValue("NearBubble",(float)SpiritRenderSettings.NEAR_BUBBLE);
                 KUWAHARA_SHADER.setUniformValue("EffectStrength",effectStrength());
                 KUWAHARA_SHADER.setUniformValue("OpaqueRadius", (float) SpiritRenderSettings.OPAQUE_RADIUS);
@@ -139,6 +134,9 @@ public final class ShaderManager {
                 main.beginWrite(false);
                 KUWAHARA_SHADER.setSamplerUniform("OriginalSampler",SpiritEntryScene.original(client,sceneDepth.getColorAttachment()));
                 KUWAHARA_SHADER.setSamplerUniform("DepthSampler", sceneDepth.getDepthAttachment());
+                // BEFORE_ENTITIES has now drawn and published the current terrain. Binding at START
+                // paired this frame's depth with last frame's density (and lost first-frame occupancy).
+                bindCurrentMedium(context.camera().getPos());
                 KUWAHARA_SHADER.render(context.tickCounter().getTickDelta(false));
                 checkGl("executing postprocess");
                 status = "volumetric " + quality.name().toLowerCase(java.util.Locale.ROOT)
@@ -178,6 +176,15 @@ public final class ShaderManager {
     public static void afterMeshDepth() { meshDepthSeen=true; }
     public static void setMediumSamples(float[] occupancy) { SpiritMediumTexture.publish(occupancy); }
     public static void setMediumSamples(float[] occupancy,Vec3d center) { SpiritMediumTexture.publish(occupancy,center); }
+    public static void clearMediumSamples() { SpiritMediumTexture.clear(); }
+
+    private static void bindCurrentMedium(Vec3d camera) {
+        int medium=SpiritMediumTexture.prepare();
+        KUWAHARA_SHADER.setUniformValue("HasOccupancy",medium==0?0:1);
+        KUWAHARA_SHADER.setSamplerUniform("OccupancySampler",medium); // also unbind deleted/stale texture on clear
+        var offset=SpiritMediumTexture.offset(camera);
+        KUWAHARA_SHADER.setUniformValue("OccupancyCameraOffset",(float)offset.x,(float)offset.y,(float)offset.z);
+    }
     public static float effectStrength() {
         if (transitionAt==0) return 0;
         double t=Math.max(0,Math.min(1,(System.nanoTime()-transitionAt)*1e-9/1.5));
