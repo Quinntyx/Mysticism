@@ -45,6 +45,15 @@ final class NegativeCoverage extends AbstractSet<BlockPos> {
             }
         };
     }
+    /** Recentered outward discovery never retains masks for source buckets outside its horizon. */
+    void retain(io.github.mysticism.landmark.Bounds range) {
+        buckets.entrySet().removeIf(e->{
+            BlockPos p=e.getKey();
+            boolean outside=!new io.github.mysticism.landmark.Bounds((long)p.getX()<<4,(long)p.getY()<<4,(long)p.getZ()<<4,
+                    ((long)p.getX()<<4)+16,((long)p.getY()<<4)+16,((long)p.getZ()<<4)+16).intersects(range);
+            if(outside)size-=e.getValue().cardinality();return outside;
+        });
+    }
     void copyFrom(NegativeCoverage other) {
         buckets.clear();other.buckets.forEach((p,bits)->buckets.put(p,(BitSet)bits.clone()));size=other.size;
     }

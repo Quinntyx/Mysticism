@@ -37,6 +37,12 @@ public final class WalkPolicy {
     /** Fraction of the remaining q/coordinate residual closed per validated slide tick. */
     public static final float SLIDE_FRACTION = 0.2f;
 
+    /** Elapsed server time, not successful contact ticks. Intermittent support and retry/semantic
+     * readiness gates cannot renew an intent; repeated toggle packets keep the original start. */
+    public static boolean requestExpired(long startedTick, long currentTick) {
+        return currentTick - startedTick >= MAX_PENDING_TICKS;
+    }
+
     public static SupportPhase phase(boolean semanticSupport, boolean meshGround, boolean ownershipPending,
                                      boolean blankSourceId) {
         if (semanticSupport) return SupportPhase.SUPPORTED;

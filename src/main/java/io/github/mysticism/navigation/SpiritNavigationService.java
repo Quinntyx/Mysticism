@@ -43,8 +43,8 @@ public final class SpiritNavigationService {
     public static void installLandingSafety(LandingSafety safety) { landingSafety = Objects.requireNonNull(safety); }
     private SpiritNavigationService() {}
     private static final class Session {
-        int unsupported, blendTick, landingTick, supportTick, supportAlignTick, supportStall, acquireFailures;
-        long acquireRetry;
+        int unsupported, blendTick, landingTick, supportAlignTick, supportStall, acquireFailures;
+        long acquireRetry, supportStartedTick;
         boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, supportPending;
         /** Feet height of the last mesh-supported shallow tick; NaN until support is first measured. */
         double supportY = Double.NaN;
@@ -348,7 +348,7 @@ public final class SpiritNavigationService {
         flight(p, true); // remains deep/freeflight until the real terrain acquisition commits
         if (s.supportPending) return; // repeated packets cannot reset budgets or duplicate requests
         endApproach(p, s); s.blendFrom = null; s.blendTo = null;
-        s.supportPending = true; s.supportTick = 0; s.supportFrom = null;
+        s.supportPending = true; s.supportStartedTick = p.getServer().getTicks(); s.supportFrom = null;
         s.supportStall = 0; s.acquireFailures = 0; s.acquireRetry = 0;
         s.supportId = ""; s.supportDimension = "";
         s.supportTargetSnapshot = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target();
@@ -358,7 +358,7 @@ public final class SpiritNavigationService {
     private static void endSupportApproach(ServerPlayerEntity p, Session s) {
         if (s.supportPending) SpiritTerrainService.cancelCurrentSupport(p);
         s.supportPending = false; s.supportTargetSnapshot = null; s.supportFrom = null; s.supportGrid = null;
-        s.supportId = ""; s.supportDimension = ""; s.supportTick = 0; s.supportAlignTick = 0;
+        s.supportId = ""; s.supportDimension = ""; s.supportStartedTick = 0; s.supportAlignTick = 0;
         s.supportStall = 0; s.acquireFailures = 0; s.acquireRetry = 0;
         if (state(p).supportApproach()) { state(p).setSupportApproach(false); sync(p); }
     }
@@ -514,6 +514,14 @@ public final class SpiritNavigationService {
     /** Current support, independent of captured destinations. Physical movement drives q; the only
      * non-movement q change is the bounded validated slide below that closes alignment residual. */
     private static void attemptSupport(ServerPlayerEntity p, Session s, Vec3d delta) {
+        if (WalkPolicy.requestExpired(s.supportStartedTick, p.getServer().getTicks())) {
+            // Expired intent leaves a stable usable hover: an unbounded residual velocity would keep
+            // drifting the carrier while the player decides what to do next. Still deep; no substitute landing.
+            deliverStableHover(p, s);
+            endSupportApproach(p, s);
+            p.sendMessage(Text.literal("Walk request expired: current support could not be continuously aligned/owned. Still deep; no substitute landing."), true);
+            return;
+        }
         var nav = state(p); var component = p.getComponent(MysticismEntityComponents.LATENT_BASIS);
         var q = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
         // During a walk request q integrates along the DESTINATION source grid once known: after the
@@ -535,14 +543,6 @@ public final class SpiritNavigationService {
             return;
         }
         s.supportStall = 0;
-        if (++s.supportTick > WalkPolicy.MAX_PENDING_TICKS) {
-            // Expired intent leaves a stable usable hover: an unbounded residual velocity would keep
-            // drifting the carrier while the player decides what to do next. Still deep; no substitute landing.
-            deliverStableHover(p, s);
-            endSupportApproach(p, s);
-            p.sendMessage(Text.literal("Walk request expired: current support could not be continuously aligned/owned. Still deep; no substitute landing."), true);
-            return;
-        }
         if (!s.semanticReady) return; // Real late source discovery must finish; never invent q.
         if (s.supportTargetSnapshot.squareDistance(p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target()) > 0) {
             endSupportApproach(p, s);

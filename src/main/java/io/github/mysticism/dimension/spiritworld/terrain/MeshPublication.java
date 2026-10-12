@@ -20,13 +20,19 @@ final class MeshPublication {
             Vec3d root,Vec3d ax,Vec3d ay,Vec3d az,Vec3d viewer,float alpha,int limit,
             List<TerrainMeshFrame.Material> materials,Map<TerrainMeshFrame.Material,Integer> palette,
             List<TerrainMeshFrame.Cell> cells,Set<Long> keys) {
+        return append(nodes,dimension,sourceOrigin,root,ax,ay,az,viewer,alpha,limit,materials,palette,cells,keys,DiscoveryBudget.RENDER_DISTANCE);
+    }
+    static List<TerrainMeshFrame.Cell> append(List<SourceMeshBuilder.Node> nodes,String dimension,Vec3d sourceOrigin,
+            Vec3d root,Vec3d ax,Vec3d ay,Vec3d az,Vec3d viewer,float alpha,int limit,
+            List<TerrainMeshFrame.Material> materials,Map<TerrainMeshFrame.Material,Integer> palette,
+            List<TerrainMeshFrame.Cell> cells,Set<Long> keys,int renderDistance) {
         if(Math.abs(ax.dotProduct(ay.crossProduct(az)))<1e-6)return List.of();
         List<Patch> fine=new ArrayList<>(),far=new ArrayList<>();
         for(var n:nodes) {
             Patch patch=new Patch(new Vec3d(n.position().getX(),n.position().getY(),n.position().getZ()),
                     new Vec3d(n.side(),n.side(),n.side()),n.tile(),n.ownerId());
             Candidate c=project(patch,sourceOrigin,root,ax,ay,az,viewer);
-            if(c.distance>(double)DiscoveryBudget.RENDER_DISTANCE*DiscoveryBudget.RENDER_DISTANCE)continue;
+            if(c.distance>(double)renderDistance*renderDistance)continue;
             if(n.tile().cube() && n.tile().collision().equals(List.of(SourceMeshBuilder.UNIT)) && c.distance>BODY_RADIUS*BODY_RADIUS)far.add(patch);
             else fine.add(patch);
         }

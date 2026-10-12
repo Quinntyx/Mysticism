@@ -15,7 +15,7 @@ final class TerrainGeometryStream {
     final Vec3d focus;
     final Map<SourceMeshBuilder.Key,SourceMeshBuilder.Node> nodes=new HashMap<>();
     private final Map<BlockPalette.State,SourceMeshBuilder.Tile> materials=new HashMap<>();
-    int pageIndex;
+    int pageIndex,renderDistance=DiscoveryBudget.RENDER_DISTANCE;
     boolean far,complete,changed;
     SparseOctree<BlockSample>.Cursor cells;
     GeometryPage page;
@@ -27,6 +27,10 @@ final class TerrainGeometryStream {
     void accept(GeometryPage geometry){page=geometry;cells=geometry.cells().cursor(far?geometry.bounds():near);}
     /** Node visits, emitted leaves and newly resolved server-thread materials are all budgeted. */
     void advance(String owner,ToDoubleFunction<SourceMeshBuilder.Node> distance) {
+        advance(owner,distance,DiscoveryBudget.RENDER_DISTANCE);
+    }
+    void advance(String owner,ToDoubleFunction<SourceMeshBuilder.Node> distance,int renderDistance) {
+        this.renderDistance=renderDistance;
         if(cells==null)return;
         for(var cell:cells.advance(128,32)) {
             if(cell.value().occupancy()!=BlockSample.Occupancy.SOLID)continue;
@@ -37,7 +41,7 @@ final class TerrainGeometryStream {
             // No global palette truncation: cold materials omitted from this bounded reservoir can be revisited on a new spatial pass.
             if(tile==null){tile=SourceMeshBuilder.stored(state,at);if(materials.size()<TerrainMeshFrame.MAX_MATERIALS)materials.put(state,tile);}
             var node=new SourceMeshBuilder.Node(at,side,tile,owner);double d=distance.applyAsDouble(node);
-            if(d>(double)DiscoveryBudget.RENDER_DISTANCE*DiscoveryBudget.RENDER_DISTANCE)continue;
+            if(d>(double)renderDistance*renderDistance)continue;
             var key=new SourceMeshBuilder.Key(at.getX(),at.getY(),at.getZ(),side);
             if(nodes.containsKey(key))continue;
             nodes.put(key,node);changed=true;

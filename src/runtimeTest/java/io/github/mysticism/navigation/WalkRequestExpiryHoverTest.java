@@ -33,6 +33,31 @@ public final class WalkRequestExpiryHoverTest {
                 "A zero semantic residual has zero world error");
     }
 
+    private static void elapsedExpiry() throws Exception {
+        long started = 100;
+        int stall = 0, contactTicks = 0;
+        for (int elapsed = 0; elapsed <= WalkPolicy.MAX_PENDING_TICKS; elapsed++) {
+            // This intermittent pattern never reaches either the old stall or contact budget.
+            boolean contact = elapsed % 199 == 198;
+            stall = contact ? 0 : stall + 1;
+            if (contact) contactTicks++;
+            check(stall <= WalkPolicy.STALL_CANCEL_TICKS, "Fixture must evade the missing-support stall budget");
+            check(WalkPolicy.requestExpired(started, started + elapsed) == (elapsed >= WalkPolicy.MAX_PENDING_TICKS),
+                    "Intermittent/missing support must not extend elapsed intent lifetime");
+        }
+        check(contactTicks < 10, "Fixture would have kept the old contact-only request pending for hours");
+        check(!WalkPolicy.requestExpired(1300, 1300), "A fresh request must receive a fresh budget");
+        check(WalkPolicy.requestExpired(started, started + 10000), "Skipped validation ticks must still expire elapsed intent");
+        String service = java.nio.file.Files.readString(java.nio.file.Path.of(
+                "src/main/java/io/github/mysticism/navigation/SpiritNavigationService.java"));
+        int attempt = service.indexOf("private static void attemptSupport");
+        int expiry = service.indexOf("WalkPolicy.requestExpired(s.supportStartedTick", attempt);
+        int lookup = service.indexOf("SpiritTerrainService.currentSupport(p)", attempt);
+        check(expiry > attempt && expiry < lookup, "Elapsed expiry must run before missing support/readiness can return");
+        check(service.indexOf("if (s.supportPending) return;") < service.indexOf("s.supportStartedTick = p.getServer().getTicks()"),
+                "Repeated entry packets must not renew the request deadline");
+    }
+
     private static void singleAirborneDecision() {
         // Supported and pending phases never convert; only AIRBORNE reaches the envelope decision.
         check(WalkPolicy.phase(true, false, false, false) == WalkPolicy.SupportPhase.SUPPORTED,
@@ -79,6 +104,7 @@ public final class WalkRequestExpiryHoverTest {
 
     public static void main(String[] args) throws Exception {
         budgetShape();
+        elapsedExpiry();
         singleAirborneDecision();
         navigationSeams();
         System.out.println("WalkRequestExpiryHoverTest: " + checks + " checks passed (merged walk-request expiry/hover contracts)");

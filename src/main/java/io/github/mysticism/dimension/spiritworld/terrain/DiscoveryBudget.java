@@ -14,8 +14,9 @@ import java.util.function.Predicate;
  *  Publication separately preserves the render-distance footprint within its wire budget;
  *  the absolute support floor survives even under last-resort retention pressure. */
 final class DiscoveryBudget {
-    /** Render/collision coverage contract in blocks; shared by the mesh append cull and the geometry-stream cull. */
+    /** Default offline-fixture distance. Production passes the observer's actual client view distance. */
     static final int RENDER_DISTANCE=128;
+    static int renderDistance(int clientChunks) {return Math.max(2,Math.min(32,clientChunks))*16;}
     /** Exact samples at or inside this radius are always retained while any farther sample can absorb the pressure. */
     static final int EXACT_RETENTION_RADIUS=24;
     /** Absolute retention floor: even last-resort eviction never reaches inside this radius. */
