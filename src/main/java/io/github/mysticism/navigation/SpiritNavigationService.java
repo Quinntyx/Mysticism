@@ -143,6 +143,7 @@ public final class SpiritNavigationService {
         s.confirmedOwned = false; s.warnedAnchor = false; s.prefetched = false;
         try {
             // Source-identical carrier pose: no shared origin, entry search or replacement floor.
+            io.github.mysticism.net.SpiritTransitionPayload.beforeTeleport(p, world, source, p.getYaw(), p.getPitch());
             p.teleport(world, source.x, source.y, source.z, p.getYaw(), p.getPitch());
             SpiritTerrainService.setShallow(p, true); flight(p, false);
             p.setVelocity(Vec3d.ZERO); sync(p);
