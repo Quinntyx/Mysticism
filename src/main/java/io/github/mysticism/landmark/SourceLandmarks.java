@@ -11,6 +11,7 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.ChunkPos;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -84,6 +85,34 @@ public final class SourceLandmarks {
     public static void activity(MinecraftServer server,String landmarkId,String dimension,BlockPos position){
         ensure(server,dimension,position,landmarkId,true); // bounded operation retains the actual event location
     }
+    /** Backfills discovery of already-loaded source chunks that predate spirit entry. Chunk-load
+     * events only fire on actual loads, so terrain loaded before a session (spawn area, the
+     * entrant's own view distance) never reached the hint pipeline. Loaded-only: missing holders
+     * are skipped, never loaded or generated. Each seed mirrors the CHUNK_LOAD path exactly: the
+     * chunk-center surface hint for the Ensure pipeline, plus a bounded frontier retry so existing
+     * caves can grow into this loaded terrain. One full plan has reserved hint capacity even
+     * when ordinary discovery is saturated. Returns only retained seeds, including duplicates;
+     * further entries can exceed the combined bounded capacity and are not counted as queued. */
+    public static int discoverLoaded(MinecraftServer server,String dimension,BlockPos center,int maxSeeds){
+        if(!server.isOnThread())throw new IllegalStateException("source server thread");
+        Session s=SESSIONS.get(server);
+        if(s==null||!SourceDimensions.isSource(dimension)||maxSeeds<0)return 0;
+        ServerWorld world=s.world(dimension);if(world==null)return 0;
+        var origin=new ChunkPos(center.toImmutable());
+        var plan=LoadedSourceBackfill.plan(origin,LoadedSourceBackfill.RADIUS,maxSeeds,
+            packed->world.getChunkManager().getWorldChunk(ChunkPos.getPackedX(packed),ChunkPos.getPackedZ(packed))!=null);
+        int hinted=0;
+        for(var pos:plan){
+            var chunk=world.getChunkManager().getWorldChunk(pos.x,pos.z);
+            if(chunk==null)continue; // plan is advisory; a concurrently unloaded holder must not resurrect a load
+            int x=pos.getStartX()+8,z=pos.getStartZ()+8;
+            int y=Math.min(chunk.sampleHeightmap(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,8,8)+1,world.getTopY()-1);
+            if(!s.hints.offerBackfill(dimension,new BlockPos(x,y,z)))continue;
+            hinted++;
+            if(s.retries.size()<32)s.retries.add(new FrontierRetry(dimension,new Bounds(pos.getStartX()-1L,world.getBottomY(),pos.getStartZ()-1L,pos.getStartX()+17L,world.getTopY(),pos.getStartZ()+17L)));
+        }
+        return hinted;
+    }
     public static void changed(ServerWorld world,BlockPos pos){
         if(!SourceDimensions.isSource(world.getRegistryKey().getValue().toString()))return;
         Session s=SESSIONS.get(world.getServer());if(s!=null){s.invalidate(world.getRegistryKey().getValue().toString(),pos);s.hint(world.getRegistryKey().getValue().toString(),pos.toImmutable());}
@@ -93,7 +122,6 @@ public final class SourceLandmarks {
     public static String status(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?"Stopped":s.status;}
     private static Session session(MinecraftServer server){if(!server.isOnThread())throw new IllegalStateException("source server thread");Session s=SESSIONS.get(server);if(s==null)throw new IllegalStateException("source service not initialized");return s;}
     private static void checkBounds(Bounds b,int maxCells){long volume=Math.multiplyExact(Math.multiplyExact(b.maxX()-b.minX(),b.maxY()-b.minY()),b.maxZ()-b.minZ());if(maxCells<1||maxCells>32768||volume>maxCells||b.minX()<Integer.MIN_VALUE||b.maxX()>Integer.MAX_VALUE||b.minY()<Integer.MIN_VALUE||b.maxY()>Integer.MAX_VALUE||b.minZ()<Integer.MIN_VALUE||b.maxZ()>Integer.MAX_VALUE)throw new IllegalArgumentException("source query bounds");}
-    private record Hint(String dimension,BlockPos pos){}
     private static final class FrontierRetry {
         final String dimension;final Bounds bounds;String cursor;boolean end;final ArrayDeque<LandmarkMetadata> headers=new ArrayDeque<>();Iterator<FrontierFace> faces;
         FrontierRetry(String dimension,Bounds bounds){this.dimension=dimension;this.bounds=bounds;}
@@ -106,14 +134,14 @@ public final class SourceLandmarks {
     private static final class Session {
         final MinecraftServer server;final LandmarkStore store;final ItemEmbeddingIndexState itemIndex;final ExecutorService worker=new ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(4),Thread.ofPlatform().daemon().name("mysticism-source").factory(),new ThreadPoolExecutor.AbortPolicy());
         final ArrayDeque<SourceOwnership.Request> ownerRequests=new ArrayDeque<>();
-        final ArrayDeque<FrontierRetry> retries=new ArrayDeque<>();final Map<CompletableFuture<?>,String> auxiliary=new IdentityHashMap<>();final ArrayDeque<Operation<?>> requests=new ArrayDeque<>();final LinkedHashSet<Hint> hints=new LinkedHashSet<>();Operation<?> active;String status="Ready";int playerCursor,lastCells;
+        final ArrayDeque<FrontierRetry> retries=new ArrayDeque<>();final Map<CompletableFuture<?>,String> auxiliary=new IdentityHashMap<>();final ArrayDeque<Operation<?>> requests=new ArrayDeque<>();final SourceDiscoveryHints hints=new SourceDiscoveryHints();Operation<?> active;String status="Ready";int playerCursor,lastCells;
         Session(MinecraftServer server){this.server=server;store=LandmarkStore.get(server);itemIndex=ItemEmbeddingIndexState.get(server);}
         <T> CompletableFuture<T> computeAndDeliver(String dim,java.util.function.Supplier<T> computation){
             var out=new CompletableFuture<T>();if(auxiliary.size()>=64){out.completeExceptionally(new RejectedExecutionException("source auxiliary budget"));return out;}auxiliary.put(out,dim);
             try{CompletableFuture.supplyAsync(computation,worker).whenComplete((value,error)->server.execute(()->{auxiliary.remove(out);if(SESSIONS.get(server)!=this)out.cancel(false);else if(error!=null)out.completeExceptionally(error);else out.complete(value);}));}catch(RuntimeException failure){auxiliary.remove(out);out.completeExceptionally(failure);}return out;
         }
         void offer(Operation<?> op){if(requests.size()==64){op.future.completeExceptionally(new RejectedExecutionException("source request budget"));return;}if(op instanceof Read)requests.addFirst(op);else requests.addLast(op);}
-        void hint(String dim,BlockPos p){if(hints.size()<128)hints.add(new Hint(dim,p));}
+        void hint(String dim,BlockPos p){hints.offer(dim,p);}
         void invalidate(String dim,BlockPos pos){if(active!=null&&active.dimension.equals(dim)&&active.guarded!=null&&active.guarded.contains(pos.getX(),pos.getY(),pos.getZ()))active.cancel(new CancellationException("source edit invalidated snapshot"));}
         void tick(){
             lastCells=0;
@@ -122,12 +150,12 @@ public final class SourceLandmarks {
             if(server.getTicks()%200==0){var players=server.getPlayerManager().getPlayerList();for(int n=0;n<Math.min(2,players.size());n++){var p=players.get(Math.floorMod(playerCursor++,players.size()));if(SourceDimensions.isSource(p.getServerWorld().getRegistryKey().getValue().toString()))hint(p.getServerWorld().getRegistryKey().getValue().toString(),p.getBlockPos());}}
             boolean ready=EmbeddingHelper.isReady()||itemIndex.isPopulated();
             if(active==null&&!requests.isEmpty()&&(requests.peekFirst() instanceof Read||ready))active=requests.removeFirst();
-            if(active==null&&ready&&!hints.isEmpty()){Hint h=hints.iterator().next();hints.remove(h);active=new Ensure(this,h.dimension,h.pos,null,false,new CompletableFuture<>());}
+            if(active==null&&ready&&!hints.isEmpty()){var h=hints.poll();active=new Ensure(this,h.dimension(),h.pos(),null,false,new CompletableFuture<>());}
             if(active==null)return;
             try{if(active.future.isCancelled())active.cancel(new CancellationException());if(!active.done)active.advance();if(active.done){active.release();active=null;status="Ready";}}
             catch(RuntimeException e){status="Deferred: "+e.getMessage();active.cancel(e);active.release();active=null;}
         }
-        void unload(String dim){ownerRequests.removeIf(request->{if(request.dimension.equals(dim)){request.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});retries.removeIf(r->r.dimension.equals(dim));auxiliary.entrySet().removeIf(e->{if(e.getValue().equals(dim)){e.getKey().cancel(false);return true;}return false;});if(active!=null&&active.dimension.equals(dim)){active.cancel(new CancellationException("source dimension unloaded"));active.release();active=null;}requests.removeIf(op->{if(op.dimension.equals(dim)){op.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});hints.removeIf(h->h.dimension.equals(dim));}
+        void unload(String dim){ownerRequests.removeIf(request->{if(request.dimension.equals(dim)){request.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});retries.removeIf(r->r.dimension.equals(dim));auxiliary.entrySet().removeIf(e->{if(e.getValue().equals(dim)){e.getKey().cancel(false);return true;}return false;});if(active!=null&&active.dimension.equals(dim)){active.cancel(new CancellationException("source dimension unloaded"));active.release();active=null;}requests.removeIf(op->{if(op.dimension.equals(dim)){op.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});hints.unload(dim);}
         void close(){ownerRequests.forEach(request->request.cancel(new CancellationException("server stopping")));ownerRequests.clear();auxiliary.keySet().forEach(f->f.cancel(false));auxiliary.clear();retries.clear();if(active!=null){active.cancel(new CancellationException("server stopping"));active.release();}requests.forEach(op->op.cancel(new CancellationException("server stopping")));requests.clear();hints.clear();worker.shutdownNow();}
         ServerWorld world(String dimension){return SourceDimensions.isSource(dimension)?server.getWorld(RegistryKey.of(RegistryKeys.WORLD,Identifier.of(dimension))):null;}
     }
