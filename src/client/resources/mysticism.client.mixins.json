@@ -5,6 +5,8 @@
   "client": [
     "SpiritBackgroundRendererMixin",
     "SpiritInteractionMixin",
+    "SpiritPickingMixin",
+    "SpiritCrosshairHudMixin",
     "SpiritNativeSceneMixin",
     "SpiritLayerPhasesAccess",
     "SpiritTextureAccess",
