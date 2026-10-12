@@ -16,7 +16,7 @@ public final class EmbeddingHelper {
         if(engine!=null)return;
         EmbeddingProvider provider=null;
         try{
-            provider=new EmbeddingService();
+            provider=EmbeddingProviders.configured();
             engine=new AsyncEmbeddingEngine(provider,threads,256,8192,Duration.ofMillis(Long.getLong("mysticism.embedding.deadlineMillis",30000)));
             AsyncEmbeddingEngine started=engine;
             readiness=started.readiness();failure="Initializing";

@@ -2,9 +2,16 @@
 
 ## Deployment, not an automatic download
 
-Mysticism uses an administrator-provisioned **Ollama-compatible** HTTP service. No
-model weights, software, fallback model, hash vectors, or model-pull endpoints are
-used by the mod. The official model exists at
+The default launch now uses the [embedded resource/adapter wiring](embedded-intellij-runtime.md),
+with a still-unprovisioned native v2 runtime/model as an explicit deployment blocker.
+The HTTP deployment below is optional: select `-Dmysticism.embedding.provider=http`.
+It is never an automatic fallback after embedded failure. The historical integration
+and validation notes later in this document predate the current Gradle/runtime suites;
+use `./gradlew --no-daemon --console=plain build` for canonical validation.
+
+The explicit HTTP backend uses an administrator-provisioned **Ollama-compatible**
+service. No model weights, software, fallback model, hash vectors, or model-pull
+endpoints are used by that backend. The official model exists at
 [Ollama nomic-embed-text-v2-moe](https://ollama.com/library/nomic-embed-text-v2-moe).
 The upstream [v2 model card](https://huggingface.co/nomic-ai/nomic-embed-text-v2-moe)
 documents 768 native dimensions, a 512-token context, multilingual text, and
@@ -74,11 +81,11 @@ and restart the server to retry failed startup readiness.
 
 Packages are `io.github.mysticism.embedding` and `.vector`.
 
-* `EmbeddingSpace.DIMENSIONS = 256`, `NATIVE_DIMENSIONS = 768`, `SCHEMA = 2`,
+* `EmbeddingSpace.DIMENSIONS = 768`, `NATIVE_DIMENSIONS = 768`, `SCHEMA = 2`,
   `DESCRIPTOR_VERSION = 2`; `FINGERPRINT` is SHA256 of
   `MODEL + "|" + REVISION + "|" + DIMENSIONS + "|" + SEMANTICS`.
   `SEMANTICS` includes the family, tokenizer=model-manifest, mean pooling,
-  `search_document: ` task, first-256 Matryoshka reduction, L2 normalization,
+  `search_document: ` task, full native 768 dimensions (no truncation), L2 normalization,
   and descriptor version. Equal dimensions never imply equal semantic space.
 * `EmbeddingHelper.profile(): EmbeddingProfile` returns immutable
   `(model, revision, dimensions, semantics, fingerprint)`.
@@ -88,7 +95,7 @@ Packages are `io.github.mysticism.embedding` and `.vector`.
 * `EmbeddingHelper.getEmbedding(String descriptor): CompletableFuture<Vec384f>`
   accepts **unprefixed**, nonblank canonical text, at most 8192 Java characters.
   The provider sends `search_document: ` itself. Each success is independently
-  owned, finite, nonzero, current-profile, L2-normalized and 256-dimensional.
+  owned, finite, nonzero, current-profile, L2-normalized and 768-dimensional.
   The bounded queue has 256 slots and a copied LRU cache holds 8192 entries.
   Queue rejection, provider exceptions, timeouts and shutdown complete futures;
   caller cancellation does not cancel another caller's shared inference.
@@ -126,8 +133,8 @@ CompletableFuture<Vec384f> semantic = EmbeddingHelper.readiness()
 engine: `profile()`, `checkReady()`, `getEmbedding(String)`, `close()`.
 `EmbeddingService(URI, Duration connectTimeout, Duration requestTimeout)` implements
 `GET /api/tags` and `POST /api/embed`, expects the declared model in the response
-and exactly one native 768-number embedding, then takes the first 256 dimensions
-and normalizes. Already-reduced 256 responses are deliberately rejected, as are
+and exactly one native 768-number embedding, retaining all dimensions and
+normalizing without truncation. Already-reduced 256 responses are deliberately rejected, as are
 legacy 384 responses. JSON bodies are bounded to 128 KiB. `truncate:false` makes
 actual 512-token overflow explicit; a character limit is not a token estimator.
 Custom providers must preserve the complete current profile, not just shape.

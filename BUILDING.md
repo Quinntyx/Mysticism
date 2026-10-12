@@ -99,9 +99,21 @@ runtimes must not enter the production artifact. Artifact checks are static;
 they do not substitute for a dedicated-server/client launch, GUI-scale/reload
 checks, or an embedding-service integration test.
 
-## Branch integration status
+## Embedded IntelliJ launch/resource unit
 
-This build intentionally has no DJL dependencies or local/native model runtime.
+See [embedded-intellij-runtime.md](docs/embedded-intellij-runtime.md) for local
+bundle provisioning, Loom/IntelliJ JVM arguments, SPI lifecycle and regression
+boundaries. The default provider is in-process; HTTP is explicit opt-in. This
+checkout contains resource/adapter wiring but no provisioned native v2 runtime
+or weights, so successful model inference remains blocked, not simulated.
+`runtimeSelfTest` discovers current embedding and `src/runtimeTest/java` suites;
+`check` also verifies actual Loom run arguments and serialized IntelliJ XML.
+
+## Historical branch integration status (not current build results)
+
+The following notes describe the earlier build-portability branch, not this
+checkout's current source or canonical build. This earlier build intentionally
+had no DJL dependencies or local/native model runtime.
 The original source still imports DJL in `EmbeddingService`, `EmbeddingCommand`,
 `KnnIndex`, `SimpleKnnIndex` and `ItemEmbeddingIndexState`. Until the separately
 owned JDK HTTP embedding migration removes those imports, full compilation is

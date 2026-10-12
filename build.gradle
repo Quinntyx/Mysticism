@@ -10,8 +10,22 @@ base {
     archivesName = project.archives_base_name
 }
 
+// Resolve provisioned resources relative to the Gradle project exactly once. Generated
+// IntelliJ launches use run/ as their cwd, not the checkout; never pass a relative model path.
+// No runtime/model downloads or external-service launch tasks are introduced here.
+def embeddedBundle = providers.gradleProperty('mysticismEmbeddingBundle')
+        .map { file(it).absoluteFile.toPath().normalize().toString() }
+
 loom {
     splitEnvironmentSourceSets()
+    runs {
+        configureEach {
+            // Data generation inherits client arguments; adding to it again duplicates JVM properties.
+            if (name in ['client', 'server'] && embeddedBundle.isPresent()) {
+                vmArg "-Dmysticism.embedding.bundle=${embeddedBundle.get()}"
+            }
+        }
+    }
     mods {
         mysticism {
             sourceSet sourceSets.main
@@ -88,6 +102,43 @@ jar {
 }
 
 apply from: 'scripts/selftest.gradle'
+
+tasks.register('verifyEmbeddedLaunchConfiguration') {
+    group = 'verification'
+    description = 'Check client/server Loom and generated IntelliJ bundle path wiring (not inference).'
+    doLast {
+        loom.runs.each { run ->
+            def name = run.name
+            def arguments = run.vmArgs.findAll { it.startsWith('-Dmysticism.embedding.bundle=') }
+            def expected = embeddedBundle.isPresent()
+                    ? ["-Dmysticism.embedding.bundle=${embeddedBundle.get()}".toString()] : []
+            if (arguments != expected) throw new GradleException("Incorrect ${name} embedded bundle launch path: ${arguments}")
+            if (embeddedBundle.isPresent() && !new File(embeddedBundle.get()).isAbsolute()) {
+                throw new GradleException('IDE embedded bundle path must be absolute')
+            }
+            // Exercise Loom's actual IntelliJ XML serializer without overwriting user IDE files.
+            def config = net.fabricmc.loom.configuration.ide.RunConfig.runConfig(project, run)
+            def xml = config.fromDummy('idea_run_config_template.xml', true, project)
+            def factory = javax.xml.parsers.DocumentBuilderFactory.newInstance()
+            factory.setFeature('http://apache.org/xml/features/disallow-doctype-decl', true)
+            def document = factory.newDocumentBuilder().parse(new org.xml.sax.InputSource(new StringReader(xml)))
+            def options = document.getElementsByTagName('option')
+            def vm = (0..<options.length).collect { options.item(it) }
+                    .find { it.getAttribute('name') == 'VM_PARAMETERS' }.getAttribute('value')
+            if (vm.count('-Dmysticism.embedding.bundle=') != expected.size()) {
+                throw new GradleException("Incorrect ${name} IntelliJ embedded bundle properties: ${vm}")
+            }
+            if (embeddedBundle.isPresent()) {
+                def argument = expected.first()
+                def quoted = embeddedBundle.get().any { Character.isWhitespace(it as char) }
+                        ? "\"${argument}\"" : argument
+                if (!vm.contains(quoted)) throw new GradleException("Incorrect ${name} IntelliJ path quoting: ${vm}")
+            }
+        }
+        logger.lifecycle('Client/server/data-generation embedded bundle paths and IntelliJ XML verified (no model inference)')
+    }
+}
+tasks.named('check') { dependsOn tasks.named('verifyEmbeddedLaunchConfiguration') }
 
 // Loom replaces the Java publication's dev artifact with remapJar.
 publishing {
