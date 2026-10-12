@@ -31,21 +31,24 @@ public final class SourceLandmarks {
         ServerTickEvents.END_SERVER_TICK.register(server->{Session s=SESSIONS.get(server);if(s!=null)s.tick();});
         ServerLifecycleEvents.SERVER_STOPPING.register(server->{Session s=SESSIONS.remove(server);if(s!=null)s.close();});
         ServerWorldEvents.UNLOAD.register((server,world)->{Session s=SESSIONS.get(server);if(s!=null)s.unload(world.getRegistryKey().getValue().toString());});
-        ServerChunkEvents.CHUNK_UNLOAD.register((world,chunk)->{Session s=SESSIONS.get(world.getServer());if(s!=null&&s.active!=null){String dim=world.getRegistryKey().getValue().toString();Bounds area=new Bounds(chunk.getPos().getStartX(),world.getBottomY(),chunk.getPos().getStartZ(),chunk.getPos().getStartX()+16L,world.getTopY(),chunk.getPos().getStartZ()+16L);if(s.active.dimension.equals(dim)&&s.active.guarded!=null&&s.active.guarded.intersects(area))s.active.cancel(new CancellationException("source chunk unloaded during observation"));}});
+        ServerChunkEvents.CHUNK_UNLOAD.register((world,chunk)->{Session s=SESSIONS.get(world.getServer());if(s!=null&&s.active!=null){String dim=world.getRegistryKey().getValue().toString();Bounds area=new Bounds(chunk.getPos().getStartX(),world.getBottomY(),chunk.getPos().getStartZ(),chunk.getPos().getStartX()+16L,world.getTopY(),chunk.getPos().getStartZ()+16L);s.invalidate(dim,area,"source chunk unloaded during observation");}});
         ServerChunkEvents.CHUNK_LOAD.register((world,chunk)->{
             if(!SourceDimensions.isSource(world.getRegistryKey().getValue().toString()))return;
             Session s=SESSIONS.get(world.getServer());if(s==null)return;
             int x=chunk.getPos().getStartX()+8,z=chunk.getPos().getStartZ()+8;
             int y=chunk.sampleHeightmap(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,x&15,z&15);
-            s.hint(world.getRegistryKey().getValue().toString(),new BlockPos(x,y+1,z));
-            if(s.retries.size()<64)s.retries.add(new FrontierRetry(world.getRegistryKey().getValue().toString(),new Bounds(chunk.getPos().getStartX()-1L,world.getBottomY(),chunk.getPos().getStartZ()-1L,chunk.getPos().getStartX()+17L,world.getTopY(),chunk.getPos().getStartZ()+17L)));
+            String dim=world.getRegistryKey().getValue().toString();
+            Bounds area=new Bounds(chunk.getPos().getStartX()-1L,world.getBottomY(),chunk.getPos().getStartZ()-1L,chunk.getPos().getStartX()+17L,world.getTopY(),chunk.getPos().getStartZ()+17L);
+            s.invalidate(dim,area,"source chunk loaded during observation");
+            s.hint(dim,new BlockPos(x,y+1,z));
+            s.retries.offer(new FrontierRetry(dim,area,false));
         });
     }
     public static CompletableFuture<Optional<LandmarkMetadata>> ensureSourceLocation(MinecraftServer server,String dimension,BlockPos position){return ensure(server,dimension,position,null,false);}
     private static CompletableFuture<Optional<LandmarkMetadata>> ensure(MinecraftServer server,String dimension,BlockPos position,String preferred,boolean activity){
         Session s=session(server);var future=new CompletableFuture<Optional<LandmarkMetadata>>();
         if(!SourceDimensions.isSource(dimension)){future.complete(Optional.empty());return future;}
-        s.offer(new Ensure(s,dimension,position.toImmutable(),preferred,activity,future));return future;
+        s.offer(new Ensure(s,dimension,position.toImmutable(),preferred,activity,false,future));return future;
     }
     /** Near-view refinement and growth use exact generated material samples. */
     public static CompletableFuture<Optional<LandmarkMetadata>> refine(MinecraftServer server,String dimension,BlockPos position){return ensureSourceLocation(server,dimension,position);}
@@ -88,55 +91,135 @@ public final class SourceLandmarks {
         if(!SourceDimensions.isSource(world.getRegistryKey().getValue().toString()))return;
         Session s=SESSIONS.get(world.getServer());if(s!=null){s.invalidate(world.getRegistryKey().getValue().toString(),pos);s.hint(world.getRegistryKey().getValue().toString(),pos.toImmutable());}
     }
-    public static int pending(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.requests.size()+s.hints.size()+(s.active==null?0:1);}
+    public static int pending(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.requests.size()+s.hints.size()+s.retries.size()+(s.active==null?0:1);}
     public static int lastSampledCells(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.lastCells;}
     public static String status(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?"Stopped":s.status;}
     private static Session session(MinecraftServer server){if(!server.isOnThread())throw new IllegalStateException("source server thread");Session s=SESSIONS.get(server);if(s==null)throw new IllegalStateException("source service not initialized");return s;}
     private static void checkBounds(Bounds b,int maxCells){long volume=Math.multiplyExact(Math.multiplyExact(b.maxX()-b.minX(),b.maxY()-b.minY()),b.maxZ()-b.minZ());if(maxCells<1||maxCells>32768||volume>maxCells||b.minX()<Integer.MIN_VALUE||b.maxX()>Integer.MAX_VALUE||b.minY()<Integer.MIN_VALUE||b.maxY()>Integer.MAX_VALUE||b.minZ()<Integer.MIN_VALUE||b.maxZ()>Integer.MAX_VALUE)throw new IllegalArgumentException("source query bounds");}
-    private record Hint(String dimension,BlockPos pos){}
-    private static final class FrontierRetry {
-        final String dimension;final Bounds bounds;String cursor;boolean end;final ArrayDeque<LandmarkMetadata> headers=new ArrayDeque<>();Iterator<FrontierFace> faces;
-        FrontierRetry(String dimension,Bounds bounds){this.dimension=dimension;this.bounds=bounds;}
-        boolean advance(Session s){
-            if(faces!=null){for(int n=0;n<8&&faces.hasNext();n++){var b=faces.next().missingBounds();if(bounds.contains(b.minX(),b.minY(),b.minZ()))s.hint(dimension,new BlockPos((int)b.minX(),(int)b.minY(),(int)b.minZ()));}if(!faces.hasNext())faces=null;return false;}
-            if(!headers.isEmpty()){var h=headers.removeFirst().header();if(h.kind()==Landmark.Kind.CAVE)faces=h.geometry().frontiers().iterator();return false;}
-            if(end)return true;var page=s.store.sourceRangePage(dimension,bounds,cursor,2,2);cursor=page.nextId();end=page.end();headers.addAll(page.landmarks());return false;
+    /** A resumable metadata/frontier AND known-page refresh. New generation can invalidate
+     * an incomplete disk snapshot, and edits can affect any landmark kind, not only caves. */
+    static final class FrontierRetry implements DiscoveryInvalidation.Retry {
+        final String dimension;Bounds bounds;String cursor;boolean end,started,discover;
+        final ArrayDeque<LandmarkMetadata> headers=new ArrayDeque<>();Iterator<FrontierFace> faces;
+        LandmarkMetadata current;LandmarkStore.GeometryRead read;DiscoveryInvalidation.Sweep sweep;int nextGeometryPage;
+        FrontierRetry(String dimension,Bounds bounds,boolean discover){this.dimension=dimension;this.bounds=bounds;this.discover=discover;}
+        public String dimension(){return dimension;}
+        public Bounds bounds(){return bounds;}
+        public boolean started(){return started;}
+        public void extend(DiscoveryInvalidation.Retry additional){
+            cancel();bounds=bounds.union(additional.bounds());discover|=((FrontierRetry)additional).discover;
+            cursor=null;end=false;started=false;headers.clear();faces=null;current=null;sweep=null;nextGeometryPage=0;
+        }
+        public void cancel(){if(read!=null){read.cancel();read=null;}}
+        boolean advance(Session s){return advance(s.store,s.hints,p->s.hint(dimension,p));}
+        boolean advance(LandmarkStore store,DiscoveryInvalidation.HintQueue hints,java.util.function.Consumer<BlockPos> hint){
+            // Do not manufacture overflow while draining an existing conservative scan.
+            if(hints.remaining()<8){
+                // An Ensure may be waiting for this same geometry lane while hints cannot
+                // drain until it finishes. Yield at a completed-page boundary under pressure;
+                // partial decoders are discarded, never acknowledged as completed work.
+                if(read!=null){nextGeometryPage=read.nextPageIndex();read.cancel();read=null;}
+                return false;
+            }
+            started=true;
+            if(read!=null){
+                read.advance(1,512);
+                for(var page:read.drain())for(var cell:page.knownCells()){
+                    var b=cell.bounds();if(!b.intersects(bounds))continue;
+                    hint.accept(new BlockPos((int)Math.max(b.minX(),bounds.minX()),(int)Math.max(b.minY(),bounds.minY()),(int)Math.max(b.minZ(),bounds.minZ())));break;
+                }
+                if(read.complete()){
+                    boolean stale=!read.isCurrent();read=null;
+                    if(stale){cursor=null;end=false;headers.clear();current=null;faces=null;}
+                    else current=null;
+                    nextGeometryPage=0;
+                }
+                return false;
+            }
+            if(faces!=null){
+                for(int n=0;n<8&&faces.hasNext();n++){
+                    var b=faces.next().missingBounds();if(b.intersects(bounds))hint.accept(new BlockPos((int)Math.max(b.minX(),bounds.minX()),(int)Math.max(b.minY(),bounds.minY()),(int)Math.max(b.minZ(),bounds.minZ())));
+                }
+                if(!faces.hasNext())faces=null;return false;
+            }
+            if(current!=null){
+                if(!store.geometryReadAvailable())return false;
+                var live=store.metadata(current.id());
+                // A queued header may have been deleted/aliased while refresh waited behind
+                // discovery. Never let a retired identity permanently pin this scan.
+                if(live.isEmpty()){current=null;nextGeometryPage=0;return false;}
+                if(!live.get().geometryKeys().equals(current.geometryKeys()))nextGeometryPage=0;
+                current=live.get();read=store.beginGeometryRead(current.id(),bounds,nextGeometryPage);return false;
+            }
+            if(!headers.isEmpty()){current=headers.removeFirst();faces=current.header().geometry().frontiers().iterator();return false;}
+            if(!end){var page=store.sourceRangePage(dimension,bounds,cursor,2,2);cursor=page.nextId();end=page.end();headers.addAll(page.landmarks());return false;}
+            // Spilled hints also need discovery where no persisted landmark exists yet.
+            if(discover){if(sweep==null)sweep=new DiscoveryInvalidation.Sweep(bounds);var p=sweep.poll();if(p!=null){hint.accept(new BlockPos((int)p.x(),(int)p.y(),(int)p.z()));return false;}}
+            return true;
         }
     }
     private static final class Session {
         final MinecraftServer server;final LandmarkStore store;final ItemEmbeddingIndexState itemIndex;final ExecutorService worker=new ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(4),Thread.ofPlatform().daemon().name("mysticism-source").factory(),new ThreadPoolExecutor.AbortPolicy());
         final ArrayDeque<SourceOwnership.Request> ownerRequests=new ArrayDeque<>();
-        final ArrayDeque<FrontierRetry> retries=new ArrayDeque<>();final Map<CompletableFuture<?>,String> auxiliary=new IdentityHashMap<>();final ArrayDeque<Operation<?>> requests=new ArrayDeque<>();final LinkedHashSet<Hint> hints=new LinkedHashSet<>();Operation<?> active;String status="Ready";int playerCursor,lastCells;
+        final DiscoveryInvalidation.RetryQueue<FrontierRetry> retries=new DiscoveryInvalidation.RetryQueue<>(64);
+        final Map<CompletableFuture<?>,String> auxiliary=new IdentityHashMap<>();final ArrayDeque<Operation<?>> requests=new ArrayDeque<>();final DiscoveryInvalidation.HintQueue hints=new DiscoveryInvalidation.HintQueue(128);Operation<?> active;String status="Ready";int playerCursor,lastCells;
         Session(MinecraftServer server){this.server=server;store=LandmarkStore.get(server);itemIndex=ItemEmbeddingIndexState.get(server);}
         <T> CompletableFuture<T> computeAndDeliver(String dim,java.util.function.Supplier<T> computation){
             var out=new CompletableFuture<T>();if(auxiliary.size()>=64){out.completeExceptionally(new RejectedExecutionException("source auxiliary budget"));return out;}auxiliary.put(out,dim);
             try{CompletableFuture.supplyAsync(computation,worker).whenComplete((value,error)->server.execute(()->{auxiliary.remove(out);if(SESSIONS.get(server)!=this)out.cancel(false);else if(error!=null)out.completeExceptionally(error);else out.complete(value);}));}catch(RuntimeException failure){auxiliary.remove(out);out.completeExceptionally(failure);}return out;
         }
         void offer(Operation<?> op){if(requests.size()==64){op.future.completeExceptionally(new RejectedExecutionException("source request budget"));return;}if(op instanceof Read)requests.addFirst(op);else requests.addLast(op);}
-        void hint(String dim,BlockPos p){if(hints.size()<128)hints.add(new Hint(dim,p));}
-        void invalidate(String dim,BlockPos pos){if(active!=null&&active.dimension.equals(dim)&&active.guarded!=null&&active.guarded.contains(pos.getX(),pos.getY(),pos.getZ()))active.cancel(new CancellationException("source edit invalidated snapshot"));}
+        void hint(String dim,BlockPos p){
+            var spill=hints.offer(new DiscoveryInvalidation.Hint(dim,p.getX(),p.getY(),p.getZ()));
+            if(spill!=null)retries.offer(new FrontierRetry(spill.dimension(),Bounds.cube(spill.x(),spill.y(),spill.z(),1),true));
+        }
+        void invalidate(String dim,BlockPos pos){invalidate(dim,Bounds.cube(pos.getX(),pos.getY(),pos.getZ(),1),"source edit invalidated snapshot");}
+        void invalidate(String dim,Bounds area,String reason){invalidateObservation(active,dim,area,reason,p->hint(dim,p));}
         void tick(){
             lastCells=0;
             if(!ownerRequests.isEmpty()){var request=ownerRequests.peekFirst();try{request.advance();}catch(RuntimeException failure){request.cancel(failure);}if(request.done)ownerRequests.removeFirst();}
-            if(server.getTicks()%5==0&&!retries.isEmpty()){try{if(retries.peekFirst().advance(this))retries.removeFirst();}catch(RuntimeException stale){retries.removeFirst();}}
+            if(server.getTicks()%5==0&&retries.size()>0){
+                try{if(retries.peek().advance(this))retries.poll();}
+                catch(RuntimeException failure){
+                    var retry=retries.poll();retry.cancel();
+                    if(DiscoveryInvalidation.transientStaleness(failure))retries.offer(new FrontierRetry(retry.dimension,retry.bounds,retry.discover));
+                    else org.slf4j.LoggerFactory.getLogger("Mysticism-Extraction").error("Source refresh failed for {} {}",retry.dimension,retry.bounds,failure);
+                    status="Deferred refresh: "+failure.getMessage();
+                }
+            }
             if(server.getTicks()%200==0){var players=server.getPlayerManager().getPlayerList();for(int n=0;n<Math.min(2,players.size());n++){var p=players.get(Math.floorMod(playerCursor++,players.size()));if(SourceDimensions.isSource(p.getServerWorld().getRegistryKey().getValue().toString()))hint(p.getServerWorld().getRegistryKey().getValue().toString(),p.getBlockPos());}}
             boolean ready=EmbeddingHelper.isReady()||itemIndex.isPopulated();
             if(active==null&&!requests.isEmpty()&&(requests.peekFirst() instanceof Read||ready))active=requests.removeFirst();
-            if(active==null&&ready&&!hints.isEmpty()){Hint h=hints.iterator().next();hints.remove(h);active=new Ensure(this,h.dimension,h.pos,null,false,new CompletableFuture<>());}
+            if(active==null&&ready){var h=hints.poll();if(h!=null)active=new Ensure(this,h.dimension(),new BlockPos((int)h.x(),(int)h.y(),(int)h.z()),null,false,true,new CompletableFuture<>());}
             if(active==null)return;
             try{if(active.future.isCancelled())active.cancel(new CancellationException());if(!active.done)active.advance();if(active.done){active.release();active=null;status="Ready";}}
-            catch(RuntimeException e){status="Deferred: "+e.getMessage();active.cancel(e);active.release();active=null;}
+            catch(RuntimeException e){
+                status="Deferred: "+e.getMessage();
+                // A refresh pass defeated only by a concurrently committed revision is re-hinted;
+                // losing the hint would leave the edited/generated terrain undiscovered forever.
+                String dim=active.dimension;BlockPos resume=DiscoveryInvalidation.transientStaleness(e)?active.refreshPoint():null;
+                active.cancel(e);active.release();active=null;
+                if(resume!=null)hint(dim,resume);
+            }
         }
-        void unload(String dim){ownerRequests.removeIf(request->{if(request.dimension.equals(dim)){request.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});retries.removeIf(r->r.dimension.equals(dim));auxiliary.entrySet().removeIf(e->{if(e.getValue().equals(dim)){e.getKey().cancel(false);return true;}return false;});if(active!=null&&active.dimension.equals(dim)){active.cancel(new CancellationException("source dimension unloaded"));active.release();active=null;}requests.removeIf(op->{if(op.dimension.equals(dim)){op.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});hints.removeIf(h->h.dimension.equals(dim));}
+        void unload(String dim){ownerRequests.removeIf(request->{if(request.dimension.equals(dim)){request.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});retries.removeIf(r->r.dimension.equals(dim));auxiliary.entrySet().removeIf(e->{if(e.getValue().equals(dim)){e.getKey().cancel(false);return true;}return false;});if(active!=null&&active.dimension.equals(dim)){active.cancel(new CancellationException("source dimension unloaded"));active.release();active=null;}requests.removeIf(op->{if(op.dimension.equals(dim)){op.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});hints.removeIf(h->h.dimension().equals(dim));}
         void close(){ownerRequests.forEach(request->request.cancel(new CancellationException("server stopping")));ownerRequests.clear();auxiliary.keySet().forEach(f->f.cancel(false));auxiliary.clear();retries.clear();if(active!=null){active.cancel(new CancellationException("server stopping"));active.release();}requests.forEach(op->op.cancel(new CancellationException("server stopping")));requests.clear();hints.clear();worker.shutdownNow();}
         ServerWorld world(String dimension){return SourceDimensions.isSource(dimension)?server.getWorld(RegistryKey.of(RegistryKeys.WORLD,Identifier.of(dimension))):null;}
     }
-    private abstract static class Operation<T> {
+    /** Shared edit/load/unload invalidation path, tested without constructing a game server. */
+    static void invalidateObservation(Operation<?> active,String dimension,Bounds area,String reason,java.util.function.Consumer<BlockPos> refresh){
+        if(active==null||active.done||!active.dimension.equals(dimension)||active.guarded==null||!active.guarded.intersects(area))return;
+        BlockPos point=active.refreshPoint();
+        active.cancel(new CancellationException(reason));
+        if(point!=null)refresh.accept(point);
+    }
+    abstract static class Operation<T> {
         final Session s;String dimension;Bounds bounds,guarded;final CompletableFuture<T> future;boolean done;
         GeneratedSourceReader reader;CompletableFuture<Region> snapshot;CompletableFuture<Landmark> hydrated;LandmarkStore.GeometryRead geometryRead;LandmarkStore.PendingMutation mutation;CompletableFuture<?> work;Runnable resume;
         LandmarkExtractionService.TopologyPlan history;
         Operation(Session s,String dimension,Bounds bounds,CompletableFuture<T> future){this.s=s;this.dimension=dimension;this.bounds=bounds;this.guarded=bounds;this.future=future;}
         abstract void advance();
+        BlockPos refreshPoint(){return null;}
         void complete(T value){done=true;future.complete(value);}
         void pause(){if(resume==null)resume=SpiritActivityService.pauseLandmarkMutations(s.server);}
         void cancel(Throwable failure){done=true;if(reader!=null)reader.cancel();if(geometryRead!=null)geometryRead.cancel();if(work!=null)work.cancel(false);if(mutation!=null&&!mutation.complete())mutation.cancel();if(history!=null)history.cancel();future.completeExceptionally(failure);}
@@ -149,15 +232,16 @@ public final class SourceLandmarks {
     }
     record Prepared(Landmark prior,String id,String biome,Landmark.Kind kind,BlockPoint anchor,SourceGeometry geometry,List<DescriptorVectors.WeightedDescriptor> descriptors,Map<String,Double> items,String adjoining){}
     private static final class Ensure extends Operation<Optional<LandmarkMetadata>> {
-        final BlockPos position;final String preferred;final boolean activity;String cursor;boolean catalogEnd;
+        final BlockPos position;final String preferred;final boolean activity,refresh;String cursor;boolean catalogEnd;
         final ArrayDeque<LandmarkMetadata> candidates=new ArrayDeque<>();final List<Landmark> parents=new ArrayList<>();final List<GeometryPage> pages=new ArrayList<>();
-        final Map<String,Double> importance=new HashMap<>();Region observed;CompletableFuture<Prepared> prepared;CompletableFuture<Vec384f> embedding;Prepared value;Landmark published;long time;int seaLevel;
-        Ensure(Session s,String dimension,BlockPos pos,String preferred,boolean activity,CompletableFuture<Optional<LandmarkMetadata>> future){super(s,dimension,new Bounds(pos.getX()-12L,pos.getY()-12L,pos.getZ()-12L,pos.getX()+13L,pos.getY()+13L,pos.getZ()+13L),future);this.position=pos;this.preferred=preferred;this.activity=activity;}
+        final Map<String,Double> importance=new HashMap<>();Region observed;CompletableFuture<Prepared> prepared;CompletableFuture<Vec384f> embedding;Prepared value;Landmark published;long time,catalogRevision=-1;int seaLevel;
+        Ensure(Session s,String dimension,BlockPos pos,String preferred,boolean activity,boolean refresh,CompletableFuture<Optional<LandmarkMetadata>> future){super(s,dimension,new Bounds(pos.getX()-12L,pos.getY()-12L,pos.getZ()-12L,pos.getX()+13L,pos.getY()+13L,pos.getZ()+13L),future);this.position=pos;this.preferred=preferred;this.activity=activity;this.refresh=refresh;}
+        BlockPos refreshPoint(){return position;}
         void advance(){
             if(mutation!=null){mutation.advance(1,512);if(mutation.complete()){
                 if(history!=null){history.commit();history=null;}
                 var metadata=s.store.metadata(published.id());complete(metadata);
-                if(published.kind()==Landmark.Kind.CAVE)for(var face:published.geometry().frontiers()){var b=face.missingBounds();s.hint(dimension,new BlockPos((int)b.minX(),(int)b.minY(),(int)b.minZ()));}
+                for(var face:published.geometry().frontiers())if(published.kind()==Landmark.Kind.CAVE||face.cursor().equals(DiscoveryInvalidation.REFRESH_FRONTIER)){var b=face.missingBounds();s.hint(dimension,new BlockPos((int)b.minX(),(int)b.minY(),(int)b.minZ()));}
                 if(value.adjoining!=null)s.offer(new Transfer(s,published.id(),value.adjoining,activity?bounds:null,true,activity,new CompletableFuture<>()));
             }return;}
             if(observed==null){if(observe()){observed=snapshot.getNow(null);time=s.server.getOverworld().getTime();seaLevel=reader.world.getSeaLevel();}return;}
@@ -166,10 +250,10 @@ public final class SourceLandmarks {
                 if(hydrated!=null){if(!hydrated.isDone())return;parents.add(hydrated.getNow(null));hydrated=null;return;}
                 if(geometryRead!=null){geometryRead.advance(1,512);pages.addAll(geometryRead.drain());if(pages.size()>512)throw new IllegalArgumentException("source parent page budget");if(geometryRead.complete()){if(!geometryRead.isCurrent())throw new IllegalStateException("stale source geometry");var meta=geometryRead.metadata();var immutable=List.copyOf(pages);hydrated=CompletableFuture.supplyAsync(()->LandmarkNbt.hydrate(meta,immutable),s.worker);work=hydrated;pages.clear();geometryRead=null;}return;}
                 if(!candidates.isEmpty()){if(!s.store.geometryReadAvailable())return;var m=candidates.removeFirst();importance.put(m.id(),SpiritActivityService.importance(s.server,m));guarded=guarded.union(m.header().bounds());geometryRead=s.store.beginGeometryRead(m.id());return;}
-                if(!catalogEnd){var page=s.store.sourceRangePage(dimension,bounds,cursor,4,4);cursor=page.nextId();catalogEnd=page.end();candidates.addAll(page.landmarks());if(parents.size()+candidates.size()>64)throw new IllegalArgumentException("local overlap operation budget");return;}
-                List<Landmark> snapshot=List.copyOf(parents);prepared=CompletableFuture.supplyAsync(()->prepare(observed,snapshot,position,preferred,activity,time,seaLevel,Map.copyOf(importance)),s.worker);work=prepared;return;
+                if(!catalogEnd){if(catalogRevision<0)catalogRevision=s.store.ownershipRevision();if(catalogRevision!=s.store.ownershipRevision())throw new IllegalStateException("stale source catalog");var page=s.store.sourceRangePage(dimension,bounds,cursor,4,4);cursor=page.nextId();catalogEnd=page.end();candidates.addAll(page.landmarks());if(parents.size()+candidates.size()>64)throw new IllegalArgumentException("local overlap operation budget");return;}
+                List<Landmark> snapshot=List.copyOf(parents);prepared=CompletableFuture.supplyAsync(()->prepare(observed,snapshot,position,preferred,activity,time,seaLevel,Map.copyOf(importance),refresh),s.worker);work=prepared;return;
             }
-            if(!prepared.isDone())return;if(value==null){value=prepared.getNow(null);if(value==null){complete(Optional.empty());return;}}
+            if(!prepared.isDone())return;if(value==null){DiscoveryInvalidation.requireCurrentParents(s.store,catalogRevision,parents);value=prepared.getNow(null);if(value==null){complete(Optional.empty());return;}}
             if(embedding==null){
                 ArrayList<DescriptorVectors.WeightedVector> fallback=new ArrayList<>();var index=s.itemIndex;
                 if(index.isPopulated())for(var item:value.items.entrySet()){Vec384f v=index.getVec(item.getKey());if(v!=null)fallback.add(new DescriptorVectors.WeightedVector(v,item.getValue()));}
@@ -179,17 +263,33 @@ public final class SourceLandmarks {
             }
             if(!embedding.isDone())return;
             if(resume==null){try{pause();}catch(IllegalStateException busy){return;}}
-            Vec384f vector=embedding.getNow(null);Landmark old=value.prior;
+            DiscoveryInvalidation.requireCurrentParents(s.store,catalogRevision,parents);
+            Vec384f vector=embedding.getNow(null);
+            // Rebase activity-only revisions under the acquired pause. Repeated traversals
+            // during asynchronous inference must not starve discovery or lose newer claims.
+            Landmark old=value.prior==null?null:s.store.metadata(value.prior.id()).orElseThrow().header();
             // Terrain changes move low-importance semantics strongly, high-importance ones slowly.
             if(old!=null){double inertia=SpiritActivityService.importance(s.server,s.store.metadata(old.id()).orElseThrow());vector=DescriptorVectors.compose(List.of(new DescriptorVectors.WeightedVector(old.baseEmbedding().vector(),1),new DescriptorVectors.WeightedVector(vector,0.05+0.5*(1-inertia))));}
-            long revision=old==null?0:old.revision()+1;
-            published=new Landmark(value.id,dimension,ALGORITHM,value.kind,value.biome,value.anchor,OwnershipGeometry.bounds(value.anchor,value.geometry),LandmarkProfiles.wrap(vector),old==null?.08:old.baseImportance(),old==null?new ActivityMetadata(0,time):old.activity(),old==null?new Ownership(List.of()):old.ownership(),value.geometry,revision,"native 3D source observation; generated-only IO");
+            published=publication(value,dimension,LandmarkProfiles.wrap(vector),old,time);
             if(old!=null)history=SpiritActivityService.prepareSourceUpdate(s.server,old,published);
             mutation=s.store.stagePut(published,old==null?-1:old.revision());s.status="Source geometry publication";
         }
     }
+    /** Constructor shared with deterministic regressions; old is CURRENT metadata under pause,
+     * not the worker's earlier hydrated parent. Geometry was prepared from the same source stamp. */
+    static Landmark publication(Prepared value,String dimension,LandmarkEmbedding embedding,Landmark old,long time){
+        return new Landmark(value.id,dimension,ALGORITHM,value.kind,value.biome,value.anchor,OwnershipGeometry.bounds(value.anchor,value.geometry),embedding,old==null?.08:old.baseImportance(),old==null?new ActivityMetadata(0,time):old.activity(),old==null?new Ownership(List.of()):old.ownership(),value.geometry,old==null?0:old.revision()+1,"native 3D source observation; generated-only IO");
+    }
     static Prepared prepare(Region region,List<Landmark> parents,BlockPos position,String preferred,boolean activity,long tick,int seaLevel,Map<String,Double> importance){
-        BlockPoint point=new BlockPoint(position.getX(),position.getY(),position.getZ());Map<BlockPoint,Cell> observed=new HashMap<>();region.cells.forEach(c->observed.put(c.position,c));Cell seed=observed.get(point);if(seed==null)return null;
+        return prepare(region,parents,position,preferred,activity,tick,seaLevel,importance,false);
+    }
+    static Prepared prepare(Region region,List<Landmark> parents,BlockPos position,String preferred,boolean activity,long tick,int seaLevel,Map<String,Double> importance,boolean refresh){
+        Map<BlockPoint,Cell> observed=new HashMap<>();region.cells.forEach(c->observed.put(c.position,c));
+        Cell sampled=observed.get(new BlockPoint(position.getX(),position.getY(),position.getZ()));
+        // A coalesced refresh window may have an unavailable centre. Select actual generated
+        // evidence in that window; exact caller requests must still fail closed at their point.
+        if(sampled==null&&refresh)sampled=region.cells.stream().min(Comparator.<Cell>comparingDouble(c->distance(c.position,position)).thenComparing(Cell::position)).orElse(null);
+        if(sampled==null)return null;Cell seed=sampled;BlockPoint point=seed.position;
         Map<String,Map<BlockPoint,OwnershipGeometry.Material>> masks=new HashMap<>();Map<BlockPoint,String> owners=new HashMap<>();
         for(var parent:parents){var mask=OwnershipGeometry.expand(parent.geometry());masks.put(parent.id(),mask);for(var p:mask.keySet())if(owners.put(p,parent.id())!=null)throw new IllegalStateException("conflicting source ownership");}
         Landmark prior=parents.stream().filter(p->p.id().equals(preferred!=null?preferred:owners.get(point))).findFirst().orElse(null);
@@ -217,8 +317,9 @@ public final class SourceLandmarks {
         BlockPoint anchor=prior==null?point:prior.anchor();String biome=prior==null?seed.biome:prior.biome();String id=prior==null?LandmarkIds.seed(region.dimension,ALGORITHM,kind,biome,anchor):prior.id();long revision=prior==null?0:prior.revision()+1;
         List<FrontierFace> frontiers=new ArrayList<>();for(int[] d:OwnershipGeometry.DIRECTIONS){var direction=d[0]<0?FrontierFace.Direction.WEST:d[0]>0?FrontierFace.Direction.EAST:d[1]<0?FrontierFace.Direction.DOWN:d[1]>0?FrontierFace.Direction.UP:d[2]<0?FrontierFace.Direction.NORTH:FrontierFace.Direction.SOUTH;
             for(var p:desired){if(kind==Landmark.Kind.CAVE&&!result.get(p).air())continue;var n=OwnershipGeometry.next(p,d);if(!observed.containsKey(n)&&!result.containsKey(n)){frontiers.add(new FrontierFace(region.dimension,Bounds.cube(n.x(),n.y(),n.z(),1),direction,revision,"source-coordinate retry"));break;}}}
-        if(prior!=null)for(var face:prior.geometry().frontiers())if(!observed.containsKey(new BlockPoint(face.missingBounds().minX(),face.missingBounds().minY(),face.missingBounds().minZ())))frontiers.add(face);
-        frontiers=frontiers.stream().distinct().limit(LandmarkNbt.MAX_FRONTIERS).toList();
+        if(prior!=null){Map<BlockPoint,Object> accounted=new HashMap<>();owners.keySet().forEach(p->accounted.put(p,Boolean.TRUE));result.keySet().forEach(p->accounted.put(p,Boolean.TRUE));frontiers.addAll(DiscoveryInvalidation.retainFrontiers(prior.geometry().frontiers(),observed,accounted,revision));}
+        frontiers=frontiers.stream().distinct().toList();
+        if(frontiers.size()>LandmarkNbt.MAX_FRONTIERS)throw new IllegalArgumentException("source frontier operation budget");
         double score=prior==null?.08:importance.getOrDefault(prior.id(),.08);int detail=score>=.65?1:score>=.3?2:4;
         SourceGeometry geometry=OwnershipGeometry.geometry(region.dimension,id,revision,result,frontiers,detail,point);
         Map<String,Integer> blocks=new HashMap<>();for(var v:result.values())if(!v.air())blocks.merge(v.state().blockId(),1,Integer::sum);
