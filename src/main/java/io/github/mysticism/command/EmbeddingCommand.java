@@ -546,7 +546,7 @@ public class EmbeddingCommand {
                     return;
                 }
                 if (error != null) {
-                    source.sendError(Text.literal("Embedding query failed: " + error.getClass().getSimpleName()));
+                    source.sendError(Text.literal("Embedding query failed: " + io.github.mysticism.embedding.EmbeddingFailures.describe(error)));
                     return;
                 }
                 try {

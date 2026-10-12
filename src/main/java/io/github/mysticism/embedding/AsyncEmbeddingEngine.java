@@ -4,6 +4,9 @@ import io.github.mysticism.vector.*;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.function.Supplier;
+import java.util.function.Function;
+import java.util.function.BooleanSupplier;
 
 /** Bounded work/deadlines and individually reserved callback delivery. Neither engine
  * monitors nor deadline/inference threads execute subscriber callbacks. Cancellation is detached. */
@@ -34,6 +37,29 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
     private static <T> CompletableFuture<T> overloaded() {
         // Already terminal BEFORE exposure: any attached callback runs on its caller, not our scheduler.
         return CompletableFuture.failedFuture(new RejectedExecutionException("Embedding callback capacity exhausted; retry later"));
+    }
+
+    /** Reserve completion delivery BEFORE starting composite work. Even a fully cached operation
+     * runs on the supplied worker; publication uses the reserved delivery pool, not that worker.
+     * Standard CompletableFuture semantics (late attachment, cancellation, waiter assistance)
+     * still apply; critical-thread callback consumers must choose an explicit async executor.
+     * Cancellation does not cancel shared inference. The private composite pipeline can stop
+     * scheduling further work when the supplied cancellation token becomes true. */
+    static <T> CompletableFuture<T> offThread(Supplier<CompletableFuture<T>> operation, Executor executor) {
+        return offThread(ignored -> operation.get(), executor);
+    }
+    static <T> CompletableFuture<T> offThread(Function<BooleanSupplier, CompletableFuture<T>> operation, Executor executor) {
+        Subscriber<T> subscriber = admit();
+        if (subscriber == null) return overloaded();
+        try {
+            executor.execute(() -> {
+                try {
+                    Objects.requireNonNull(operation.apply(subscriber.future::isCancelled))
+                            .whenComplete((value, error) -> publish(subscriber, value, error));
+                } catch (Throwable error) { publish(subscriber, null, error); }
+            });
+        } catch (RejectedExecutionException error) { publish(subscriber, null, error); }
+        return subscriber.future;
     }
 
     private final EmbeddingProvider provider;
