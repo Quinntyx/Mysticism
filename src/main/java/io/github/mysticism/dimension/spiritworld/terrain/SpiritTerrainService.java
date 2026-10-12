@@ -132,17 +132,24 @@ public final class SpiritTerrainService {
             s.shallow=shallow;publish(p,s,true);
         }
     }
-    public static Optional<SourcePosition> sourcePosition(ServerPlayerEntity p) {
+    public static Optional<SourcePosition> sourcePosition(ServerPlayerEntity p) {return sourcePosition(p,false);}
+    /** Navigation-only retained identity while the local octree snapshot resolves. This is NOT
+     * authority to exit, capture a target, sync source entities, or acquire another landmark. */
+    public static Optional<SourcePosition> walkingPosition(ServerPlayerEntity p) {return sourcePosition(p,true);}
+    private static Optional<SourcePosition> sourcePosition(ServerPlayerEntity p,boolean retainPending) {
         Session s=session(p);if(s==null || !s.shallow)return Optional.empty();
         Vec3d at=s.local.origin.add(p.getPos().subtract(s.carrier));
         if(!s.local.tiles.containsKey(BlockPos.ofFloored(at)))return Optional.empty();
         Optional<String> actual=exactOwner(p,s,s.local,at);
+        String retained=ownerId(p,s.local);
         if(actual.isEmpty()) {
             // Initial native shallow view does not require a pre-known semantic feature. This grants NO support/exit authority.
             if(!s.anchorDelivered && (s.local.id.isEmpty() || ownershipPending(p)))return Optional.of(new SourcePosition(s.local.dimension,at,""));
+            // A retained binding must not flip a supported walker into deep flight while octree
+            // ownership is transiently resolving/stale; the retained identity is mode-keeping only.
+            if(retainPending && !retained.isEmpty() && ownershipPending(p))return Optional.of(new SourcePosition(s.local.dimension,at,retained));
             return Optional.empty();
         }
-        String retained=ownerId(p,s.local);
         if(!retained.isEmpty() && !actual.get().equals(retained))return Optional.empty();
         Optional<Support> grounded=support(p);
         if(grounded.isPresent() && !grounded.get().landmarkId().equals(actual.get()))return Optional.empty();
@@ -181,6 +188,21 @@ public final class SpiritTerrainService {
             Vec3d center=cell.point((anchor.x()-cell.sourceMin().x)/cell.size().x,(anchor.y()-cell.sourceMin().y)/cell.size().y,(anchor.z()-cell.sourceMin().z)/cell.size().z);
             return Optional.of(new Support(metadata.get().id(),SpiritActivityService.effectiveEmbedding(p.getServer(),metadata.get()).vector(),center,hit.normal()));
         });
+    }
+    /** True while the player has real visible mesh ground but its exact octree owner is still
+     * resolving or revalidating. Navigation holds supported walking through this transient window
+     * instead of resetting the player into deep flight. */
+    public static boolean groundPending(ServerPlayerEntity p) {
+        Session s=session(p);if(s==null || !s.shallow)return false;
+        var ground=MeshCollision.ground(p);if(ground.isEmpty())return false;
+        var cell=ground.get().cell();Window w=windowFor(s,cell);
+        // Pending ownership of some OTHER representative cannot hold this shallow binding. Use
+        // producing-frame provenance and the exact floor sample, not merely the local feet region.
+        if(w!=s.local || !cell.landmarkId().isEmpty() && !cell.landmarkId().equals(ownerId(p,w)))return false;
+        Vec3d contact=p.getPos().add(0,.025-.15*ground.get().time(),0).subtract(ground.get().normal().multiply(.001));
+        Vec3d source=sourceContact(cell,contact);
+        if(!ownershipPendingAt(p,w,source))return false; // Current unowned ground is not pending.
+        requestOwnership(p,s,w,source);return true;
     }
     /** Exit is exact current shallow mapping, never saved entry/spawn or safe-air substitution. */
     public record WalkSupport(String landmarkId,String sourceDimension,Vec3d sourcePosition,
@@ -282,6 +304,7 @@ public final class SpiritTerrainService {
     public static boolean exit(ServerPlayerEntity p) {
         Optional<SourcePosition> mapped=sourcePosition(p);if(mapped.isEmpty() || !p.getWorld().getRegistryKey().equals(WORLD))return false;
         SourcePosition at=mapped.get();if(at.landmarkId().isEmpty())return false; // Pending native entry view is not permission to materialize.
+        if(ownershipPending(p))return false; // A transiently stale ownership window cannot authorize materializing either.
         ServerWorld world=world(p.getServer(),at.dimension);
         if(world==null || !clearBody(world,at.position))return false;
         float yaw=p.getYaw(),pitch=p.getPitch();p.teleport(world,at.position.x,at.position.y,at.position.z,yaw,pitch);
@@ -403,6 +426,9 @@ public final class SpiritTerrainService {
     public static boolean ownershipPending(ServerPlayerEntity p) {
         Session s=session(p);if(s==null)return false;Window w=s.local;
         Vec3d at=s.shallow?w.origin.add(p.getPos().subtract(s.carrier)):w.origin;
+        return ownershipPendingAt(p,w,at);
+    }
+    private static boolean ownershipPendingAt(ServerPlayerEntity p,Window w,Vec3d at) {
         return w.owners==null || !w.owners.isCurrent(p.getServer()) || !w.owners.bounds().contains(MathHelper.floor(at.x),MathHelper.floor(at.y),MathHelper.floor(at.z));
     }
     private static Optional<String> exactOwner(ServerPlayerEntity p,Session s,Window w,Vec3d source) {
@@ -445,11 +471,7 @@ public final class SpiritTerrainService {
         // Held frames keep their original producer even after source cells are relabeled or a new stream starts.
         return s.frameProducers.get(cell.key());
     }
-    private static Vec3d sourcePoint(TerrainMeshFrame.Cell c,Vec3d world) {
-        Vec3d v=world.subtract(c.min());double det=c.axisX().dotProduct(c.axisY().crossProduct(c.axisZ()));
-        return c.sourceMin().add(v.dotProduct(c.axisY().crossProduct(c.axisZ()))/det*c.size().x,
-                v.dotProduct(c.axisZ().crossProduct(c.axisX()))/det*c.size().y,v.dotProduct(c.axisX().crossProduct(c.axisY()))/det*c.size().z);
-    }
+    private static Vec3d sourcePoint(TerrainMeshFrame.Cell c,Vec3d world) {return c.sourcePoint(world);}
     private static Vec3d sourceContact(TerrainMeshFrame.Cell c,Vec3d world) {
         Vec3d v=world.subtract(c.min());double det=c.axisX().dotProduct(c.axisY().crossProduct(c.axisZ()));
         double x=v.dotProduct(c.axisY().crossProduct(c.axisZ()))/det,y=v.dotProduct(c.axisZ().crossProduct(c.axisX()))/det,z=v.dotProduct(c.axisX().crossProduct(c.axisY()))/det;

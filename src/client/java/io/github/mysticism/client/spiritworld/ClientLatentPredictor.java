@@ -2,6 +2,7 @@ package io.github.mysticism.client.spiritworld;
 
 import io.github.mysticism.activity.TraversalSteering;
 import io.github.mysticism.component.MysticismEntityComponents;
+import io.github.mysticism.navigation.WalkingModePolicy;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -42,7 +43,7 @@ public final class ClientLatentPredictor {
                     && lastEpoch == nav.motionEpoch() && lastDeep == nav.deep() && nav.semanticReady()) {
                 Vec3d delta = now.subtract(lastPos);
                 if (delta.lengthSquared() <= 16) {
-                    if (nav.deep() && nav.supportApproach()) TraversalSteering.advance(q, basis, delta.x, delta.y, delta.z);
+                    if (nav.deep() && nav.supportApproach()) WalkingModePolicy.advanceSupport(q, basis, delta.x, delta.y, delta.z);
                     else if (nav.deep() && nav.landingApproach()) TraversalSteering.approachStep(q, target, delta.x, delta.y, delta.z);
                     else if (nav.deep()) TraversalSteering.deepStep(q, basis, target, delta.x, delta.y, delta.z, nav.hasShallowTarget());
                     else if (!nav.landmarkId().isEmpty()) TraversalSteering.advance(q, basis, delta.x, delta.y, delta.z);
