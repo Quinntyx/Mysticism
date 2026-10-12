@@ -62,7 +62,11 @@ public final class SpiritTerrainService {
             Context c=SERVERS.get(server);if(c==null)return;
             if(world.getRegistryKey().equals(WORLD))close(server);
             else for(var p:List.copyOf(server.getPlayerManager().getPlayerList())) {
-                Session s=c.sessions.get(p.getUuid());if(s!=null && s.local.dimension.equals(world.getRegistryKey().getValue().toString()))cancelEnter(p);
+                Session s=c.sessions.get(p.getUuid());
+                String dimension=world.getRegistryKey().getValue().toString();
+                if(s!=null && s.local.dimension.equals(dimension))cancelEnter(p);
+                else if(s!=null && s.walkProbe!=null && s.walkProbe.dimension.equals(dimension))
+                    cancelCurrentSupport(p); // Includes proof retained after a walk intent expired.
             }
         });
         ServerLifecycleEvents.SERVER_STOPPING.register(SpiritTerrainService::close);
@@ -192,6 +196,15 @@ public final class SpiritTerrainService {
     private record WalkCandidate(Window field,WalkSupport support) {}
     /** Current visible contact only; no target attraction, q replacement or remembered-entry rebinding. */
     public static Optional<WalkSupport> currentSupport(ServerPlayerEntity p) {return walkCandidate(p).map(WalkCandidate::support);}
+    /** Real async work for the CURRENT visible floor, not a remembered proof or fabricated support.
+     * Navigation may wait boundedly for it without counting source IO latency as a no-floor stall. */
+    public static boolean currentSupportProofPending(ServerPlayerEntity p) {
+        Session s=session(p);if(s==null || s.shallow)return false;
+        var hit=MeshCollision.ground(p);if(hit.isEmpty())return false;
+        Window field=windowFor(s,hit.get().cell());if(field==null)return false;
+        return field.ownershipFuture!=null && !field.ownershipFuture.isDone()
+                || s.walkField==field.identity && s.walkProbe!=null && s.walkFuture!=null && !s.walkFuture.isDone();
+    }
     private static Optional<WalkCandidate> walkCandidate(ServerPlayerEntity p) {
         Session s=session(p);
         if(s==null || s.shallow || !MysticismEntityComponents.SPIRIT_NAVIGATION.get(p).semanticReady())return Optional.empty();

@@ -4,6 +4,7 @@ import io.github.mysticism.activity.TraversalSteering;
 import io.github.mysticism.activity.SpiritActivityService;
 import io.github.mysticism.component.*;
 import io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService;
+import io.github.mysticism.dimension.spiritworld.terrain.MeshCollision;
 import io.github.mysticism.dimension.spiritworld.SpiritBasisEvolver;
 import io.github.mysticism.landmark.*;
 import io.github.mysticism.net.SpiritScenePayload;
@@ -41,7 +42,8 @@ public final class SpiritNavigationService {
     public static void installLandingSafety(LandingSafety safety) { landingSafety = Objects.requireNonNull(safety); }
     private SpiritNavigationService() {}
     private static final class Session {
-        int unsupported, blendTick, landingTick, supportTick, supportAlignTick;
+        int unsupported, entrySupportTicks, blendTick, landingTick, supportAlignTick;
+        WalkIntent walkIntent;
         boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, jumping, supportPending, everSupported;
         Vec384f targetSnapshot, supportTargetSnapshot;
         Basis384f supportFrom, supportGrid;
@@ -106,7 +108,8 @@ public final class SpiritNavigationService {
         Map<UUID, Session> sessions = SERVERS.get(p.getServer());
         Session removed = sessions == null ? null : sessions.remove(p.getUuid());
         if (removed != null && removed.capture != null) removed.capture.cancel(false);
-        if (removed != null && removed.supportPending) SpiritTerrainService.cancelCurrentSupport(p);
+        // Also release a proof retained by a request that already expired.
+        SpiritTerrainService.cancelCurrentSupport(p);
         // Pending support ownership/alignment is session-local, never resumed from a saved/wire flag.
         state(p).setSupportApproach(false);
     }
@@ -140,7 +143,8 @@ public final class SpiritNavigationService {
         nav.shallow(dimension, mapped.map(SpiritTerrainService.SourcePosition::landmarkId).orElse(""), source);
         Session s = session(p); s.semanticReady = false; s.checkedRestore = true;
         nav.setSemanticReady(false); nav.setLandingApproach(false);
-        s.confirmedOwned = false; s.warnedAnchor = false; s.prefetched = false;
+        s.confirmedOwned = false; s.everSupported = false; s.unsupported = 0; s.entrySupportTicks = 0; s.jumping = false;
+        s.warnedAnchor = false; s.prefetched = false;
         try {
             // Source-identical carrier pose: no shared origin, entry search or replacement floor.
             p.teleport(world, source.x, source.y, source.z, p.getYaw(), p.getPitch());
@@ -211,21 +215,25 @@ public final class SpiritNavigationService {
 
     /** Shallow stance outcome for one update tick. */
     public enum Stance { WALK, FREE_FALL, HOLD_ENTRY_SUPPORT }
-    public record StanceStep(Stance stance, int unsupportedTicks) {}
+    public record StanceStep(Stance stance, int unsupportedTicks, int entrySupportTicks) {}
 
     /** Pure shallow-stance decision. Entering spirit mode while standing on supported source terrain
      * must begin supported walking, not unconditional flight: while no support or ownership has ever
      * confirmed for this shallow session and the terrain's octree ownership is still publishing
-     * asynchronously, a standing player holds, bounded by {@link #ENTRY_SUPPORT_GRACE_TICKS}, instead
+     * asynchronously, a player on the real visible mesh floor holds (standing means actual mesh
+     * contact, not a stale onGround flag), bounded by {@link #ENTRY_SUPPORT_GRACE_TICKS}, instead
      * of immediately entering freeflight. Ascending takeoff keeps the ordinary 14-tick jump grace;
      * walking over an edge, a confirmed-then-lost stance, and grace expiry all enter freeflight. */
-    public static StanceStep entryStance(int unsupported, boolean everSupported, boolean confirmedOwned,
+    public static StanceStep entryStance(int unsupported, int entrySupportTicks, boolean everSupported, boolean confirmedOwned,
             boolean standing, boolean jumping, boolean ownershipPending) {
-        if (standing && !everSupported && !confirmedOwned && ownershipPending && unsupported < ENTRY_SUPPORT_GRACE_TICKS)
-            return new StanceStep(Stance.HOLD_ENTRY_SUPPORT, unsupported + 1);
+        if (standing && !jumping && !everSupported && !confirmedOwned && ownershipPending) {
+            if (entrySupportTicks < ENTRY_SUPPORT_GRACE_TICKS)
+                return new StanceStep(Stance.HOLD_ENTRY_SUPPORT, 0, entrySupportTicks + 1);
+            return new StanceStep(Stance.FREE_FALL, unsupported + 1, entrySupportTicks);
+        }
         int ticks = unsupported + 1;
-        if (ticks > 14 || !jumping) return new StanceStep(Stance.FREE_FALL, ticks);
-        return new StanceStep(Stance.WALK, ticks);
+        if (ticks > 14 || !jumping) return new StanceStep(Stance.FREE_FALL, ticks, entrySupportTicks);
+        return new StanceStep(Stance.WALK, ticks, entrySupportTicks);
     }
 
     public static void enterDeep(ServerPlayerEntity p) {
@@ -253,17 +261,30 @@ public final class SpiritNavigationService {
         flight(p, true); // remains deep/freeflight until the real terrain acquisition commits
         if (s.supportPending) return; // repeated packets cannot reset budgets or duplicate requests
         endApproach(p, s); s.blendFrom = null; s.blendTo = null;
-        s.supportPending = true; s.supportTick = 0; s.supportFrom = null;
+        s.supportPending = true; s.walkIntent = new WalkIntent(); s.supportFrom = null;
         s.supportId = ""; s.supportDimension = "";
         s.supportTargetSnapshot = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target();
         state(p).setSupportApproach(true); sync(p);
         p.sendMessage(Text.literal("Walk request: validating current source-owned support; flight remains active until ready."), true);
     }
     private static void endSupportApproach(ServerPlayerEntity p, Session s) {
-        if (s.supportPending) SpiritTerrainService.cancelCurrentSupport(p);
+        // Explicit cancellation also releases proofs retained after bounded expiry. Only expiry
+        // itself preserves them for retry; a flight-on/retarget/touch/restore must not reuse them.
+        SpiritTerrainService.cancelCurrentSupport(p);
         s.supportPending = false; s.supportTargetSnapshot = null; s.supportFrom = null; s.supportGrid = null;
-        s.supportId = ""; s.supportDimension = ""; s.supportTick = 0; s.supportAlignTick = 0;
+        s.supportId = ""; s.supportDimension = ""; s.supportAlignTick = 0; s.walkIntent = null;
         if (state(p).supportApproach()) { state(p).setSupportApproach(false); sync(p); }
+    }
+
+    /** Truthful bounded expiry. Unlike endSupportApproach, terrain's prepared ownership proof is
+     * RETAINED: a repeated walk request reuses it instead of restarting the expensive source
+     * fetch. Retry still has to pass all current ownership/contact/continuity checks. */
+    private static void expireSupport(ServerPlayerEntity p, Session s, WalkIntent.Reason reason) {
+        s.supportPending = false; s.supportTargetSnapshot = null; s.supportFrom = null; s.supportGrid = null;
+        s.supportId = ""; s.supportDimension = ""; s.supportAlignTick = 0; s.walkIntent = null;
+        if (state(p).supportApproach()) { state(p).setSupportApproach(false); sync(p); }
+        p.sendMessage(Text.literal("Walk request ended: " + reason.message()
+                + ". Still deep; flight remains available — request walking again to retry (any prepared source proof is reused)."), true);
     }
 
     /** Called once by the evolver. True permits ordinary deep movement integration. */
@@ -281,11 +302,14 @@ public final class SpiritNavigationService {
             var support = SpiritTerrainService.support(p);
             if (support.isPresent()) { s.unsupported = 0; s.jumping = false; s.everSupported = true; }
             else {
-                if (s.unsupported == 0) s.jumping = delta.y > .01;
-                boolean standing = p.isOnGround() || Math.abs(delta.y) < .05;
-                var stance = entryStance(s.unsupported, s.everSupported, s.confirmedOwned, standing,
+                // Ownership may lag behind the already visible/collidable entry mesh. Use that
+                // REAL floor, not a stale vanilla onGround flag or zero delta while hovering.
+                boolean standing = MeshCollision.ground(p).isPresent();
+                if (standing && delta.y <= .01) s.jumping = false;
+                else if (s.unsupported == 0) s.jumping = delta.y > .01;
+                var stance = entryStance(s.unsupported, s.entrySupportTicks, s.everSupported, s.confirmedOwned, standing,
                         s.jumping, SpiritTerrainService.ownershipPending(p));
-                s.unsupported = stance.unsupportedTicks();
+                s.unsupported = stance.unsupportedTicks(); s.entrySupportTicks = stance.entrySupportTicks();
                 if (stance.stance() == Stance.FREE_FALL) { enterDeep(p); return nav.deep() && s.semanticReady; }
                 if (stance.stance() == Stance.HOLD_ENTRY_SUPPORT) {
                     // Bounded walking hold: octree ownership for this fresh supported stance is still
@@ -370,18 +394,28 @@ public final class SpiritNavigationService {
         if (s.semanticReady && Double.isFinite(delta.x) && Double.isFinite(delta.y) && Double.isFinite(delta.z)
                 && delta.lengthSquared() <= 16)
             TraversalSteering.advance(q, component.get(), delta.x, delta.y, delta.z);
-        if (++s.supportTick > 200) {
-            endSupportApproach(p, s);
-            p.sendMessage(Text.literal("Walk request expired: current support could not be continuously aligned/owned. Still deep; no substitute landing."), true);
-            return;
-        }
-        if (!s.semanticReady) return; // Real late source discovery must finish; never invent q.
+        if (s.walkIntent == null) { endSupportApproach(p, s); return; } // Request already ended elsewhere.
+        // Truthful intent guard first: a changed attunement cancels immediately instead of
+        // burning any bounded wait on an already-invalid request.
         if (s.supportTargetSnapshot.squareDistance(p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target()) > 0) {
             endSupportApproach(p, s);
             p.sendMessage(Text.literal("Walk request cancelled after attunement changed; captured target was not altered by landing."), true);
             return;
         }
+        // Phase 1: a pending-valid request waits for real late source discovery WITHOUT querying
+        // terrain or consuming the support-stall budget; the bounded wait is tracked separately.
+        if (!s.semanticReady) {
+            if (s.walkIntent.tick(false, false).outcome() == WalkIntent.Outcome.EXPIRED)
+                expireSupport(p, s, s.walkIntent.expiryReason());
+            return; // Real late source discovery must finish; never invent q.
+        }
+        // Exactly one current-support query per pending tick. Candidate presence is real
+        // progress, not deadline consumption: slow terrain proof no longer expires a valid
+        // request mid-flight or trigger a restart-from-zero stuck-flight loop.
         var found = SpiritTerrainService.currentSupport(p);
+        var evaluation = s.walkIntent.tick(true, found.isPresent(),
+                found.isEmpty() && SpiritTerrainService.currentSupportProofPending(p));
+        if (evaluation.outcome() == WalkIntent.Outcome.EXPIRED) { expireSupport(p, s, evaluation.reason()); return; }
         if (found.isEmpty()) return; // Terrain starts/reuses bounded exact source-cell proof, never a join.
         var support = found.get(); Basis384f destination = support.sourceBasis();
         if (s.supportFrom == null) {

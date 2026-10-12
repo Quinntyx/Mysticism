@@ -17,13 +17,13 @@ public final class SpiritEntrySupportedWalkingTest {
 
     /** Simulates update()'s shallow support bookkeeping: support confirmation resets the counter. */
     private static final class Stance {
-        int unsupported;
+        int unsupported, entrySupportTicks;
         boolean everSupported, confirmedOwned;
 
         SpiritNavigationService.StanceStep tick(boolean standing, boolean jumping, boolean ownershipPending) {
-            var step = SpiritNavigationService.entryStance(unsupported, everSupported, confirmedOwned,
+            var step = SpiritNavigationService.entryStance(unsupported, entrySupportTicks, everSupported, confirmedOwned,
                     standing, jumping, ownershipPending);
-            unsupported = step.unsupportedTicks();
+            unsupported = step.unsupportedTicks(); entrySupportTicks = step.entrySupportTicks();
             return step;
         }
         void confirmSupport() { everSupported = true; confirmedOwned = true; unsupported = 0; }
@@ -37,14 +37,15 @@ public final class SpiritEntrySupportedWalkingTest {
             var step = stance.tick(true, false, true);
             check(step.stance() == SpiritNavigationService.Stance.HOLD_ENTRY_SUPPORT,
                     "Tick " + t + " of a fresh standing entry must hold supported walking, got " + step.stance());
-            check(step.unsupportedTicks() == t + 1, "Hold must advance its bounded counter");
+            check(step.entrySupportTicks() == t + 1, "Hold must advance its bounded entry counter");
+            check(step.unsupportedTicks() == 0, "Entry hold must not spend ordinary jump grace");
         }
         // Grace is bounded: expiry enters freeflight instead of holding forever.
         var expired = stance.tick(true, false, true);
         check(expired.stance() == SpiritNavigationService.Stance.FREE_FALL,
                 "Entry-support hold must expire into freeflight after the grace budget");
-        check(expired.unsupportedTicks() == SpiritNavigationService.ENTRY_SUPPORT_GRACE_TICKS + 1,
-                "Expiry tick must still account its counter");
+        check(expired.entrySupportTicks() == SpiritNavigationService.ENTRY_SUPPORT_GRACE_TICKS,
+                "Expiry must retain the spent entry budget");
     }
 
     private static void ownershipResolutionEndsTheHoldAndRestoresOrdinaryRules() {
@@ -63,7 +64,7 @@ public final class SpiritEntrySupportedWalkingTest {
     private static void confirmedOwnershipIsNeverReheld() {
         // Ownership already confirmed for this session; support vanished while standing (e.g. an
         // ownership revision flip). Re-holding would mask a real region change.
-        check(SpiritNavigationService.entryStance(0, false, true, true, false, true).stance()
+        check(SpiritNavigationService.entryStance(0, 0, false, true, true, false, true).stance()
                 == SpiritNavigationService.Stance.FREE_FALL,
                 "Confirmed-then-lost stance must not re-enter the walking hold");
     }
@@ -76,18 +77,41 @@ public final class SpiritEntrySupportedWalkingTest {
                     "Jump tick " + t + " must keep ordinary walking grace");
         check(jump.tick(false, true, true).stance() == SpiritNavigationService.Stance.FREE_FALL,
                 "Jump grace must expire into freeflight after 14 ticks");
+        // The first ascending tick may still overlap the ground probe, but must not hold entry support.
+        check(SpiritNavigationService.entryStance(0, 0, false, false, true, true, true).stance()
+                == SpiritNavigationService.Stance.WALK,
+                "An ascending jump with residual ground contact must use jump grace, not entry hold");
         // Walking over an edge at entry: immediate freeflight, no hold.
-        check(SpiritNavigationService.entryStance(0, false, false, false, false, true).stance()
+        check(SpiritNavigationService.entryStance(0, 0, false, false, false, false, true).stance()
                 == SpiritNavigationService.Stance.FREE_FALL,
                 "An unsupported edge walk-off must freefall immediately");
         // Standing on genuinely unowned ground (ownership resolved, nothing pending): no hold.
-        check(SpiritNavigationService.entryStance(0, false, false, true, false, false).stance()
+        check(SpiritNavigationService.entryStance(0, 0, false, false, true, false, false).stance()
                 == SpiritNavigationService.Stance.FREE_FALL,
                 "Resolved-unowned ground must not hold walking");
         // Established bindings do not matter here: the hold keys on session-confirmed state only.
-        check(SpiritNavigationService.entryStance(0, true, false, true, false, true).stance()
+        check(SpiritNavigationService.entryStance(0, 0, true, false, true, false, true).stance()
                 == SpiritNavigationService.Stance.FREE_FALL,
                 "A session that already had support must not re-enter the hold");
+    }
+
+    private static void entryWaitDoesNotSpendJumpGraceOrResetEntryBudget() {
+        var stance = new Stance();
+        for (int t = 0; t < 30; t++) stance.tick(true, false, true);
+        check(stance.unsupported == 0 && stance.entrySupportTicks == 30,
+                "Waiting on a real floor needs separate ownership-wait and jump counters");
+        for (int t = 0; t < 14; t++)
+            check(stance.tick(false, true, true).stance() == SpiritNavigationService.Stance.WALK,
+                    "A normal jump after a long entry wait must still receive its full ordinary grace");
+        check(stance.tick(true, false, true).stance() == SpiritNavigationService.Stance.HOLD_ENTRY_SUPPORT,
+                "Landing on the actual pending floor must restore entry walking");
+        check(stance.unsupported == 0 && stance.entrySupportTicks == 31,
+                "Landing resets jump grace, never the consumed entry lifetime");
+        for (int t = 31; t < SpiritNavigationService.ENTRY_SUPPORT_GRACE_TICKS; t++)
+            check(stance.tick(true, false, true).stance() == SpiritNavigationService.Stance.HOLD_ENTRY_SUPPORT,
+                    "Remaining entry budget must be preserved after a jump");
+        check(stance.tick(true, false, true).stance() == SpiritNavigationService.Stance.FREE_FALL,
+                "Repeated jumps must not replenish the bounded entry ownership wait");
     }
 
     /** The decision is only real if update()/enter() actually wire it that way in production source. */
@@ -104,10 +128,13 @@ public final class SpiritEntrySupportedWalkingTest {
         String updateBody = source.substring(update, afterUpdate);
         check(updateBody.contains("SpiritTerrainService.ownershipPending(p)"),
                 "Shallow stance decision must consult live octree ownership publication state");
-        check(updateBody.contains("p.isOnGround()"),
-                "Standing detection must use the physical ground state");
+        check(updateBody.contains("MeshCollision.ground(p).isPresent()"),
+                "Standing detection must use actual visible/collidable mesh contact, not low delta or stale vanilla flags");
         check(Pattern.compile("entryStance\\(").matcher(updateBody).find(),
                 "update() must route shallow support through the shared stance decision");
+        check(updateBody.contains("if (standing && delta.y <= .01) s.jumping = false")
+                        && updateBody.contains("s.entrySupportTicks = stance.entrySupportTicks()"),
+                "Physical recontact must reset jumping while preserving the separate entry lifetime");
         check(updateBody.contains("s.everSupported = true"),
                 "Confirmed support must permanently end the entry hold for the session");
         check(updateBody.contains("Stance.HOLD_ENTRY_SUPPORT") && updateBody.contains("flight(p, false)"),
@@ -131,6 +158,7 @@ public final class SpiritEntrySupportedWalkingTest {
         ownershipResolutionEndsTheHoldAndRestoresOrdinaryRules();
         confirmedOwnershipIsNeverReheld();
         airborneEntryKeepsTheJumpGraceAndEdgeRules();
+        entryWaitDoesNotSpendJumpGraceOrResetEntryBudget();
         try {
             productionWireUp();
         } catch (Exception e) {
