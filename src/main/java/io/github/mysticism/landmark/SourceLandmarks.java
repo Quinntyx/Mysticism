@@ -15,11 +15,12 @@ import java.util.*;
 import java.util.concurrent.*;
 
 /** Real bounded source-coordinate pipeline. Chunks are read-only IO, not ownership or identity.
- * One live operation per server; detached topology/encoding work runs on a bounded worker.
+ * One advancing operation per server; discovery owners may suspend only for movement reads.
+ * Detached topology/encoding work runs on a bounded worker.
  * No generation, source writes, joins, model inference or catalogue hydration on tick. */
 public final class SourceLandmarks {
     public static final String ALGORITHM="source-octree-v2";
-    /** Movement reads may jump ahead of at most this many discovery ops between discovery ticks. */
+    /** At most this many movement reads between advances of waiting requested/resource-owning discovery. */
     static final int DISCOVERY_FAIR_SHARE=5,READ_BUDGET=64,DISCOVERY_BUDGET=64;
     public record Cell(BlockPoint position,BlockPalette.State material,String biome,boolean sky) {
         public boolean air(){return Set.of("minecraft:air","minecraft:cave_air","minecraft:void_air").contains(material.blockId());}
@@ -145,8 +146,11 @@ public final class SourceLandmarks {
             if(!ownerRequests.isEmpty()){var request=ownerRequests.peekFirst();try{request.advance();}catch(RuntimeException failure){request.cancel(failure);}if(request.done)ownerRequests.removeFirst();}
             if(server.getTicks()%5==0&&!retries.isEmpty()){try{if(retries.peekFirst().advance(this))retries.removeFirst();}catch(RuntimeException stale){retries.removeFirst();}}
             if(server.getTicks()%200==0){var players=server.getPlayerManager().getPlayerList();for(int n=0;n<Math.min(2,players.size());n++){var p=players.get(Math.floorMod(playerCursor++,players.size()));if(SourceDimensions.isSource(p.getServerWorld().getRegistryKey().getValue().toString()))hint(p.getServerWorld().getRegistryKey().getValue().toString(),p.getBlockPos());}}
-            boolean ready=EmbeddingHelper.isReady()||itemIndex.isPopulated();
-            active=schedule.pick(active,op->admissible(op,ready),op->parkable(op));
+            advanceScheduled(EmbeddingHelper.isReady()||itemIndex.isPopulated());
+        }
+        /** One bounded operation advance per tick, also exercised by runtime regressions. */
+        private void advanceScheduled(boolean ready){
+            active=schedule.pick(active,op->admissible(op,ready),Session::parkable);
             if(active==null){
                 if(ready&&!hints.isEmpty()&&schedule.backgroundPending()<DISCOVERY_BUDGET){Hint h=hints.iterator().next();hints.remove(h);
                     Ensure cascade=new Ensure(this,h.dimension,h.pos,null,false,new CompletableFuture<>());cascade.background=true;schedule.background(cascade);}
@@ -155,7 +159,7 @@ public final class SourceLandmarks {
             try{if(active.future.isCancelled())active.cancel(new CancellationException());if(!active.done)active.advance();if(active.done){active.release();active=null;status="Ready";}}
             catch(RuntimeException e){status="Deferred: "+e.getMessage();active.cancel(e);active.release();active=null;}
             // An op that can only wait for real embedding readiness must never hold the pipeline.
-            if(active instanceof Ensure ensure&&ensure.needsEngine&&!EmbeddingHelper.isReady()){
+            if(active instanceof Ensure ensure&&ensure.needsEngine&&!EmbeddingHelper.isReady()&&parkable(ensure)){
                 schedule.discoveryLane.addFirst(active);active=null;status="Deferred: waiting for real embedding readiness";
             }
         }
@@ -168,10 +172,9 @@ public final class SourceLandmarks {
             if(op instanceof Ensure ensure&&ensure.needsEngine)return EmbeddingHelper.isReady();
             return ready;
         }
-        /** A parked op must never hold an exclusive resource: the store's single geometry read,
-         * the activity mutation pause, or a staged store mutation. Parking such an op would
-         * livelock every op (requested or not) waiting for that resource, since the owner could
-         * never resume to release it. Resource owners finish their stage before yielding. */
+        /** Whether discovery may yield to OTHER discovery. Resource owners may suspend for
+         * movement reads (which use none of these resources), but the scheduler reserves their
+         * next discovery turn ahead of every lane so they can always release their resources. */
         private static boolean parkable(Operation<?> op){
             return op.geometryRead==null&&op.resume==null&&!(op.mutation!=null&&!op.mutation.complete());
         }
@@ -183,7 +186,7 @@ public final class SourceLandmarks {
     }
     private abstract static class Operation<T> {
         final Session s;String dimension;Bounds bounds,guarded;final CompletableFuture<T> future;boolean done;
-        /** Hint-cascade discovery runs only when no reads and no requested discovery is admissible. */
+        /** Hint cascade starts only without reads/requests; an acquired resource keeps discovery precedence. */
         boolean background;
         GeneratedSourceReader reader;CompletableFuture<Region> snapshot;CompletableFuture<Landmark> hydrated;LandmarkStore.GeometryRead geometryRead;LandmarkStore.PendingMutation mutation;CompletableFuture<?> work;Runnable resume;
         LandmarkExtractionService.TopologyPlan history;

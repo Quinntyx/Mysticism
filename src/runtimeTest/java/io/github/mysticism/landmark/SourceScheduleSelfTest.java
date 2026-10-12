@@ -7,8 +7,8 @@ import java.util.function.Predicate;
  * never block movement-critical reads (terrain mesh/collision/support), never hold the
  * pipeline while gated on real embedding readiness, never starve under read pressure, never
  * let hint-cascade background work delay requested walk/support/target answers, never park
- * an op that owns an exclusive resource (geometry read / activity mutation pause), and
- * support lane-wide invalidation of parked observations after source edits. */
+ * allow resource owners to yield ONLY to reads while retaining discovery precedence, and
+ * support invalidation of both queued observations and suspended owners after source edits. */
 public final class SourceScheduleSelfTest {
     private static int checks;
     private static void check(boolean value,String message){checks++;if(!value)throw new AssertionError(message);}
@@ -35,8 +35,10 @@ public final class SourceScheduleSelfTest {
         backgroundNeverDelaysRequestedOrReads();
         movementLatencyBoundedAndDiscoveryNeverStarves();
         emptySchedulePicksNothing();
-        resourceOwnerIsNeverPreempted();
-        parkedResourceOwnerCanNeverExist();
+        resourceOwnerYieldsOnlyToReads();
+        backgroundOwnerRetainsPrecedenceAndProgress();
+        suspendedOwnerCancellationReleasesExactlyOnce();
+        quotaExpiryGrantsOneDiscoveryTick();
         cancelIfRemovesMatchedOpsAcrossLanesExactlyOnce();
         editDuringPreemptionInvalidatesParkedObservation();
         System.out.println("SourceScheduleSelfTest: "+checks+" checks passed");
@@ -162,38 +164,57 @@ public final class SourceScheduleSelfTest {
         check(schedule.readPending()==0&&schedule.discoveryPending()==0&&schedule.backgroundPending()==0,"lane counters track reality");
     }
 
-    /** An op holding an exclusive resource (store geometry read, activity mutation pause or
-     * staged store mutation) is never parked: it runs to release the resource, so requested
-     * discovery waiting on that resource can never livelock behind a parked owner. */
-    private static void resourceOwnerIsNeverPreempted(){
-        var schedule=new SourceSchedule<Op>(1,op->op.read,op->op.background);
-        var owner=discovery("geometry-read-owner");
-        schedule.discover(owner);
+    /** Reads need no exclusive resource. Other discovery must never pass a suspended owner. */
+    private static void resourceOwnerYieldsOnlyToReads(){
+        var schedule=new SourceSchedule<Op>(5,op->op.read,op->op.background);
+        var owner=discovery("geometry-read-owner");var other=discovery("other");
+        schedule.discover(owner);schedule.discover(other);
         check(schedule.pick(null,OPEN,HOLDING_RESOURCE)==owner,"resource owner starts");
-        for(int tick=0;tick<6;tick++){
-            schedule.read(read("stream-"+tick));
-            check(schedule.pick(owner,OPEN,HOLDING_RESOURCE)==owner,"resource owner keeps the pipeline despite waiting reads (tick "+tick+")");
-            check(schedule.readPending()==tick+1,"reads queue while the owner releases its resource");
-        }
-        check(schedule.discoveryPending()==0,"the owner was never parked into a lane");
-        check(schedule.pick(null,OPEN,HOLDING_RESOURCE).id.equals("stream-5"),"after the owner finishes, queued reads are served first (newest read first, matching production read priority)");
+        var walkRead=read("walk-region");schedule.read(walkRead);
+        check(schedule.pick(owner,OPEN,HOLDING_RESOURCE)==walkRead,"resource owner yields immediately to movement read");
+        check(schedule.discoveryPending()==2,"pending count includes the suspended owner");
+        check(schedule.discoveryLane.peekFirst()==other,"owner is reserved, not parked among competing discovery");
+        check(schedule.pick(null,op->false,HOLDING_RESOURCE)==owner,"owner resumes even if model readiness changes");
+        check(schedule.pick(null,OPEN,HOLDING_RESOURCE)==other,"other discovery proceeds only after owner finishes");
+        check(schedule.pick(null,OPEN,HOLDING_RESOURCE)==null,"nothing lost or duplicated");
     }
 
-    /** Invariant: pick() can never move a resource-owning op into a lane, so a parked op can
-     * never hold the store's single geometry read or the activity mutation pause. */
-    private static void parkedResourceOwnerCanNeverExist(){
+    private static void backgroundOwnerRetainsPrecedenceAndProgress(){
         var schedule=new SourceSchedule<Op>(5,op->op.read,op->op.background);
-        var owner=discovery("pause-owner");var other=discovery("other");
-        schedule.discover(owner);schedule.discover(other);
-        check(schedule.pick(null,OPEN,HOLDING_RESOURCE)==owner,"owner starts");
-        var walkRead=read("walk-region");schedule.read(walkRead);
-        check(schedule.pick(owner,OPEN,HOLDING_RESOURCE)==owner,"resource owner keeps the pipeline even though a read waits");
-        check(schedule.readPending()==1,"the read queues while the owner releases its resource");
-        check(schedule.pick(owner,OPEN,HOLDING_RESOURCE)==owner,"owner is still not parked into a lane");
-        check(schedule.discoveryPending()==1&&schedule.discoveryLane.peekFirst()==other,"only the non-owning op is queued; the owner stays off-lane");
-        check(schedule.pick(null,OPEN,HOLDING_RESOURCE)==walkRead,"after the owner finishes, the waiting read is served first");
-        check(schedule.pick(null,OPEN,HOLDING_RESOURCE)==other,"other discovery proceeds afterwards");
-        check(schedule.pick(null,OPEN,HOLDING_RESOURCE)==null,"nothing else runs once lanes drain");
+        var owner=cascade("publication-owner");schedule.background(owner);
+        Op current=schedule.pick(null,OPEN,HOLDING_RESOURCE);
+        schedule.discover(discovery("waiting-request"));int ownerTicks=0;
+        for(int tick=0;tick<60;tick++){
+            var read=read("stream-"+tick);schedule.read(read);
+            current=schedule.pick(current,OPEN,HOLDING_RESOURCE);
+            if(current==owner){ownerTicks++;check(schedule.readPending()>0,"owner receives one advance under sustained reads");}
+            else{check(current.read,"requested discovery cannot pass background resource owner");current=null;}
+            check(schedule.backgroundPending()+(current==owner?1:0)==1,"owner counted exactly once");
+        }
+        check(ownerTicks==10,"resource owner advances once per five completed reads");
+        schedule.cancelIf(op->op==owner,op->{});
+    }
+
+    private static void suspendedOwnerCancellationReleasesExactlyOnce(){
+        var schedule=new SourceSchedule<Op>(5,op->op.read,op->op.background);
+        var owner=cascade("stale-owner");var later=discovery("fresh-request");
+        schedule.background(owner);check(schedule.pick(null,OPEN,HOLDING_RESOURCE)==owner,"owner starts");
+        schedule.discover(later);var read=read("walk");schedule.read(read);
+        check(schedule.pick(owner,OPEN,HOLDING_RESOURCE)==read,"owner suspends");
+        List<Op> released=new ArrayList<>();
+        schedule.cancelIf(op->op==owner,released::add);schedule.cancelIf(op->op==owner,released::add);
+        check(released.equals(List.of(owner)),"suspended owner cancelled/released exactly once");
+        check(schedule.backgroundPending()==0,"cancel removes reserved owner");
+        check(schedule.pick(null,OPEN,PARKABLE)==later,"cancelled owner never resumes; other discovery may proceed");
+    }
+
+    private static void quotaExpiryGrantsOneDiscoveryTick(){
+        var schedule=new SourceSchedule<Op>(1,op->op.read,op->op.background);
+        var discovery=discovery("long-discovery");schedule.discover(discovery);
+        schedule.read(read("first"));check(schedule.pick(null,OPEN,PARKABLE).read,"first read consumes quota");
+        var next=read("next");schedule.read(next);
+        check(schedule.pick(null,OPEN,PARKABLE)==discovery,"quota expiry grants discovery one tick");
+        check(schedule.pick(discovery,OPEN,PARKABLE)==next,"discovery yields again after that one tick, not after completion");
     }
 
     /** Lane-wide cancellation: matched ops are removed from every lane, the action runs

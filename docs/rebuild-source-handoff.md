@@ -65,9 +65,9 @@ No tests/build run for this bounded hook, per parent instruction. Terrain wiring
 
 ## Bounds / honest remaining limits
 
-One active source operation/server, request queue 64, hint queue 128, frontier-retry queue 64, worker queue 4. Live reads <=512 cells and stop after ~1.5ms between cell samples; this is **not** a hard whole-tick deadline for metadata/NBT page IO/publication. Region volume <=32768 and <=16 chunk IO adapters; local overlap operation <=64 parents, <=512 hydrated pages/parent, expanded topology <=131072 cells. These are per-operation limits, not a global catalog cap. Oversized operations fail visibly through futures/status rather than fabricate coverage.
+One advancing source operation/server; separate read/requested/background lanes (64 pending reads/requested ops each), hint queue 128, frontier-retry queue 64, worker queue 16. A suspended resource owner is counted in its discovery lane's pending budget. Live reads <=512 cells and stop after ~1.5ms between cell samples; this is **not** a hard whole-tick deadline for metadata/NBT page IO/publication. Region volume <=32768 and <=16 chunk IO adapters; local overlap operation <=64 parents, <=512 hydrated pages/parent, expanded topology <=131072 cells. These are per-operation limits, not a global catalog cap. Oversized operations fail visibly through futures/status rather than fabricate coverage.
 
-Live gameplay, new save/reload cycles, actual Nomic inference, multiplayer entry, projected meshes/collision and terrain coupling were **not exercised** in this worktree. Parent performs integrated validation. Source and semantic catalog paging are resumable linear traversal, not spatial/high-dimensional acceleration indexes; large catalogs may take many ticks and cold metadata page reads still happen on the owner thread. A single operation waiting for descriptor inference can also delay later queued source reads. Old immutable generated blob files are not garbage-collected. Raw SourceSelector intentionally does not choose representatives itself. Natural neighboring cave union currently requires semantic convergence too; temporarily separate provisional owners can remain. The worker's individual-feature expansion/page caps can stop growth of very large caves. Source edits revise occupancy/material but do not repartition one historical cave ID into new air-component IDs after a new wall splits its air. Safe-air support recognizes a conservative floor whitelist and may reject otherwise valid modded/slab floors. Stored coarse far material detail requires successful near refinement before full fidelity. Nearby chest sampling covers at most two loaded chests and 16 slots/chest per sample. A full-air observation with no real item fallback must await a working descriptor model.
+Live gameplay, new save/reload cycles, actual Nomic inference, multiplayer entry, projected meshes/collision and terrain coupling were **not exercised** in this worktree. Parent performs integrated validation. Source and semantic catalog paging are resumable linear traversal, not spatial/high-dimensional acceleration indexes; large catalogs may take many ticks and cold metadata page reads still happen on the owner thread. Descriptor inference does not exclusively occupy the pipeline: movement reads can interrupt waiting discovery (see the async-discovery scheduling correction below). Read backlog, worker saturation and pending generated-chunk IO can still delay read completion. Old immutable generated blob files are not garbage-collected. Raw SourceSelector intentionally does not choose representatives itself. Natural neighboring cave union currently requires semantic convergence too; temporarily separate provisional owners can remain. The worker's individual-feature expansion/page caps can stop growth of very large caves. Source edits revise occupancy/material but do not repartition one historical cave ID into new air-component IDs after a new wall splits its air. Safe-air support recognizes a conservative floor whitelist and may reject otherwise valid modded/slab floors. Stored coarse far material detail requires successful near refinement before full fidelity. Nearby chest sampling covers at most two loaded chests and 16 slots/chest per sample. A full-air observation with no real item fallback must await a working descriptor model.
 
 ## Async-discovery Ensure observation repair
 
@@ -93,6 +93,44 @@ actual native-model launch was exercised; cold metadata/page IO still has the bo
 but not hard-wall-clock tick limitations described above. This repair does not certify
 all eleven runtime symptoms or change their independently owned subsystems.
 
-## Validation actually run
+## Async-discovery scheduling correction: movement reads during resource ownership
+
+Discovery can retain the single store geometry cursor, staged mutation or activity
+mutation pause across ticks. Those resources are not needed by `region(...)` movement
+reads. `SourceSchedule` now reserves a suspended resource owner outside the ordinary
+lanes: reads may interrupt it, but no other discovery (even a requested op ahead of a
+background owner) may take its discovery turn. Five read operations grant the owner
+one bounded advance; quota expiry no longer lets discovery run to completion before
+yielding again. An already running read is not interrupted. Resource completion is
+not gated on model readiness. Source edits/unload/shutdown also cancel the suspended
+owner and release its cursor/mutation/pause through the existing operation lifecycle.
+
+The per-tick geometry/publication budgets remain one page and 512 reconstructed
+leaves. No new concurrency or store schema, projection, terrain/collision, source
+ownership or embedding policy is introduced. The independent ownership-map request
+lane still shares the store cursor; this fix removes discovery-stage blocking of
+movement `Read` operations, not every kind of shared-cursor contention.
+
+`SourceDiscoveryReadLatencyTest` drives the actual Session scheduling step, real
+Ensure operations, real 100-page LandmarkStore geometry/publication and actual
+GeneratedSourceReader movement reads with detached generated NBT. During both
+geometry reading and background publication, three queued walk/near-terrain/target
+reads completed in nine simulated ticks instead of waiting for 100+ discovery ticks.
+Under sustained reads, every read took at most four simulated ticks; all 100 geometry
+pages / 102 publication advances completed, without admitting competing discovery or
+exposing a partial catalog. Real session invalidation cancels suspended geometry and
+publication and releases resources exactly once. These are scheduler tick counts,
+not a guarantee on disk IO, workers or live-game movement latency.
+
+Cached Gradle 8.13 `--no-daemon --console=plain build` passed, including all **eight**
+discovered main-based runtime classes, packaging fixtures and production-jar
+verification. The latency regression passed 12,762 checks, scheduler regression 179,
+Ensure observation regression 14 and multi-chunk reader regression 1,036. Retained
+build pane `%2146`, run `cff3248e153140298b2aca9481d424ee` (exit 0). The initial build
+failed only on the new fixture's hard-coded legacy vector dimension; the fixture
+now follows the current native vector size without altering production vectors.
+No gameplay, GPU, multiplayer launch or real native-model inference was performed.
+
+## Validation actually run (historical concurrent rebuild)
 
 No new tests added and no Gradle run during concurrent rebuild (parent instruction). Scoped Java21 `javac --release 21 -proc:none` compilation of all SOURCE-owned landmark/activity classes against cached mapped Fabric/Yarn 1.21.1 classpath plus the read-only NAV LatentAttunement source. Interactive tmux pane `%463`, script `/tmp/mysticism-source-rebuild-check.sh`; output displayed, not redirected. `git diff --check`. This is compile validation, **not** evidence that live runtime behaviors above have passed.

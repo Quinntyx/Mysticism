@@ -8,14 +8,15 @@ import java.util.function.Predicate;
  * reads (terrain mesh/collision/support sampling) or hold the pipeline while waiting for
  * real embedding readiness:
  * <ul>
- *   <li>Read ops preempt a running non-read op under a bounded fair-share quota, so a
- *       discovery burst can delay a read by at most the quota, never starve it.</li>
- *   <li>Discovery still makes progress under sustained read pressure (one op per quota),
+ *   <li>Read ops preempt a running non-read op under a bounded fair-share quota,
+ *       including resource owners: movement sampling needs no store/activity lock.</li>
+ *   <li>Requested/resource-owning discovery still advances under sustained reads (one tick per quota),
  *       and requested ops keep FIFO order; a preempted op resumes where it was parked.</li>
  *   <li>An inadmissible op (e.g. gated on embedding readiness) is skipped without losing
  *       its place: it can never block later ops in its own lane or the other lanes.</li>
- *   <li>Background ops (hint-driven discovery cascade) run only when no reads and no
- *       requested discovery ops are admissible.</li>
+ *   <li>Background ops (hint-driven discovery cascade) start only when no reads and no
+ *       requested discovery ops are admissible. A started resource owner retains discovery
+ *       precedence until it releases its resources, but can still yield to reads.</li>
  * </ul>
  * Ops are identified by identity; the caller owns all op state and lifecycle. */
 final class SourceSchedule<T> {
@@ -25,6 +26,8 @@ final class SourceSchedule<T> {
     private final int fairShare;
     private final Predicate<T> readOp,backgroundOp;
     private int debt;
+    /** Suspended only for movement reads, never for another discovery (in any lane). */
+    private T resourceOwner;
     /** @param fairShare how many read ops may go first before a waiting discovery op runs */
     SourceSchedule(int fairShare,Predicate<T> readOp,Predicate<T> backgroundOp){
         if(fairShare<1)throw new IllegalArgumentException("source schedule fair share");
@@ -37,20 +40,31 @@ final class SourceSchedule<T> {
     /** Hint-driven wider discovery cascade; never outranks requested work. */
     void background(T op){backgroundLane.addLast(op);}
     int readPending(){return readLane.size();}
-    int discoveryPending(){return discoveryLane.size();}
-    int backgroundPending(){return backgroundLane.size();}
-    /** Decide the op to advance this tick. A running non-read op is parked back into its
-     * own lane (front, resuming in place) when reads wait, the fair share allows, AND the op
-     * holds no exclusive resource: a parked op can never hold the store's single geometry
-     * read or the activity mutation pause, which would livelock the ops waiting on them. */
+    int discoveryPending(){return discoveryLane.size()+(resourceOwner!=null&&!backgroundOp.test(resourceOwner)?1:0);}
+    int backgroundPending(){return backgroundLane.size()+(resourceOwner!=null&&backgroundOp.test(resourceOwner)?1:0);}
+    /** Decide the op to advance this tick. Resource owners may yield to movement reads,
+     * but retain precedence over ALL other discovery, including requested work ahead of
+     * a background owner. Thus locks stay releasable without delaying movement by the
+     * entire geometry/publication stage. Quota expiry grants one discovery advance, not
+     * permission to run that op to completion. A read already running is never interrupted. */
     T pick(T current,Predicate<T> admissible,Predicate<T> parkable){
         Objects.requireNonNull(admissible);Objects.requireNonNull(parkable);
-        if(current!=null&&!readOp.test(current)&&parkable.test(current)&&!readLane.isEmpty()&&debt<fairShare){
-            (backgroundOp.test(current)?backgroundLane:discoveryLane).addFirst(current);
-            current=null;
+        if(current!=null&&!readOp.test(current)){
+            if(!parkable.test(current)){
+                if(resourceOwner!=null)throw new IllegalStateException("another source resource owner is suspended");
+                resourceOwner=current;current=null;
+            }else if(!readLane.isEmpty()){
+                (backgroundOp.test(current)?backgroundLane:discoveryLane).addFirst(current);
+                current=null;
+            }
         }
         if(current!=null)return current;
         boolean readWaiting=!readLane.isEmpty();
+        if(resourceOwner!=null){
+            if(readWaiting&&debt<fairShare){debt++;return readLane.removeFirst();}
+            // Finish the lock-owning stage even if model readiness changed meanwhile.
+            T owner=resourceOwner;resourceOwner=null;debt=0;return owner;
+        }
         if(readWaiting){
             T requested=firstAdmissible(discoveryLane,admissible);
             if(requested!=null){
@@ -70,6 +84,9 @@ final class SourceSchedule<T> {
      * parked op can never resume stale work or retain the activity mutation pause). */
     void cancelIf(Predicate<T> matches,java.util.function.Consumer<T> action){
         Objects.requireNonNull(matches);Objects.requireNonNull(action);
+        if(resourceOwner!=null&&matches.test(resourceOwner)){
+            T owner=resourceOwner;resourceOwner=null;action.accept(owner);
+        }
         for(var lane:List.of(readLane,discoveryLane,backgroundLane))
             for(Iterator<T> it=lane.iterator();it.hasNext();){T op=it.next();if(matches.test(op)){it.remove();action.accept(op);}}
     }
