@@ -13,6 +13,7 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
     interface Model extends AutoCloseable {
         int dimensions();
         int tokens(String input);
+        /** One mean-pooled native sentence vector, not CLS/token rows or a reduced vector. */
         float[] embed(String input);
         @Override void close();
     }
@@ -82,19 +83,28 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
         validateDescriptor(descriptor);
         String input = "search_document: " + descriptor;
         // Use the actual GGUF tokenizer (including special tokens), never a character heuristic.
-        if (model.tokens(input) > 512) throw new IllegalArgumentException("Nomic v2 input exceeds 512 tokens; truncation is forbidden");
+        int tokens = model.tokens(input);
+        if (tokens < 1 || tokens > NativeEmbeddingOutput.MAX_TOKENS)
+            throw new IllegalArgumentException("Nomic v2 input must have 1..512 tokens; truncation is forbidden");
         return decodeEmbedding(model.embed(input));
     }
     private static void validateDescriptor(String descriptor) {
         if (descriptor == null || descriptor.isBlank() || descriptor.length() > 8192)
             throw new IllegalArgumentException("Descriptor must be nonempty and at most 8192 characters");
+        for (int i = 0; i < descriptor.length(); i++) {
+            char value = descriptor.charAt(i);
+            if (Character.isHighSurrogate(value)) {
+                if (++i == descriptor.length() || !Character.isLowSurrogate(descriptor.charAt(i)))
+                    throw new IllegalArgumentException("Descriptor contains unpaired UTF-16 surrogate");
+            } else if (Character.isLowSurrogate(value)) {
+                throw new IllegalArgumentException("Descriptor contains unpaired UTF-16 surrogate");
+            }
+        }
     }
     static Vec384f decodeEmbedding(float[] values) {
-        if (values == null || values.length != EmbeddingSpace.NATIVE_DIMENSIONS)
-            throw new IllegalArgumentException("Expected all 768 native Nomic v2 coordinates");
-        Vec384f vector = new Vec384f(values); // validates finiteness and takes a copy
-        if (vector.length() == 0) throw new IllegalArgumentException("Zero embedding");
-        return new Vec384f(vector.norm());
+        // llama.cpp performs MEAN pooling. Treat its result as a sentence tensor: never
+        // pool again, select CLS, resize, layer-normalize (v1), or cast before stable L2.
+        return NativeEmbeddingOutput.fromTensor(values, new long[]{1, EmbeddingSpace.NATIVE_DIMENSIONS}, null);
     }
     private void requireOpen() {
         if (closed || Thread.currentThread().isInterrupted()) throw new CancellationException("Embedded inference closed/cancelled");
