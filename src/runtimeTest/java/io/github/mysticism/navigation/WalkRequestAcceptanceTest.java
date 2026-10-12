@@ -2,9 +2,14 @@ package io.github.mysticism.navigation;
 
 import io.github.mysticism.activity.TraversalSteering;
 import io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService;
+import io.github.mysticism.dimension.spiritworld.terrain.MeshCollision;
+import io.github.mysticism.dimension.spiritworld.terrain.MeshTransitionClearanceTest;
+import io.github.mysticism.dimension.spiritworld.terrain.TerrainMeshFrame;
 import io.github.mysticism.vector.Basis384f;
 import io.github.mysticism.vector.Vec384f;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.util.math.Box;
+import java.util.List;
 import java.util.Random;
 
 /**
@@ -29,6 +34,7 @@ public final class WalkRequestAcceptanceTest {
         pivotSemanticMakesAcquisitionResidualExactlyZero();
         alignmentScheduleConvergesBounded();
         alignmentScheduleAdaptsToRefusals();
+        supportedAlignmentPassesProductionContinuityGuard();
         System.out.println("Walk request acceptance self-tests passed: pivot re-anchor, guarded adaptive alignment (" + checks + " checks)");
     }
 
@@ -203,6 +209,53 @@ public final class WalkRequestAcceptanceTest {
             check(alignment.step()<=1f/SupportAlignment.FULL_STEPS,"step recovery never exceeds a full step");
             check(alignment.progress()<=1f && alignment.progress()>=0f,"accepted progress stays a bounded fraction summing to at most one");
         }
+    }
+
+    /** Unlike the synthetic increment-limit schedule test, this drives the REAL affine collision
+     * guard with the same placement/blend/pivot helpers used by attemptSupport/canAlign. The tilted
+     * floor's AABB still intersects the strict body on every first-step subdivision; the old guard
+     * never accepted any progress and exhausted all 200 ticks. */
+    private static void supportedAlignmentPassesProductionContinuityGuard() {
+        for(float degrees:new float[]{-5,5})for(Vec3d player:new Vec3d[]{Vec3d.ZERO,new Vec3d(8123,70,-431.5),new Vec3d(29000000,255,-29000000)}) {
+            Basis384f grid=new Basis384f();
+            double angle=Math.toRadians(degrees);float sine=(float)Math.sin(angle),cosine=(float)Math.cos(angle);
+            Basis384f from=new Basis384f(grid.i.clone().mul(cosine).sub(grid.j.clone().mul(sine)),
+                    grid.i.clone().mul(sine).add(grid.j.clone().mul(cosine)),grid.k);
+            Vec3d feet=new Vec3d(.5,1+.3*Math.abs(sine),.5);
+            Vec384f q=Vec384f.ZERO(),semantic=SpiritTerrainService.supportPivotSemantic(q,grid,feet,Vec3d.ZERO);
+            Box body=new Box(player.x-.3,player.y,player.z-.3,player.x+.3,player.y+1.8,player.z+.3);
+            TerrainMeshFrame current=placedFloor(player,semantic,q,from,grid);
+            check(MeshCollision.bodyClear(current,body),"initial tilted support has SAT body clearance");
+            check(current.cells().getFirst().bounds().intersects(body.expand(-1e-5)),"fixture exercises original AABB-union rejection");
+            SupportAlignment alignment=new SupportAlignment();Basis384f acceptedBasis=from;int ticks=0,accepted=0;
+            while(!alignment.complete() && ticks<200) {
+                ticks++;float fraction=alignment.nextFraction();
+                Basis384f proposed=TraversalSteering.blend(from,grid,fraction);
+                TerrainMeshFrame next=placedFloor(player,semantic,q,proposed,grid);
+                if(maxAxisDistance(acceptedBasis,proposed)>.1f || !MeshCollision.transitionClear(current,next,body)) {
+                    alignment.refuse();continue;
+                }
+                check(MeshCollision.bodyClear(next,body),"accepted real alignment never clips floor through player");
+                check(new MeshCollision.Index(next).sweep(body.offset(0,.025,0),new Vec3d(0,-.15,0)).isPresent(),
+                        "accepted alignment retains real affine ground contact");
+                alignment.accept(fraction);acceptedBasis=proposed;current=next;accepted++;
+            }
+            check(alignment.complete(),"supported walk alignment reaches source grid before 200-tick expiry (ticks="+ticks+")");
+            check(accepted<=SupportAlignment.FULL_STEPS,"valid 5-degree support accepts full steps rather than starving at subdivision floor");
+            // The deep-to-shallow acquisition uses identity source axes at exactly the same source
+            // feet/carrier pose. Its final whole-frame guard must also accept without a teleport.
+            TerrainMeshFrame shallow=MeshTransitionClearanceTest.frame(new TerrainMeshFrame.Cell(1,0,"floor",Vec3d.ZERO,
+                    player.subtract(feet),new Vec3d(1,1,1),new Vec3d(1,0,0),new Vec3d(0,1,0),new Vec3d(0,0,1),
+                    -1,0,1,List.of(new Box(0,0,0,1,1,1))));
+            check(MeshCollision.bodyClear(shallow,body) && MeshCollision.transitionClear(current,shallow,body),
+                    "final walking acquisition geometry passes production body/continuity gates");
+        }
+    }
+    private static TerrainMeshFrame placedFloor(Vec3d player,Vec384f semantic,Vec384f q,Basis384f observer,Basis384f grid) {
+        return MeshTransitionClearanceTest.frame(new TerrainMeshFrame.Cell(1,0,"floor",Vec3d.ZERO,
+                SpiritTerrainService.frameCellMin(player,semantic,q,observer,grid,Vec3d.ZERO,Vec3d.ZERO),new Vec3d(1,1,1),
+                SpiritTerrainService.frameAxis(grid.i,observer),SpiritTerrainService.frameAxis(grid.j,observer),
+                SpiritTerrainService.frameAxis(grid.k,observer),-1,0,1,List.of(new Box(0,0,0,1,1,1))));
     }
 
     private static float maxAxisDistance(Basis384f a,Basis384f b) {
