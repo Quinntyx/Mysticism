@@ -41,9 +41,9 @@ public final class SpiritProjectionService {
     private static final Map<ServerPlayNetworkHandler,Connection> connections=new IdentityHashMap<>();
     private static boolean initialized;private static int cursor,activeConnections;
     private static final class Connection {
-        final UUID nonce=UUID.randomUUID();long generation,glyphSequence,sceneSequence,terrainSequence,lastTouch=-1,lastSendTick=-20;ServerPlayerEntity player;
+        final UUID nonce=UUID.randomUUID();long generation,glyphSequence,sceneSequence,terrainSequence,lastTouch=-1,lastSendTick=-20,lastTerrainResyncTick=-20;ServerPlayerEntity player;
         SpiritFramePayload.Session session;boolean acknowledged;TerrainMeshFrame pendingTerrain,sentTerrain;String error;Set<UUID> seenPeers=Set.of();
-        void invalidate(){if(player!=null)SourceObservationTickets.release(player);if(session!=null)activeConnections--;session=null;acknowledged=false;player=null;pendingTerrain=null;sentTerrain=null;seenPeers=Set.of();glyphSequence=sceneSequence=terrainSequence=0;lastTouch=-1;}
+        void invalidate(){if(player!=null)SourceObservationTickets.release(player);if(session!=null)activeConnections--;session=null;acknowledged=false;player=null;pendingTerrain=null;sentTerrain=null;seenPeers=Set.of();glyphSequence=sceneSequence=terrainSequence=0;lastTouch=-1;lastTerrainResyncTick=-20;}
     }
     private SpiritProjectionService(){}
     public static void install(Navigation nav,MeshProvider provider){navigation=Objects.requireNonNull(nav);meshes=Objects.requireNonNull(provider);}
@@ -122,6 +122,14 @@ public final class SpiritProjectionService {
         }
     }
     public static void acknowledge(ServerPlayerEntity actor,SpiritSessionAckPayload ack){thread(actor);var c=connections.get(actor.networkHandler);if(c!=null&&c.player==actor&&c.session!=null&&c.session.connection().equals(ack.connectionNonce())&&c.session.generation()==ack.epoch())c.acknowledged=true;}
+    /** A bounded, authenticated recovery of the terrain stream, even when source geometry is idle. */
+    public static void resyncTerrain(ServerPlayerEntity actor,SpiritTerrainSyncPayload request){
+        thread(actor);var c=connections.get(actor.networkHandler);
+        if(c==null || c.player!=actor || !spirit(actor) || !c.acknowledged || c.session==null
+                || !c.session.connection().equals(request.connectionNonce()) || c.session.generation()!=request.epoch())return;
+        long tick=actor.getServer().getTicks();if(tick-c.lastTerrainResyncTick<10)return;
+        c.lastTerrainResyncTick=tick;c.sentTerrain=null; // next send is full, with a new sequence, even at the same revision
+    }
     /** No actor UUID from the packet. No combat, no shallow effect. Both observer meshes are tested. */
     public static void touch(ServerPlayerEntity actor,UUID targetId){
         thread(actor);if(!spirit(actor)||!navigation.deep(actor))return;var actorState=actor.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION);if(!actorState.semanticReady()||!actorState.modelCompatible())return;var target=actor.getServer().getPlayerManager().getPlayer(targetId);

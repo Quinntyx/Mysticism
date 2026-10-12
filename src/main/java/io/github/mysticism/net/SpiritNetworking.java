@@ -10,7 +10,9 @@ public final class SpiritNetworking {
         PayloadTypeRegistry.playS2C().register(SpiritTerrainPayload.ID,SpiritTerrainPayload.CODEC);
         PayloadTypeRegistry.playC2S().register(SpiritTouchPayload.ID,SpiritTouchPayload.CODEC);
         PayloadTypeRegistry.playC2S().register(SpiritSessionAckPayload.ID,SpiritSessionAckPayload.CODEC);
+        PayloadTypeRegistry.playC2S().register(SpiritTerrainSyncPayload.ID,SpiritTerrainSyncPayload.CODEC);
         ServerPlayNetworking.registerGlobalReceiver(SpiritTouchPayload.ID,(payload,context)->{var actor=context.player();var handler=actor.networkHandler;context.server().execute(()->{if(handler.player==actor&&actor.networkHandler==handler&&context.server().getPlayerManager().getPlayer(actor.getUuid())==actor)SpiritProjectionService.touch(actor,payload.target());});});
+        ServerPlayNetworking.registerGlobalReceiver(SpiritTerrainSyncPayload.ID,(payload,context)->{var actor=context.player();var handler=actor.networkHandler;context.server().execute(()->{if(handler.player==actor&&actor.networkHandler==handler&&context.server().getPlayerManager().getPlayer(actor.getUuid())==actor)SpiritProjectionService.resyncTerrain(actor,payload);});});
         ServerPlayNetworking.registerGlobalReceiver(SpiritSessionAckPayload.ID,(payload,context)->{var actor=context.player();var handler=actor.networkHandler;context.server().execute(()->{if(handler.player==actor&&actor.networkHandler==handler&&context.server().getPlayerManager().getPlayer(actor.getUuid())==actor)SpiritProjectionService.acknowledge(actor,payload);});});
     }
 }
