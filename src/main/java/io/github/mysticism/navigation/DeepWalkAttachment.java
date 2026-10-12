@@ -1,36 +1,22 @@
 package io.github.mysticism.navigation;
 
 /**
- * Attachment policy for a pending DEEP walk request.
- *
- * A deep-flying player who requests a walk is still MOVING through the projection: they descend,
- * graze slopes and fly across several projected source localities before settling. The request
- * therefore must not lock onto the first transient terrain contact, and it must not cancel when
- * the contacted locality changes underneath the moving player. Instead:
- *
- * <ul>
- *   <li>Only an acquisition-compatible contact (near-horizontal normal, matching walk
- *       acquisition's own {@code normal().y >= .99} gate) may attach the request to a locality.
- *       Steep grazing contacts pass the generic ground filter but can never complete walk
- *       acquisition, so locking onto them could only waste the request budget.</li>
- *   <li>While the player keeps moving, a changed contacted locality RE-ATTACHES the request
- *       (follows the player through the projection) instead of cancelling it.</li>
- *   <li>Only a locality change under a settled player cancels the request: terrain genuinely
- *       changed underfoot, and a fresh request must validate the new support.</li>
- * </ul>
- *
- * Pure Java: no Minecraft types, so regressions can exercise every branch without a server.
+ * Attachment policy for a pending DEEP walk request. A source floor can be steep in the current
+ * projection: alignment must START before the projected normal can reach the acquisition gate.
+ * Unsupported side/edge grazes wait; alignable floors attach, and moving requests follow the
+ * actual contacted locality. Only a locality change under a settled player cancels the request.
+ * Terrain still guards every basis step and revalidates the projected floor at final acquisition.
  */
 public final class DeepWalkAttachment {
-    /** Matches walk acquisition's own refusal of contacts with {@code current.normal().y < .99}. */
-    public static final float MIN_WALK_NORMAL_Y = .99f;
+    /** Final projected-normal threshold, matching terrain acquisition's double-precision .99. */
+    public static final double MIN_WALK_NORMAL_Y = .99;
     /** Movement threshold matching the existing per-tick movement epsilon used for touch blending. */
     public static final double MOVING_EPSILON = 1e-5;
 
     public enum Decision {
-        /** No (or no acquisition-compatible) contact: leave the pending request untouched. */
+        /** No alignable source floor: leave the pending request untouched. */
         WAIT,
-        /** First acquisition-compatible contact: attach the request to that locality. */
+        /** First alignable source floor: attach the request to that locality. */
         ATTACH,
         /** Contact is the already-attached locality: continue the request unchanged. */
         KEEP,
@@ -42,8 +28,16 @@ public final class DeepWalkAttachment {
 
     private DeepWalkAttachment() {}
 
-    /** A contact can only anchor a walk request if acquisition could actually commit to it. */
-    public static boolean walkable(double contactNormalY) { return contactNormalY >= MIN_WALK_NORMAL_Y; }
+    /** Final acquisition only, NOT permission to begin guarded source-grid alignment. */
+    public static boolean walkable(double projectedNormalY) {
+        return Double.isFinite(projectedNormalY) && projectedNormalY >= MIN_WALK_NORMAL_Y;
+    }
+
+    /** A real ground contact on a source floor, even if that floor is currently tilted in projection. */
+    public static boolean alignable(double projectedNormalY, double sourceNormalY) {
+        return Double.isFinite(projectedNormalY) && projectedNormalY > .3
+                && Double.isFinite(sourceNormalY) && sourceNormalY >= MIN_WALK_NORMAL_Y;
+    }
 
     /** Real per-tick physical movement. Non-finite deltas (never produced by the evolver) count as settled. */
     public static boolean moving(double deltaX, double deltaY, double deltaZ) {
@@ -53,13 +47,14 @@ public final class DeepWalkAttachment {
 
     /**
      * @param attached true when the request is currently attached to a locality
-     * @param sameLocality true when the current contact is the attached locality (window identity,
-     *     landmark, source dimension and grid basis all unchanged)
+     * @param sameLocality current window identity, landmark, source dimension and grid are unchanged
      * @param moving true when the player physically moved this tick
-     * @param contactNormalY the current contact's ground normal Y component
+     * @param projectedNormalY current contact normal Y in the visible/collidable projection
+     * @param sourceNormalY the same contact normal pulled back through its producing cell into source space
      */
-    public static Decision evaluate(boolean attached, boolean sameLocality, boolean moving, double contactNormalY) {
-        if (!walkable(contactNormalY)) return Decision.WAIT;
+    public static Decision evaluate(boolean attached, boolean sameLocality, boolean moving,
+                                    double projectedNormalY, double sourceNormalY) {
+        if (!alignable(projectedNormalY, sourceNormalY)) return Decision.WAIT;
         if (!attached) return Decision.ATTACH;
         if (sameLocality) return Decision.KEEP;
         return moving ? Decision.FOLLOW : Decision.CANCEL;

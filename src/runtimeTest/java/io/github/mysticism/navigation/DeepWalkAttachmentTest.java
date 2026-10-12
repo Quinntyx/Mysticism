@@ -1,6 +1,6 @@
 package io.github.mysticism.navigation;
 
-/** Every branch of the deep walk attachment policy, with boundary values for both gates. */
+/** Attachment and final acquisition have deliberately different gates. */
 public final class DeepWalkAttachmentTest {
     private static int checks;
     private static void check(boolean value, String why) { checks++; if (!value) throw new AssertionError(why); }
@@ -8,55 +8,69 @@ public final class DeepWalkAttachmentTest {
     public static void main(String[] args) {
         gates();
         decisions();
+        changingNormals();
         System.out.println("deep walk attachment checks: " + checks);
     }
 
     private static void expect(DeepWalkAttachment.Decision expected, boolean attached, boolean sameLocality,
-            boolean moving, double normalY, String why) {
+            boolean moving, double projectedY, double sourceY, String why) {
         checks++;
-        var actual = DeepWalkAttachment.evaluate(attached, sameLocality, moving, normalY);
+        var actual = DeepWalkAttachment.evaluate(attached, sameLocality, moving, projectedY, sourceY);
         if (actual != expected) throw new AssertionError(why + ": expected " + expected + " got " + actual);
     }
 
     private static void gates() {
-        check(DeepWalkAttachment.walkable(1f), "flat floor contact is acquisition-compatible");
-        check(DeepWalkAttachment.walkable(.99f), "the acquisition boundary itself is still walkable");
-        check(!DeepWalkAttachment.walkable(.9899f), "just below the boundary refuses attachment");
-        check(!DeepWalkAttachment.walkable(.7071f), "a 45 degree slope can never anchor a walk request");
-        check(!DeepWalkAttachment.walkable(-1f), "an overhang/ceiling normal can never anchor a walk request");
+        check(DeepWalkAttachment.walkable(1), "flat projected floor is acquisition-compatible");
+        check(DeepWalkAttachment.walkable(.99), "exact double acquisition boundary is walkable");
+        check(!DeepWalkAttachment.walkable(Math.nextDown(.99)), "below the final boundary refuses acquisition");
+        check(!DeepWalkAttachment.walkable(.7071), "tilted floor must align before acquisition");
+        check(!DeepWalkAttachment.walkable(Double.NaN), "invalid normal refuses acquisition");
+        check(!DeepWalkAttachment.walkable(Double.POSITIVE_INFINITY), "infinite normal refuses acquisition");
+        check(DeepWalkAttachment.alignable(.7071, 1), "tilted source floor may BEGIN alignment");
+        check(DeepWalkAttachment.alignable(Math.nextUp(.3), .99), "both attachment boundaries");
+        check(!DeepWalkAttachment.alignable(.3, 1), "exact generic-ground threshold is not support");
+        check(!DeepWalkAttachment.alignable(1, Math.nextDown(.99)), "non-floor source contact does not attach");
+        check(!DeepWalkAttachment.alignable(1, 0), "source wall projected upward does not attach");
+        check(!DeepWalkAttachment.alignable(.7, -1), "source ceiling does not attach");
+        check(!DeepWalkAttachment.alignable(Double.NaN, 1), "invalid projected contact waits");
+        check(!DeepWalkAttachment.alignable(.7, Double.NaN), "invalid source contact waits");
+        check(!DeepWalkAttachment.alignable(.7, Double.POSITIVE_INFINITY), "infinite source contact waits");
 
         check(!DeepWalkAttachment.moving(0, 0, 0), "a settled player is not moving");
         check(!DeepWalkAttachment.moving(.001, .001, .001), "sub-epsilon idle drift is not movement");
-        check(DeepWalkAttachment.moving(.01, 0, 0), "ordinary descent/hover movement is movement");
+        check(DeepWalkAttachment.moving(.01, 0, 0), "ordinary movement is movement");
         check(DeepWalkAttachment.moving(0, -.3, 0), "a falling player is moving");
-        check(!DeepWalkAttachment.moving(Double.NaN, 0, 0), "non-finite deltas count as settled, never as movement");
+        check(!DeepWalkAttachment.moving(Double.NaN, 0, 0), "non-finite deltas count as settled");
         double epsilon = Math.sqrt(DeepWalkAttachment.MOVING_EPSILON);
-        check(!DeepWalkAttachment.moving(epsilon, 0, 0), "exactly the epsilon length is not movement (strict threshold)");
-        check(DeepWalkAttachment.moving(Math.nextUp(epsilon), 0, 0), "just above the epsilon length is movement");
+        check(!DeepWalkAttachment.moving(epsilon, 0, 0), "exactly the epsilon length is not movement");
+        check(DeepWalkAttachment.moving(Math.nextUp(epsilon), 0, 0), "above the epsilon is movement");
     }
 
     private static void decisions() {
-        // No acquisition-compatible contact: the pending request is never touched.
-        expect(DeepWalkAttachment.Decision.WAIT, false, false, false, .98f, "unattached: sub-acquisition contact waits");
-        expect(DeepWalkAttachment.Decision.WAIT, false, false, true, .5f, "unattached moving player on a slope waits");
-        expect(DeepWalkAttachment.Decision.WAIT, true, true, false, .9f, "attached locality contact gone steep waits, never cancels");
-        expect(DeepWalkAttachment.Decision.WAIT, true, false, true, .3f, "moving between localities over steep terrain waits");
+        expect(DeepWalkAttachment.Decision.WAIT, false, false, true, .8, 0, "source wall graze waits");
+        expect(DeepWalkAttachment.Decision.WAIT, true, false, true, .95, .7, "unsupported graze never follows");
+        expect(DeepWalkAttachment.Decision.WAIT, true, false, false, 1, 0, "unsupported graze never cancels");
+        expect(DeepWalkAttachment.Decision.ATTACH, false, false, true, .5, 1, "tilted source floor attaches in motion");
+        expect(DeepWalkAttachment.Decision.ATTACH, false, false, false, .8, 1, "tilted source floor attaches at rest");
+        expect(DeepWalkAttachment.Decision.ATTACH, false, true, true, 1, 1, "stale identity cannot replace attachment");
+        expect(DeepWalkAttachment.Decision.KEEP, true, true, true, .6, 1, "tilted attached floor keeps alignment");
+        expect(DeepWalkAttachment.Decision.KEEP, true, true, false, 1, 1, "same settled locality keeps alignment");
+        expect(DeepWalkAttachment.Decision.FOLLOW, true, false, true, .5, 1, "new tilted floor is followed in motion");
+        expect(DeepWalkAttachment.Decision.CANCEL, true, false, false, .8, 1, "new source floor at rest cancels");
+    }
 
-        // First acquisition-compatible contact attaches, moving or settled.
-        expect(DeepWalkAttachment.Decision.ATTACH, false, false, true, 1f, "first walkable contact while descending attaches");
-        expect(DeepWalkAttachment.Decision.ATTACH, false, false, false, 1f, "first walkable contact while settled attaches");
-        expect(DeepWalkAttachment.Decision.ATTACH, false, true, true, .995f, "stale identity with no attachment still attaches");
-
-        // Same locality keeps the request running regardless of motion.
-        expect(DeepWalkAttachment.Decision.KEEP, true, true, true, 1f, "attached and still over the same locality keeps going");
-        expect(DeepWalkAttachment.Decision.KEEP, true, true, false, 1f, "settled on the attached locality keeps going");
-
-        // Locality changed while moving: the request follows the player through the projection.
-        expect(DeepWalkAttachment.Decision.FOLLOW, true, false, true, 1f, "new walkable locality while moving is followed");
-        expect(DeepWalkAttachment.Decision.FOLLOW, true, false, true, .99f, "boundary-walkable new locality while moving is followed");
-
-        // Locality changed under a settled player: terrain changed underfoot, cancel and re-request.
-        expect(DeepWalkAttachment.Decision.CANCEL, true, false, false, 1f, "locality changed under a settled player cancels");
-        expect(DeepWalkAttachment.Decision.CANCEL, true, false, false, .99f, "boundary-walkable changed locality when settled cancels");
+    private static void changingNormals() {
+        boolean attached = false;
+        double[] normals = {.65, .8, .7, .98, .99, 1};
+        for (double projectedY : normals) {
+            expect(attached ? DeepWalkAttachment.Decision.KEEP : DeepWalkAttachment.Decision.ATTACH,
+                    attached, attached, true, projectedY, 1, "source floor remains attached as projected normal changes");
+            attached = true;
+            check(DeepWalkAttachment.walkable(projectedY) == (projectedY >= .99),
+                    "alignment eligibility never weakens the final projected acquisition gate");
+        }
+        expect(DeepWalkAttachment.Decision.WAIT, attached, false, true, .95, 0, "transient wall does not steal attachment");
+        expect(DeepWalkAttachment.Decision.FOLLOW, attached, false, true, .85, 1, "next tilted source floor is followed");
+        expect(DeepWalkAttachment.Decision.KEEP, attached, true, false, .9, 1, "settling during alignment keeps the floor");
     }
 }

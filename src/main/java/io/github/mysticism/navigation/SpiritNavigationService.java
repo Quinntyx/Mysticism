@@ -346,11 +346,12 @@ public final class SpiritNavigationService {
         boolean sameLocality = s.supportFrom != null && s.supportWindow == support.windowIdentity()
                 && s.supportId.equals(support.landmarkId()) && s.supportDimension.equals(support.sourceDimension())
                 && basisError(s.supportGrid, destination) <= 1e-12f;
-        // A moving deep walker is descended/grazing through the projection: only an acquisition-compatible
-        // contact may anchor the request, and a changed locality is FOLLOWED while moving, not cancelled.
+        // Classify the SOURCE floor, not its current projected tilt: guarded alignment must run
+        // before the projected normal can reach acquisition's .99 gate. Side/edge grazes wait;
+        // an alignable source floor in a changed locality is FOLLOWED while moving, not cancelled.
         switch (DeepWalkAttachment.evaluate(s.supportFrom != null, sameLocality,
-                DeepWalkAttachment.moving(delta.x, delta.y, delta.z), support.normal().y)) {
-            case WAIT -> { return; } // Steep/unacquirable grazing contacts never lock or cancel the pending request.
+                DeepWalkAttachment.moving(delta.x, delta.y, delta.z), support.normal().y, support.sourceNormal().y)) {
+            case WAIT -> { return; } // Unsupported grazes never lock or cancel the pending request.
             case KEEP -> { }
             case ATTACH, FOLLOW -> { // (Re)attach to the locality actually contacted while moving through the projection.
                 s.supportFrom = component.get().clone(); s.supportGrid = destination.clone(); s.supportAlignTick = 0;
