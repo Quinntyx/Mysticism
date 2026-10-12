@@ -75,7 +75,7 @@ public final class LoadedSourceBackfillTest {
         // The production entry point exists with the real server-thread signature.
         try {
             var method=SourceLandmarks.class.getMethod("discoverLoaded",MinecraftServer.class,String.class,BlockPos.class,int.class);
-            check(method.getReturnType()==int.class,"discoverLoaded reports hinted seed count");
+            check(method.getReturnType()==int.class,"discoverLoaded reports retained seed count");
         } catch(NoSuchMethodException e){throw new AssertionError("SourceLandmarks.discoverLoaded missing",e);}
         try {
             var method=SpiritTerrainService.class.getDeclaredMethod("backfillLoadedSource",ServerPlayerEntity.class,String.class,Vec3d.class);
@@ -86,10 +86,14 @@ public final class LoadedSourceBackfillTest {
         check(references(SpiritTerrainService.class,"discoverLoaded"),"spirit entry invokes source backfill discovery");
         check(references(SpiritTerrainService.class,"backfillLoadedSource"),"spirit entry uses the defensive helper");
         check(references(SourceLandmarks.class,"LoadedSourceBackfill"),"source discovery uses the bounded backfill plan");
+        check(references(SourceLandmarks.class,"offerBackfill"),"loaded-source seeds use reserved admission");
+        var session=Arrays.stream(SourceLandmarks.class.getDeclaredClasses()).filter(c->c.getSimpleName().equals("Session")).findFirst().orElseThrow();
+        check(references(session,"SourceDiscoveryHints")&&references(session,"poll"),"session drains the tested queue into extraction");
     }
 
     private static boolean references(Class<?> owner,String constant) {
-        try(var in=new DataInputStream(owner.getResourceAsStream(owner.getSimpleName()+".class"))){
+        String resource=owner.getName().substring(owner.getName().lastIndexOf('.')+1)+".class";
+        try(var in=new DataInputStream(owner.getResourceAsStream(resource))){
             var bytes=in.readAllBytes();var pattern=constant.getBytes(java.nio.charset.StandardCharsets.UTF_8);
             for(int i=0;i+pattern.length<=bytes.length;i++){
                 int j=0;while(j<pattern.length&&bytes[i+j]==pattern[j])j++;

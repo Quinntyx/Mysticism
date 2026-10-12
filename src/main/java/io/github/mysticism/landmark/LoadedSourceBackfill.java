@@ -17,8 +17,8 @@ public final class LoadedSourceBackfill {
      * local 32^3 source read and reach beyond it, so nearby generated terrain is useful
      * immediately after entry instead of only after unrelated chunk-load events. */
     public static final int RADIUS = 2;
-    /** Bounded queue impact: 25 hints against the 128-hint budget, never saturating
-     * source request or frontier-retry budgets on repeated entries. */
+    /** One full plan fits the reserved backfill hint lane independently of the ordinary
+     * 128-hint budget. Repeated distinct entries still share bounded admission capacity. */
     public static final int MAX_SEEDS = 25;
     private LoadedSourceBackfill() {}
     /** Closest-first loaded chunk seeds around {@code center} (inclusive), at most
