@@ -62,11 +62,13 @@ tasks.named('test') { enabled = false }
 tasks.register('runtimeSelfTest', JavaExec) {
     group = 'verification'
     description = 'Run all discovered current main-based runtime regression tests.'
-    dependsOn tasks.named('runtimeTestClasses'), tasks.named('buildTestClasses')
+    dependsOn tasks.named('runtimeTestClasses'), tasks.named('buildTestClasses'), tasks.named('remapJar')
     classpath = sourceSets.runtimeTest.runtimeClasspath + sourceSets.buildTest.output
     mainClass = 'io.github.mysticism.build.SelfTestRunner'
+    systemProperty 'mysticism.embedding.nativeDirectory', layout.buildDirectory.dir('embedding-selftest/native').get().asFile.absolutePath
     enableAssertions = true
     doFirst {
+        systemProperty 'mysticism.selftest.productionJar', tasks.named('remapJar').get().archiveFile.get().asFile.absolutePath
         setArgs(sourceSets.runtimeTest.output.classesDirs.files.collect { it.absolutePath })
     }
 }
@@ -81,6 +83,7 @@ tasks.register('embeddedInferenceProbe', JavaExec) {
     dependsOn tasks.named('runtimeTestClasses')
     classpath = sourceSets.runtimeTest.runtimeClasspath
     mainClass = 'io.github.mysticism.embedding.EmbeddedInferenceProbe'
+    systemProperty 'mysticism.embedding.nativeDirectory', layout.buildDirectory.dir('embedding-inference-probe/native').get().asFile.absolutePath
     enableAssertions = true
     doFirst {
         setArgs([providers.gradleProperty('embeddingModelPath').getOrElse(

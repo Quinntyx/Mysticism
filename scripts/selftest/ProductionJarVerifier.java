@@ -19,7 +19,8 @@ public final class ProductionJarVerifier {
             "net/ladenthin/llama/Linux/x86_64/libjllama.so",
             "net/ladenthin/llama/Linux/aarch64/libjllama.so",
             "net/ladenthin/llama/Mac/aarch64/libjllama.dylib",
-            "net/ladenthin/llama/Windows/x86_64/jllama.dll");
+            "net/ladenthin/llama/Windows/x86_64/jllama.dll",
+            "net/ladenthin/llama/Windows/aarch64/jllama.dll");
     // Minecraft 1.21.1 preserves these names in intermediary. Derived from the
     // official common/client jars and net.fabricmc:intermediary:1.21.1:v2.
     static final java.util.Set<String> STABLE_MINECRAFT_NAMES = java.util.Set.of(
@@ -72,6 +73,7 @@ public final class ProductionJarVerifier {
         required(entries, "io/github/mysticism/client/MysticismClient.class");
         required(entries, "io/github/mysticism/embedding/EmbeddedEmbeddingService.class");
         required(entries, "io/github/mysticism/embedding/LlamaEmbeddingModel.class");
+        required(entries, "io/github/mysticism/embedding/EmbeddedNativeRuntime.class");
         Map<String, byte[]> nativeEntries = inspectArchive(required(entries, NATIVE_JAR), 1);
         required(nativeEntries, "net/ladenthin/llama/LlamaModel.class");
         for (String nativeResource : NATIVE_RESOURCES) {

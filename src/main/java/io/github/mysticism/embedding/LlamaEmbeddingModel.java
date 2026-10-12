@@ -1,7 +1,6 @@
 package io.github.mysticism.embedding;
 
 import java.nio.file.Path;
-import java.nio.file.Files;
 import java.io.IOException;
 import com.google.gson.JsonParser;
 import java.util.function.BooleanSupplier;
@@ -13,16 +12,10 @@ import net.ladenthin.llama.parameters.ModelParameters;
 final class LlamaEmbeddingModel implements EmbeddedEmbeddingService.Model {
     private final LlamaModel model;
     LlamaEmbeddingModel(Path path, BooleanSupplier cancelled) throws IOException {
-        isolateNativeExtraction();
+        EmbeddedNativeRuntime.prepare();
         int threads = Integer.getInteger("mysticism.embedding.nativeThreads", Math.min(4, Math.max(1, Runtime.getRuntime().availableProcessors() - 1)));
         if (threads < 1 || threads > 32) throw new IllegalArgumentException("nativeThreads must be 1..32");
         model = new LlamaModel(parameters(path, threads), progress -> !cancelled.getAsBoolean());
-    }
-    private static synchronized void isolateNativeExtraction() throws IOException {
-        // The upstream loader cleans ggml/llama-prefixed files in its extraction directory.
-        // Never let that cleanup share the system temp root with other JVMs/applications.
-        if (System.getProperty("net.ladenthin.llama.tmpdir") == null)
-            System.setProperty("net.ladenthin.llama.tmpdir", Files.createTempDirectory("mysticism-jni-").toString());
     }
     static ModelParameters parameters(Path path, int threads) {
         return new ModelParameters().setModel(path.toString()).setOffline(true).setFit(false)

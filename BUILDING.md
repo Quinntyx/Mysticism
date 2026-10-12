@@ -66,7 +66,12 @@ outputs and runtime dependencies are included. `check` and `build` run
 disabled. Historical shared-frame tests outside these roots are not current
 suites. Ordinary tests must not call live embedding services, download weights,
 or bootstrap a game. The separate opt-in `embeddedInferenceProbe` task tests
-actual native v2 forward passes; see the embedding runtime contract.
+actual native v2 forward passes; see the embedding runtime contract. JNI ABI and
+platform preflight tests do not access weights. `EmbeddedPackagedRuntimeTest`
+also runs the bundled CPU bootstrap in a fresh JVM from the real remapped jar
+and its extracted nested dependencies, without the Gradle dependency classpath.
+For supported desktops, native dependencies and actionable IntelliJ VM options,
+see [embedded desktop runtime](docs/embedded-desktop-runtime.md).
 
 ## Production artifact
 
@@ -94,8 +99,9 @@ the pinned llama JNI jar, supported native resource payloads and transitive Java
 libraries registered in metadata; missing payloads/dependencies, weight bundles,
 and duplicate logging jars are rejected. No icon is declared until an actual
 icon is supplied. Finder metadata and legacy DJL/PyTorch/tokenizers runtimes must
-not enter the production artifact. Artifact checks are static;
-they do not substitute for a dedicated-server/client launch, GUI-scale/reload
+not enter the production artifact. The verifier's checks are static; isolated
+packaged JNI execution additionally checks bundled bootstrap on the current host.
+Neither substitutes for a dedicated-server/client launch, GUI-scale/reload
 checks, or an embedding-service integration test.
 
 ## Historical build-portability branch validation (not current runtime status)

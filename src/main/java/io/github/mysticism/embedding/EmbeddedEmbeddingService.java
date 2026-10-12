@@ -16,7 +16,11 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
         float[] embed(String input);
         @Override void close();
     }
-    interface Loader { Model load(Path path, BooleanSupplier cancelled) throws Exception; }
+    interface Loader {
+        /** Platform/JNI preflight before potentially provisioning a gigabyte of weights. */
+        default void prepare() throws Exception {}
+        Model load(Path path, BooleanSupplier cancelled) throws Exception;
+    }
     interface Asset extends AutoCloseable { Path resolve() throws Exception; @Override void close(); }
     private final Asset asset;
     private final Loader loader;
@@ -44,7 +48,10 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
                 if (selected != null) selected.close();
             }
         };
-        loader = LlamaEmbeddingModel::new;
+        loader = new Loader() {
+            public void prepare() throws Exception { EmbeddedNativeRuntime.prepare(); }
+            public Model load(Path path, BooleanSupplier cancelled) throws Exception { return new LlamaEmbeddingModel(path, cancelled); }
+        };
     }
     EmbeddedEmbeddingService(Asset asset, Loader loader) { this.asset = asset; this.loader = loader; }
     @Override public EmbeddingProfile profile() { return EmbeddingProfile.current(); }
@@ -54,6 +61,8 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
         try {
             requireOpen();
             if (model != null) return;
+            loader.prepare();
+            requireOpen();
             Path path = asset.resolve();
             requireOpen();
             Model candidate = loader.load(path, () -> closed || Thread.currentThread().isInterrupted());

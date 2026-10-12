@@ -117,7 +117,9 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
         String key = EmbeddingSpace.FINGERPRINT + ":" + descriptor;
         Subscriber<Vec384f> subscriber = null; Vec384f cached = null; Throwable rejection = null;
         synchronized (this) {
-            if (!ready || closed) rejection = new IllegalStateException("Embeddings unavailable; inspect readiness");
+            if (!ready || closed) rejection = readinessError == null
+                    ? new IllegalStateException("Embeddings unavailable; inspect readiness")
+                    : new IllegalStateException("Embeddings unavailable: " + readinessError.getMessage(), readinessError);
             else {
                 cached = cache.get(key); if (cached != null) cached = cached.clone();
                 if (cached == null) {

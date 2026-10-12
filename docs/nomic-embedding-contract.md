@@ -18,8 +18,10 @@ manifest**, not a different conversion or a moving Hugging Face/Ollama tag:
 - Source: `https://registry.ollama.ai/v2/library/nomic-embed-text-v2-moe/blobs/sha256:a5db3381f2e514d3490a3a31fe70eb1a65e95016c85c6c2c23223b810806594f`
 
 Provider construction does no asset IO/native loading. On the embedding worker,
-preparation verifies a configured/cached file, or downloads the pinned blob on
-first use. The download is not inference over HTTP and needs no running service.
+preparation first validates the desktop/JVM and loads the bundled CPU JNI ABI,
+then verifies a configured/cached file, or downloads the pinned blob on first use.
+Unsupported platforms, broken native dependencies and extraction permissions fail
+before a gigabyte of weights can be downloaded. The download is not inference over HTTP and needs no running service.
 Both length and SHA256 are checked before native loading. Publication is atomic,
 concurrent JVMs share a file lock, incomplete downloads are removed, corrupt
 existing files are **not** replaced, and cancellation/deadlines are enforced.
@@ -35,8 +37,13 @@ Resolution order:
 First use therefore requires internet access **or** a preprovisioned exact file,
 about 958 MB disk space, and sufficient native memory. Build/test never downloads
 model weights. Native runtime selection/CPU support is platform-dependent; no
-fallback model is used on unsupported platforms. JNI extraction uses a private
-temporary directory rather than cleaning a shared system temp root.
+fallback model is used on unsupported platforms. The pinned CPU library is
+SHA256/length-verified and loaded from a private per-JVM directory underneath
+`~/.cache/mysticism/native` by default, avoiding common noexec system-temp mounts.
+Upstream JNI initialization/cleanup is confined to an empty private scratch
+subdirectory, even during recursive JNI_OnLoad initialization. An installed
+`jllama` in `java.library.path` cannot replace the bundled runtime. See
+[desktop native support and diagnostics](embedded-desktop-runtime.md).
 
 ## JVM properties (set before mod classes load)
 
@@ -46,6 +53,7 @@ temporary directory rather than cleaning a shared system temp root.
 | `mysticism.embedding.modelPath` | resolution above | Offline/preprovisioned exact GGUF |
 | `mysticism.embedding.download` | `true` | Allow first-use pinned blob download; ignored for an explicit modelPath |
 | `mysticism.embedding.nativeThreads` | up to 4, leaving one CPU | 1..32 native CPU threads; inference on one context is serialized |
+| `mysticism.embedding.nativeDirectory` | `~/.cache/mysticism/native` | Writable local execution-enabled root for private CPU JNI extraction; never a library override |
 | `mysticism.embedding.workers` | `2` | 1..32 async workers |
 | `mysticism.embedding.deadlineMillis` | `30000` | 1..120000 total queue + inference deadline |
 | `mysticism.embedding.preparationDeadlineMillis` | `900000` embedded / `30000` HTTP | 1..900000 preparation budget, separate from request deadlines |

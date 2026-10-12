@@ -13,7 +13,9 @@ public final class EmbeddedInferenceProbe {
     public static void main(String[] args) throws Exception {
         if (args.length != 2) throw new IllegalArgumentException("Usage: EmbeddedInferenceProbe <exact-GGUF-path> <provision:true|false>");
         Path base = Path.of("build/embedding-inference-probe").toAbsolutePath(); Files.createDirectories(base);
-        System.setProperty("net.ladenthin.llama.tmpdir", Files.createTempDirectory(base, "jni-").toString());
+        if (System.getProperty(EmbeddedNativeRuntime.DIRECTORY) == null)
+            System.setProperty(EmbeddedNativeRuntime.DIRECTORY, base.resolve("native").toString());
+        System.out.println("CPU platform preflight passed: " + EmbeddedNativeRuntime.prepare() + "; model inference not yet performed");
         Path path = Path.of(args[0]).toAbsolutePath();
         try (var pinned = new PinnedEmbeddingModel(path, PinnedEmbeddingModel.SOURCE, PinnedEmbeddingModel.SHA256,
                 PinnedEmbeddingModel.BYTES, Boolean.parseBoolean(args[1]), Duration.ofMinutes(10))) {
