@@ -528,7 +528,6 @@ public final class SpiritTerrainService {
                     ServerWorld sourceWorld=world(server,s.local.dimension);
                     if(sourceWorld!=null)captureLoaded(sourceWorld,s.local,source,64,false);
                     if(s.sourceRequested==null || s.sourceRequested.distanceTo(source)>4)requestSource(p,s,source,16);
-                    reportCoverage(p,s,source);
                 }
                 if(s.ingesting!=null){int count=0;while(s.ingesting.hasNext() && count++<256){var cell=s.ingesting.next();ingest(server,s.local,List.of(cell),1);}if(!s.ingesting.hasNext())s.ingesting=null;}
                 if(s.local.tiles.size()>32768) {
@@ -550,37 +549,90 @@ public final class SpiritTerrainService {
             ServerPlayerEntity p=players.get(Math.floorMod(c.playerCursor++,players.size()));Session s=c.sessions.get(p.getUuid());
             if(s!=null && p.getWorld().getRegistryKey().equals(WORLD))try{c.maintain(p,s);c.scan(p,s);}catch(RuntimeException failure){status(p,s,"Selection deferred: "+failure.getMessage());}
         }
+        // Coverage describes the ACCEPTED frame after ingestion, compaction and all publication attempts,
+        // including maintenance below the player loop. A cached candidate is not collision readiness.
+        for(var p:players) {
+            Session s=c.sessions.get(p.getUuid());
+            if(s!=null && s.shallow && p.getWorld().getRegistryKey().equals(WORLD))reportCoverage(p,s);
+        }
     }
     private static void status(ServerPlayerEntity p,Session s,String message){if(!Objects.equals(message,s.status)){s.status=message;p.sendMessage(Text.literal(message),true);}}
     /** Truthful shallow coverage readiness: the displayed terrain is usable only when the source cells
      * under and around the body are actually known. Unknown cells load from the live source or the
      * generated region stream; nothing is fabricated while they resolve. */
-    public record Coverage(boolean ready,boolean bodyKnown,boolean streaming) {}
-    static boolean bodyKnown(Map<BlockPos,SourceMeshBuilder.Tile> tiles,Vec3d at) {
-        Box b=body(at);
-        for(BlockPos pos:BlockPos.iterate(MathHelper.floor(b.minX),MathHelper.floor(b.minY),MathHelper.floor(b.minZ),MathHelper.floor(b.maxX),MathHelper.floor(b.maxY),MathHelper.floor(b.maxZ)))
-            if(!tiles.containsKey(pos))return false;
+    public record Coverage(boolean ready,boolean bodyKnown,boolean supportKnown,boolean collisionKnown,boolean streaming) {}
+    private static Iterable<BlockPos> samples(Box b) {
+        return BlockPos.iterate(MathHelper.floor(b.minX),MathHelper.floor(b.minY),MathHelper.floor(b.minZ),
+                MathHelper.floor(b.maxX),MathHelper.floor(b.maxY),MathHelper.floor(b.maxZ));
+    }
+    private static boolean known(Map<BlockPos,SourceMeshBuilder.Tile> tiles,Box footprint) {
+        for(BlockPos pos:samples(footprint))if(!tiles.containsKey(pos))return false;
         return true;
     }
-    static Coverage coverage(Map<BlockPos,SourceMeshBuilder.Tile> tiles,Vec3d at,boolean streaming) {
-        boolean known=bodyKnown(tiles,at);return new Coverage(known,known,streaming);
+    static boolean bodyKnown(Map<BlockPos,SourceMeshBuilder.Tile> tiles,Vec3d at) {return known(tiles,body(at));}
+    /** Air is resolved without a mesh cell; non-air must survive budgets/stitching in the accepted local
+     * frame with its source-identical transform and shape. A held candidate or stale carrier cannot pass.
+     * Near nodes are unit cells; uniform octree cubes may also cover multiple resolved source samples. */
+    static Coverage coverage(Map<BlockPos,SourceMeshBuilder.Tile> tiles,Vec3d at,boolean streaming,
+            TerrainMeshFrame accepted,String dimension,Vec3d sourceOrigin,Vec3d carrier,Set<Long> localKeys) {
+        Box footprint=MeshCollision.supportFootprint(body(at));
+        boolean bodyKnown=bodyKnown(tiles,at),supportKnown=known(tiles,footprint);
+        boolean matching=bodyKnown && supportKnown && accepted!=null && accepted.shallow()
+                && accepted.sourceDimension().equals(dimension) && accepted.sourceOrigin().equals(sourceOrigin)
+                && accepted.carrierOrigin().equals(carrier);
+        if(matching) {
+            List<TerrainMeshFrame.Cell> local=new ArrayList<>();
+            for(var cell:accepted.cells())if(localKeys.contains(cell.key()))local.add(cell);
+            for(BlockPos pos:samples(footprint)) {
+                var tile=tiles.get(pos);TerrainMeshFrame.Cell covering=null;
+                for(var cell:local)if(containsSource(cell,pos)) {
+                    if(covering!=null){matching=false;break;} // overlapping local samples are not a proven match
+                    covering=cell;
+                }
+                if(!matching || (tile.air()?covering!=null:covering==null
+                        || !matchesTile(accepted,covering,tile,sourceOrigin,carrier))) {matching=false;break;}
+            }
+        }
+        return new Coverage(bodyKnown && supportKnown && matching,bodyKnown,supportKnown,matching,streaming);
+    }
+    private static boolean containsSource(TerrainMeshFrame.Cell cell,BlockPos pos) {
+        Vec3d min=cell.sourceMin(),size=cell.size();
+        return pos.getX()>=min.x && pos.getX()<min.x+size.x && pos.getY()>=min.y && pos.getY()<min.y+size.y
+                && pos.getZ()>=min.z && pos.getZ()<min.z+size.z;
+    }
+    private static boolean matchesTile(TerrainMeshFrame frame,TerrainMeshFrame.Cell cell,SourceMeshBuilder.Tile tile,
+            Vec3d sourceOrigin,Vec3d carrier) {
+        Vec3d size=cell.size();
+        if(cell.opacity()!=1 || !frame.materials().get(cell.material()).equals(tile.material())
+                || cell.min().squaredDistanceTo(carrier.add(cell.sourceMin().subtract(sourceOrigin)))>1e-12
+                || !cell.axisX().equals(new Vec3d(size.x,0,0)) || !cell.axisY().equals(new Vec3d(0,size.y,0))
+                || !cell.axisZ().equals(new Vec3d(0,0,size.z)))return false;
+        return size.equals(new Vec3d(1,1,1))?cell.collision().equals(tile.collision())
+                :tile.cube() && cell.collision().equals(List.of(SourceMeshBuilder.UNIT));
+    }
+    private static Set<Long> localKeys(Session s) {
+        Set<Long> keys=new HashSet<>();s.frameProducers.forEach((key,w)->{if(w==s.local)keys.add(key);});return keys;
     }
     /** Current shallow coverage readiness, or null outside a shallow spirit session. */
     public static Coverage coverage(ServerPlayerEntity p) {
         Session s=session(p);
         if(s==null || !s.shallow || !p.getWorld().getRegistryKey().equals(WORLD))return null;
         Vec3d at=shallowSource(s.local.origin,p.getPos(),s.carrier);
-        return coverage(s.local.tiles,at,s.ingesting!=null || s.sourceFuture!=null && !s.sourceFuture.isDone());
+        return coverage(s.local.tiles,at,s.ingesting!=null || s.sourceFuture!=null && !s.sourceFuture.isDone(),
+                s.frame,s.local.dimension,s.local.origin,s.carrier,localKeys(s));
     }
-    private static void reportCoverage(ServerPlayerEntity p,Session s,Vec3d at) {
-        Coverage coverage=coverage(s.local.tiles,at,s.ingesting!=null || s.sourceFuture!=null && !s.sourceFuture.isDone());
-        if(s.coverageReady==null){s.coverageReady=coverage.ready();return;} // entry state is reported only when it changes
-        if(s.coverageReady!=coverage.ready()) {
-            s.coverageReady=coverage.ready();
-            status(p,s,coverage.ready()
-                    ?"Spirit terrain ready: displayed terrain has matching collision at your location."
-                    :"Spirit terrain loading: source cells around your body are unknown until the region resolves.");
-        }
+    static String coverageMessage(Coverage coverage) {
+        return coverage.ready()?"Spirit terrain ready: displayed terrain has matching collision at your location."
+                :!coverage.bodyKnown() || !coverage.supportKnown()
+                        ?"Spirit terrain loading: body/support source cells are still unknown."
+                        :"Spirit terrain loading: resolved source cells await matching local collision publication.";
+    }
+    private static void reportCoverage(ServerPlayerEntity p,Session s) {
+        Coverage coverage=coverage(p);String message=coverageMessage(coverage);
+        // Do not spam a ready entry, but announce initial loading and changes in WHY it is loading too.
+        boolean announce=s.coverageReady==null?!coverage.ready():!message.equals(s.coverageStatus);
+        s.coverageReady=coverage.ready();s.coverageStatus=message;
+        if(announce)status(p,s,message);
     }
     private static Vec3d origin(ServerPlayerEntity p,Session s,Window w) {
         if(w==s.local && s.shallow)return s.carrier;
@@ -590,12 +642,13 @@ public final class SpiritTerrainService {
     public static boolean canAlign(ServerPlayerEntity p,Basis384f proposed) {
         Session s=session(p);if(s==null)return false;
         Vec3d observerDelta=s.frame==null?Vec3d.ZERO:p.getPos().subtract(s.frameAnchor);
-        return MeshCollision.transitionClear(s.frame,build(p,s,s.revision+1,proposed),p.getBoundingBox(),observerDelta);
+        return transitionClear(s,buildMesh(p,s,s.revision+1,proposed),p.getBoundingBox(),observerDelta);
     }
-    private static TerrainMeshFrame build(ServerPlayerEntity p,Session s,long revision) {return build(p,s,revision,basis(p));}
     private record BuiltMesh(TerrainMeshFrame frame,Map<Long,Window> producers) {}
-    private static TerrainMeshFrame build(ServerPlayerEntity p,Session s,long revision,Basis384f observer) {
-        return buildMesh(p,s,revision,observer).frame();
+    private static boolean transitionClear(Session s,BuiltMesh built,Box body,Vec3d observerDelta) {
+        Set<Long> aligned=localKeys(s);
+        aligned.removeIf(key->built.producers().get(key)!=s.local);
+        return MeshCollision.transitionClear(s.frame,built.frame(),body,observerDelta,aligned);
     }
     private static BuiltMesh buildMesh(ServerPlayerEntity p,Session s,long revision,Basis384f observer) {
         Map<Long,Window> producers=new HashMap<>();
@@ -653,10 +706,10 @@ public final class SpiritTerrainService {
                 && s.frame.materials().equals(frame.materials()) && s.frame.cells().equals(frame.cells())) {
             s.frameProducers=built.producers();confirmTargetFade(s);return true;
         }
-        // Cells that translate exactly with the observer since the accepted frame rigidly relocate with it
-        // (teleport re-anchor, ordinary deep re-rooting); only true surface motion may hold a transition.
+        // Shallow local cells use accepted carrier displacement; intervening ordinary walking must not
+        // contaminate that delta. Other representatives still use observer displacement for deep re-rooting.
         Vec3d observerDelta=s.frame==null?Vec3d.ZERO:p.getPos().subtract(s.frameAnchor);
-        if(!MeshCollision.transitionClear(s.frame,frame,p.getBoundingBox(),observerDelta)) {
+        if(!transitionClear(s,built,p.getBoundingBox(),observerDelta)) {
             status(p,s,"Terrain transition held: moving surface intersects your body; move clear to continue.");return false;
         }
         acceptFrame(p,s,built);confirmTargetFade(s);return true;
@@ -664,9 +717,10 @@ public final class SpiritTerrainService {
     /** All runtime frame replacements commit provenance together and roll both back on transport failure. */
     private static void acceptFrame(ServerPlayerEntity p,Session s,BuiltMesh built) {
         TerrainMeshFrame previous=s.frame;Map<Long,Window> previousProducers=s.frameProducers;long previousRevision=s.revision;
+        Vec3d previousAnchor=s.frameAnchor;
         s.frame=built.frame();s.frameProducers=built.producers();s.revision=s.frame.revision();s.frameAnchor=p.getPos();
         try {if(p.getWorld().getRegistryKey().equals(WORLD))transport.accept(p,s.frame);}
-        catch(RuntimeException failure){s.frame=previous;s.frameProducers=previousProducers;s.revision=previousRevision;throw failure;}
+        catch(RuntimeException failure){s.frame=previous;s.frameProducers=previousProducers;s.revision=previousRevision;s.frameAnchor=previousAnchor;throw failure;}
     }
     private static void confirmTargetFade(Session s) {
         Window target=s.target;if(target==null || target==s.local)return;
@@ -690,7 +744,7 @@ public final class SpiritTerrainService {
         TerrainMeshFrame frame;Map<Long,Window> frameProducers=Map.of();CompletableFuture<?> ownerFuture,sourceFuture,targetFuture,targetOwnerFuture,walkFuture;Iterator<SourceLandmarks.Cell> ingesting;
         final Map<String,Window> regions=new LinkedHashMap<>();final MeshRepresentatives selection=new MeshRepresentatives();
         final Map<String,Window> prepared=new LinkedHashMap<>();
-        String scanCursor,status,closestId="";int dimensionCursor,regionCursor;boolean scanning;Set<String> selected=Set.of();
+        String scanCursor,status,coverageStatus,closestId="";int dimensionCursor,regionCursor;boolean scanning;Set<String> selected=Set.of();
         Session(Window local,Vec3d carrier){this.local=local;this.carrier=carrier;}
         void cancel(){if(ownerFuture!=null)ownerFuture.cancel(false);if(sourceFuture!=null)sourceFuture.cancel(false);if(targetFuture!=null)targetFuture.cancel(false);if(targetOwnerFuture!=null)targetOwnerFuture.cancel(false);if(walkFuture!=null)walkFuture.cancel(false);cancelWindow(local);if(target!=null)cancelWindow(target);for(var w:regions.values())cancelWindow(w);for(var w:prepared.values())cancelWindow(w);regions.clear();prepared.clear();}
     }

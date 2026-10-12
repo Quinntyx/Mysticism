@@ -130,9 +130,14 @@ public final class MeshCollision {
     }
     private static boolean supported(Index i,Box body,Vec3d down){return i.sweep(body,down).filter(h->h.normal.y>.3).isPresent();}
     private static double trim(double x){return Math.abs(x)<=.05?0:x-Math.copySign(.05,x);}
+    private static final double GROUND_RISE=.025,GROUND_DROP=.15;
+    /** Source readiness must resolve the whole same footprint that the support sweep queries. */
+    static Box supportFootprint(Box body) {
+        return body.union(body.offset(0,GROUND_RISE,0).stretch(new Vec3d(0,-GROUND_DROP,0)));
+    }
     public static Optional<Hit> ground(PlayerEntity player) {
         Index i=index(player);
-        return i==null?Optional.empty():i.sweep(player.getBoundingBox().offset(0,.025,0),new Vec3d(0,-.15,0))
+        return i==null?Optional.empty():i.sweep(player.getBoundingBox().offset(0,GROUND_RISE,0),new Vec3d(0,-GROUND_DROP,0))
                 .filter(h->h.normal.y>.3);
     }
     public static boolean clearRay(ServerPlayerEntity player,Vec3d from,Vec3d to) {
@@ -155,7 +160,14 @@ public final class MeshCollision {
      * accepted relative relationship to the body and cannot sweep through it; only true surface motion,
      * or geometry appearing near the body, is held. */
     public static boolean transitionClear(TerrainMeshFrame old,TerrainMeshFrame next,Box body,Vec3d observerDelta) {
+        return transitionClear(old,next,body,observerDelta,Set.of());
+    }
+    /** Aligned shallow cells follow the accepted CARRIER, not ordinary walking since frame acceptance.
+     * Other producers (including deep representatives retained in a shallow view) still follow the observer.
+     * Callers supply only keys with the same local producer in both accepted and candidate frames. */
+    static boolean transitionClear(TerrainMeshFrame old,TerrainMeshFrame next,Box body,Vec3d observerDelta,Set<Long> shallowLocalKeys) {
         if(old==null)return true;
+        Vec3d carrierDelta=next.carrierOrigin().subtract(old.carrierOrigin());
         Map<Long,TerrainMeshFrame.Cell> previous=new HashMap<>();for(var c:old.cells())previous.put(c.key(),c);
         Box local=body.expand(5),strict=body.expand(-1e-5);
         for(var c:next.cells()) {
@@ -164,7 +176,8 @@ public final class MeshCollision {
                     && c.axisZ().equals(before.axisZ()) && c.collision().equals(before.collision()))continue;
             if(before!=null && c.axisX().equals(before.axisX()) && c.axisY().equals(before.axisY())
                     && c.axisZ().equals(before.axisZ()) && c.collision().equals(before.collision())
-                    && rigidWith(c.min().subtract(before.min()),observerDelta))continue;
+                    && rigidWith(c.min().subtract(before.min()),old.shallow() && next.shallow() && shallowLocalKeys.contains(c.key())
+                            ?carrierDelta:observerDelta))continue;
             if(!c.bounds().intersects(local) && (before==null || !before.bounds().intersects(local)))continue;
             if(before==null) {for(Box b:c.collision())if(penetration(strict,new Shape(c,b,c.bounds(b)))!=null)return false;continue;}
             if(c.collision().isEmpty())continue;

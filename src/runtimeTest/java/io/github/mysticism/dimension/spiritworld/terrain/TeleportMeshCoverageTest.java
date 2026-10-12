@@ -6,6 +6,9 @@ import net.minecraft.util.math.Vec3d;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.HashSet;
+import java.util.ArrayList;
 
 /** After /tp the displayed terrain must carry matching usable collision, with truthful readiness while
  * coverage genuinely loads. Regression suite for the carrier relocation, rigid-observer transition
@@ -59,24 +62,119 @@ public final class TeleportMeshCoverageTest {
                 "ordinary movement still advances the source mapping by the body delta");
     }
 
+    /** Build via the production octree compactor, not a fake readiness flag. */
+    private static TerrainMeshFrame sampled(Map<BlockPos,SourceMeshBuilder.Tile> tiles,Vec3d carrier) {
+        List<TerrainMeshFrame.Cell> cells=new ArrayList<>();List<TerrainMeshFrame.Material> materials=new ArrayList<>();
+        long key=1;
+        for(var node:SourceMeshBuilder.compact(tiles,FEET)) {
+            var material=node.tile().material();if(!materials.contains(material))materials.add(material);
+            Vec3d source=new Vec3d(node.position().getX(),node.position().getY(),node.position().getZ());
+            double side=node.side();
+            cells.add(new TerrainMeshFrame.Cell(key++,materials.indexOf(material),"landmark",source,source.add(carrier),
+                    new Vec3d(side,side,side),new Vec3d(side,0,0),new Vec3d(0,side,0),new Vec3d(0,0,side),
+                    0xffffffff,0,1,node.tile().collision()));
+        }
+        return new TerrainMeshFrame(1,true,"minecraft:overworld",Vec3d.ZERO,carrier,materials,cells);
+    }
+    private static Set<Long> keys(TerrainMeshFrame frame) {
+        Set<Long> keys=new HashSet<>();if(frame!=null)for(var cell:frame.cells())keys.add(cell.key());return keys;
+    }
+    private static SpiritTerrainService.Coverage coverage(Map<BlockPos,SourceMeshBuilder.Tile> tiles,Vec3d at,
+            boolean streaming,TerrainMeshFrame accepted,Vec3d carrier) {
+        return SpiritTerrainService.coverage(tiles,at,streaming,accepted,"minecraft:overworld",Vec3d.ZERO,carrier,keys(accepted));
+    }
     private static void coverageReadiness() {
         Map<BlockPos,SourceMeshBuilder.Tile> tiles=new HashMap<>();
-        Vec3d at=new Vec3d(.5,128,.5);
-        check(!SpiritTerrainService.coverage(tiles,at,false).ready(),"unknown body cells are not ready");
-        check(!SpiritTerrainService.coverage(tiles,at,false).bodyKnown(),"unknown body cells are reported unknown");
-        // Known air above, solid floor below: the exact cells the body overlaps must all be known.
+        Vec3d at=FEET;
+        var unknown=coverage(tiles,at,false,null,Vec3d.ZERO);
+        check(!unknown.ready() && !unknown.bodyKnown() && !unknown.supportKnown(),"unknown source samples are not ready");
         tiles.put(new BlockPos(0,128,0),tile(AIR,true));
         tiles.put(new BlockPos(0,129,0),tile(AIR,true));
+        var bodyOnly=coverage(tiles,at,false,sampled(tiles,Vec3d.ZERO),Vec3d.ZERO);
+        check(bodyOnly.bodyKnown() && !bodyOnly.supportKnown() && !bodyOnly.ready(),
+                "review regression: known air at 128/129 cannot hide unknown floor at 127");
+        check(SpiritTerrainService.coverageMessage(bodyOnly).contains("still unknown"),"unresolved support reports source loading");
         tiles.put(new BlockPos(0,127,0),tile(STONE,false));
-        SpiritTerrainService.Coverage ready=SpiritTerrainService.coverage(tiles,at,true);
-        check(ready.ready() && ready.bodyKnown(),"known near coverage is ready even while a broader region still streams");
-        check(ready.streaming(),"streaming state is surfaced truthfully");
+        var accepted=sampled(tiles,Vec3d.ZERO);
+        var ready=coverage(tiles,at,true,accepted,Vec3d.ZERO);
+        check(ready.ready() && ready.bodyKnown() && ready.supportKnown() && ready.collisionKnown(),
+                "resolved source support and matching accepted floor are ready");
+        check(ready.streaming(),"broader streaming does not withhold resolved local coverage");
+        var absent=coverage(tiles,at,false,null,Vec3d.ZERO);
+        check(!absent.ready() && absent.bodyKnown() && absent.supportKnown() && !absent.collisionKnown(),
+                "source coverage without an accepted frame is not collision readiness");
+        check(SpiritTerrainService.coverageMessage(absent).contains("await matching local collision publication"),
+                "resolved coverage awaiting publication never falsely reports unknown source cells");
+        var omitted=new TerrainMeshFrame(2,true,"minecraft:overworld",Vec3d.ZERO,Vec3d.ZERO,List.of(),List.of());
+        check(!coverage(tiles,at,false,omitted,Vec3d.ZERO).ready(),
+                "frame budgets/stitching omitting a resolved floor do not report ready");
+        var noProvenance=SpiritTerrainService.coverage(tiles,at,false,accepted,"minecraft:overworld",Vec3d.ZERO,Vec3d.ZERO,Set.of());
+        check(!noProvenance.ready(),"an unrelated producer cannot prove local collision coverage");
+        // Hold a source change in the cache before compaction/publication. The accepted floor is stale.
+        tiles.put(new BlockPos(0,127,0),tile(AIR,true));
+        check(!coverage(tiles,at,false,accepted,Vec3d.ZERO).ready(),
+                "held/stale publication cannot report ready after the cached floor changes to air");
+        var resolvedAir=coverage(tiles,at,false,sampled(tiles,Vec3d.ZERO),Vec3d.ZERO);
+        check(resolvedAir.ready() && resolvedAir.supportKnown() && resolvedAir.collisionKnown(),
+                "known air below the feet is resolved coverage, not a fabricated support floor");
+        check(!coverage(tiles,at,true,accepted,Vec3d.ZERO).ready(),"streaming never overrides stale accepted collision");
+        tiles.put(new BlockPos(0,127,0),tile(STONE,false));
+        Vec3d jump=new Vec3d(100,0,0);
+        check(!coverage(tiles,at,false,accepted,jump).ready(),"old accepted carrier is not ready after teleport");
+        var relocated=sampled(tiles,jump);
+        check(coverage(tiles,at,false,relocated,jump).ready(),"matching accepted relocated source floor is ready");
+        check(new MeshCollision.Index(relocated).sweep(body(at.add(jump)).offset(0,.025,0),new Vec3d(0,-.15,0)).isPresent(),
+                "ready relocated frame has usable support sweep collision");
         tiles.remove(new BlockPos(0,129,0));
-        SpiritTerrainService.Coverage loading=SpiritTerrainService.coverage(tiles,at,false);
-        check(!loading.ready() && !loading.bodyKnown() && !loading.streaming(),
-                "a single unknown body cell holds readiness while not streaming");
-        check(SpiritTerrainService.coverage(tiles,new Vec3d(500.5,128,.5),false).ready()==false,
-                "coverage follows the queried body position");
+        var loading=coverage(tiles,at,false,relocated,jump);
+        check(!loading.ready() && !loading.bodyKnown() && !loading.streaming(),"one unknown body sample holds readiness");
+        check(!coverage(tiles,new Vec3d(500.5,128,.5),false,relocated,jump).ready(),"coverage follows queried source feet");
+    }
+
+    private static void probeFootprintAndShapeReadiness() {
+        Map<BlockPos,SourceMeshBuilder.Tile> tiles=new HashMap<>();
+        // The body spans two X cells: support under its edge must resolve, not just its center floor.
+        Vec3d edge=new Vec3d(.95,128,.5);
+        for(int x=0;x<=1;x++)for(int y=128;y<=129;y++)tiles.put(new BlockPos(x,y,0),tile(AIR,true));
+        tiles.put(new BlockPos(0,127,0),tile(STONE,false));
+        check(!coverage(tiles,edge,false,sampled(tiles,Vec3d.ZERO),Vec3d.ZERO).supportKnown(),
+                "unknown floor at footprint edge with known center floor blocks readiness");
+        tiles.put(new BlockPos(1,127,0),tile(AIR,true));
+        check(coverage(tiles,edge,false,sampled(tiles,Vec3d.ZERO),Vec3d.ZERO).ready(),"resolved edge air counts as known");
+        // At y=128.1 the ground sweep still reaches y=127.975, unlike a single feet-.05 lookup.
+        tiles.remove(new BlockPos(0,127,0));
+        check(!coverage(tiles,FEET.add(0,.1,0),false,sampled(tiles,Vec3d.ZERO),Vec3d.ZERO).supportKnown(),
+                "readiness covers the full actual support sweep depth");
+        // Shape updates must be accepted, not merely cached (slabs/stairs are not replaced by cubes).
+        var slab=new SourceMeshBuilder.Tile(STONE,List.of(new Box(0,0,0,1,.5,1)),0xffffffff,0,false,false);
+        tiles.put(new BlockPos(0,127,0),tile(STONE,false));
+        var full=sampled(tiles,Vec3d.ZERO);
+        tiles.put(new BlockPos(0,127,0),slab);
+        check(!coverage(tiles,FEET,false,full,Vec3d.ZERO).collisionKnown(),"stale full cube does not match a cached slab");
+        check(coverage(tiles,FEET,false,sampled(tiles,Vec3d.ZERO),Vec3d.ZERO).ready(),"published exact slab shape is ready");
+        TerrainMeshFrame sampled=sampled(tiles,Vec3d.ZERO);
+        var floor=sampled.cells().stream().filter(c->c.sourceMin().equals(new Vec3d(0,127,0))).findFirst().orElseThrow();
+        var warped=new TerrainMeshFrame.Cell(floor.key(),floor.material(),floor.landmarkId(),floor.sourceMin(),floor.min().add(.2,0,0),
+                floor.size(),floor.axisX(),floor.axisY(),floor.axisZ(),floor.color(),floor.light(),floor.opacity(),floor.collision());
+        List<TerrainMeshFrame.Cell> wrongCells=new ArrayList<>(sampled.cells());wrongCells.set(wrongCells.indexOf(floor),warped);
+        TerrainMeshFrame wrongTransform=new TerrainMeshFrame(3,true,"minecraft:overworld",Vec3d.ZERO,Vec3d.ZERO,sampled.materials(),wrongCells);
+        check(!coverage(tiles,FEET,false,wrongTransform,Vec3d.ZERO).ready(),"stale local transform fails even with matching carrier metadata");
+        Vec3d sourceOrigin=new Vec3d(140.3,64.1,-209.7),carrier=sourceOrigin.add(100,17,-30);
+        List<TerrainMeshFrame.Cell> shifted=new ArrayList<>();
+        for(var c:sampled.cells())shifted.add(new TerrainMeshFrame.Cell(c.key(),c.material(),c.landmarkId(),c.sourceMin(),
+                carrier.add(c.sourceMin().subtract(sourceOrigin)),c.size(),c.axisX(),c.axisY(),c.axisZ(),c.color(),c.light(),c.opacity(),c.collision()));
+        TerrainMeshFrame anchored=new TerrainMeshFrame(4,true,"minecraft:overworld",sourceOrigin,carrier,sampled.materials(),shifted);
+        check(SpiritTerrainService.coverage(tiles,FEET,false,anchored,"minecraft:overworld",sourceOrigin,carrier,keys(anchored)).ready(),
+                "fractional source origin and a vertical/horizontal carrier relocation still match actual shapes");
+        check(!SpiritTerrainService.coverage(tiles,FEET,false,anchored,"minecraft:the_nether",sourceOrigin,carrier,keys(anchored)).ready(),
+                "an accepted different source dimension cannot claim local readiness");
+        var coarse=new TerrainMeshFrame(5,true,"minecraft:overworld",Vec3d.ZERO,Vec3d.ZERO,List.of(STONE),List.of(
+                new TerrainMeshFrame.Cell(1,0,"landmark",new Vec3d(0,126,0),new Vec3d(0,126,0),new Vec3d(2,2,2),
+                        new Vec3d(2,0,0),new Vec3d(0,2,0),new Vec3d(0,0,2),0xffffffff,0,1,List.of(SourceMeshBuilder.UNIT))));
+        tiles.put(new BlockPos(0,127,0),tile(STONE,false));
+        check(coverage(tiles,FEET,false,coarse,Vec3d.ZERO).ready(),"matching uniform octree cube covers a resolved floor sample");
+        tiles.put(new BlockPos(0,127,0),slab);
+        check(!coverage(tiles,FEET,false,coarse,Vec3d.ZERO).ready(),"a coarse cube cannot prove resolved non-cube shape coverage");
     }
 
     private static void rigidObserverPublication() {
@@ -106,6 +204,36 @@ public final class TeleportMeshCoverageTest {
                 cell(1,0,new Vec3d(origin.x*1.0+100,127,origin.z)),
                 cell(2,0,new Vec3d(2+100+1e-9,128,0))));
         check(MeshCollision.transitionClear(accepted,fp,newBody,jump),"floating-point rigid motion is still recognized");
+    }
+
+    private static void teleportAfterWalkingPublication() {
+        Vec3d walk=new Vec3d(.3,0,0),jump=new Vec3d(100,0,0);
+        TerrainMeshFrame old=frame(1,Vec3d.ZERO),next=frame(2,jump);
+        Box teleportedBody=body(FEET.add(walk).add(jump));
+        Vec3d observerDelta=walk.add(jump);
+        check(!MeshCollision.transitionClear(old,next,teleportedBody,observerDelta),
+                "review regression control: walking .3 then teleporting 100 held the nearby wall swept corridor");
+        check(MeshCollision.transitionClear(old,next,teleportedBody,observerDelta,Set.of(1L,2L)),
+                "shallow local motion uses accepted carrier delta (100), not body delta (100.3)");
+        // More than one relocation before an acceptance must use the last accepted frame's carrier.
+        TerrainMeshFrame twice=frame(3,jump.multiply(2));
+        check(MeshCollision.transitionClear(old,twice,body(FEET.add(walk).add(jump.multiply(2))),walk.add(jump.multiply(2)),Set.of(1L,2L)),
+                "pending relocation accumulation is measured from accepted carrier, not last tick");
+        // Independently projected regions retained in a shallow view follow the body, NOT its carrier.
+        TerrainMeshFrame mixedOld=new TerrainMeshFrame(4,true,"minecraft:overworld",Vec3d.ZERO,Vec3d.ZERO,List.of(STONE),List.of(
+                old.cells().getFirst(),old.cells().get(1),cell(3,0,new Vec3d(2,129,0))));
+        TerrainMeshFrame mixedNext=new TerrainMeshFrame(5,true,"minecraft:overworld",Vec3d.ZERO,jump,List.of(STONE),List.of(
+                next.cells().getFirst(),next.cells().get(1),cell(3,0,new Vec3d(2,129,0).add(observerDelta))));
+        check(MeshCollision.transitionClear(mixedOld,mixedNext,teleportedBody,observerDelta,Set.of(1L,2L)),
+                "mixed shallow/deep producer cells each use their independent accepted displacement");
+        check(!MeshCollision.transitionClear(mixedOld,mixedNext,teleportedBody,observerDelta,Set.of(1L,2L,3L)),
+                "regression control: treating a deep representative as carrier-aligned falsely holds its swept corridor");
+        TerrainMeshFrame intrusive=new TerrainMeshFrame(6,true,"minecraft:overworld",Vec3d.ZERO,jump,List.of(STONE),List.of(
+                next.cells().getFirst(),cell(2,0,new Vec3d(100,128,0))));
+        check(!MeshCollision.transitionClear(old,intrusive,teleportedBody,observerDelta,Set.of(1L,2L)),
+                "carrier exemption never admits real wall motion into the relocated body");
+        check(new MeshCollision.Index(next).sweep(teleportedBody.offset(0,.025,0),new Vec3d(0,-.15,0)).isPresent(),
+                "teleport after walking retains usable floor collision in the published frame");
     }
 
     private static boolean sameBox(Box a,Box b) {
@@ -143,7 +271,9 @@ public final class TeleportMeshCoverageTest {
         relocationThreshold();
         carrierContinuity();
         coverageReadiness();
+        probeFootprintAndShapeReadiness();
         rigidObserverPublication();
+        teleportAfterWalkingPublication();
         matchingUsableCollision();
         System.out.println("TeleportMeshCoverageTest: "+checks+" checks passed");
     }
