@@ -4,6 +4,7 @@ import java.nio.file.Path;
 import java.nio.file.Files;
 import java.io.IOException;
 import com.google.gson.JsonParser;
+import com.google.gson.JsonParseException;
 import java.util.function.BooleanSupplier;
 import net.ladenthin.llama.LlamaModel;
 import net.ladenthin.llama.args.PoolingType;
@@ -38,9 +39,23 @@ final class LlamaEmbeddingModel implements EmbeddedEmbeddingService.Model {
     }
     static int decodeTokenCount(String response) {
         if (response == null || response.length() > 262144) throw new IllegalArgumentException("Invalid tokenizer response");
-        var tokens = JsonParser.parseString(response).getAsJsonObject().getAsJsonArray("tokens");
-        if (tokens == null || tokens.isEmpty()) throw new IllegalArgumentException("Tokenizer returned no tokens");
-        return tokens.size();
+        try {
+            var parsed = JsonParser.parseString(response);
+            if (!parsed.isJsonObject()) throw new IllegalArgumentException("Expected tokenizer response object");
+            var values = parsed.getAsJsonObject().get("tokens");
+            if (values == null || !values.isJsonArray() || values.getAsJsonArray().isEmpty())
+                throw new IllegalArgumentException("Tokenizer returned no token IDs");
+            var tokens = values.getAsJsonArray();
+            for (var token : tokens) {
+                if (!token.isJsonPrimitive() || !token.getAsJsonPrimitive().isNumber())
+                    throw new IllegalArgumentException("Tokenizer returned a non-numeric token ID");
+                if (token.getAsBigDecimal().intValueExact() < 0)
+                    throw new IllegalArgumentException("Tokenizer returned a negative token ID");
+            }
+            return tokens.size();
+        } catch (JsonParseException | ArithmeticException | NumberFormatException malformed) {
+            throw new IllegalArgumentException("Invalid tokenizer response", malformed);
+        }
     }
     public float[] embed(String input) { return model.embed(input); }
     public void close() { model.close(); }
