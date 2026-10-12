@@ -31,7 +31,13 @@ final class MeshRepresentatives {
      * sweep-start snapshot; otherwise landmarks discovered after the sweep began (exactly the
      * freshly generated terrain case) are never offered. Accumulated cluster statistics stay valid. */
     void retarget(Vec384f current,Basis384f currentBasis) {
-        if(current!=null)this.q=current.clone();
+        if(current!=null) {
+            this.q=current.clone();
+            // Compare every new offer in the same observer frame as the retained closest vector.
+            // A stale smaller distance can reject the only current-radius target when the old
+            // closest leaves the radius and same-cluster hysteresis still keeps its old medoid.
+            closestDistance=closestVector==null?Double.POSITIVE_INFINITY:closestVector.squareDistance(this.q);
+        }
         if(currentBasis!=null)this.basis=currentBasis.clone();
     }
     /** True when the observer moved far enough from the sweep origin that catalog regions the

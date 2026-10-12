@@ -128,7 +128,58 @@ public final class SelectionAvailabilityTest {
         check(completed.stream().noneMatch(m->m.header().anchor().x()==1),"passed catalog region stays excluded at completion");
     }
 
+    /** Small movement does not restart the sweep. The old closest candidate leaves the current
+     * radius while a newly discovered candidate enters it in the SAME cluster. Cluster hysteresis
+     * keeps the old medoid, so the refreshed closest slot must retain the new target at completion. */
+    private static void smallRetargetKeepsNewInRadiusTarget() {
+        var selection=new MeshRepresentatives();
+        Vec384f start=vector(1,-1.4,0),current=vector(1,-1.6,0);
+        Vec384f a=vector(1,0,0),b=vector(Math.cos(.15),-Math.sin(.15),0);
+        LandmarkMetadata old=metadata(new BlockPoint(4,0,0),a.data()[0]);
+        LandmarkMetadata discovered=metadata(new BlockPoint(5,0,0),b.data()[0]);
+        check(a.squareDistance(start)<radiusSquared(),"precondition: A starts inside the radius");
+        check(a.squareDistance(current)>=radiusSquared(),"precondition: A leaves the current radius");
+        check(b.squareDistance(current)<radiusSquared(),"precondition: B is inside the current radius");
+        check(b.squareDistance(current)>a.squareDistance(start),"precondition: B loses to A's stale closest distance");
+        check(a.squareDistance(b)<MeshRepresentatives.CLUSTER*MeshRepresentatives.CLUSTER,
+                "precondition: same-cluster hysteresis cannot rescue B through a separate cluster slot");
+        selection.begin(start,IDENTITY);
+        selection.offer(old,a,.5);
+        check(!selection.sweepStale(current),"small movement keeps the current sweep; no restart masks the defect");
+        selection.retarget(current,IDENTITY);
+        selection.offer(discovered,b,.5);
+        var completed=selection.finish(); // Context.scan re-derives selected and cancels unselected preparation.
+        check(completed.size()==1 && completed.getFirst().id().equals(discovered.id()),
+                "newly discovered B survives sweep completion instead of losing selection and preparation");
+        check(selection.finish().equals(completed),"new target remains selected on repeated completion");
+    }
+
+    /** Refresh, rather than merely clear, the slot: movement toward A must keep its now-smaller
+     * distance so a farther B cannot displace it using A's larger sweep-start distance. */
+    private static void smallRetargetPreservesNowCloserTarget() {
+        var selection=new MeshRepresentatives();
+        Vec384f start=vector(1,-1.4,0),current=vector(1,-1.2,0);
+        Vec384f a=vector(1,0,0),b=vector(Math.cos(.15),Math.sin(.15),0);
+        LandmarkMetadata old=metadata(new BlockPoint(6,0,0),a.data()[0]);
+        LandmarkMetadata discovered=metadata(new BlockPoint(7,0,0),b.data()[0]);
+        check(a.squareDistance(current)<b.squareDistance(current) && b.squareDistance(current)<a.squareDistance(start),
+                "precondition: farther B would displace A using A's stale distance");
+        check(a.squareDistance(b)<MeshRepresentatives.CLUSTER*MeshRepresentatives.CLUSTER,
+                "precondition: A and B share a cluster");
+        selection.begin(start,IDENTITY);
+        selection.offer(old,a,.5);
+        check(!selection.sweepStale(current),"movement toward A does not restart the sweep");
+        selection.retarget(current,IDENTITY);
+        check(selection.finish().getFirst().id().equals(old.id()),"retarget without another offer preserves A");
+        selection.offer(discovered,b,.5);
+        var completed=selection.finish();
+        check(completed.size()==1 && completed.getFirst().id().equals(old.id()),
+                "current closest A is preserved rather than displaced by farther B");
+    }
+
     public static void main(String[] args){
+        smallRetargetKeepsNewInRadiusTarget();
+        smallRetargetPreservesNowCloserTarget();
         midSweepDiscoveryBecomesSelectable();
         publicationImmediatelyBeforeSweepCompletion();
         sweepRestartWhenObserverLeavesSweptLocality();
