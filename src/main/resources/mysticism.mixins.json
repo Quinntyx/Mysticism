@@ -13,6 +13,7 @@
     "SpiritTeleportCorrectionMixin",
     "SpiritNativeMobMixin",
     "SpiritFlightToggleMixin",
+    "SpiritTeleportBaselineMixin",
     "DroppedItemSemanticMixin",
     "SourceEntityLookupAccessor",
     "SourceChunkHolderAccessor"

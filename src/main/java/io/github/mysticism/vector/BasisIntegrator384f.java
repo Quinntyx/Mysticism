@@ -8,7 +8,7 @@ package io.github.mysticism.vector;
  * - Let u = normalize(Δℓ) where Δℓ = dx*i + dy*j + dz*k (latent step dir).
  * - Let â = normalize(attunement) (direction only).
  * - Let θ = arccos(<u, â>) be the remaining angle to the target direction.
- * - Let f = clamp(eta * |Δ3D|, 0..1) be the fraction this tick ("eta" ≈ % per block).
+ * - Let f = 1 - (1 - eta)^|Δ3D| be the distance-composable fraction ("eta" ≈ % per block).
  * - Apply an exact 2D rotation by α = f * θ in the plane span{u, t}, where t is â's
  *   component orthogonal to u. Apply the SAME rotation to i, j, k.
  *
@@ -61,10 +61,11 @@ public final class BasisIntegrator384f {
         }
         t.mul(1f / tLen); // unit, orth to u
 
-        // 4) Fraction of remaining angle this step (eta ≈ percent per block)
-        // alpha = theta * clamp(eta * |Δ3D|, 0..1)
+        // 4) Distance-composable remaining-angle decay. Linear eta*distance saturates on
+        // lag bursts and differs from the same movement received in smaller windows.
+        // eta is the fraction removed over ONE block, independent of tick/frame duration.
         final double theta = Math.acos(ua);
-        final float fraction = clamp((float)(eta * dist), 0f, 1f);
+        final float fraction = eta >= 1 ? 1f : (float)-Math.expm1(Math.log1p(-eta) * dist);
         final float alpha = (float)(theta * fraction);
         if (alpha < 1e-9f) return false;
 

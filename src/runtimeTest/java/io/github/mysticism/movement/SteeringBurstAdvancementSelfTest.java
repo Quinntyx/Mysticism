@@ -22,17 +22,17 @@ public final class SteeringBurstAdvancementSelfTest {
         return new Vec384f(values);
     }
     public static void main(String[] args) {
-        burstsAdvanceQWithoutTarget();
+        burstsAdvanceQAlongTarget();
         burstsAdvanceQAndRotateBasisTowardTarget();
         approachStepConvergesOnBursts();
         admittedAndRejectedBoundsAgree();
         classifiedBurstFeedsRealAdvancement();
         System.out.println("SteeringBurstAdvancementSelfTest: " + checks + " checks passed");
     }
-    private static void burstsAdvanceQWithoutTarget() {
+    private static void burstsAdvanceQAlongTarget() {
         Basis384f basis = new Basis384f();
         Vec384f q = Vec384f.ZERO();
-        TraversalSteering.deepStep(q, basis, Vec384f.ZERO(), 6, 0, 0, false);
+        TraversalSteering.deepStep(q, basis, unit(0), 6, 0, 0, false);
         close(6f / 96f, q.data()[0], 1e-5f, "a 6-block burst must advance q along the basis by 6/96");
         close(0f, q.data()[1], 1e-5f, "the burst advances only along the movement axis");
         close(0f, q.data()[2], 1e-5f, "the burst advances only along the movement axis");
@@ -42,11 +42,12 @@ public final class SteeringBurstAdvancementSelfTest {
         Vec384f q = Vec384f.ZERO();
         Vec384f target = unit(1);
         TraversalSteering.deepStep(q, basis, target, 6, 0, 0, false);
-        // 0.30 rotation per block over 6 blocks saturates the fraction: the burst turns the basis
-        // fully toward the target and advances q along the ROTATED axis - real navigation progress.
-        close(6f / 96f, q.data()[1], 1e-4f, "the burst advances q along the rotated basis");
-        close(0f, q.data()[0], 1e-4f, "no movement is left on the pre-rotation axis");
-        check(basis.i.dot(unit(1)) > 0.999f, "the basis itself rotated toward the target");
+        // A burst follows the curved path instead of snapping the whole translation onto the
+        // final basis. Rotation decays by distance, without burst-size-dependent saturation.
+        check(q.data()[1] > .04f, "the burst makes real progress toward the target");
+        check(q.data()[0] > .01f, "the initial part of the curved path is retained");
+        check(q.length() <= 6f / 96f + 1e-5f, "semantic travel cannot exceed physical travel/96");
+        check(basis.i.dot(unit(1)) > .95f, "the basis itself rotated toward the target");
     }
     private static void approachStepConvergesOnBursts() {
         Vec384f q = unit(0);
@@ -61,7 +62,7 @@ public final class SteeringBurstAdvancementSelfTest {
     }
     private static void admittedAndRejectedBoundsAgree() {
         Vec384f atBound = Vec384f.ZERO();
-        TraversalSteering.deepStep(atBound, new Basis384f(), Vec384f.ZERO(),
+        TraversalSteering.deepStep(atBound, new Basis384f(), unit(0),
                 MovementIntegration.REPOSITION_LIMIT, 0, 0, false);
         close((float) (MovementIntegration.REPOSITION_LIMIT / 96), atBound.data()[0], 1e-5f,
                 "a window exactly at the admitted bound advances");
@@ -78,7 +79,8 @@ public final class SteeringBurstAdvancementSelfTest {
         check(semantic.lengthSquared() > 0, "the lag burst is classified as chosen movement");
         Basis384f basis = new Basis384f();
         Vec384f q = Vec384f.ZERO();
-        TraversalSteering.deepStep(q, basis, Vec384f.ZERO(), semantic.x, semantic.y, semantic.z, false);
+        Vec384f direction = unit(0).mul((float)semantic.x).add(unit(1).mul((float)semantic.y)).add(unit(2).mul((float)semantic.z));
+        TraversalSteering.deepStep(q, basis, direction, semantic.x, semantic.y, semantic.z, false);
         double expected = measured.length() / 96;
         check(Math.abs(q.length() - expected) < 1e-5, "the classified burst advanced q by its full semantic distance, got " + q.length());
         check(sample.semanticDelta() == sample.stateDelta() || sample.semanticDelta().equals(sample.stateDelta()),

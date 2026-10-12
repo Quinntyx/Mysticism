@@ -38,12 +38,14 @@ public final class SpiritMovementHookContractSelfTest {
         check(common == 1 && client == 1, "Movement hooks must register through the existing mixin configs exactly once each");
         var commonConfig = resource("mysticism.mixins.json");
         var commonHooks = strings(commonConfig, "mixins");
-        check(commonHooks.contains("SpiritTeleportCorrectionMixin"), "Server teleport provenance hook must be registered");
+        check(commonHooks.containsAll(Set.of("SpiritTeleportCorrectionMixin", "SpiritTeleportBaselineMixin")),
+                "Both server teleport provenance and pose baseline hooks must be registered");
         check(commonConfig.get("required").getAsBoolean() && commonConfig.getAsJsonObject("injectors").get("defaultRequire").getAsInt() == 1,
                 "Movement hooks must fail visibly when their target disappears");
         var clientConfig = resource("mysticism.client.mixins.json");
         var clientHooks = strings(clientConfig, "client");
-        check(clientHooks.contains("SpiritPositionCorrectionMixin"), "Client position-correction hook must be registered");
+        check(clientHooks.containsAll(Set.of("SpiritPositionCorrectionMixin", "SpiritPositionLookMixin")),
+                "Both client correction provenance and pose-history invalidation hooks must be registered");
         check(clientConfig.get("required").getAsBoolean() && clientConfig.getAsJsonObject("injectors").get("defaultRequire").getAsInt() == 1,
                 "Client movement hooks must fail visibly when their target disappears");
         // Existing movement hooks must survive unchanged.
@@ -59,7 +61,9 @@ public final class SpiritMovementHookContractSelfTest {
         Class.forName("io.github.mysticism.navigation.MovementIntegration");
         Class.forName("io.github.mysticism.mixin.SpiritTeleportCorrectionMixin");
         Class.forName("io.github.mysticism.client.mixin.SpiritPositionCorrectionMixin");
-        checks += 4;
+        Class.forName("io.github.mysticism.mixin.SpiritTeleportBaselineMixin");
+        Class.forName("io.github.mysticism.client.mixin.SpiritPositionLookMixin");
+        checks += 6;
         System.out.println("SpiritMovementHookContractSelfTest: " + checks + " checks passed (offline contracts only)");
     }
 }

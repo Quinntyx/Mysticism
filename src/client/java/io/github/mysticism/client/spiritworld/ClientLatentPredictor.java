@@ -15,10 +15,9 @@ import net.minecraft.client.world.ClientWorld;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.Vec3d;
 
-/** Same per-player movement math as server; stationary CCA touch corrections still refresh render state.
- *  Prediction integrates only chosen movement: server position corrections and our own depenetration
- *  response are excluded by provenance, so prediction tracks the server instead of rubber-banding back
- *  to every authoritative sync. */
+/** Shared server/client movement math: correction provenance excludes repositioning and applied
+ *  depenetration; post-integration pose history rejects delayed/reordered authoritative snapshots.
+ *  Stationary CCA touch corrections still refresh render state. */
 @Environment(EnvType.CLIENT)
 public final class ClientLatentPredictor {
     private static boolean initialized;
@@ -30,10 +29,15 @@ public final class ClientLatentPredictor {
     private ClientLatentPredictor() {}
     public static void init() {
         if (initialized) return; initialized = true;
+        // The pose sync ordering guard shares this predictor's context; install before any sync lands.
+        ClientPoseSync.install();
         ClientTickEvents.END_CLIENT_TICK.register(ClientLatentPredictor::onEndTick);
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> clear());
     }
-    private static void clear() { lastPos = null; lastPlayer = null; lastWorld = null; lastEpoch = -1; lastDeep = false; }
+    private static void clear() {
+        lastPos = null; lastPlayer = null; lastWorld = null; lastEpoch = -1; lastDeep = false;
+        ClientPoseSync.clear();
+    }
     private static void onEndTick(MinecraftClient mc) {
         if (mc.world == null || mc.player == null) { clear(); return; }
         var nav = mc.player.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION);
@@ -46,16 +50,22 @@ public final class ClientLatentPredictor {
             boolean repositioned = MovementProvenance.drainClientRepositioned(mc.player.getUuid());
             Vec3d correction = MeshCollision.drainCorrection(mc.player);
             Vec3d now = mc.player.getPos();
-            // Acquisition/anchor corrections (even <4 blocks) are NOT chosen movement.
-            if (lastPlayer == mc.player && lastWorld == mc.world && lastPos != null
-                    && lastEpoch == nav.motionEpoch() && lastDeep == nav.deep() && nav.semanticReady()) {
-                Vec3d delta = MovementIntegration.clientSemantic(now.subtract(lastPos), correction, repositioned);
+            boolean predicting = lastPlayer == mc.player && lastWorld == mc.world && lastPos != null
+                    && lastEpoch == nav.motionEpoch() && lastDeep == nav.deep() && nav.semanticReady();
+            // Consume even during a baseline break: a correction cannot skip a later clean window.
+            boolean corrected = ClientPoseSync.consumeTeleportCorrection() || repositioned;
+            if (predicting && !corrected) {
+                Vec3d delta = MovementIntegration.clientSemantic(now.subtract(lastPos), correction, false);
                 if (nav.deep() && nav.supportApproach()) TraversalSteering.advance(q, basis, delta.x, delta.y, delta.z);
                 else if (nav.deep() && nav.landingApproach()) TraversalSteering.approachStep(q, target, delta.x, delta.y, delta.z);
                 else if (nav.deep()) TraversalSteering.deepStep(q, basis, target, delta.x, delta.y, delta.z, nav.hasShallowTarget());
                 else if (!nav.landmarkId().isEmpty()) TraversalSteering.advance(q, basis, delta.x, delta.y, delta.z);
-            } // Window re-based: the just-measured displacement spans a mode/anchor change, not chosen travel;
-            //   provenance was already drained above, so nothing stale carries into the next window.
+            }
+            // Record AFTER integration so a reversed/accumulated movement endpoint is not lost.
+            ClientPoseSync.beginPrediction(
+                    mc.player.getComponent(MysticismEntityComponents.LATENT_POS),
+                    mc.player.getComponent(MysticismEntityComponents.LATENT_BASIS),
+                    nav, predicting && !corrected);
             lastPos = now; lastPlayer = mc.player; lastWorld = mc.world;
             lastEpoch = nav.motionEpoch(); lastDeep = nav.deep();
         } else clear();
