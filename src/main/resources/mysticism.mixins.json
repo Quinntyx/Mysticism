@@ -11,6 +11,8 @@
     "SpiritMeshSneakMixin",
     "SpiritMeshCollisionMixin",
     "SpiritFlightPredictionMixin",
+    "SpiritTravelMixin",
+    "EntityFlagAccess",
     "SpiritNativeMobMixin",
     "SpiritFlightToggleMixin",
     "DroppedItemSemanticMixin",

@@ -35,6 +35,8 @@ public final class FlightMixinTestService extends MixinServiceAbstract
     }
     public Collection<IContainerHandle> getMixinContainers() { return List.of(); }
     public InputStream getResourceAsStream(String name) {
+        if (name.equals(SpiritIntegratedMixinApplicationTest.CONFIG))
+            return SpiritIntegratedMixinApplicationTest.config();
         if (name.equals("mysticism-flight-application-test.json")) {
             try { return SpiritFlightMixinApplicationTest.config(); }
             catch (IOException failure) { throw new IllegalStateException(failure); }
