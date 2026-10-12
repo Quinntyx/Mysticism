@@ -1,5 +1,6 @@
 package io.github.mysticism.dimension.spiritworld.terrain;
 
+import net.minecraft.entity.MovementType;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
 import java.util.List;
@@ -143,6 +144,105 @@ public final class MeshGroundSupportTest {
                 "aligned flat cells agree between mesh and block stand-in (no false discrimination)");
     }
 
+    private static MeshCollision.MotionState state(Box body,boolean vanillaOnGround,boolean flying,boolean sneaking) {
+        return new MeshCollision.MotionState(body,.6,flying,sneaking,vanillaOnGround);
+    }
+    private static void sameMovement(Vec3d actual,Vec3d expected,String why) {
+        close(actual.x,expected.x,1e-9,why+" (x)");
+        close(actual.y,expected.y,1e-9,why+" (y)");
+        close(actual.z,expected.z,1e-9,why+" (z)");
+    }
+    private static TerrainMeshFrame.Cell lowObstacle() {
+        return cell(20,new Vec3d(1,1,0),UNIT,new Vec3d(0,.4,0),DEPTH,1f);
+    }
+    private static TerrainMeshFrame.Cell wideFloor() {
+        return cell(21,new Vec3d(-1,0,-1),new Vec3d(4,0,0),UP,new Vec3d(0,0,3),1f);
+    }
+
+    private static void unsupportedStepIgnoresTrueVanillaFlag() {
+        var i=index(lowObstacle());
+        Box body=new Box(0,1,0,.6,2.8,.6);
+        var claimedGround=state(body,true,false,false);
+        check(claimedGround.vanillaOnGround(),"adversarial step fixture carries a TRUE vanilla ground flag");
+        check(!MeshCollision.supported(i,body),"adversarial step fixture has a NEGATIVE mesh support verdict");
+        Vec3d wanted=new Vec3d(1,0,0);
+        Vec3d moved=MeshCollision.move(i,claimedGround,wanted);
+        check(moved.x>.39 && moved.x<.41,"unsupported player hits the obstacle instead of stepping onto it");
+        close(moved.y,0,1e-9,"unsupported player is not lifted onto a low obstacle");
+        sameMovement(moved,MeshCollision.move(i,state(body,false,false,false),wanted),
+                "changing only the vanilla flag cannot enable unsupported step-up");
+    }
+
+    private static void supportedStepAndSweptLandingStillWork() {
+        var i=index(wideFloor(),lowObstacle());
+        Vec3d wanted=new Vec3d(1,0,0);
+        Box grounded=new Box(0,1,0,.6,2.8,.6);
+        check(MeshCollision.supported(i,grounded),"grounded step fixture has real mesh support");
+        Vec3d stepped=MeshCollision.move(i,state(grounded,false,false,false),wanted);
+        close(stepped.x,1,1e-6,"actual mesh support allows step-up even with a FALSE vanilla flag");
+        close(grounded.minY+stepped.y,1.4,2e-5,"step lands on the true mesh obstacle top");
+        Vec3d flying=MeshCollision.move(i,state(grounded,true,true,false),wanted);
+        check(flying.x<.41,"flying players slide, not step, even with mesh support and a TRUE vanilla flag");
+
+        Box falling=new Box(0,1.3,0,.6,3.1,.6);
+        check(!MeshCollision.supported(i,falling),"falling step fixture is beyond the short support probe");
+        Vec3d fall=new Vec3d(1,-.5,0);
+        check(i.sweep(falling,fall).isPresent(),"falling fixture has a swept collision");
+        Vec3d landed=MeshCollision.move(i,state(falling,false,false,false),fall);
+        close(landed.x,1,1e-6,"a genuine swept floor landing also allows stepping");
+        close(falling.minY+landed.y,1.4,2e-5,"swept landing step finishes on the obstacle top");
+    }
+
+    private static void upwardWallSlideIsNotALanding() {
+        // This leaning side's normal has y ~= .196: horizontal collision deflects motion upward,
+        // but it is NOT an up-facing ground contact. The former result.y>wanted.y test allowed a step.
+        var i=index(cell(30,new Vec3d(.8,.6,0),UNIT,new Vec3d(.2,1,0),DEPTH,1f));
+        Box body=new Box(0,1.2,0,.6,3,.6);
+        Vec3d wanted=new Vec3d(1,-.1,0);
+        check(!MeshCollision.supported(i,body),"leaning-wall fixture has no mesh support");
+        var hit=i.sweep(body,wanted).orElseThrow();
+        check(hit.normal().y>0 && hit.normal().y<=.3,"leaning-wall contact is upward but not ground");
+        Vec3d moved=MeshCollision.move(i,state(body,true,false,false),wanted);
+        check(moved.y>wanted.y+1e-5,"wall slide really clips the downward delta (old landing shortcut discriminator)");
+        check(moved.x<.5,"upward wall sliding does not authorize an unsupported step");
+    }
+
+    private static void unsupportedSneakIgnoresTrueVanillaFlag() {
+        var i=index();
+        Box body=new Box(0,1,0,.6,2.8,.6);
+        var claimedGround=state(body,true,false,true);
+        check(claimedGround.vanillaOnGround(),"adversarial sneak fixture carries a TRUE vanilla ground flag");
+        check(!MeshCollision.supported(i,body),"adversarial sneak fixture has a NEGATIVE mesh support verdict");
+        Vec3d wanted=new Vec3d(.8,-.1,.5);
+        for(MovementType type:List.of(MovementType.SELF,MovementType.PLAYER)) {
+            sameMovement(MeshCollision.sneak(i,claimedGround,wanted,type),wanted,
+                    "airborne sneaking cannot clip movement based on a vanilla claim ("+type+")");
+            sameMovement(MeshCollision.sneak(i,state(body,false,false,true),wanted,type),wanted,
+                    "airborne sneaking is independent of the vanilla flag ("+type+")");
+        }
+    }
+
+    private static void supportedSneakStillProtectsMeshLedges() {
+        var i=index(cell(40,Vec3d.ZERO,UNIT,UP,DEPTH,1f));
+        Box body=new Box(0,1,0,.6,2.8,.6);
+        Vec3d wanted=new Vec3d(1.5,0,0);
+        check(MeshCollision.supported(i,body),"sneak ledge fixture has real mesh support");
+        Vec3d clipped=MeshCollision.sneak(i,state(body,false,false,true),wanted,MovementType.SELF);
+        check(clipped.x>0 && clipped.x<1.01,"actual mesh support protects a ledge even with a FALSE vanilla flag");
+        sameMovement(MeshCollision.sneak(i,state(body,true,false,true),wanted,MovementType.SELF),clipped,
+                "supported sneak clipping does not depend on the vanilla flag");
+        sameMovement(MeshCollision.sneak(i,state(body,true,true,true),wanted,MovementType.SELF),wanted,
+                "flying bypasses sneak ledge clipping");
+        sameMovement(MeshCollision.sneak(i,state(body,true,false,false),wanted,MovementType.SELF),wanted,
+                "not sneaking bypasses ledge clipping");
+        sameMovement(MeshCollision.sneak(i,state(body,true,false,true),wanted,MovementType.PISTON),wanted,
+                "external movement bypasses sneak ledge clipping");
+        sameMovement(MeshCollision.move(null,state(body,true,false,false),wanted),wanted,
+                "no mesh frame does not fabricate movement support");
+        sameMovement(MeshCollision.sneak(null,state(body,true,false,true),wanted,MovementType.SELF),wanted,
+                "no mesh frame does not fabricate sneak support");
+    }
+
     public static void main(String[] args) {
         flatFloor();
         shearedFootprintIsNotTheBoundingBox();
@@ -151,6 +251,11 @@ public final class MeshGroundSupportTest {
         fadedTerrainIsNotSupport();
         steepWallIsNotSupport();
         blockShapedStandInsWouldDiffer();
+        unsupportedStepIgnoresTrueVanillaFlag();
+        supportedStepAndSweptLandingStillWork();
+        upwardWallSlideIsNotALanding();
+        unsupportedSneakIgnoresTrueVanillaFlag();
+        supportedSneakStillProtectsMeshLedges();
         System.out.println("MeshGroundSupportTest: "+checks+" checks passed");
     }
 }

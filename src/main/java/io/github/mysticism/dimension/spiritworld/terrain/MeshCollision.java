@@ -18,6 +18,15 @@ public final class MeshCollision {
     public static void clear(UUID player) { SERVER.remove(player); CLIENT.remove(player); }
     public static void clearClient() { CLIENT.clear(); }
     public record Hit(double time, Vec3d normal, TerrainMeshFrame.Cell cell) {}
+    /** Player input snapshot shared with entity-free regressions. The vanilla ground flag is an
+     * untrusted carrier/packet claim, NOT evidence of support on this observer's mesh. */
+    record MotionState(Box body,double stepHeight,boolean flying,boolean sneaking,boolean vanillaOnGround) {
+        private static MotionState of(PlayerEntity player) {
+            return new MotionState(player.getBoundingBox(),player.getStepHeight(),player.getAbilities().flying,
+                    player.isSneaking(),player.isOnGround());
+        }
+    }
+    private record Slide(Vec3d movement,boolean landed) {}
     private record Bucket(int x,int y,int z) {}
     private record Shape(TerrainMeshFrame.Cell cell,Box local,Box bounds) {}
     public static final class Index {
@@ -73,17 +82,20 @@ public final class MeshCollision {
             }
             return moved;
         }
-        private Vec3d slide(Box body,Vec3d wanted) {
-            Vec3d moved=Vec3d.ZERO,remaining=wanted;
+        private Slide slide(Box body,Vec3d wanted) {
+            Vec3d moved=Vec3d.ZERO,remaining=wanted;boolean landed=false;
             for(int i=0;i<4 && remaining.lengthSquared()>1e-12;i++) {
                 var hit=sweep(body.offset(moved),remaining);
                 if(hit.isEmpty()){moved=moved.add(remaining);break;}
+                // A clipped vertical delta alone is not a landing: wall sliding and depenetration
+                // can also move the body upward. Keep evidence of an actual up-facing swept contact.
+                if(remaining.y<0 && hit.get().normal.y>.3)landed=true;
                 double t=Math.max(0,hit.get().time-1e-5/Math.max(1e-5,remaining.length()));
                 moved=moved.add(remaining.multiply(t));remaining=remaining.multiply(1-t);
                 double into=remaining.dotProduct(hit.get().normal);
                 if(into<0)remaining=remaining.subtract(hit.get().normal.multiply(into));else break;
             }
-            return moved;
+            return new Slide(moved,landed);
         }
     }
     private static int grid(double x){return (int)Math.floor(x/8);}
@@ -96,26 +108,31 @@ public final class MeshCollision {
         return index;
     }
     public static Vec3d move(PlayerEntity player,Vec3d wanted) {
-        Index i=index(player);
+        return move(index(player),MotionState.of(player),wanted);
+    }
+    /** Same movement path used by server/prediction, without requiring a live entity for tests. */
+    static Vec3d move(Index i,MotionState state,Vec3d wanted) {
         // No fabricated floor. Preparation supplies geometry before entry; packet delay simply has no surfaces yet.
         if(i==null)return wanted;
-        Box body=player.getBoundingBox();
+        Box body=state.body();
         if(wanted.length()>256)wanted=wanted.multiply(256/wanted.length());
         Vec3d result=i.depenetrate(body,4);
         // Bound swept traversal for unusually fast flight/teleports rather than tunnelling through a grid overflow.
         int pieces=Math.min(64,Math.max(1,(int)Math.ceil(wanted.length()/4)));
-        Vec3d piece=wanted.multiply(1.0/pieces);
-        for(int p=0;p<pieces;p++)result=result.add(i.slide(body.offset(result),piece));
-        // Grounded is the swept MESH verdict, never the vanilla flag alone: the server-side flag is
-        // the client packet's claim, while step-up must follow the actual distorted terrain below.
-        if(!player.getAbilities().flying && (player.isOnGround() || supported(i,body)
-                || wanted.y<0 && result.y>wanted.y+1e-5)
+        Vec3d piece=wanted.multiply(1.0/pieces);boolean landed=false;
+        for(int p=0;p<pieces;p++) {
+            Slide slide=i.slide(body.offset(result),piece);
+            result=result.add(slide.movement());landed|=slide.landed();
+        }
+        // Only this mesh's support probe or a genuine swept landing grants step-up. In particular,
+        // a true vanillaOnGround claim must not let an airborne player climb a nearby low obstacle.
+        if(!state.flying() && (supported(i,body) || landed)
                 && result.subtract(wanted).horizontalLengthSquared()>1e-8) {
-            double step=player.getStepHeight();
+            double step=state.stepHeight();
             if(step>0) {
-                Vec3d up=i.slide(body,new Vec3d(0,step,0));
-                Vec3d over=i.slide(body.offset(up),new Vec3d(wanted.x,0,wanted.z));
-                Vec3d down=i.slide(body.offset(up).offset(over),new Vec3d(0,wanted.y-up.y,0));
+                Vec3d up=i.slide(body,new Vec3d(0,step,0)).movement();
+                Vec3d over=i.slide(body.offset(up),new Vec3d(wanted.x,0,wanted.z)).movement();
+                Vec3d down=i.slide(body.offset(up).offset(over),new Vec3d(0,wanted.y-up.y,0)).movement();
                 Vec3d stepped=up.add(over).add(down);
                 if(stepped.horizontalLengthSquared()>result.horizontalLengthSquared()+1e-8)result=stepped;
             }
@@ -124,10 +141,12 @@ public final class MeshCollision {
     }
     /** Vanilla's carrier-air ledge check would prevent all sneaking; use the real mesh below the future footprint. */
     public static Vec3d sneak(PlayerEntity p,Vec3d wanted,MovementType type) {
-        Index i=index(p);
-        if(i==null || p.getAbilities().flying || !p.isSneaking() || !p.isOnGround() && !supported(i,p.getBoundingBox())
+        return sneak(index(p),MotionState.of(p),wanted,type);
+    }
+    static Vec3d sneak(Index i,MotionState state,Vec3d wanted,MovementType type) {
+        if(i==null || state.flying() || !state.sneaking() || !supported(i,state.body())
                 || type!=MovementType.SELF && type!=MovementType.PLAYER)return wanted;
-        Box body=p.getBoundingBox();Vec3d down=new Vec3d(0,-Math.max(.6,p.getStepHeight()),0);double x=wanted.x,z=wanted.z;int guard=0;
+        Box body=state.body();Vec3d down=new Vec3d(0,-Math.max(.6,state.stepHeight()),0);double x=wanted.x,z=wanted.z;int guard=0;
         while(x!=0 && !supportedBySweep(i,body.offset(x,0,0),down) && guard++<128)x=trim(x);
         if(guard>=128)x=0;guard=0;
         while(z!=0 && !supportedBySweep(i,body.offset(0,0,z),down) && guard++<128)z=trim(z);
