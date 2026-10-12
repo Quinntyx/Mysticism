@@ -26,6 +26,7 @@ import java.util.concurrent.CompletableFuture;
 public final class SpiritNavigationService {
     private static final Map<MinecraftServer, Map<UUID, Session>> SERVERS = new IdentityHashMap<>();
     private static boolean initialized;
+    private static final int SUPPORT_REQUEST_TICKS = 200;
     /** Terrain-owned validation; install only with no-snap acquisition and coherent visible/collision frames. */
     public interface LandingSafety {
         boolean canAlign(ServerPlayerEntity player, Basis384f proposedBasis);
@@ -42,7 +43,8 @@ public final class SpiritNavigationService {
     private SpiritNavigationService() {}
     private static final class Session {
         int unsupported, blendTick, landingTick, supportTick, supportAlignTick;
-        boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, jumping, supportPending;
+        boolean attemptedLanding, checkedRestore, prefetched, confirmedOwned, warnedLanding, jumping, supportPending;
+        String lastTransition = "";
         Vec384f targetSnapshot, supportTargetSnapshot;
         Basis384f supportFrom, supportGrid;
         long supportWindow;
@@ -81,9 +83,9 @@ public final class SpiritNavigationService {
                 if (s != null && s.supportPending && (world.getRegistryKey().equals(SpiritTerrainService.WORLD)
                         || s.supportDimension.isEmpty() || s.supportDimension.equals(dimension))) {
                     endSupportApproach(p, s);
-                    p.sendMessage(Text.literal("Walk request cancelled by source/dimension unload; remaining deep."), true);
+                    notice(p, s, "Walk request cancelled by source/dimension unload; remaining deep.", true);
                 }
-                if (spirit(p) && state(p).active() && !state(p).deep() && state(p).sourceDimension().equals(dimension)) enterDeep(p);
+                if (spirit(p) && state(p).active() && !state(p).deep() && state(p).sourceDimension().equals(dimension)) enterDeep(p, "Source dimension unloaded");
             }
         });
         ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
@@ -108,9 +110,29 @@ public final class SpiritNavigationService {
         if (removed != null && removed.capture != null) removed.capture.cancel(false);
         if (removed != null && removed.supportPending) SpiritTerrainService.cancelCurrentSupport(p);
         // Pending support ownership/alignment is session-local, never resumed from a saved/wire flag.
-        state(p).setSupportApproach(false);
+        state(p).setSupportApproach(false); state(p).setLandingApproach(false);
     }
     private static void sync(ServerPlayerEntity p) { MysticismEntityComponents.SPIRIT_NAVIGATION.sync(p); }
+    private static void notice(ServerPlayerEntity p, Session s, String message, boolean overlay) {
+        s.lastTransition = message; p.sendMessage(Text.literal(message), overlay);
+    }
+    public static List<String> status(ServerPlayerEntity p) {
+        Session s = session(p); if (spirit(p)) restoreAnchor(p, s);
+        var nav = state(p);
+        SpiritNavigationStatus.WalkPhase walk = !s.supportPending ? SpiritNavigationStatus.WalkPhase.NONE
+                : !nav.semanticReady() ? SpiritNavigationStatus.WalkPhase.WAITING_COORDINATE
+                : s.supportFrom == null ? SpiritNavigationStatus.WalkPhase.WAITING_SUPPORT : SpiritNavigationStatus.WalkPhase.ALIGNING;
+        return SpiritNavigationStatus.describe(nav, spirit(p), SpiritTerrainService.discovery(p),
+                SpiritTerrainService.retainedSource(p), walk, SUPPORT_REQUEST_TICKS - s.supportTick, s.lastTransition,
+                p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).hasTarget());
+    }
+    public static boolean retrySourceDiscovery(ServerPlayerEntity p) {
+        if (!spirit(p)) {
+            p.sendMessage(Text.literal("Source retry requires spirit mode; /spirit enter uses your current source-world location."), false);
+            return false;
+        }
+        return SpiritTerrainService.retryDiscovery(p);
+    }
     private static void deactivate(ServerPlayerEntity p) {
         var nav = state(p);
         if (nav.hasSavedAbilities()) {
@@ -138,9 +160,14 @@ public final class SpiritNavigationService {
         if (!SpiritTerrainService.prepareEnter(p)) { deactivate(p); return false; }
         var mapped = SpiritTerrainService.sourcePosition(p);
         nav.shallow(dimension, mapped.map(SpiritTerrainService.SourcePosition::landmarkId).orElse(""), source);
-        Session s = session(p); s.semanticReady = false; s.checkedRestore = true;
+        Session s = session(p); endSupportApproach(p, s); endApproach(p, s);
+        // A queued explicit target capture is a source snapshot and may finish after entry.
+        // Reset movement approaches, not that independent user request.
+        s.blendFrom = null; s.blendTo = null; s.targetSnapshot = null; s.attemptedLanding = false;
+        s.unsupported = 0; s.jumping = false; s.checkedRestore = true;
         nav.setSemanticReady(false); nav.setLandingApproach(false);
-        s.confirmedOwned = false; s.warnedAnchor = false; s.prefetched = false;
+        s.confirmedOwned = false; s.prefetched = false;
+        s.lastTransition = "Entered the source-local shallow view; exact ownership discovery may still be pending.";
         try {
             // Source-identical carrier pose: no shared origin, entry search or replacement floor.
             p.teleport(world, source.x, source.y, source.z, p.getYaw(), p.getPitch());
@@ -157,14 +184,11 @@ public final class SpiritNavigationService {
             p.sendMessage(Text.literal("Spirit entry failed: " + failure.getMessage()), false); return false;
         }
     }
-    private static void anchorSource(ServerPlayerEntity p, Session s, SpiritTerrainService.SourcePosition source) {
-        anchorSource(p, source, p.getComponent(MysticismEntityComponents.LATENT_BASIS).get());
-    }
     /** Terrain calls this after actual async ownership publication, including while already flying deep.
      * source is the retained physical source pose; sourceBasis is its captured grid, NOT a later camera basis. */
     public static void anchorSource(ServerPlayerEntity p, SpiritTerrainService.SourcePosition source, Basis384f sourceBasis) {
-        var nav = state(p); Session s = session(p);
-        if (!spirit(p) || !nav.active() || s.semanticReady || source.landmarkId().isEmpty()
+        var nav = state(p); Session s = session(p); restoreAnchor(p, s);
+        if (!spirit(p) || !nav.active() || nav.semanticReady() || source.landmarkId().isEmpty()
                 || !source.dimension().equals(nav.sourceDimension())
                 || (!nav.landmarkId().isEmpty() && !nav.landmarkId().equals(source.landmarkId()))) return;
         var found = LandmarkStore.get(p.getServer()).metadata(source.landmarkId());
@@ -172,19 +196,18 @@ public final class SpiritNavigationService {
         var metadata = found.get();
         if (!metadata.header().dimension().equals(source.dimension()) || !metadata.header().bounds().contains(
                 MathHelper.floor(source.position().x), MathHelper.floor(source.position().y), MathHelper.floor(source.position().z))) return;
-        boolean wasDeep = nav.deep();
-        nav.shallow(source.dimension(), source.landmarkId(), source.position());
-        if (wasDeep) { nav.enterDeep(); nav.setSupportApproach(s.supportPending); } // Never take flight away or lose pending prediction mode.
-        s.semanticReady = true; nav.setSemanticReady(true);
         Vec384f q = SpiritActivityService.effectiveEmbedding(p.getServer(), metadata).vector();
         Vec3d offset = source.position().subtract(metadata.header().anchor().x(), metadata.header().anchor().y(), metadata.header().anchor().z());
         TraversalSteering.advance(q, sourceBasis, offset.x, offset.y, offset.z);
+        nav.bindSource(source.dimension(), source.landmarkId(), source.position());
         p.getComponent(MysticismEntityComponents.LATENT_POS).set(q);
         var att = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT);
-        if (!nav.hasShallowTarget() && att.target().length() < 1e-6) {
+        if (!nav.hasShallowTarget() && !att.hasTarget()) {
             att.set(q); // initialize only an absent default, never overwrite a captured coordinate (even ZERO)
             if (s.supportPending) s.supportTargetSnapshot = att.target();
         }
+        nav.anchored(SpiritNavigation.AnchorOrigin.SOURCE);
+        s.lastTransition = "Exact source ownership discovered; semantic travel is now ready. Movement mode unchanged.";
         MysticismEntityComponents.LATENT_ATTUNEMENT.sync(p); MysticismEntityComponents.LATENT_POS.sync(p); sync(p);
     }
     private static boolean live(ServerPlayerEntity p, Session s) {
@@ -198,14 +221,16 @@ public final class SpiritNavigationService {
         }
         var support = SpiritTerrainService.support(p);
         if (support.isPresent() && !support.get().landmarkId().equals(state(p).landmarkId())) {
-            enterDeep(p); p.sendMessage(Text.literal("The actual supporting region changed; cannot exit through the previous source binding."), false); return false;
+            enterDeep(p, "Actual supporting owner changed");
+            p.sendMessage(Text.literal("Cannot exit through the previous source binding."), false); return false;
         }
         if (!SpiritTerrainService.exit(p)) {
             p.sendMessage(Text.literal("Current shallow source location is unavailable or obstructed; no substitute exit."), false); return false;
         }
         deactivate(p); return true;
     }
-    public static void enterDeep(ServerPlayerEntity p) {
+    public static void enterDeep(ServerPlayerEntity p) { enterDeep(p, "Flight requested"); }
+    private static void enterDeep(ServerPlayerEntity p, String reason) {
         if (!spirit(p)) return;
         var permissions = state(p);
         if (!permissions.hasSavedAbilities()) permissions.rememberAbilities(p.getAbilities().allowFlying, p.getAbilities().flying, p.hasNoGravity());
@@ -214,9 +239,12 @@ public final class SpiritNavigationService {
         // Flight safety never waits for a model. Only semantic travel/landing/touch require a real anchor.
         nav.enterDeep(); SpiritTerrainService.setShallow(p, false); flight(p, true);
         s.unsupported = 0; s.jumping = false;
-        if (changed) sync(p);
-        if (!s.semanticReady && !s.warnedAnchor) {
-            p.sendMessage(Text.literal("Free flight active; semantic travel awaits real source discovery."), false); s.warnedAnchor = true;
+        if (changed) {
+            s.lastTransition = reason + "; switched to deep flight.";
+            sync(p);
+            p.sendMessage(Text.literal(s.lastTransition + " " + (nav.semanticReady()
+                    ? "Semantic travel ready. Toggle flight off on source-owned terrain to request walking."
+                    : "Semantic travel unavailable. /spirit shows discovery progress and recovery actions.")), false);
         }
     }
 
@@ -234,7 +262,7 @@ public final class SpiritNavigationService {
         s.supportId = ""; s.supportDimension = "";
         s.supportTargetSnapshot = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target();
         state(p).setSupportApproach(true); sync(p);
-        p.sendMessage(Text.literal("Walk request: validating current source-owned support; flight remains active until ready."), true);
+        notice(p, s, "Walk requested: waiting for a real coordinate and current source-owned support; flight remains active until ready.", true);
     }
     private static void endSupportApproach(ServerPlayerEntity p, Session s) {
         if (s.supportPending) SpiritTerrainService.cancelCurrentSupport(p);
@@ -251,42 +279,60 @@ public final class SpiritNavigationService {
             SpiritTerrainService.prefetchTarget(p, nav.targetDimension(), nav.targetLandmarkId(), nav.targetPosition(),
                     p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target(), nav.targetBasis()); s.prefetched = true;
         }
-        if (!nav.active()) enterDeep(p); // Safe freeflight even without an anchor; never invent a semantic vector.
+        if (!nav.active()) enterDeep(p, "Spirit arrival without an active source binding"); // Safety, not semantic readiness.
         if (!nav.deep()) {
-            if (p.getAbilities().flying) { enterDeep(p); return nav.deep() && s.semanticReady; }
+            if (p.getAbilities().flying) { enterDeep(p, "Flight toggled on"); return nav.deep() && nav.semanticReady(); }
             var mapping = SpiritTerrainService.sourcePosition(p);
             var support = SpiritTerrainService.support(p);
-            if (mapping.isEmpty()) { enterDeep(p); return nav.deep() && s.semanticReady; }
+            boolean physicalSupport = SpiritTerrainService.physicalSupport(p);
+            boolean ownershipPending = SpiritTerrainService.ownershipPending(p);
+            if (mapping.isEmpty()) {
+                if (ShallowContinuity.awaitMapping(ownershipPending, physicalSupport)) {
+                    // Temporary exact-proof invalidation is not walking off a visible floor.
+                    s.unsupported = 0; s.jumping = false; flight(p, false);
+                    if (nav.semanticReady()) TraversalSteering.advance(p.getComponent(MysticismEntityComponents.LATENT_POS).get(),
+                            p.getComponent(MysticismEntityComponents.LATENT_BASIS).get(), delta.x, delta.y, delta.z);
+                    return false;
+                }
+                enterDeep(p, "Current shallow source mapping unavailable"); return nav.deep() && nav.semanticReady();
+            }
             var source = mapping.get(); boolean anchoredNow = false;
             String id = source.landmarkId();
             // Permit the initial unowned frame to catch up with asynchronous ownership publication.
             // Once geometry actually confirms ownership, leaving it enters deep, never switches regions.
             if (!nav.landmarkId().isEmpty() && !id.equals(nav.landmarkId()) && (!id.isEmpty() || s.confirmedOwned)) {
-                enterDeep(p); return nav.deep() && s.semanticReady;
+                enterDeep(p, "Current source owner no longer matches the shallow binding"); return nav.deep() && nav.semanticReady();
             }
             if (!id.isEmpty()) s.confirmedOwned = true;
             if (id.isEmpty() && !s.confirmedOwned) id = nav.landmarkId();
             // A retained local window is NOT proof that the floor belongs to it. Blank matches blank only.
             if (support.isPresent() && !support.get().landmarkId().equals(id)) {
-                enterDeep(p); return nav.deep() && s.semanticReady;
+                enterDeep(p, "Supporting terrain belongs to a different source owner"); return nav.deep() && nav.semanticReady();
             }
             // Ownership checks precede initial anchoring; discovery cannot overwrite an established binding.
-            if (!s.semanticReady && !source.landmarkId().isEmpty()) { anchorSource(p, s, source); anchoredNow = s.semanticReady; }
+            if (!nav.semanticReady() && !source.landmarkId().isEmpty()) {
+                SpiritTerrainService.deliverSourceAnchor(p); anchoredNow = nav.semanticReady();
+            }
             nav.shallow(source.dimension(), id, source.position());
-            if (support.isPresent()) { s.unsupported = 0; s.jumping = false; }
+            if (ShallowContinuity.grounded(support.isPresent(), physicalSupport, s.confirmedOwned, ownershipPending)) {
+                s.unsupported = 0; s.jumping = false;
+            }
             else {
                 if (s.unsupported == 0) s.jumping = delta.y > .01;
-                if (++s.unsupported > 14 || !s.jumping) { enterDeep(p); return nav.deep() && s.semanticReady; }
+                if (++s.unsupported > 14 || !s.jumping) {
+                    enterDeep(p, s.jumping ? "Jump grace expired without supporting terrain" : "Left supporting terrain");
+                    return nav.deep() && nav.semanticReady();
+                }
             } // Ascending takeoff gets ordinary jump grace; walking over an edge gets immediate freeflight.
             flight(p, false);
-            if (s.semanticReady && !anchoredNow) TraversalSteering.advance(p.getComponent(MysticismEntityComponents.LATENT_POS).get(),
+            if (state(p).semanticReady() && !anchoredNow) TraversalSteering.advance(p.getComponent(MysticismEntityComponents.LATENT_POS).get(),
                     p.getComponent(MysticismEntityComponents.LATENT_BASIS).get(), delta.x, delta.y, delta.z);
             if (p.getServer().getTicks() % 4 == 0) sync(p);
             return false;
         }
         flight(p, true);
         if (s.supportPending) { attemptSupport(p, s, delta); return false; }
-        if (!s.semanticReady) return false;
+        if (!state(p).semanticReady()) return false;
         if (s.blendTo != null) {
             if (delta.lengthSquared() > 1e-5) { s.blendFrom = null; s.blendTo = null; }
             else {
@@ -302,20 +348,23 @@ public final class SpiritNavigationService {
     private static void restoreAnchor(ServerPlayerEntity p, Session s) {
         if (s.checkedRestore) return; s.checkedRestore = true;
         endSupportApproach(p, s);
-        var nav = state(p); Vec384f q = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
-        // Physical pose survives model reset, but discarded q/IDs cannot authorize semantic travel.
-        s.semanticReady = nav.active() && nav.semanticReady();
-        if (nav.modelCompatible() && nav.active() && nav.deep() && q.length() > 1e-6) s.semanticReady = true;
-        if (nav.modelCompatible() && nav.active() && !nav.landmarkId().isEmpty()
-                && LandmarkStore.get(p.getServer()).metadata(nav.landmarkId()).isPresent()) s.semanticReady = true;
-        if (nav.semanticReady() != s.semanticReady) { nav.setSemanticReady(s.semanticReady); sync(p); }
+        var nav = state(p);
+        // Keep only explicit saved readiness AND a valid coordinate payload. Neither vector
+        // magnitude nor landmark metadata can initialize q; a valid ZERO coordinate stays ready.
+        boolean ready = nav.semanticReady(); long epoch = nav.motionEpoch();
+        nav.restoreSession(p.getComponent(MysticismEntityComponents.LATENT_POS).hasCoordinate());
+        if (nav.semanticReady() != ready || nav.motionEpoch() != epoch) sync(p);
         // Terrain restores its source window and runs initial discovery; no duplicate entry extraction here.
     }
     /** Called only when a debug command supplies a ready real item location, not a fabricated fallback. */
     public static void anchorFromConcept(ServerPlayerEntity p) {
-        if (p.getComponent(MysticismEntityComponents.LATENT_POS).get().length() > 1e-6) {
-            Session s = session(p); s.semanticReady = true; s.checkedRestore = true;
-            state(p).setSemanticReady(true); sync(p);
+        if (p.getComponent(MysticismEntityComponents.LATENT_POS).hasCoordinate()) {
+            Session s = session(p); endSupportApproach(p, s); endApproach(p, s);
+            s.blendFrom = null; s.blendTo = null; s.targetSnapshot = null;
+            s.attemptedLanding = false; s.warnedLanding = false; s.checkedRestore = true;
+            state(p).anchored(SpiritNavigation.AnchorOrigin.CONCEPT);
+            s.lastTransition = "Semantic position explicitly set to a ready concept coordinate; no source landing was acquired.";
+            sync(p);
         }
     }
     private static void endApproach(ServerPlayerEntity p, Session s) {
@@ -326,18 +375,18 @@ public final class SpiritNavigationService {
     private static void attemptSupport(ServerPlayerEntity p, Session s, Vec3d delta) {
         var nav = state(p); var component = p.getComponent(MysticismEntityComponents.LATENT_BASIS);
         var q = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
-        if (s.semanticReady && Double.isFinite(delta.x) && Double.isFinite(delta.y) && Double.isFinite(delta.z)
+        if (state(p).semanticReady() && Double.isFinite(delta.x) && Double.isFinite(delta.y) && Double.isFinite(delta.z)
                 && delta.lengthSquared() <= 16)
             TraversalSteering.advance(q, component.get(), delta.x, delta.y, delta.z);
-        if (++s.supportTick > 200) {
+        if (++s.supportTick > SUPPORT_REQUEST_TICKS) {
             endSupportApproach(p, s);
-            p.sendMessage(Text.literal("Walk request expired: current support could not be continuously aligned/owned. Still deep; no substitute landing."), true);
+            notice(p, s, "Walk request expired: current support could not be continuously aligned/owned. Still deep; no substitute landing.", true);
             return;
         }
-        if (!s.semanticReady) return; // Real late source discovery must finish; never invent q.
+        if (!state(p).semanticReady()) return; // Real late source discovery must finish; never invent q.
         if (s.supportTargetSnapshot.squareDistance(p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target()) > 0) {
             endSupportApproach(p, s);
-            p.sendMessage(Text.literal("Walk request cancelled after attunement changed; captured target was not altered by landing."), true);
+            notice(p, s, "Walk request cancelled after attunement changed; captured target was not altered by landing.", true);
             return;
         }
         var found = SpiritTerrainService.currentSupport(p);
@@ -349,7 +398,7 @@ public final class SpiritNavigationService {
         } else if (s.supportWindow != support.windowIdentity() || !s.supportId.equals(support.landmarkId())
                 || !s.supportDimension.equals(support.sourceDimension()) || basisError(s.supportGrid, destination) > 1e-12f) {
             endSupportApproach(p, s);
-            p.sendMessage(Text.literal("Actual support window/ownership changed; remaining deep. Request walking on the new support again."), true);
+            notice(p, s, "Actual support window/ownership changed; remaining deep. Request walking on the new support again.", true);
             return;
         }
         Basis384f before = component.get();
@@ -358,7 +407,7 @@ public final class SpiritNavigationService {
         if (before.i.squareDistance(proposed.i) > .01f || before.j.squareDistance(proposed.j) > .01f
                 || before.k.squareDistance(proposed.k) > .01f) {
             endSupportApproach(p, s);
-            p.sendMessage(Text.literal("Source-grid alignment would be discontinuous; remaining deep on current geometry."), true);
+            notice(p, s, "Source-grid alignment would be discontinuous; remaining deep on current geometry.", true);
             return;
         }
         // q already represents ACTUAL movement in the previous frame. Validate the joint current-q /
@@ -373,14 +422,14 @@ public final class SpiritNavigationService {
         if (mapped.isEmpty() || !mapped.get().landmarkId().equals(support.landmarkId())
                 || !mapped.get().dimension().equals(support.sourceDimension())) {
             SpiritTerrainService.setShallow(p, false); endSupportApproach(p, s);
-            p.sendMessage(Text.literal("Terrain acquisition did not retain its validated source mapping; remaining deep."), true);
+            notice(p, s, "Terrain acquisition did not retain its validated source mapping; remaining deep.", true);
             return;
         }
         var at = mapped.get(); nav.shallow(at.dimension(), at.landmarkId(), at.position());
         s.confirmedOwned = true; s.unsupported = 0; s.jumping = false; endSupportApproach(p, s);
         SpiritBasisEvolver.resetMotion(p); flight(p, false);
         MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p); sync(p);
-        p.sendMessage(Text.literal("Shallow: walking on the current source-owned landmark. Captured attunement retained."), true);
+        notice(p, s, "Shallow: walking on the current source-owned landmark. Captured attunement retained.", true);
     }
     private static float basisError(Basis384f a, Basis384f b) {
         return a.i.squareDistance(b.i) + a.j.squareDistance(b.j) + a.k.squareDistance(b.k);
@@ -401,7 +450,7 @@ public final class SpiritNavigationService {
         LandingSafety safety = landingSafety;
         if (safety == null) {
             endApproach(p, s);
-            if (!s.warnedLanding) { p.sendMessage(Text.literal("Landing remains deep: continuous terrain-transition guard is not installed."), false); s.warnedLanding = true; }
+            if (!s.warnedLanding) { notice(p, s, "Landing remains deep: continuous terrain-transition guard is not installed.", false); s.warnedLanding = true; }
             return false;
         }
         var component = p.getComponent(MysticismEntityComponents.LATENT_BASIS);
@@ -421,7 +470,7 @@ public final class SpiritNavigationService {
         if (before.i.squareDistance(proposed.i) > .01f || before.j.squareDistance(proposed.j) > .01f
                 || before.k.squareDistance(proposed.k) > .01f) {
             s.attemptedLanding = true; endApproach(p, s);
-            p.sendMessage(Text.literal("Captured source-grid alignment cannot transition continuously; remaining deep nearby."), false);
+            notice(p, s, "Captured source-grid alignment cannot transition continuously; remaining deep nearby.", false);
             return false;
         }
         Vec384f original = q.clone(), candidate = q.clone();
@@ -453,18 +502,18 @@ public final class SpiritNavigationService {
             var source = SpiritTerrainService.sourcePosition(p);
             if (source.isPresent()) {
                 var at = source.get(); nav.shallow(at.dimension(), at.landmarkId(), at.position()); s.unsupported = 0;
+                s.confirmedOwned = true; s.lastTransition = "Captured destination acquired on validated source-owned support; now shallow.";
                 endApproach(p, s); SpiritBasisEvolver.resetMotion(p); flight(p, false);
                 MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p); sync(p);
             }
-        } else { endApproach(p, s); p.sendMessage(Text.literal("Captured destination changed or blocked. Remaining deep nearby."), false); }
+        } else { endApproach(p, s); notice(p, s, "Captured destination changed or blocked. Remaining deep nearby.", false); }
         return true;
     }
     public static Optional<SpiritScenePayload.Binding> binding(ServerPlayerEntity p) {
         var nav = state(p); if (!spirit(p) || !nav.active() || nav.deep()) return Optional.empty();
-        Session s = session(p);
         // An unowned source binding has no semantic anchor yet. ZERO is explicitly unavailable
         // binding metadata, never passed to the deep evolver/semantic selection as a fabricated embedding.
-        Vec384f captured = s.semanticReady ? p.getComponent(MysticismEntityComponents.LATENT_POS).get().clone() : Vec384f.ZERO();
+        Vec384f captured = state(p).semanticReady() ? p.getComponent(MysticismEntityComponents.LATENT_POS).get().clone() : Vec384f.ZERO();
         return SpiritTerrainService.sourcePosition(p)
                 .map(source -> new SpiritScenePayload.Binding(source.dimension(), source.landmarkId(), source.position(), captured));
     }

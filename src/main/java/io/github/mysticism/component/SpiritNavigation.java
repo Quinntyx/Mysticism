@@ -15,6 +15,8 @@ import org.ladysnake.cca.api.v3.component.sync.AutoSyncedComponent;
 /** Per-player navigation, not a shared world frame. Target coordinates and vectors are snapshots. */
 public final class SpiritNavigation implements ComponentV3, AutoSyncedComponent {
     private boolean active, deep, semanticReady, landingApproach, supportApproach;
+    public enum AnchorOrigin { NONE, SOURCE, CONCEPT, RETAINED }
+    private AnchorOrigin anchorOrigin = AnchorOrigin.NONE;
     private boolean modelCompatible = true;
     private long motionEpoch;
     private String dimension = "", landmark = "";
@@ -29,13 +31,31 @@ public final class SpiritNavigation implements ComponentV3, AutoSyncedComponent 
     public boolean deep() { return deep; }
     public boolean semanticReady() { return semanticReady; }
     public boolean modelCompatible() { return modelCompatible; }
+    public AnchorOrigin anchorOrigin() { return anchorOrigin; }
+    public boolean sourceAnchorMatches(String dimension, String id) {
+        return semanticReady && anchorOrigin == AnchorOrigin.SOURCE
+                && !id.isEmpty() && this.dimension.equals(dimension) && landmark.equals(id);
+    }
+    /** A saved ID or nonzero vector is not proof of an initialized coordinate. */
+    public void restoreSession(boolean coordinateAvailable) {
+        setLandingApproach(false); setSupportApproach(false);
+        if (!active || !modelCompatible || !coordinateAvailable) setSemanticReady(false);
+    }
+    public void anchored(AnchorOrigin origin) {
+        if (origin == null || origin == AnchorOrigin.NONE) throw new IllegalArgumentException("Missing anchor origin");
+        if (origin == AnchorOrigin.SOURCE && (dimension.isEmpty() || landmark.isEmpty()))
+            throw new IllegalStateException("Source anchoring requires an exact source binding");
+        anchorOrigin = origin; setSemanticReady(true);
+    }
     public boolean landingApproach() { return landingApproach; }
     public boolean supportApproach() { return supportApproach; }
     public long motionEpoch() { return motionEpoch; }
     private void resetPrediction() { motionEpoch = motionEpoch == Long.MAX_VALUE ? 0 : motionEpoch + 1; }
     public void setSemanticReady(boolean ready) {
         if (semanticReady != ready) resetPrediction();
-        semanticReady = ready; if (ready) modelCompatible = true;
+        semanticReady = ready;
+        if (ready) { modelCompatible = true; if (anchorOrigin == AnchorOrigin.NONE) anchorOrigin = AnchorOrigin.RETAINED; }
+        else anchorOrigin = AnchorOrigin.NONE;
     }
     public void setLandingApproach(boolean approach) {
         if (landingApproach != approach) resetPrediction();
@@ -58,15 +78,22 @@ public final class SpiritNavigation implements ComponentV3, AutoSyncedComponent 
         if (!active || !deep) resetPrediction();
         active = true; deep = true;
     }
+    /** Async discovery updates the source binding, never the actor's current movement mode. */
+    public void bindSource(String dimension, String id, Vec3d pos) {
+        check(dimension, id, pos);
+        if (!this.dimension.equals(dimension) || !landmark.equals(id)) resetPrediction();
+        this.dimension = dimension; landmark = id; position = pos;
+    }
     public void shallow(String dimension, String id, Vec3d pos) {
         check(dimension, id, pos);
-        if (!active || deep || !this.dimension.equals(dimension) || !landmark.equals(id)) resetPrediction();
-        this.dimension = dimension; landmark = id; position = pos; active = true; deep = false; supportApproach = false;
+        if (!active || deep) resetPrediction();
+        bindSource(dimension, id, pos);
+        active = true; deep = false; setLandingApproach(false); setSupportApproach(false);
     }
     public void setActive(boolean active) {
         if (this.active != active) resetPrediction();
         this.active = active;
-        if (!active) { deep = false; semanticReady = false; landingApproach = false; supportApproach = false; }
+        if (!active) { deep = false; setSemanticReady(false); landingApproach = false; supportApproach = false; }
     }
     public void target(String dimension, String id, BlockPos pos) { target(dimension, id, pos, new Basis384f()); }
     public void target(String dimension, String id, BlockPos pos, Basis384f basis) {
@@ -101,7 +128,7 @@ public final class SpiritNavigation implements ComponentV3, AutoSyncedComponent 
             throw new IllegalArgumentException("Invalid source navigation location");
     }
     @Override public void readFromNbt(NbtCompound tag, RegistryWrapper.WrapperLookup lookup) {
-        active = false; deep = false; semanticReady = false; landingApproach = false; supportApproach = false;
+        active = false; deep = false; semanticReady = false; anchorOrigin = AnchorOrigin.NONE; landingApproach = false; supportApproach = false;
         dimension = ""; landmark = ""; position = Vec3d.ZERO; clearTarget();
         savedAbilities = tag.getBoolean("savedAbilities");
         allowFlying = tag.getBoolean("allowFlying"); flying = tag.getBoolean("flying"); noGravity = tag.getBoolean("noGravity");
@@ -116,14 +143,25 @@ public final class SpiritNavigation implements ComponentV3, AutoSyncedComponent 
                 throw new IllegalArgumentException("Missing physical source coordinates");
             Vec3d pose = new Vec3d(tag.getDouble("x"), tag.getDouble("y"), tag.getDouble("z"));
             if (!source.isEmpty()) { check(source, "", pose); dimension = source; position = pose; }
-            if (tag.getBoolean("active")) { check(source, "", pose); active = true; deep = tag.getBoolean("deep"); }
+            if (tag.getBoolean("active")) {
+                deep = tag.getBoolean("deep");
+                // Direct spirit teleports/concept flight can legitimately have no source binding.
+                if (!deep || !source.isEmpty()) check(source, "", pose);
+                active = true;
+            }
         } catch (IllegalArgumentException invalidPose) { active = false; deep = false; dimension = ""; position = Vec3d.ZERO; }
         if (!modelCompatible) { resetPrediction(); return; } // Discard generated semantic data ONLY.
         try { String id = tag.getString("landmark"); check(dimension, id, position); landmark = id; }
         catch (IllegalArgumentException invalidBinding) { landmark = ""; }
         semanticReady = active && tag.getBoolean("semanticReady");
+        if (semanticReady) {
+            try { anchorOrigin = AnchorOrigin.valueOf(tag.getString("anchorOrigin")); }
+            catch (IllegalArgumentException missingOrigin) { anchorOrigin = AnchorOrigin.RETAINED; }
+            if (anchorOrigin == AnchorOrigin.NONE || anchorOrigin == AnchorOrigin.SOURCE && (dimension.isEmpty() || landmark.isEmpty()))
+                anchorOrigin = AnchorOrigin.RETAINED;
+        }
         landingApproach = active && deep && semanticReady && tag.getBoolean("landingApproach");
-        supportApproach = active && deep && semanticReady && tag.getBoolean("supportApproach");
+        supportApproach = active && deep && tag.getBoolean("supportApproach");
         try {
             if (tag.getBoolean("hasTarget")) {
                 Vec3d foot;
@@ -139,7 +177,8 @@ public final class SpiritNavigation implements ComponentV3, AutoSyncedComponent 
     @Override public void writeToNbt(NbtCompound tag, RegistryWrapper.WrapperLookup lookup) {
         EmbeddingNbt.stamp(tag);
         tag.putBoolean("active", active); tag.putBoolean("deep", deep);
-        tag.putBoolean("semanticReady", semanticReady); tag.putBoolean("landingApproach", landingApproach);
+        tag.putBoolean("semanticReady", semanticReady); tag.putString("anchorOrigin", anchorOrigin.name());
+        tag.putBoolean("landingApproach", landingApproach);
         tag.putBoolean("supportApproach", supportApproach);
         tag.putLong("motionEpoch", motionEpoch);
         tag.putString("sourceDimension", dimension); tag.putString("landmark", landmark);

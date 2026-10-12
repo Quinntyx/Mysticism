@@ -88,6 +88,23 @@ public final class SourceLandmarks {
         if(!SourceDimensions.isSource(world.getRegistryKey().getValue().toString()))return;
         Session s=SESSIONS.get(world.getServer());if(s!=null){s.invalidate(world.getRegistryKey().getValue().toString(),pos);s.hint(world.getRegistryKey().getValue().toString(),pos.toImmutable());}
     }
+    public enum RequestProgress { UNAVAILABLE, WAITING_EMBEDDINGS, QUEUED, RUNNING, COMPLETE }
+    /** Progress of THIS observer's request, never another player's global service status. */
+    public static RequestProgress progress(MinecraftServer server, CompletableFuture<?> future) {
+        if (!server.isOnThread()) throw new IllegalStateException("source server thread");
+        Session s = SESSIONS.get(server);
+        if (s == null || future == null) return RequestProgress.UNAVAILABLE;
+        if (future.isDone()) return RequestProgress.COMPLETE;
+        boolean ready = EmbeddingHelper.isReady() || s.itemIndex.isPopulated();
+        if (s.active != null && s.active.future == future) {
+            if (s.active instanceof Ensure e && e.waitingEmbedding)
+                return RequestProgress.WAITING_EMBEDDINGS;
+            return RequestProgress.RUNNING;
+        }
+        for (var op : s.requests) if (op.future == future)
+            return op instanceof Ensure && !ready ? RequestProgress.WAITING_EMBEDDINGS : RequestProgress.QUEUED;
+        return RequestProgress.UNAVAILABLE;
+    }
     public static int pending(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.requests.size()+s.hints.size()+(s.active==null?0:1);}
     public static int lastSampledCells(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.lastCells;}
     public static String status(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?"Stopped":s.status;}
@@ -149,7 +166,7 @@ public final class SourceLandmarks {
     }
     record Prepared(Landmark prior,String id,String biome,Landmark.Kind kind,BlockPoint anchor,SourceGeometry geometry,List<DescriptorVectors.WeightedDescriptor> descriptors,Map<String,Double> items,String adjoining){}
     private static final class Ensure extends Operation<Optional<LandmarkMetadata>> {
-        final BlockPos position;final String preferred;final boolean activity;String cursor;boolean catalogEnd;
+        final BlockPos position;final String preferred;final boolean activity;String cursor;boolean catalogEnd,waitingEmbedding;
         final ArrayDeque<LandmarkMetadata> candidates=new ArrayDeque<>();final List<Landmark> parents=new ArrayList<>();final List<GeometryPage> pages=new ArrayList<>();
         final Map<String,Double> importance=new HashMap<>();Region observed;CompletableFuture<Prepared> prepared;CompletableFuture<Vec384f> embedding;Prepared value;Landmark published;long time;int seaLevel;
         Ensure(Session s,String dimension,BlockPos pos,String preferred,boolean activity,CompletableFuture<Optional<LandmarkMetadata>> future){super(s,dimension,new Bounds(pos.getX()-12L,pos.getY()-12L,pos.getZ()-12L,pos.getX()+13L,pos.getY()+13L,pos.getZ()+13L),future);this.position=pos;this.preferred=preferred;this.activity=activity;}
@@ -174,7 +191,8 @@ public final class SourceLandmarks {
                 ArrayList<DescriptorVectors.WeightedVector> fallback=new ArrayList<>();var index=s.itemIndex;
                 if(index.isPopulated())for(var item:value.items.entrySet()){Vec384f v=index.getVec(item.getKey());if(v!=null)fallback.add(new DescriptorVectors.WeightedVector(v,item.getValue()));}
                 Vec384f backup=fallback.isEmpty()?null:DescriptorVectors.compose(fallback);
-                if(!EmbeddingHelper.isReady()&&backup==null){s.status="Waiting for real embedding/index readiness";return;}
+                waitingEmbedding=!EmbeddingHelper.isReady()&&backup==null;
+                if(waitingEmbedding){s.status="Waiting for real embedding/index readiness";return;}
                 embedding=EmbeddingHelper.isReady()?EmbeddingHelper.composeDescriptors(value.descriptors).handle((v,e)->{if(e==null)return v;if(backup!=null)return backup.clone();throw new CompletionException(e);}):CompletableFuture.completedFuture(backup);work=embedding;return;
             }
             if(!embedding.isDone())return;

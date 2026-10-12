@@ -1,14 +1,13 @@
 package io.github.mysticism.command;
 
 import com.mojang.brigadier.CommandDispatcher;
-import io.github.mysticism.component.MysticismEntityComponents;
 import io.github.mysticism.navigation.SpiritNavigationService;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
 import static net.minecraft.server.command.CommandManager.literal;
 
-/** V1 debug controls; no survival UI or return-to-entry substitute. */
+/** Per-player movement/source diagnostics; no return-to-entry substitute. */
 public final class SpiritCommand {
     private SpiritCommand() {}
     public static void register(CommandDispatcher<ServerCommandSource> dispatcher) {
@@ -20,14 +19,15 @@ public final class SpiritCommand {
                     var p = context.getSource().getPlayerOrThrow();
                     SpiritNavigationService.enterDeep(p); return status(p);
                 }))
-                .then(literal("capture").executes(context -> SpiritNavigationService.captureHere(context.getSource().getPlayerOrThrow()) ? 1 : 0)));
+                .then(literal("capture").executes(context -> SpiritNavigationService.captureHere(context.getSource().getPlayerOrThrow()) ? 1 : 0))
+                .then(literal("discover").executes(context -> {
+                    var p = context.getSource().getPlayerOrThrow();
+                    boolean queued = SpiritNavigationService.retrySourceDiscovery(p);
+                    status(p); return queued ? 1 : 0;
+                })));
     }
     private static int status(ServerPlayerEntity p) {
-        var nav = p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION);
-        p.sendMessage(Text.literal("Spirit " + (!nav.active() ? "inactive" : nav.deep() ? "deep" : "shallow")
-                + "; source " + nav.sourceDimension() + " " + nav.landmarkId() + " " + nav.sourcePosition()
-                + "; target " + (nav.hasShallowTarget() ? nav.targetDimension() + " " + nav.targetLandmarkId()
-                + " " + nav.targetBlock().toShortString() : "concept vector")), false);
+        SpiritNavigationService.status(p).forEach(line -> p.sendMessage(Text.literal(line), false));
         return 1;
     }
 }
