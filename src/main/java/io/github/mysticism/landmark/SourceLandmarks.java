@@ -11,6 +11,7 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.world.chunk.WorldChunk;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -19,6 +20,7 @@ import java.util.concurrent.*;
  * No generation, source writes, joins, model inference or catalogue hydration on tick. */
 public final class SourceLandmarks {
     public static final String ALGORITHM="source-octree-v2";
+    public static final int VERTICAL_PROBE_BUDGET=128,VERTICAL_QUEUE=64;
     public record Cell(BlockPoint position,BlockPalette.State material,String biome,boolean sky) {
         public boolean air(){return Set.of("minecraft:air","minecraft:cave_air","minecraft:void_air").contains(material.blockId());}
     }
@@ -31,13 +33,14 @@ public final class SourceLandmarks {
         ServerTickEvents.END_SERVER_TICK.register(server->{Session s=SESSIONS.get(server);if(s!=null)s.tick();});
         ServerLifecycleEvents.SERVER_STOPPING.register(server->{Session s=SESSIONS.remove(server);if(s!=null)s.close();});
         ServerWorldEvents.UNLOAD.register((server,world)->{Session s=SESSIONS.get(server);if(s!=null)s.unload(world.getRegistryKey().getValue().toString());});
-        ServerChunkEvents.CHUNK_UNLOAD.register((world,chunk)->{Session s=SESSIONS.get(world.getServer());if(s!=null&&s.active!=null){String dim=world.getRegistryKey().getValue().toString();Bounds area=new Bounds(chunk.getPos().getStartX(),world.getBottomY(),chunk.getPos().getStartZ(),chunk.getPos().getStartX()+16L,world.getTopY(),chunk.getPos().getStartZ()+16L);if(s.active.dimension.equals(dim)&&s.active.guarded!=null&&s.active.guarded.intersects(area))s.active.cancel(new CancellationException("source chunk unloaded during observation"));}});
+        ServerChunkEvents.CHUNK_UNLOAD.register((world,chunk)->{Session s=SESSIONS.get(world.getServer());if(s!=null)s.vertical.remove(new VerticalChunk(world.getRegistryKey().getValue().toString(),chunk.getPos().x,chunk.getPos().z));if(s!=null&&s.active!=null){String dim=world.getRegistryKey().getValue().toString();Bounds area=new Bounds(chunk.getPos().getStartX(),world.getBottomY(),chunk.getPos().getStartZ(),chunk.getPos().getStartX()+16L,world.getTopY(),chunk.getPos().getStartZ()+16L);if(s.active.dimension.equals(dim)&&s.active.guarded!=null&&s.active.guarded.intersects(area))s.active.cancel(new CancellationException("source chunk unloaded during observation"));}});
         ServerChunkEvents.CHUNK_LOAD.register((world,chunk)->{
             if(!SourceDimensions.isSource(world.getRegistryKey().getValue().toString()))return;
             Session s=SESSIONS.get(world.getServer());if(s==null)return;
             int x=chunk.getPos().getStartX()+8,z=chunk.getPos().getStartZ()+8;
             int y=chunk.sampleHeightmap(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,x&15,z&15);
             s.hint(world.getRegistryKey().getValue().toString(),new BlockPos(x,y+1,z));
+            s.queueVertical(world,chunk);
             if(s.retries.size()<64)s.retries.add(new FrontierRetry(world.getRegistryKey().getValue().toString(),new Bounds(chunk.getPos().getStartX()-1L,world.getBottomY(),chunk.getPos().getStartZ()-1L,chunk.getPos().getStartX()+17L,world.getTopY(),chunk.getPos().getStartZ()+17L)));
         });
     }
@@ -88,12 +91,13 @@ public final class SourceLandmarks {
         if(!SourceDimensions.isSource(world.getRegistryKey().getValue().toString()))return;
         Session s=SESSIONS.get(world.getServer());if(s!=null){s.invalidate(world.getRegistryKey().getValue().toString(),pos);s.hint(world.getRegistryKey().getValue().toString(),pos.toImmutable());}
     }
-    public static int pending(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.requests.size()+s.hints.size()+(s.active==null?0:1);}
+    public static int pending(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.requests.size()+s.hints.size()+s.vertical.size()+(s.active==null?0:1);}
     public static int lastSampledCells(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.lastCells;}
     public static String status(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?"Stopped":s.status;}
     private static Session session(MinecraftServer server){if(!server.isOnThread())throw new IllegalStateException("source server thread");Session s=SESSIONS.get(server);if(s==null)throw new IllegalStateException("source service not initialized");return s;}
     private static void checkBounds(Bounds b,int maxCells){long volume=Math.multiplyExact(Math.multiplyExact(b.maxX()-b.minX(),b.maxY()-b.minY()),b.maxZ()-b.minZ());if(maxCells<1||maxCells>32768||volume>maxCells||b.minX()<Integer.MIN_VALUE||b.maxX()>Integer.MAX_VALUE||b.minY()<Integer.MIN_VALUE||b.maxY()>Integer.MAX_VALUE||b.minZ()<Integer.MIN_VALUE||b.maxZ()>Integer.MAX_VALUE)throw new IllegalArgumentException("source query bounds");}
     private record Hint(String dimension,BlockPos pos){}
+    private record VerticalChunk(String dimension,int x,int z){}
     private static final class FrontierRetry {
         final String dimension;final Bounds bounds;String cursor;boolean end;final ArrayDeque<LandmarkMetadata> headers=new ArrayDeque<>();Iterator<FrontierFace> faces;
         FrontierRetry(String dimension,Bounds bounds){this.dimension=dimension;this.bounds=bounds;}
@@ -106,6 +110,7 @@ public final class SourceLandmarks {
     private static final class Session {
         final MinecraftServer server;final LandmarkStore store;final ItemEmbeddingIndexState itemIndex;final ExecutorService worker=new ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(4),Thread.ofPlatform().daemon().name("mysticism-source").factory(),new ThreadPoolExecutor.AbortPolicy());
         final ArrayDeque<SourceOwnership.Request> ownerRequests=new ArrayDeque<>();
+        final LinkedHashMap<VerticalChunk,VerticalSeeds.Scan> vertical=new LinkedHashMap<>();
         final ArrayDeque<FrontierRetry> retries=new ArrayDeque<>();final Map<CompletableFuture<?>,String> auxiliary=new IdentityHashMap<>();final ArrayDeque<Operation<?>> requests=new ArrayDeque<>();final LinkedHashSet<Hint> hints=new LinkedHashSet<>();Operation<?> active;String status="Ready";int playerCursor,lastCells;
         Session(MinecraftServer server){this.server=server;store=LandmarkStore.get(server);itemIndex=ItemEmbeddingIndexState.get(server);}
         <T> CompletableFuture<T> computeAndDeliver(String dim,java.util.function.Supplier<T> computation){
@@ -114,9 +119,36 @@ public final class SourceLandmarks {
         }
         void offer(Operation<?> op){if(requests.size()==64){op.future.completeExceptionally(new RejectedExecutionException("source request budget"));return;}if(op instanceof Read)requests.addFirst(op);else requests.addLast(op);}
         void hint(String dim,BlockPos p){if(hints.size()<128)hints.add(new Hint(dim,p));}
+        /** Chunk load captures just sixteen heightmap values. Block reads are spread over
+         * ticks, including every vertical level at these columns, not two lucky deep bands.
+         * No tickets, generated-unloaded reads, inference, or ownership changes here. */
+        void queueVertical(ServerWorld world,WorldChunk chunk){
+            var key=new VerticalChunk(world.getRegistryKey().getValue().toString(),chunk.getPos().x,chunk.getPos().z);
+            if(vertical.containsKey(key)||vertical.size()>=VERTICAL_QUEUE)return;
+            ArrayList<VerticalSeeds.Column> columns=new ArrayList<>();
+            for(int ox:VerticalSeeds.LATTICE)for(int oz:VerticalSeeds.LATTICE)
+                columns.add(new VerticalSeeds.Column(chunk.getPos().getStartX()+ox,chunk.getPos().getStartZ()+oz,
+                    chunk.sampleHeightmap(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,ox,oz)));
+            vertical.put(key,new VerticalSeeds.Scan(columns,world.getBottomY(),world.getTopY()));
+        }
+        void advanceVertical(){
+            if(vertical.isEmpty()||hints.size()>=128)return;
+            var entry=vertical.entrySet().iterator().next();var key=entry.getKey();var scan=entry.getValue();
+            ServerWorld world=world(key.dimension);
+            WorldChunk chunk=world==null?null:world.getChunkManager().getWorldChunk(key.x,key.z);
+            if(chunk==null){vertical.remove(key);return;} // non-loading lookup; unload never invents air
+            scan.advance(VERTICAL_PROBE_BUDGET,p->chunk.getBlockState(new BlockPos((int)p.x(),(int)p.y(),(int)p.z())).isAir());
+            lastCells+=scan.lastSampled();
+            if(!scan.complete())return;
+            while(hints.size()<128){
+                var seed=scan.pollSeed();if(seed.isEmpty()){vertical.remove(key);return;}
+                var p=seed.get();hint(key.dimension,new BlockPos((int)p.x(),(int)p.y(),(int)p.z()));
+            } // full queue retains the remaining bands for the next tick, rather than dropping them
+        }
         void invalidate(String dim,BlockPos pos){if(active!=null&&active.dimension.equals(dim)&&active.guarded!=null&&active.guarded.contains(pos.getX(),pos.getY(),pos.getZ()))active.cancel(new CancellationException("source edit invalidated snapshot"));}
         void tick(){
             lastCells=0;
+            advanceVertical();
             if(!ownerRequests.isEmpty()){var request=ownerRequests.peekFirst();try{request.advance();}catch(RuntimeException failure){request.cancel(failure);}if(request.done)ownerRequests.removeFirst();}
             if(server.getTicks()%5==0&&!retries.isEmpty()){try{if(retries.peekFirst().advance(this))retries.removeFirst();}catch(RuntimeException stale){retries.removeFirst();}}
             if(server.getTicks()%200==0){var players=server.getPlayerManager().getPlayerList();for(int n=0;n<Math.min(2,players.size());n++){var p=players.get(Math.floorMod(playerCursor++,players.size()));if(SourceDimensions.isSource(p.getServerWorld().getRegistryKey().getValue().toString()))hint(p.getServerWorld().getRegistryKey().getValue().toString(),p.getBlockPos());}}
@@ -127,8 +159,8 @@ public final class SourceLandmarks {
             try{if(active.future.isCancelled())active.cancel(new CancellationException());if(!active.done)active.advance();if(active.done){active.release();active=null;status="Ready";}}
             catch(RuntimeException e){status="Deferred: "+e.getMessage();active.cancel(e);active.release();active=null;}
         }
-        void unload(String dim){ownerRequests.removeIf(request->{if(request.dimension.equals(dim)){request.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});retries.removeIf(r->r.dimension.equals(dim));auxiliary.entrySet().removeIf(e->{if(e.getValue().equals(dim)){e.getKey().cancel(false);return true;}return false;});if(active!=null&&active.dimension.equals(dim)){active.cancel(new CancellationException("source dimension unloaded"));active.release();active=null;}requests.removeIf(op->{if(op.dimension.equals(dim)){op.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});hints.removeIf(h->h.dimension.equals(dim));}
-        void close(){ownerRequests.forEach(request->request.cancel(new CancellationException("server stopping")));ownerRequests.clear();auxiliary.keySet().forEach(f->f.cancel(false));auxiliary.clear();retries.clear();if(active!=null){active.cancel(new CancellationException("server stopping"));active.release();}requests.forEach(op->op.cancel(new CancellationException("server stopping")));requests.clear();hints.clear();worker.shutdownNow();}
+        void unload(String dim){vertical.keySet().removeIf(key->key.dimension.equals(dim));ownerRequests.removeIf(request->{if(request.dimension.equals(dim)){request.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});retries.removeIf(r->r.dimension.equals(dim));auxiliary.entrySet().removeIf(e->{if(e.getValue().equals(dim)){e.getKey().cancel(false);return true;}return false;});if(active!=null&&active.dimension.equals(dim)){active.cancel(new CancellationException("source dimension unloaded"));active.release();active=null;}requests.removeIf(op->{if(op.dimension.equals(dim)){op.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});hints.removeIf(h->h.dimension.equals(dim));}
+        void close(){vertical.clear();ownerRequests.forEach(request->request.cancel(new CancellationException("server stopping")));ownerRequests.clear();auxiliary.keySet().forEach(f->f.cancel(false));auxiliary.clear();retries.clear();if(active!=null){active.cancel(new CancellationException("server stopping"));active.release();}requests.forEach(op->op.cancel(new CancellationException("server stopping")));requests.clear();hints.clear();worker.shutdownNow();}
         ServerWorld world(String dimension){return SourceDimensions.isSource(dimension)?server.getWorld(RegistryKey.of(RegistryKeys.WORLD,Identifier.of(dimension))):null;}
     }
     private abstract static class Operation<T> {
@@ -141,7 +173,7 @@ public final class SourceLandmarks {
         void pause(){if(resume==null)resume=SpiritActivityService.pauseLandmarkMutations(s.server);}
         void cancel(Throwable failure){done=true;if(reader!=null)reader.cancel();if(geometryRead!=null)geometryRead.cancel();if(work!=null)work.cancel(false);if(mutation!=null&&!mutation.complete())mutation.cancel();if(history!=null)history.cancel();future.completeExceptionally(failure);}
         void release(){if(resume!=null){resume.run();resume=null;}}
-        boolean observe(){if(snapshot!=null)return snapshot.isDone();if(reader==null){ServerWorld world=s.world(dimension);if(world==null)throw new IllegalStateException("source world unavailable");reader=new GeneratedSourceReader(world,bounds,s.worker);}s.status="Source read";boolean complete=reader.advance(512);s.lastCells=reader.lastSampled;if(complete){snapshot=reader.resultAsync();work=snapshot;}return false;}
+        boolean observe(){if(snapshot!=null)return snapshot.isDone();if(reader==null){ServerWorld world=s.world(dimension);if(world==null)throw new IllegalStateException("source world unavailable");reader=new GeneratedSourceReader(world,bounds,s.worker);}s.status="Source read";boolean complete=reader.advance(512-s.lastCells);s.lastCells+=reader.lastSampled;if(complete){snapshot=reader.resultAsync();work=snapshot;}return false;}
     }
     private static final class Read extends Operation<Region> {
         Read(Session s,String dimension,Bounds bounds,CompletableFuture<Region> future){super(s,dimension,bounds,future);}
