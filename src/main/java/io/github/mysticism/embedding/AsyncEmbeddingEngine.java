@@ -2,6 +2,10 @@ package io.github.mysticism.embedding;
 
 import io.github.mysticism.vector.*;
 import java.time.Duration;
+import java.io.IOException;
+import java.nio.file.Path;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -36,7 +40,9 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
         return CompletableFuture.failedFuture(new RejectedExecutionException("Embedding callback capacity exhausted; retry later"));
     }
 
+    private static final Logger LOGGER = LoggerFactory.getLogger("Mysticism-EmbeddingCache");
     private final EmbeddingProvider provider;
+    private final Path cacheFile;
     private final ThreadPoolExecutor workers;
     private final ScheduledThreadPoolExecutor timer;
     private final long deadlineMillis;
@@ -55,12 +61,19 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
 
     public AsyncEmbeddingEngine(EmbeddingProvider provider, int threads, int queueCapacity,
                                 int cacheCapacity, Duration deadline) {
+        this(provider, threads, queueCapacity, cacheCapacity, deadline, null);
+    }
+    /** Optional disposable cache. Read on the readiness worker, atomically saved on orderly close.
+     * A cache hit still requires a healthy current-profile provider; it is not readiness evidence. */
+    public AsyncEmbeddingEngine(EmbeddingProvider provider, int threads, int queueCapacity,
+                                int cacheCapacity, Duration deadline, Path cacheFile) {
         if (threads < 1 || threads > 32 || queueCapacity < 1 || queueCapacity > 4096
                 || cacheCapacity < 1 || cacheCapacity > 65536 || deadline.isZero() || deadline.isNegative()
                 || deadline.toMillis() < 1 || deadline.toMillis() > 120000)
             throw new IllegalArgumentException("Invalid embedding bounds");
         if (!provider.profile().equals(EmbeddingProfile.current())) throw new IllegalArgumentException("Provider profile mismatch");
         this.provider = provider; this.deadlineMillis = deadline.toMillis(); this.cacheCapacity = cacheCapacity;
+        this.cacheFile = cacheFile == null ? null : cacheFile.toAbsolutePath();
         workers = new ThreadPoolExecutor(threads, threads, 0, TimeUnit.SECONDS,
                 new ArrayBlockingQueue<>(queueCapacity), r -> daemon(r, "Mysticism-EmbedWorker"),
                 new ThreadPoolExecutor.AbortPolicy());
@@ -68,18 +81,30 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
         timer.setRemoveOnCancelPolicy(true);
         readyDeadline = timer.schedule(() -> finishReadiness(new TimeoutException("Embedding readiness deadline")), deadlineMillis, TimeUnit.MILLISECONDS);
         workers.execute(() -> {
-            try { provider.checkReady(); finishReadiness(null); }
+            try { provider.checkReady(); finishReadiness(null, loadCache()); }
             catch (Throwable error) { finishReadiness(error); }
         });
+    }
+    private Map<String, Vec384f> loadCache() {
+        if (cacheFile == null) return Map.of();
+        try { return EmbeddingCacheFile.read(cacheFile, cacheCapacity); }
+        catch (IOException | RuntimeException error) {
+            LOGGER.warn("Discarding unavailable/stale embedding cache {}; fresh inference required", cacheFile, error);
+            return Map.of();
+        }
     }
     private static Thread daemon(Runnable r, String name) {
         Thread thread = new Thread(r, name); thread.setDaemon(true); return thread;
     }
-    private void finishReadiness(Throwable error) {
+    private void finishReadiness(Throwable error) { finishReadiness(error, Map.of()); }
+    private void finishReadiness(Throwable error, Map<String, Vec384f> restored) {
         List<Subscriber<Void>> subscribers;
         synchronized (this) {
             if (readinessTerminal) return;
             readinessTerminal = true; readinessError = error; ready = error == null && !closed;
+            // Cache activation and readiness have one terminal claim: late IO never populates a
+            // failed/stopped engine, even when the timer races immediately after a successful read.
+            if (ready) cache.putAll(restored);
             if (readyDeadline != null) readyDeadline.cancel(false);
             subscribers = List.copyOf(readySubscribers); readySubscribers.clear();
         }
@@ -97,9 +122,10 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
     public synchronized boolean isReady() { return ready && !closed; }
 
     public CompletableFuture<Vec384f> embed(String descriptor) {
-        if (descriptor == null || descriptor.isBlank() || descriptor.length() > 8192)
+        if (!EmbeddingCacheFile.validDescriptor(descriptor))
             return CompletableFuture.failedFuture(new IllegalArgumentException("Invalid descriptor"));
-        String key = EmbeddingSpace.FINGERPRINT + ":" + descriptor;
+        // Engine profile is immutable/current; disk headers validate that same complete profile.
+        String key = descriptor;
         Subscriber<Vec384f> subscriber = null; Vec384f cached = null; Throwable rejection = null;
         synchronized (this) {
             if (!ready || closed) rejection = new IllegalStateException("Embeddings unavailable; inspect readiness");
@@ -137,7 +163,9 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
         try {
             Vec384f value = provider.getEmbedding(descriptor); EmbeddingSpace.requireCurrent(value);
             if (value.length() == 0) throw new IllegalArgumentException("Provider returned zero embedding");
-            finish(key, request, new Vec384f(value.norm()), null);
+            Vec384f normalized = new Vec384f(value.norm());
+            EmbeddingCacheFile.requireUnitVector(normalized);
+            finish(key, request, normalized, null);
         } catch (Throwable error) { finish(key, request, null, error); }
     }
     private void finish(String key, Request request, Vec384f value, Throwable error) {
@@ -157,9 +185,14 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
     public synchronized int inflightSize() { return pending.size(); }
     public void close() {
         List<Request> cancelled; List<Subscriber<Void>> readyCancelled;
+        Map<String, Vec384f> saved = null;
         CancellationException error = new CancellationException("Embedding shutdown");
         synchronized (this) {
             if (closed) return;
+            if (ready && cacheFile != null) {
+                saved = new LinkedHashMap<>();
+                for (var entry : cache.entrySet()) saved.put(entry.getKey(), entry.getValue().clone());
+            }
             closed = true; ready = false;
             readyCancelled = List.copyOf(readySubscribers); readySubscribers.clear();
             if (!readinessTerminal) { readinessTerminal = true; readinessError = error; }
@@ -170,6 +203,12 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
         workers.shutdownNow(); timer.shutdownNow();
         for (var subscriber : readyCancelled) publish(subscriber, null, error);
         for (Request request : cancelled) for (var subscriber : request.subscribers) publish(subscriber, null, error);
-        provider.close();
+        try { provider.close(); }
+        finally {
+            // Outside engine/helper monitors. Failure to save a derived cache never replaces model
+            // failure or blocks callbacks; the next startup simply computes fresh vectors.
+            if (saved != null) try { EmbeddingCacheFile.write(cacheFile, saved); }
+            catch (IOException | RuntimeException saving) { LOGGER.warn("Unable to save embedding cache {}", cacheFile, saving); }
+        }
     }
 }

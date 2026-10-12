@@ -2,6 +2,7 @@ package io.github.mysticism.embedding;
 
 import io.github.mysticism.vector.Vec384f;
 import java.time.Duration;
+import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -17,7 +18,9 @@ public final class EmbeddingHelper {
         EmbeddingProvider provider=null;
         try{
             provider=new EmbeddingService();
-            engine=new AsyncEmbeddingEngine(provider,threads,256,8192,Duration.ofMillis(Long.getLong("mysticism.embedding.deadlineMillis",30000)));
+            String cache=System.getProperty("mysticism.embedding.cacheFile","cache/mysticism/embeddings-v2.bin");
+            engine=new AsyncEmbeddingEngine(provider,threads,256,8192,Duration.ofMillis(Long.getLong("mysticism.embedding.deadlineMillis",30000)),
+                    cache.isBlank()?null:Path.of(cache));
             AsyncEmbeddingEngine started=engine;
             readiness=started.readiness();failure="Initializing";
             readiness.whenComplete((v,e)->{
