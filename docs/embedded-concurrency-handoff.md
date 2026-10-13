@@ -1,5 +1,8 @@
 # Embedded inference ownership handoff
 
+Historical parent-unit report. Its shutdown disposal policy is superseded by the
+combined drain/ownership integration in [merge-0032](runtime-sol-merge-0032-handoff.md).
+
 ## Retained scope
 
 The prior retained session stopped on provider rate limits/timeouts after reading

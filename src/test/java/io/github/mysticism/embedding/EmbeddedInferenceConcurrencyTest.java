@@ -42,6 +42,7 @@ public final class EmbeddedInferenceConcurrencyTest {
         final CountDownLatch started = new CountDownLatch(1), gate = new CountDownLatch(1), disposed = new CountDownLatch(1);
         final Vec384f output = Vec384f.ZERO();
         volatile boolean holdReady, holdFirst;
+        volatile String closingThread;
         public EmbeddingProfile profile() { return EmbeddingProfile.current(); }
         private void enter() { if (active.incrementAndGet() != 1) overlap.set(true); }
         private void leave() { active.decrementAndGet(); }
@@ -64,12 +65,13 @@ public final class EmbeddedInferenceConcurrencyTest {
             } finally { leave(); }
         }
         public void close() {
+            closingThread = Thread.currentThread().getName();
             enter();
             try { closes.incrementAndGet(); output.mul(0); }
             finally { leave(); disposed.countDown(); }
         }
     }
-    private static AsyncEmbeddingEngine engine(BorrowingProvider provider, int workers, long deadlineMillis) {
+    private static AsyncEmbeddingEngine engine(EmbeddingProvider provider, int workers, long deadlineMillis) {
         return new AsyncEmbeddingEngine(provider, workers, 64, 64, Duration.ofMillis(deadlineMillis));
     }
     private static void axis(Vec384f vector, int index) {
@@ -91,9 +93,12 @@ public final class EmbeddedInferenceConcurrencyTest {
         await(provider.disposed);
         check(provider.closes.get() == 1 && !provider.overlap.get(), "Session disposal raced or repeated");
     }
-    private static void concurrentRequests() throws Exception {
+    private static void concurrentRequests(boolean lifecycleManaged) throws Exception {
         BorrowingProvider provider = new BorrowingProvider(); provider.holdFirst = true;
-        var e = engine(provider, 8, 3000);
+        // Both adapters must retain output ownership through snapshot/normalization;
+        // serializing getEmbedding alone does not protect a borrowed return buffer.
+        EmbeddingProvider adapter = lifecycleManaged ? new LifecycleEmbeddingProvider(() -> provider) : provider;
+        var e = engine(adapter, 8, 3000);
         try {
             get(e.readiness());
             List<CompletableFuture<Vec384f>> requests = new ArrayList<>();
@@ -116,7 +121,9 @@ public final class EmbeddedInferenceConcurrencyTest {
             check(!provider.overlap.get(), "Failure recovery bypassed session ownership");
         } finally { provider.gate.countDown(); e.close(); }
         await(provider.disposed);
-        check(provider.closes.get() == 1, "Provider not closed exactly once");
+        check(e.awaitClosed(Duration.ofSeconds(2)), "Worker drain/cleanup did not finish");
+        check(provider.closes.get() == 1 && "Mysticism-EmbedCleanup".equals(provider.closingThread),
+                "Provider not closed exactly once on cleanup thread");
     }
     private static void expiredWaiters() throws Exception {
         BorrowingProvider provider = new BorrowingProvider(); provider.holdFirst = true;
@@ -154,7 +161,10 @@ public final class EmbeddedInferenceConcurrencyTest {
             check(provider.closes.get() == 0 && !provider.overlap.get(), "Shutdown freed active native state");
             failed(e.embed("2"), IllegalStateException.class);
             provider.gate.countDown(); await(provider.disposed);
-            check(provider.closes.get() == 1 && !provider.overlap.get(), "Deferred native disposal raced or repeated");
+            check(e.awaitClosed(Duration.ofSeconds(2)), "Deferred worker drain did not finish");
+            check(provider.closes.get() == 1 && !provider.overlap.get()
+                    && "Mysticism-EmbedCleanup".equals(provider.closingThread),
+                    "Deferred native disposal raced, repeated, or ran on active worker");
             check(provider.calls.get() == (readiness ? 0 : 1), "Queued native call ran after shutdown");
             check(!e.isReady() && e.cacheSize() == 0, "Late native return revived closed engine");
         } finally { provider.gate.countDown(); e.close(); }
@@ -188,7 +198,7 @@ public final class EmbeddedInferenceConcurrencyTest {
         await(provider.disposed);
     }
     public static void main(String[] args) throws Exception {
-        borrowedOutput(); concurrentRequests(); expiredWaiters();
+        borrowedOutput(); concurrentRequests(false); concurrentRequests(true); expiredWaiters();
         shutdownDuringCall(false); shutdownDuringCall(true); independentSessions(); cancelledSubscriber();
         System.out.println("EmbeddedInferenceConcurrencyTest passed: " + checks + " checks (unsafe provider fixtures; no model inference)");
     }

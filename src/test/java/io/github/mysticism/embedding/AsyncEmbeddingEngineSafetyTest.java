@@ -103,8 +103,8 @@ public final class AsyncEmbeddingEngineSafetyTest {
             submit.start(); start.countDown(); e.close(); submit.join(2000);
             check(!submit.isAlive(), "Submission/shutdown deadlocked");
             for (var f : futures) get(f.handle((v, error) -> null));
-            // An active native owner, rather than close(), now performs safe disposal on return.
-            check(p.disposed.await(2, TimeUnit.SECONDS), "Deferred provider disposal did not finish");
+            check(e.awaitClosed(Duration.ofSeconds(2)), "Shutdown resource cleanup did not finish");
+            check(p.disposed.getCount() == 0, "Deferred provider disposal did not finish");
             check(e.inflightSize() == 0 && e.cacheSize() == 0 && p.closed, "Shutdown race leaked");
         }
     }

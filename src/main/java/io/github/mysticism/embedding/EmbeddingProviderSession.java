@@ -11,7 +11,7 @@ import java.util.function.BooleanSupplier;
  */
 final class EmbeddingProviderSession implements AutoCloseable {
     private final EmbeddingProvider provider;
-    private boolean busy, closing, disposed;
+    private boolean busy, closing, disposeRequested, disposed;
 
     EmbeddingProviderSession(EmbeddingProvider provider) { this.provider = provider; }
 
@@ -25,7 +25,7 @@ final class EmbeddingProviderSession implements AutoCloseable {
         boolean dispose;
         synchronized (this) {
             busy = false;
-            dispose = closing && !disposed;
+            dispose = disposeRequested && !disposed;
             if (dispose) disposed = true;
             notifyAll();
         }
@@ -54,10 +54,28 @@ final class EmbeddingProviderSession implements AutoCloseable {
         } finally { release(); }
     }
 
+    /** Admission/cancellation only. Engine shutdown must not run native disposal on
+     * the exiting server thread, even when the provider is currently idle. */
+    void requestStop() {
+        synchronized (this) {
+            closing = true;
+            notifyAll();
+        }
+        if (provider instanceof LifecycleEmbeddingProvider owned) owned.requestStop();
+    }
+
+    /** Called only after worker termination. Empty launches must not accumulate behind
+     * another session's hung native close on the cleanup executor. */
+    boolean closeUnopened() {
+        if (!(provider instanceof LifecycleEmbeddingProvider owned) || !owned.closeUnopened()) return false;
+        close(); // The lifecycle provider is already closed; no native resources exist.
+        return true;
+    }
+
     @Override public void close() {
         boolean dispose;
         synchronized (this) {
-            closing = true;
+            closing = true; disposeRequested = true;
             dispose = !busy && !disposed;
             if (dispose) disposed = true;
             notifyAll();
