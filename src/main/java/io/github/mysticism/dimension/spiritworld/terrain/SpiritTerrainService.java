@@ -192,6 +192,60 @@ public final class SpiritTerrainService {
     private record WalkCandidate(Window field,WalkSupport support) {}
     /** Current visible contact only; no target attraction, q replacement or remembered-entry rebinding. */
     public static Optional<WalkSupport> currentSupport(ServerPlayerEntity p) {return walkCandidate(p).map(WalkCandidate::support);}
+    /** Semantic re-anchor that places the live contact feet at the observer: q − grid·(feet−origin)/SCALE.
+     * The coordinate of the current contact becomes exactly q, so acquisition's projected 1 mm
+     * residual is exactly zero and the guarded alignment pivots about the player instead of a
+     * drift-shifted point. */
+    public static Vec384f supportPivotSemantic(Vec384f q,Basis384f grid,Vec3d feet,Vec3d windowOrigin) {
+        Vec3d offset=feet.subtract(windowOrigin);
+        return q.clone().sub(grid.i.clone().mul((float)(offset.x/SCALE)))
+                .sub(grid.j.clone().mul((float)(offset.y/SCALE)))
+                .sub(grid.k.clone().mul((float)(offset.z/SCALE)));
+    }
+    /** Exact inverse of the deep placement at the observer: the source point currently rendered at
+     * the player. Solves [axis_i]·(feet−origin) = player − root for the producing window's affine
+     * frame; null when the grid is invisible under this observer (no contact to pivot on). */
+    public static Vec3d supportContactFeet(Vec384f windowSemantic,Vec384f q,Basis384f windowGrid,Basis384f observer,Vec3d windowOrigin) {
+        Vec384f delta=windowSemantic.clone().sub(q);
+        Vec3d translation=new Vec3d(delta.dot(observer.i)*SCALE,delta.dot(observer.j)*SCALE,delta.dot(observer.k)*SCALE);
+        Vec3d c0=axis(windowGrid.i,observer),c1=axis(windowGrid.j,observer),c2=axis(windowGrid.k,observer);
+        double det=c0.dotProduct(c1.crossProduct(c2));
+        if(Math.abs(det)<1e-9)return null;
+        Vec3d rhs=translation.multiply(-1);
+        return windowOrigin.add(c1.crossProduct(c2).dotProduct(rhs)/det,
+                c2.crossProduct(c0).dotProduct(rhs)/det,c0.crossProduct(c1).dotProduct(rhs)/det);
+    }
+    /** Deep placement helpers shared with append/origin and exercised by runtime regressions. */
+    public static Vec3d frameRoot(Vec3d playerPos,Vec384f windowSemantic,Vec384f q,Basis384f observer) {
+        Vec384f delta=windowSemantic.clone().sub(q);
+        return playerPos.add(delta.dot(observer.i)*SCALE,delta.dot(observer.j)*SCALE,delta.dot(observer.k)*SCALE);
+    }
+    public static Vec3d frameAxis(Vec384f sourceAxis,Basis384f observer) {return axis(sourceAxis,observer);}
+    public static Vec3d frameCellMin(Vec3d playerPos,Vec384f windowSemantic,Vec384f q,Basis384f observer,Basis384f windowGrid,Vec3d windowOrigin,Vec3d source) {
+        Vec3d offset=source.subtract(windowOrigin);
+        return frameRoot(playerPos,windowSemantic,q,observer)
+                .add(frameAxis(windowGrid.i,observer).multiply(offset.x))
+                .add(frameAxis(windowGrid.j,observer).multiply(offset.y))
+                .add(frameAxis(windowGrid.k,observer).multiply(offset.z));
+    }
+    /** Placement-neutral re-anchor of the walk support's producing window onto the player's live
+     * contact. Deep flight accumulates semantic drift OUTSIDE the source grid span (movement is
+     * lifted through the rotating personal basis). Left in place, that drift re-projects under
+     * every blended basis and TRANSLATES the whole visible scene during the guarded alignment,
+     * sweeping the supporting floor through the body so canAlign refuses every step and every
+     * walk request expires unrepeated. Re-anchoring is placement-neutral at the current basis
+     * (the scene does not move now) and makes the alignment a pure rotation about the contact. */
+    public static boolean anchorSupportPivot(ServerPlayerEntity p) {
+        Session s=session(p);if(s==null || s.shallow)return false;
+        var candidate=walkCandidate(p);if(candidate.isEmpty())return false;
+        Window w=candidate.get().field();
+        if(w==s.target)return false; // Captured-destination proof/landing semantics stay immutable during an approach.
+        var q=q(p);
+        Vec3d feet=supportContactFeet(w.semantic,q,w.sourceBasis,basis(p),w.origin);
+        if(feet==null)return false; // Grid invisible under this observer; no contact pivot to re-anchor onto.
+        w.semantic=supportPivotSemantic(q,w.sourceBasis,feet,w.origin);
+        return true;
+    }
     private static Optional<WalkCandidate> walkCandidate(ServerPlayerEntity p) {
         Session s=session(p);
         if(s==null || s.shallow || !MysticismEntityComponents.SPIRIT_NAVIGATION.get(p).semanticReady())return Optional.empty();
@@ -528,8 +582,7 @@ public final class SpiritTerrainService {
     private static void status(ServerPlayerEntity p,Session s,String message){if(!Objects.equals(message,s.status)){s.status=message;p.sendMessage(Text.literal(message),true);}}
     private static Vec3d origin(ServerPlayerEntity p,Session s,Window w) {
         if(w==s.local && s.shallow)return s.carrier;
-        Vec384f delta=w.semantic.clone().sub(q(p));Basis384f b=basis(p);
-        return p.getPos().add(delta.dot(b.i)*SCALE,delta.dot(b.j)*SCALE,delta.dot(b.k)*SCALE);
+        return frameRoot(p.getPos(),w.semantic,q(p),basis(p));
     }
     public static boolean canAlign(ServerPlayerEntity p,Basis384f proposed) {
         Session s=session(p);return s!=null && MeshCollision.transitionClear(s.frame,build(p,s,s.revision+1,proposed),p.getBoundingBox());
@@ -564,8 +617,8 @@ public final class SpiritTerrainService {
         if(w.compactedOwnership!=epoch)w.nodes=compact(p.getServer(),w,w.origin);
     }
     private static void append(ServerPlayerEntity p,Session s,Window w,List<TerrainMeshFrame.Material> materials,Map<TerrainMeshFrame.Material,Integer> palette,List<TerrainMeshFrame.Cell> cells,Set<Long> keys,Map<Long,Window> producers,int limit,Basis384f current) {
-        boolean aligned=w==s.local && s.shallow;Vec3d root;
-        if(aligned)root=s.carrier;else {Vec384f delta=w.semantic.clone().sub(q(p));root=p.getPos().add(delta.dot(current.i)*SCALE,delta.dot(current.j)*SCALE,delta.dot(current.k)*SCALE);}
+        boolean aligned=w==s.local && s.shallow;
+        Vec3d root=aligned?s.carrier:frameRoot(p.getPos(),w.semantic,q(p),current);
         Vec3d ax=aligned?new Vec3d(1,0,0):axis(w.sourceBasis.i,current),ay=aligned?new Vec3d(0,1,0):axis(w.sourceBasis.j,current),az=aligned?new Vec3d(0,0,1):axis(w.sourceBasis.k,current);
         int count=0;
         for(var node:w.nodes) {

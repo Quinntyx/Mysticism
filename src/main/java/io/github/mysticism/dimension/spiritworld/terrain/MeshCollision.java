@@ -177,25 +177,78 @@ public final class MeshCollision {
             for(Box collision:cell.collision())if(penetration(strict,new Shape(cell,collision,cell.bounds(collision)))!=null)return false;
         return true;
     }
-    /** Conservative continuous affine-motion guard: the union of endpoint AABBs contains EVERY intermediate
-     * vertex under linear affine interpolation. An ambiguous swept/body overlap is held, never sampled through. */
+    /** Continuous affine-motion guard. Endpoint AABBs are broad phase only: a tilted supporting
+     * floor can overlap the body's AABB while its actual collision stays entirely below the feet.
+     * Each accepted interval has a separating plane between the body and BOTH endpoint solids.
+     * Their convex hull contains every intermediate vertex under linear affine interpolation.
+     * Ambiguous intervals are subdivided, never accepted merely from clear sampled poses. */
     public static boolean transitionClear(TerrainMeshFrame old,TerrainMeshFrame next,Box body) {
         if(old==null)return true;
         Map<Long,TerrainMeshFrame.Cell> previous=new HashMap<>();for(var c:old.cells())previous.put(c.key(),c);
-        Box local=body.expand(5),strict=body.expand(-1e-5);
+        Box strict=body.expand(-1e-5);
         for(var c:next.cells()) {
             var before=previous.get(c.key());
             if(before!=null && c.min().equals(before.min()) && c.axisX().equals(before.axisX()) && c.axisY().equals(before.axisY())
                     && c.axisZ().equals(before.axisZ()) && c.collision().equals(before.collision()))continue;
-            if(!c.bounds().intersects(local) && (before==null || !before.bounds().intersects(local)))continue;
             if(before==null) {for(Box b:c.collision())if(penetration(strict,new Shape(c,b,c.bounds(b)))!=null)return false;continue;}
             if(c.collision().isEmpty())continue;
             for(Box collision:c.collision()) {
                 Box swept=c.bounds(collision).union(before.bounds(collision));
-                if(swept.intersects(strict))return false;
+                if(!swept.intersects(strict))continue;
+                Shape from=new Shape(before,collision,before.bounds(collision)),to=new Shape(c,collision,c.bounds(collision));
+                if(penetration(strict,from)!=null || penetration(strict,to)!=null)return false;
+                if(!affineSweepClear(strict,AffineSolid.of(from),AffineSolid.of(to),0,new int[]{MAX_AFFINE_INTERVALS}))return false;
             }
         }
         return true;
+    }
+    /** A local collision box expressed as a center and three world-space half edges. */
+    private record AffineSolid(Vec3d center,Vec3d x,Vec3d y,Vec3d z) {
+        static AffineSolid of(Shape shape) {
+            var c=shape.cell;var b=shape.local;
+            return new AffineSolid(c.point((b.minX+b.maxX)/2,(b.minY+b.maxY)/2,(b.minZ+b.maxZ)/2),
+                    c.axisX().multiply(b.getLengthX()/2),c.axisY().multiply(b.getLengthY()/2),c.axisZ().multiply(b.getLengthZ()/2));
+        }
+        AffineSolid midpoint(AffineSolid other) {
+            return new AffineSolid(center.add(other.center).multiply(.5),x.add(other.x).multiply(.5),
+                    y.add(other.y).multiply(.5),z.add(other.z).multiply(.5));
+        }
+        double radius(Vec3d axis) {
+            return Math.abs(x.dotProduct(axis))+Math.abs(y.dotProduct(axis))+Math.abs(z.dotProduct(axis));
+        }
+    }
+    private static final int MAX_AFFINE_INTERVALS=256,MAX_AFFINE_DEPTH=16;
+    private static final double SWEEP_CLEARANCE=1e-7;
+    private static final Vec3d[] WORLD_AXES={new Vec3d(1,0,0),new Vec3d(0,1,0),new Vec3d(0,0,1)};
+    private static boolean affineSweepClear(Box body,AffineSolid from,AffineSolid to,int depth,int[] budget) {
+        // Bound both recursion depth and total work per shape. Unproven motion still fails closed.
+        if(--budget[0]<0)return false;
+        for(Vec3d axis:WORLD_AXES)if(separatesSweep(body,from,to,axis))return true;
+        if(sweepAxesSeparate(body,from,to,from) || sweepAxesSeparate(body,from,to,to))return true;
+        if(depth>=MAX_AFFINE_DEPTH)return false;
+        AffineSolid middle=from.midpoint(to);
+        return affineSweepClear(body,from,middle,depth+1,budget) && affineSweepClear(body,middle,to,depth+1,budget);
+    }
+    private static boolean sweepAxesSeparate(Box body,AffineSolid from,AffineSolid to,AffineSolid axes) {
+        if(separatesSweep(body,from,to,axes.y.crossProduct(axes.z))
+                || separatesSweep(body,from,to,axes.z.crossProduct(axes.x))
+                || separatesSweep(body,from,to,axes.x.crossProduct(axes.y)))return true;
+        for(Vec3d world:WORLD_AXES)
+            if(separatesSweep(body,from,to,world.crossProduct(axes.x))
+                    || separatesSweep(body,from,to,world.crossProduct(axes.y))
+                    || separatesSweep(body,from,to,world.crossProduct(axes.z)))return true;
+        return false;
+    }
+    private static boolean separatesSweep(Box body,AffineSolid from,AffineSolid to,Vec3d raw) {
+        double length=raw.length();if(length<1e-9)return false;
+        Vec3d axis=raw.multiply(1/length),center=body.getCenter();
+        double radius=body.getLengthX()/2*Math.abs(axis.x)+body.getLengthY()/2*Math.abs(axis.y)+body.getLengthZ()/2*Math.abs(axis.z);
+        double a=from.center.subtract(center).dotProduct(axis),b=to.center.subtract(center).dotProduct(axis);
+        double ar=from.radius(axis),br=to.radius(axis);
+        // The SAME side/plane must separate both endpoints. Positive clearance avoids numerical
+        // acceptance of an ambiguous grazing interval; strict body shrink is the contact tolerance.
+        return a-ar>radius+SWEEP_CLEARANCE && b-br>radius+SWEEP_CLEARANCE
+                || a+ar< -radius-SWEEP_CLEARANCE && b+br< -radius-SWEEP_CLEARANCE;
     }
     private static Vec3d penetration(Box body,Shape shape) {
         var c=shape.cell;Box b=shape.local;

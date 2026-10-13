@@ -2,6 +2,43 @@
 
 Authority: `docs/spirit-world-approved-design.md`, prior bounded navigation reviews, and parent’s current support-acquisition/effective-snapshot correction. Scope: navigation, its CCA component, flight packet adapter and existing predictor only. No initializer, terrain, networking payload, renderer, resource/build configuration, foundation or dependency changes. No agents spawned; coordinated directly with the existing terrain session.
 
+## Retained walk-request acceptance repair
+
+The retained `b1d3ee7` support-pivot re-anchor and adaptive `SupportAlignment` schedule remain intact.
+Review found a second, production guard failure: a supported floor tilted only 5 degrees has a
+world AABB extending about .0175 blocks into the strict body even though its affine collision is
+clear. Every adaptive subdivision includes that old AABB, so the old `transitionClear` rejected
+all progress until the 200-tick walk deadline.
+
+`MeshCollision.transitionClear` now uses endpoint AABB union only as broad phase. For each
+ambiguous moving collision box, a fixed separating plane must separate the strict body from
+**both** endpoint affine solids. This certifies their convex hull, which contains every vertex
+throughout linear affine interpolation. If no plane certifies the interval, it is subdivided;
+clear sampled poses never grant acceptance. Work is bounded to 256 interval checks and depth 16
+per collision shape; exhaustion fails closed. Endpoint penetration still refuses a transition.
+The endpoint-only five-block locality shortcut was removed because distant endpoints can sweep
+through the player. No floor/contact whitelist, body-tolerance increase, teleport or q snap was
+introduced. Ownership, per-player projection, collision/render geometry and embeddings are unchanged.
+
+Regression coverage in the canonical main-based runtime runner:
+- `MeshTransitionClearanceTest`: positive/negative 5-degree floor tilts and slabs with real SAT
+  ground contact; full endpoint convex hull overlap requiring subdivision; safe affine side-wall
+  motion; intermediate crossing with clear endpoints and midpoint; shear, raising floors, added
+  collision and shape changes; seeded accepted-sweep clearance oracle.
+- `WalkRequestAcceptanceTest`: actual production placement/pivot/blend plus `transitionClear`
+  throughout a support alignment at ordinary and near-world-border carrier coordinates. The
+  alignment reaches source-grid/acquisition geometry before expiry while preserving ground/body
+  clearance, rather than relying solely on the older simulated increment-limit guard.
+
+Verification: canonical `./gradlew --no-daemon --console=plain build` discovers six runtime mains
+(including all four existing embedding suites), runs packaging/runner fixtures and verifies the
+remapped production jar. An isolated build-directory recompilation of the original `b1d3ee7`
+guard confirmed that both new regressions fail against it (the walking alignment stalls for all
+200 ticks); no tracked source was rolled back for that check. Live player/component state, async source ownership/proof publication,
+Minecraft launch, render feel and real model inference remain **unverified**. Very tight or complex
+clear sweeps may still fail closed at the interval-work limit; no live performance profiling was
+performed. The historical continuation below records the earlier integration work, not these tests.
+
 ## Current continuation
 
 ### Actual-support flight-off
