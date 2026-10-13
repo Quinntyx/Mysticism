@@ -45,6 +45,7 @@ public final class ShaderManager {
     private static boolean initialized, failed, fogHookSeen;
     private static boolean missingHookReported;
     private static SpiritRenderSettings.Quality quality = initialQuality();
+    private static SpiritRenderSettings.FogRange fogRange = SpiritRenderSettings.DEFAULT_FOG_RANGE;
     private static String status = "starting";
 
     private ShaderManager() {}
@@ -55,6 +56,11 @@ public final class ShaderManager {
         WorldRenderEvents.START.register(context -> {
             MinecraftClient client = MinecraftClient.getInstance();
             updateSession(client);
+            // Refresh once per world frame, including fallback/entry frames. Mesh culling and
+            // volumetrics then use exactly the same range, even after changing the option.
+            fogRange = SpiritRenderSettings.fogRange(client.options.getViewDistance().getValue());
+            // Keep the lifecycle gate: a range change, resize or reload must not carry
+            // a previous frame's depth into this frame (including early-return paths).
             frame.invalidate();
             meshDepthSeen=false;
             if (sessionWorld == null || !targetActive && effectStrength()<=.001f || failed) return;
@@ -83,10 +89,10 @@ public final class ShaderManager {
                         medium == 0 ? sceneDepth.getColorAttachment() : medium);
                 var offset=SpiritMediumTexture.offset(camera);
                 KUWAHARA_SHADER.setUniformValue("OccupancyCameraOffset",(float)offset.x,(float)offset.y,(float)offset.z);
-                KUWAHARA_SHADER.setUniformValue("NearBubble",(float)SpiritRenderSettings.NEAR_BUBBLE);
+                KUWAHARA_SHADER.setUniformValue("VisibleRadius", (float) fogRange.visibleRadius());
                 KUWAHARA_SHADER.setUniformValue("EffectStrength",effectStrength());
-                KUWAHARA_SHADER.setUniformValue("OpaqueRadius", (float) SpiritRenderSettings.OPAQUE_RADIUS);
-                KUWAHARA_SHADER.setUniformValue("MinExtinction", (float) SpiritRenderSettings.MIN_EXTINCTION);
+                KUWAHARA_SHADER.setUniformValue("OpaqueRadius", (float) fogRange.opaqueRadius());
+                KUWAHARA_SHADER.setUniformValue("HorizonOpticalDepth", (float) SpiritRenderSettings.HORIZON_OPTICAL_DEPTH);
                 KUWAHARA_SHADER.setUniformValue("FogSteps", quality.fogSteps);
                 KUWAHARA_SHADER.setUniformValue("KernelRadius", quality.kernelRadius);
                 KUWAHARA_SHADER.setUniformValue("Saturation", SpiritRenderSettings.saturation(
@@ -206,8 +212,8 @@ public final class ShaderManager {
             RenderSystem.setShaderFogEnd(Float.MAX_VALUE / 2);
         } else if (!frame.ready() || failed) {
             float s=effectStrength();
-            RenderSystem.setShaderFogStart(RenderSystem.getShaderFogStart()*(1-s)+(float)SpiritRenderSettings.HORIZONS.visible()*s);
-            RenderSystem.setShaderFogEnd(RenderSystem.getShaderFogEnd()*(1-s)+(float)SpiritRenderSettings.OPAQUE_RADIUS*s);
+            RenderSystem.setShaderFogStart(RenderSystem.getShaderFogStart()*(1-s)+(float)fogRange.visibleRadius()*s);
+            RenderSystem.setShaderFogEnd(RenderSystem.getShaderFogEnd()*(1-s)+(float)fogRange.opaqueRadius()*s);
         }
     }
 
@@ -223,6 +229,9 @@ public final class ShaderManager {
     }
 
     public static String status() { return status; }
+
+    /** Current world-frame presentation range, shared by mesh culling and fallback fog. */
+    public static SpiritRenderSettings.FogRange fogRange() { return fogRange; }
 
     private static void updateSession(MinecraftClient client) {
         ClientSpiritCache.syncObserver(client);

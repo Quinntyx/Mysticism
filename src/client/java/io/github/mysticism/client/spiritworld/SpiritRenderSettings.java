@@ -1,15 +1,41 @@
 package io.github.mysticism.client.spiritworld;
 
-import io.github.mysticism.landmark.FogHorizons;
-
-/** Client contract in blocks; parent/terrain must load beyond the opaque horizon. */
+/** Client presentation distances, not terrain-readiness or collision guarantees. */
 public final class SpiritRenderSettings {
-    public static final double OPAQUE_RADIUS = 64.0;
-    public static final double MIN_LOADING_RADIUS = 80.0;
     public static final double MAX_TRANSMITTANCE = 0.001;
-    public static final double NEAR_BUBBLE = 5.0;
-    public static final double MIN_EXTINCTION = -Math.log(MAX_TRANSMITTANCE) / (OPAQUE_RADIUS - NEAR_BUBBLE);
-    public static final FogHorizons HORIZONS = new FogHorizons(40, OPAQUE_RADIUS, MIN_LOADING_RADIUS);
+    public static final double HORIZON_OPTICAL_DEPTH = -Math.log(MAX_TRANSMITTANCE);
+    public static final FogRange DEFAULT_FOG_RANGE = fogRange(12);
+
+    /** Follow the client render option, NOT the extent of the currently published mesh.
+     * Shrinking to a sparse mesh would disguise missing source generation with opaque fog. */
+    public static FogRange fogRange(int renderDistanceChunks) {
+        double radius = Math.max(2, Math.min(32, renderDistanceChunks)) * 16.0;
+        return new FogRange(radius * 0.5, radius);
+    }
+
+    /** Clear foreground followed by a smooth quadratic extinction ramp. At 75% of the
+     * render radius even the densest unoccupied medium retains >=27% scene transmission.
+     * The cubic integral is exact per segment, so even LOW quality reaches the same horizon. */
+    public record FogRange(double visibleRadius, double opaqueRadius) {
+        public FogRange {
+            if (!Double.isFinite(visibleRadius) || !Double.isFinite(opaqueRadius)
+                    || visibleRadius < 0 || visibleRadius >= opaqueRadius)
+                throw new IllegalArgumentException("fog range");
+        }
+        public boolean containsDistanceSquared(double distanceSquared) {
+            return Double.isFinite(distanceSquared) && distanceSquared >= 0
+                    && distanceSquared <= opaqueRadius * opaqueRadius;
+        }
+        /** CPU equivalent of the shader's exact ramp integral; no noise/occupancy multiplier. */
+        public double opticalDepth(double start, double end) {
+            if (!Double.isFinite(start) || !Double.isFinite(end) || start < 0 || end < start)
+                throw new IllegalArgumentException("fog segment");
+            double span = opaqueRadius - visibleRadius;
+            double a = Math.max(0, Math.min(1, (start - visibleRadius) / span));
+            double b = Math.max(0, Math.min(1, (end - visibleRadius) / span));
+            return HORIZON_OPTICAL_DEPTH * (b * b * b - a * a * a);
+        }
+    }
     public static final double SATURATION_FADE_SECONDS = 2.5;
     public static final double DENSITY_PERIOD = 4096.0;
     public static final int MAX_GLYPHS = 128;

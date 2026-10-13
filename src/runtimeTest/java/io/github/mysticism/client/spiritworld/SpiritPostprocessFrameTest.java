@@ -56,6 +56,20 @@ public final class SpiritPostprocessFrameTest {
             check(gate.captureDepth(resized) && gate.consume(resized), "Resize/reload recovery " + i);
         }
         check(!gate.ready(), "No stale readiness after render");
+        // Exercise the retained units together: option changes must widen presentation
+        // independently of surface lifecycle, while reload/resize still reject old depth.
+        for (int chunks : new int[]{8, 12, 16, 32, 8}) {
+            var range = SpiritRenderSettings.fogRange(chunks);
+            gate.prepare(initial);
+            gate.captureDepth(initial);
+            gate.invalidate(); // resource reload with identical GL names
+            check(!gate.consume(initial), "Option " + chunks + ": reload cannot reuse old depth");
+            var resized = surface(main, 800 + chunks, 600 + chunks, 20, 21, 22);
+            gate.prepare(resized);
+            check(range.containsDistanceSquared(Math.pow(chunks * 12.0, 2)), "Option " + chunks + ": useful distant terrain remains drawable during resize");
+            check(gate.captureDepth(resized) && gate.consume(resized), "Option " + chunks + ": fresh resized depth recovers");
+            check(!gate.consume(resized), "Option " + chunks + ": fresh depth remains one-shot");
+        }
         try {
             gate.prepare(surface(null, 1280, 720, 1, 2, 3));
             throw new AssertionError("Invalid surface accepted");
