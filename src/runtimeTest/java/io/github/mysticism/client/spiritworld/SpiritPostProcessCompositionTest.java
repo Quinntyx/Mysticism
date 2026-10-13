@@ -90,19 +90,19 @@ public final class SpiritPostProcessCompositionTest {
                 JsonObject value = uniform.getAsJsonObject();
                 uniforms.add(value.get("name").getAsString(), value);
             }
-            matcher = Pattern.compile("uniform\\s+(mat4|vec3|float|int)\\s+(\\w+)\\s*;").matcher(source);
+            matcher = Pattern.compile("uniform\\s+(mat4|vec3|vec4|float|int)\\s+(\\w+)\\s*;").matcher(source);
             while (matcher.find()) {
                 String type = matcher.group(1), variable = matcher.group(2);
                 check(uniforms.has(variable), "live uniform described: " + variable);
                 JsonObject value = uniforms.getAsJsonObject(variable);
-                int count = switch (type) { case "mat4" -> 16; case "vec3" -> 3; default -> 1; };
+                int count = switch (type) { case "mat4" -> 16; case "vec3" -> 3; case "vec4" -> 4; default -> 1; };
                 String jsonType = switch (type) { case "mat4" -> "matrix4x4"; case "int" -> "int"; default -> "float"; };
                 check(value.get("count").getAsInt() == count && value.get("type").getAsString().equals(jsonType),
                         "shader/descriptor uniform type agreement");
                 check(value.getAsJsonArray("values").size() == count, "complete default uniform values");
             }
-            if (program.equals("kuwahara") || program.equals("spirit_fog"))
-                check(samplers.contains("DepthSampler"), "both stages consume ORIGINAL scene depth");
+            if (program.equals("kuwahara") || program.equals("spirit_fog") || program.equals("spirit_transition"))
+                check(samplers.contains("DepthSampler"), "painting, volume and live-source fog consume ORIGINAL scene depth");
         }
         String fog = resource("program/spirit_fog.fsh");
         check(fog.contains("span * t * t * t * (2.0 - t)"), "CPU reference matches normalized radial integral");

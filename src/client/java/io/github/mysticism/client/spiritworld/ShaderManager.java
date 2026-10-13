@@ -8,6 +8,7 @@ import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gl.Framebuffer;
 import net.minecraft.client.gl.SimpleFramebuffer;
+import net.minecraft.client.render.FogShape;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
@@ -38,6 +39,7 @@ public final class ShaderManager {
     private static float transitionFrom;
     private static boolean initialized, failed, frameReady, depthReady, fogHookSeen;
     private static boolean missingHookReported;
+    private static SpiritSourceFog sourceFog;
     private static SpiritRenderSettings.Quality quality = initialQuality();
     private static String status = "starting";
 
@@ -51,7 +53,8 @@ public final class ShaderManager {
             updateSession(client);
             frameReady = false;
             depthReady = false;
-            fogHookSeen = false; // each prepared world frame must actually bypass analytic fog
+            fogHookSeen = false; // each prepared world frame must actually bypass analytic terrain fog
+            sourceFog = null;
             meshDepthSeen=false;
             if (sessionWorld == null || !targetActive && effectStrength()<=.001f || failed) return;
             try {
@@ -119,7 +122,7 @@ public final class ShaderManager {
             if (!frameReady || !depthReady || sessionWorld == null) return;
             frameReady = false;
             depthReady = false; // consume the world frame once; never process menus/stale frames
-            if (!fogHookSeen) {
+            if (!fogHookSeen || sourceFog == null) {
                 status = "fallback: parent must register SpiritBackgroundRendererMixin";
                 if (!missingHookReported) {
                     missingHookReported = true;
@@ -138,7 +141,13 @@ public final class ShaderManager {
                 GL30.glBlitFramebuffer(0,0,main.textureWidth,main.textureHeight,0,0,sceneDepth.textureWidth,sceneDepth.textureHeight,
                         GL11.GL_COLOR_BUFFER_BIT,GL11.GL_NEAREST);
                 main.beginWrite(false);
-                KUWAHARA_SHADER.setSamplerUniform("OriginalSampler",SpiritEntryScene.original(client,sceneDepth.getColorAttachment()));
+                var original = SpiritEntryScene.original(client,sceneDepth.getColorAttachment());
+                KUWAHARA_SHADER.setSamplerUniform("OriginalSampler",original.texture());
+                KUWAHARA_SHADER.setUniformValue("RestoreSourceFog",original.restoreSourceFog()?1:0);
+                KUWAHARA_SHADER.setUniformValue("SourceFogStart",sourceFog.start());
+                KUWAHARA_SHADER.setUniformValue("SourceFogEnd",sourceFog.end());
+                KUWAHARA_SHADER.setUniformValue("SourceFogShape",sourceFog.shape());
+                KUWAHARA_SHADER.setUniformValue("SourceFogColor",sourceFog.red(),sourceFog.green(),sourceFog.blue(),sourceFog.alpha());
                 KUWAHARA_SHADER.setSamplerUniform("DepthSampler", sceneDepth.getDepthAttachment());
                 KUWAHARA_SHADER.render(context.tickCounter().getTickDelta(false));
                 checkGl("executing postprocess");
@@ -187,14 +196,19 @@ public final class ShaderManager {
     }
 
     /** Called only from the requested client mixin. Fallback retains vanilla terrain depth/occlusion. */
-    public static void applySpiritFog() {
+    public static void applySpiritFog(boolean terrainFog) {
         if (!inSpiritWorld()) return;
-        fogHookSeen = true;
+        if (terrainFog) fogHookSeen = true;
         if(effectStrength()<=.001f)return;
-        // The transformed branch needs unfogged terrain even DURING the crossfade; otherwise
-        // it receives analytic + volumetric fog. OriginalSampler already holds the source scene
-        // with its original fog. Transition mixes that snapshot with the completed effect once.
+        // Keep the vanilla sky backdrop (no terrain depth to reconstruct it). Only terrain
+        // is bypassed. The final transition restores these parameters on LIVE original color,
+        // including cache-inactive exit; captured entry color already contains source fog.
+        // Kuwahara and the volumetric branch continue to consume unfogged terrain.
         if (SpiritRenderSettings.useVolumetricFog(frameReady, failed, effectStrength())) {
+            if (!terrainFog) return;
+            float[] color=RenderSystem.getShaderFogColor();
+            sourceFog=new SpiritSourceFog(RenderSystem.getShaderFogStart(),RenderSystem.getShaderFogEnd(),
+                    RenderSystem.getShaderFogShape()==FogShape.SPHERE?0:1,color[0],color[1],color[2],color[3]);
             RenderSystem.setShaderFogStart(Float.MAX_VALUE / 4);
             RenderSystem.setShaderFogEnd(Float.MAX_VALUE / 2);
         } else if (!frameReady || failed) {
@@ -282,6 +296,7 @@ public final class ShaderManager {
         frameReady = false;
         depthReady = false;
         fogHookSeen = false;
+        sourceFog = null;
         SpiritMediumTexture.resetGpu();
         SpiritRenderLayers.clear();
         if (sceneDepth != null) {
