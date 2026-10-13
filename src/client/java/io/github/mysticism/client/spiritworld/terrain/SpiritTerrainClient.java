@@ -29,6 +29,7 @@ public final class SpiritTerrainClient {
     private static boolean initialized,dirty;
     private static String failure;
     private static final List<Batch> gpu=new ArrayList<>();
+    private static List<SpiritMediumField.Surface> visibleSurfaces=List.of();
     private record Group(int x,int y,int z) {}
     private record Batch(VertexBuffer buffer,Box bounds) {}
     public static void init() {
@@ -53,10 +54,11 @@ public final class SpiritTerrainClient {
     public static Optional<String> failure(){return Optional.ofNullable(failure);}
     public static void clear(){MeshCollision.clearClient();frame=null;dirty=false;failure=null;closeBuffers();clearMedium();}
     private static void clearMedium(){mediumField.clear();ShaderManager.clearMediumSamples();}
-    private static void closeBuffers(){for(Batch b:gpu)b.buffer.close();gpu.clear();}
+    private static void closeBuffers(){for(Batch b:gpu)b.buffer.close();gpu.clear();visibleSurfaces=List.of();}
     private static void upload(MinecraftClient client) {
         closeBuffers();if(frame==null)return;
         var models=client.getBlockRenderManager();List<BlockState> palette=frame.materials().stream().map(TerrainMaterials::resolve).toList();
+        List<SpiritMediumField.Surface> surfaces=new ArrayList<>();
         Map<Group,List<TerrainMeshFrame.Cell>> groups=new LinkedHashMap<>();
         Vec3d anchor=frame.carrierOrigin();
         for(var cell:frame.cells()) {
@@ -71,23 +73,27 @@ public final class SpiritTerrainClient {
             BufferAllocator allocator=new BufferAllocator(65536);
             try {
                 BufferBuilder builder=new BufferBuilder(allocator,LAYER.getDrawMode(),LAYER.getVertexFormat());
-                Box bounds=null;
+                TerrainVertexConsumer.Bounds emitted=new TerrainVertexConsumer.Bounds();
                 for(var cell:cells) {
-                    Box b=cell.bounds();bounds=bounds==null?b:bounds.union(b);
                     BlockState state=palette.get(cell.material());
-                    VertexConsumer consumer=new AlphaConsumer(builder,cell.opacity());
+                    TerrainVertexConsumer.Bounds modelBounds=new TerrainVertexConsumer.Bounds();
+                    VertexConsumer consumer=new TerrainVertexConsumer(builder,cell.opacity(),modelBounds);
                     if(state.getRenderType()==BlockRenderType.MODEL)drawModel(models,state,cell,anchor,consumer,null);
                     else for(Box shape:cell.collision())drawModel(models,Blocks.STONE.getDefaultState(),cell,anchor,consumer,shape);
+                    if(!modelBounds.empty()) {
+                        emitted.include(modelBounds);
+                        surfaces.add(new SpiritMediumField.Surface(modelBounds.world(anchor),cell.opacity()));
+                    }
                 }
                 BuiltBuffer built=builder.endNullable();
                 if(built==null)continue;
                 VertexBuffer vbo=new VertexBuffer(VertexBuffer.Usage.DYNAMIC);
-                try {vbo.bind();vbo.upload(built);gpu.add(new Batch(vbo,bounds));}
+                try {vbo.bind();vbo.upload(built);gpu.add(new Batch(vbo,emitted.world(anchor)));}
                 catch(RuntimeException failure){vbo.close();throw failure;}
                 finally{VertexBuffer.unbind();} // upload owns/closes BuiltBuffer in Yarn 1.21.1
             } finally{allocator.close();}
         }
-        dirty=false;
+        visibleSurfaces=List.copyOf(surfaces);dirty=false;
     }
     private static void drawModel(net.minecraft.client.render.block.BlockRenderManager models,BlockState state,TerrainMeshFrame.Cell c,Vec3d anchor,VertexConsumer consumer,Box primitive) {
         Vec3d min=c.min().subtract(anchor),x=c.axisX(),y=c.axisY(),z=c.axisZ();
@@ -109,7 +115,7 @@ public final class SpiritTerrainClient {
             if(dirty)upload(client);
             Vec3d camera=context.camera().getPos();Vec3d offset=frame.carrierOrigin().subtract(camera);
             if(gpu.isEmpty())clearMedium();
-            else mediumField.update(frame,camera).ifPresent(samples->ShaderManager.setMediumSamples(samples.occupancy(),samples.center()));
+            else mediumField.update(frame,camera,visibleSurfaces).ifPresent(samples->ShaderManager.setMediumSamples(samples.occupancy(),samples.center()));
             Matrix4f view=new Matrix4f(context.positionMatrix()).translate((float)offset.x,(float)offset.y,(float)offset.z);
             client.getFramebuffer().beginWrite(false);RenderSystem.enableDepthTest();RenderSystem.depthMask(true);
             LAYER.startDrawing();
@@ -129,12 +135,4 @@ public final class SpiritTerrainClient {
         }
     }
     private static double distanceSquared(Box b,Vec3d p){double x=Math.max(Math.max(b.minX-p.x,0),p.x-b.maxX),y=Math.max(Math.max(b.minY-p.y,0),p.y-b.maxY),z=Math.max(Math.max(b.minZ-p.z,0),p.z-b.maxZ);return x*x+y*y+z*z;}
-    private record AlphaConsumer(VertexConsumer delegate,float alpha) implements VertexConsumer {
-        @Override public VertexConsumer vertex(float x,float y,float z){delegate.vertex(x,y,z);return this;}
-        @Override public VertexConsumer color(int r,int g,int b,int a){delegate.color(r,g,b,Math.round(a*alpha));return this;}
-        @Override public VertexConsumer texture(float u,float v){delegate.texture(u,v);return this;}
-        @Override public VertexConsumer overlay(int u,int v){delegate.overlay(u,v);return this;}
-        @Override public VertexConsumer light(int u,int v){delegate.light(u,v);return this;}
-        @Override public VertexConsumer normal(float x,float y,float z){delegate.normal(x,y,z);return this;}
-    }
 }

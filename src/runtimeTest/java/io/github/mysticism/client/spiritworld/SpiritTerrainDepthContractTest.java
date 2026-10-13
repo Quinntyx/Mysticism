@@ -46,8 +46,12 @@ public final class SpiritTerrainDepthContractTest {
         check(!accept.contains("setMediumSamples") && !accept.contains("getEyePos"),
                 "network acceptance cannot pin density to a stale eye position");
         String render = between(terrain, "private static void render(", "private static double distanceSquared");
-        check(render.contains("mediumField.update(frame,camera)") && render.contains("samples.occupancy(),samples.center()"),
-                "world render refreshes current frame/camera without requiring a packet");
+        check(render.contains("mediumField.update(frame,camera,visibleSurfaces)") && render.contains("samples.occupancy(),samples.center()"),
+                "world render refreshes uploaded model geometry/current camera without requiring a packet");
+        String upload = between(terrain, "private static void upload(", "private static void drawModel(");
+        check(upload.contains("modelBounds.world(anchor),cell.opacity()") && upload.contains("if(!modelBounds.empty())")
+                        && upload.indexOf("visibleSurfaces=List.copyOf(surfaces)") > upload.indexOf("vbo.upload(built)"),
+                "only successful nonempty model uploads publish measured density bounds");
         check(render.contains("client.getFramebuffer().beginWrite(false)") && render.contains("RenderSystem.depthMask(true)"),
                 "custom terrain targets real MAIN depth");
         check(render.indexOf("b.buffer.draw(") < render.indexOf("if(drewMesh)ShaderManager.afterMeshDepth()"),

@@ -43,6 +43,10 @@ public record TerrainMeshFrame(long revision, boolean shallow, String sourceDime
                     || axisX.length()>128 || axisY.length()>128 || axisZ.length()>128
                     || !Float.isFinite(opacity) || opacity<0 || opacity>1)
                 throw new IllegalArgumentException("mesh cell");
+            double volume=axisX.dotProduct(axisY.crossProduct(axisZ));
+            double scale=axisX.length()*axisY.length()*axisZ.length();
+            if(scale==0 || Math.abs(volume)<=1e-12*scale)
+                throw new IllegalArgumentException("collapsed mesh axes");
             collision=List.copyOf(collision);
             if(collision.size()>MAX_SHAPES)throw new IllegalArgumentException("shape budget");
             for(Box b:collision) {
@@ -65,7 +69,14 @@ public record TerrainMeshFrame(long revision, boolean shallow, String sourceDime
                     base.x+Math.max(0,xx)+Math.max(0,yx)+Math.max(0,zx),
                     base.y+Math.max(0,xy)+Math.max(0,yy)+Math.max(0,zy),base.z+Math.max(0,xz)+Math.max(0,yz)+Math.max(0,zz));
         }
+        /** Unit-model projection bounds. Actual baked-model bounds are measured by the renderer. */
         public Box bounds() { return bounds(new Box(0,0,0,1,1,1)); }
+        /** Conservative body/transition broadphase, including source shapes outside the unit model. */
+        public Box geometryBounds() {
+            Box result=bounds();
+            for(Box shape:collision)result=result.union(bounds(shape));
+            return result;
+        }
     }
     private static void finite(Vec3d p) {
         if(p==null || !Double.isFinite(p.x) || !Double.isFinite(p.y) || !Double.isFinite(p.z)

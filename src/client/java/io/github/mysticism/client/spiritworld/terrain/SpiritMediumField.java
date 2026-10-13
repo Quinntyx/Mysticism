@@ -6,13 +6,15 @@ import net.minecraft.util.math.Vec3d;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
 /**
  * Camera-local, coarse density hints from the CURRENT observer mesh, never source-world scans.
  * This is not collision or surface depth: the rasterized MAIN depth remains the exact fog endpoint.
- * Bounds conservatively include non-collidable baked models (leaves, plants, etc.).
+ * Rendering supplies bounds of uploaded vertices, including non-collidable and extended models.
+ * The frame-only path uses conservative projection/shape bounds for non-render callers.
  */
 public final class SpiritMediumField {
     public static final int GRID = 16, VOXEL_SIZE = 8, SAMPLES = GRID * GRID * GRID;
@@ -20,6 +22,15 @@ public final class SpiritMediumField {
     private static final double RECENTER_DISTANCE_SQUARED = VOXEL_SIZE * VOXEL_SIZE / 4.0;
     private TerrainMeshFrame sampledFrame;
     private Vec3d sampledCenter;
+    private List<Surface> sampledSurfaces;
+
+    /** Immutable per-model bounds measured while uploading this frame, not source proxy blocks. */
+    record Surface(Box bounds, float opacity) {
+        Surface {
+            Objects.requireNonNull(bounds);
+            if(!Float.isFinite(opacity) || opacity<0 || opacity>1)throw new IllegalArgumentException("surface opacity");
+        }
+    }
 
     public record Samples(float[] occupancy, Vec3d center) {
         public Samples { occupancy = occupancy.clone(); }
@@ -31,29 +42,43 @@ public final class SpiritMediumField {
      * Recenter even without another network packet; rebuild immediately on any accepted mesh change.
      */
     public Optional<Samples> update(TerrainMeshFrame frame, Vec3d camera) {
+        return updateBounds(frame,camera,null);
+    }
+
+    /** Renderer passes its immutable list only after every VBO upload succeeded. */
+    Optional<Samples> update(TerrainMeshFrame frame, Vec3d camera, List<Surface> surfaces) {
+        return updateBounds(frame,camera,Objects.requireNonNull(surfaces));
+    }
+
+    private Optional<Samples> updateBounds(TerrainMeshFrame frame, Vec3d camera, List<Surface> surfaces) {
         Objects.requireNonNull(frame, "mesh frame");
         if (camera == null || !Double.isFinite(camera.x) || !Double.isFinite(camera.y)
                 || !Double.isFinite(camera.z)) throw new IllegalArgumentException("Invalid medium camera");
-        if (sampledFrame == frame && sampledCenter.squaredDistanceTo(camera) < RECENTER_DISTANCE_SQUARED)
+        if (sampledFrame == frame && sampledSurfaces == surfaces
+                && sampledCenter.squaredDistanceTo(camera) < RECENTER_DISTANCE_SQUARED)
             return Optional.empty();
-        float[] occupancy = rasterize(frame, camera);
+        float[] occupancy = rasterize(frame, camera, surfaces);
         sampledFrame = frame;
         sampledCenter = camera;
+        sampledSurfaces = surfaces;
         return Optional.of(new Samples(occupancy, camera));
     }
 
-    public void clear() { sampledFrame = null; sampledCenter = null; }
+    public void clear() { sampledFrame = null; sampledCenter = null; sampledSurfaces = null; }
 
     private record Region(Box bounds, float density) {}
 
-    private static float[] rasterize(TerrainMeshFrame frame, Vec3d center) {
+    private static float[] rasterize(TerrainMeshFrame frame, Vec3d center, List<Surface> surfaces) {
         float[] result = new float[SAMPLES];
         Box volume = new Box(center.x - HALF_EXTENT, center.y - HALF_EXTENT, center.z - HALF_EXTENT,
                 center.x + HALF_EXTENT, center.y + HALF_EXTENT, center.z + HALF_EXTENT);
         var regions = new ArrayList<Region>();
-        for (var cell : frame.cells()) {
+        if(surfaces!=null) {
+            for(var surface:surfaces)if(surface.opacity()>0 && surface.bounds().intersects(volume))
+                regions.add(new Region(surface.bounds(),.5f*surface.opacity()));
+        } else for (var cell : frame.cells()) {
             if (cell.opacity() <= 0) continue;
-            Box bounds = cell.bounds();
+            Box bounds = cell.geometryBounds();
             if (bounds.intersects(volume)) regions.add(new Region(bounds, .5f * cell.opacity()));
         }
         // Highest density claims each voxel first. A 16-bit X mask per Y/Z row prevents

@@ -179,6 +179,8 @@ public final class MeshCollision {
             if(before!=null && before.opacity()<=0)before=null;
             if(before!=null && c.min().equals(before.min()) && c.axisX().equals(before.axisX()) && c.axisY().equals(before.axisY())
                     && c.axisZ().equals(before.axisZ()) && c.collision().equals(before.collision()))continue;
+            // Do not gate on endpoint model bounds: even distant endpoints can sweep through
+            // the body, and source collision shapes can extend outside the unit baked model.
             if(before==null) {for(Box b:c.collision()) {
                 Box bounds=c.bounds(b);
                 if(bounds.intersects(strict) && penetration(strict,new Shape(c,b,bounds))!=null)return false;
