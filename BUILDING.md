@@ -5,7 +5,9 @@
 - Minecraft **1.21.1**, Yarn **1.21.1+build.1**, Java **21**.
 - Gradle **8.13** and released Fabric Loom **1.10.5** (not a snapshot).
 - Use an already installed JDK/Gradle. This checkout does not install software or
-  download embedding model weights. Gradle may resolve ordinary build dependencies.
+  download embedding model weights during build. Gradle may resolve ordinary build dependencies.
+  Normal Minecraft inference now runs in-process; see [the embedding runtime contract](docs/nomic-embedding-contract.md)
+  for first-use pinned weight provisioning and offline launch options.
 - Common code is in `src/main`; client-only code is in `src/client`. Keep client
   classes out of common initializers so dedicated servers can load the mod.
 
@@ -29,19 +31,10 @@ regenerate wrapper tooling using installed Gradle without fetching a distributio
   --gradle-distribution-sha256-sum 20f1b1176237254a6fc204d8434196fa11a4cfb387567519c61556e8710aed78
 ```
 
-Long-running commands in the assigned development environment must run in a
-visible tmux pane. Example (use the printed pane ID for send/capture):
-
-```sh
-tmux new-window -n mysticism-build -P -F '#{pane_id}' 'bash --noprofile --norc'
-# In that pane, from this checkout:
-"$GRADLE" --no-daemon --console=plain build
-rc=$?
-printf 'BUILD_EXIT=%s\n' "$rc"
-tmux wait-for -S mysticism-build-done
-# Elsewhere: tmux wait-for mysticism-build-done
-# Then: tmux capture-pane -p -t <pane-id> -S -3000
-```
+Long-running commands in the assigned development environment use the
+`tmux-jobs` skill's `bin/tmux-jobs`, original session/pane, actual argv, bounded
+`wait`, and retained pane/run token. Do not launch them with send-keys or wait-for
+completion channels. The canonical check is `./gradlew --no-daemon --console=plain build`.
 
 ## Tests: no additional framework dependencies
 
@@ -61,17 +54,24 @@ javac --release 21 -d build/build-selftest scripts/selftest/*.java
 java -ea -cp build/build-selftest io.github.mysticism.build.PackagingSelfTest
 ```
 
-**Feature-agent integration contract:** place Java checks in `src/test/java`, with
-class names ending in `Test` (including `SelfTest`) and a
-`public static void main(String[] args)` method. `selfTest` discovers top-level
-classes from the compiled test output, executes them in sorted fully qualified
-name order, and propagates exceptions/`AssertionError` as a failed Gradle task.
-Assertions are explicitly enabled and checked. Do not add JUnit dependencies.
-Test compilation/runtime includes common and client outputs plus their existing
-runtime dependencies. `check`, `test` and `build` run `selfTest` and
-`buildSelfTest`; the framework-based Gradle `Test` action is disabled. An empty
-feature-test set is explicitly reported, not presented as tested functionality.
-Tests must not call live embedding services, download weights, or bootstrap a game.
+**Current integration contract:** put main-based suites in `src/runtimeTest/java`
+(or the retained `src/test/java/io/github/mysticism/embedding` root), with class
+names ending in `Test` (including `SelfTest`) and a
+`public static void main(String[] args)` method. `runtimeSelfTest` discovers
+top-level classes, executes them in sorted fully qualified name order, and
+propagates exceptions/`AssertionError` as a failed Gradle task. Assertions are
+explicitly enabled and checked. Do not add JUnit dependencies. Common/client
+outputs and runtime dependencies are included. `check` and `build` run
+`runtimeSelfTest` and `buildSelfTest`; the framework-based `test` action is
+disabled. Historical shared-frame tests outside these roots are not current
+suites. Ordinary tests must not call live embedding services, download weights,
+or bootstrap a game. The separate opt-in `embeddedInferenceProbe` task tests
+actual native v2 forward passes; see the embedding runtime contract. JNI ABI and
+platform preflight tests do not access weights. `EmbeddedPackagedRuntimeTest`
+also runs the bundled CPU bootstrap in a fresh JVM from the real remapped jar
+and its extracted nested dependencies, without the Gradle dependency classpath.
+For supported desktops, native dependencies and actionable IntelliJ VM options,
+see [embedded desktop runtime](docs/embedded-desktop-runtime.md).
 
 ## Production artifact
 
@@ -83,8 +83,9 @@ build/libs/mysticism-1.0-SNAPSHOT.jar
 
 The name follows `archives_base_name` and `mod_version` in `gradle.properties`.
 Do **not** distribute the `-dev.jar` (Yarn/named) or `-sources.jar`. Common and
-client outputs belong to the same Loom mod and are remapped together. CCA, Satin
-are included using Fabric Jar-in-Jar metadata, not a conflicting Shadow jar.
+client outputs belong to the same Loom mod and are remapped together. CCA, Satin,
+llama JNI, Jackson and JSpecify are included using Fabric Jar-in-Jar metadata,
+not a conflicting Shadow jar. Minecraft supplies SLF4J; it is not nested again.
 Dependency service descriptors remain intact inside their own jars. The unused
 JVector declaration was removed: all current searches use `SimpleKnnIndex`, and
 no common/client source imports JVector. This also avoids shipping its optional
@@ -93,15 +94,24 @@ Fabric API and Fabric Loader are installed separately by the modpack/runtime.
 
 The artifact verifier checks entrypoint and mixin resources, localization at
 `assets/mysticism/lang/en_us.json`, expanded version, MIT license packaging,
-Java 21 bytecode and intermediary Minecraft class references. No icon is declared
-until an actual icon is supplied. Finder metadata and DJL/PyTorch/tokenizer
-runtimes must not enter the production artifact. Artifact checks are static;
-they do not substitute for a dedicated-server/client launch, GUI-scale/reload
+Java 21 bytecode and intermediary Minecraft class references. It also requires
+the pinned llama JNI jar, supported native resource payloads and transitive Java
+libraries registered in metadata; missing payloads/dependencies, weight bundles,
+and duplicate logging jars are rejected. No icon is declared until an actual
+icon is supplied. Finder metadata and legacy DJL/PyTorch/tokenizers runtimes must
+not enter the production artifact. The verifier's checks are static; isolated
+packaged JNI execution additionally checks bundled bootstrap on the current host.
+Neither substitutes for a dedicated-server/client launch, GUI-scale/reload
 checks, or an embedding-service integration test.
 
-## Branch integration status
+## Historical build-portability branch validation (not current runtime status)
 
-This build intentionally has no DJL dependencies or local/native model runtime.
+The following records earlier branch work. Current source compiles without DJL,
+uses in-process JNI embeddings by default, and runs discovered runtime suites;
+the old unresolved-DJL blocker and external-server prerequisite do not describe
+this retained runtime unit.
+
+That earlier build intentionally had no DJL dependencies or local/native model runtime.
 The original source still imports DJL in `EmbeddingService`, `EmbeddingCommand`,
 `KnnIndex`, `SimpleKnnIndex` and `ItemEmbeddingIndexState`. Until the separately
 owned JDK HTTP embedding migration removes those imports, full compilation is
