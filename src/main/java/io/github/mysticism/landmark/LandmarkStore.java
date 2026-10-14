@@ -192,12 +192,19 @@ public final class LandmarkStore extends PersistentState {
     public GeometryRead beginGeometryRead(String id) {return beginGeometryRead(id,null);}
     /** Bounds-gated cold geometry traversal: skip unrelated page leaves, one header per operation. */
     public GeometryRead beginGeometryRead(String id,Bounds range) {return beginGeometryRead(id,range,0);}
-    /** Resume only at a completed/skipped page boundary against the caller's immutable key list. */
+    /** Resume only at a completed/skipped page boundary against the current immutable key list. */
     public GeometryRead beginGeometryRead(String id,Bounds range,int nextPageIndex) {
+        checkThread();
+        return resumeGeometryRead(metadata(id).orElseThrow(()->new IllegalStateException("missing landmark")),range,nextPageIndex);
+    }
+    /** Continue a captured committed page list without rebasing its index onto newer keys.
+     * Old page versions are immutable and retained. Refresh scans may use them only to emit
+     * source-observation hints; authoritative consumers still MUST check isCurrent(). This
+     * package-private path never acknowledges a partially decoded page as completed. */
+    GeometryRead resumeGeometryRead(LandmarkMetadata snapshot,Bounds range,int nextPageIndex) {
         checkThread(); if(activeRead!=null) throw new IllegalStateException("another geometry read is active");
-        LandmarkMetadata value=metadata(id).orElseThrow(()->new IllegalStateException("missing landmark"));
-        if(nextPageIndex<0 || nextPageIndex>value.geometryKeys().size()) throw new IllegalArgumentException("geometry page cursor");
-        activeRead=new GeometryRead(value,range,nextPageIndex); return activeRead;
+        if(nextPageIndex<0 || nextPageIndex>snapshot.geometryKeys().size()) throw new IllegalArgumentException("geometry page cursor");
+        activeRead=new GeometryRead(snapshot,range,nextPageIndex); return activeRead;
     }
     /** One active read; batches hold <=8 pages. Drain before advancing. Budgets count cache hits too. */
     public final class GeometryRead {

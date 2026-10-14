@@ -298,8 +298,86 @@ public final class DiscoveryInvalidationTest {
         var exact=SourceLandmarks.prepare(new SourceLandmarks.Region(DIM,Bounds.cube(0,0,0,8),List.of(cell(0,0,0,STONE,false),cell(1,0,0,AIR,false)),false),List.of(),BlockPos.ORIGIN,null,false,0,63,Map.of());
         check(exact.kind()==Landmark.Kind.BIOME&&!exact.revisit(),"exact captured callers do not substitute a skipped cave destination");
     }
+    private static Landmark refreshFixture(LandmarkStore store,Map<String,Landmark> live,List<SourceLandmarks.Cell> rows,BlockPos point,long time){
+        var bounds=new Bounds(point.getX()-12L,point.getY()-12L,point.getZ()-12L,point.getX()+13L,point.getY()+13L,point.getZ()+13L);
+        var local=rows.stream().filter(c->bounds.contains(c.position().x(),c.position().y(),c.position().z())).toList();
+        var prepared=SourceLandmarks.prepare(new SourceLandmarks.Region(DIM,bounds,local,false),List.copyOf(live.values()),point,null,false,time,63,Map.of(),true);
+        check(prepared!=null,"interleaved Ensure prepares actual generated evidence");
+        var old=prepared.prior()==null?null:store.metadata(prepared.prior().id()).orElseThrow().header();
+        var published=SourceLandmarks.publication(prepared,DIM,embedding(),old,time);put(store,published,old==null?-1:old.revision());live.put(published.id(),published);return published;
+    }
+    private static void publicationBackpressureProgress() throws Exception {
+        // Production capacity, not a tiny stand-in: one landmark alone has more pages than
+        // the entire hint queue. Every pressure drain publishes a real Ensure refresh.
+        for(boolean changeTerrain:List.of(false,true)) {
+            var disk=disk();var store=disk.store;int pageCount=130,length=pageCount*8;
+            var anchor=new BlockPoint(0,1,0);String id=LandmarkIds.seed(DIM,SourceLandmarks.ALGORITHM,Landmark.Kind.BIOME,"minecraft:plains",anchor);
+            Map<BlockPoint,OwnershipGeometry.Material> cells=new HashMap<>();List<SourceLandmarks.Cell> rows=new ArrayList<>();
+            for(int x=0;x<length;x++) {
+                cells.put(new BlockPoint(x,0,0),new OwnershipGeometry.Material(STONE,false));cells.put(new BlockPoint(x,1,0),new OwnershipGeometry.Material(AIR,true));
+                rows.add(cell(x,0,0,STONE,false));rows.add(cell(x,1,0,AIR,true));
+            }
+            BlockPos cave=new BlockPos(length+4,7,7);rows.add(cell(cave.getX(),7,7,AIR,false));
+            for(var d:OwnershipGeometry.DIRECTIONS)rows.add(cell(cave.getX()+d[0],7+d[1],7+d[2],STONE,false));
+            var geometry=OwnershipGeometry.geometry(DIM,id,0,cells,List.of(),1);
+            var original=new Landmark(id,DIM,SourceLandmarks.ALGORITHM,Landmark.Kind.BIOME,"minecraft:plains",anchor,OwnershipGeometry.bounds(anchor,geometry),embedding(),.5,new ActivityMetadata(0,0),new Ownership(List.of()),geometry,0,"large retry fixture");
+            put(store,original,-1);var captured=store.metadata(id).orElseThrow();Map<String,Landmark> live=new LinkedHashMap<>();live.put(id,original);
+            var hints=new DiscoveryInvalidation.HintQueue(128);var bounds=new Bounds(0,0,0,length+16,8,8);
+            var retry=new SourceLandmarks.FrontierRetry(DIM,bounds,true);Set<BlockPos> emitted=new HashSet<>();Map<BlockPos,Integer> pageVisits=new HashMap<>();
+            java.util.function.Consumer<BlockPos> emit=p->{
+                emitted.add(p.toImmutable());if(retry.read!=null)pageVisits.merge(p.toImmutable(),1,Integer::sum);
+                check(hints.offer(new DiscoveryInvalidation.Hint(DIM,p.getX(),p.getY(),p.getZ()))==null,"retry never spills while resuming under backpressure");
+            };
+            int pressure=0,steps=0;boolean midReadPublication=false;
+            while(!retry.advance(store,hints,emit)) {
+                check(++steps<600,"interleaved Ensure publications cannot starve later pages or discovery sweep");
+                if(!midReadPublication&&!pageVisits.isEmpty()) {
+                    check(retry.read!=null&&!retry.read.complete(),"mid-read publication precedes completion");
+                    refreshFixture(store,live,rows,pageVisits.keySet().iterator().next(),steps);midReadPublication=true;
+                    check(!retry.read.isCurrent(),"old hint snapshot correctly remains stale for authoritative consumers");
+                }
+                if(hints.remaining()<8) {
+                    boolean geometryPending=retry.current!=null;
+                    int completed=retry.read==null?retry.nextGeometryPage:retry.read.nextPageIndex();
+                    check(!retry.advance(store,hints,p->{throw new AssertionError("pressure emitted extra work");}),"pressure yields without completing retry");
+                    check(store.geometryReadAvailable(),"pressure releases geometry lane for Ensure hydration");
+                    check(retry.nextGeometryPage==completed&&(!geometryPending||completed>0),"pressure saves exact completed-page boundary");
+                    BlockPos point=null;
+                    for(int n=0;n<32;n++){var h=hints.poll();if(h==null)break;if(point==null)point=new BlockPos((int)h.x(),(int)h.y(),(int)h.z());}
+                    if(changeTerrain&&pressure==0) {
+                        final int changedX=point.getX();rows.replaceAll(c->c.position().equals(new BlockPoint(changedX,0,0))?cell(changedX,0,0,DIRT,false):c);
+                    }
+                    refreshFixture(store,live,rows,point,steps);pressure++;
+                    var now=store.metadata(id).orElseThrow();
+                    check(!now.geometryKeys().equals(captured.geometryKeys()),"Ensure replaces revision-qualified geometry keys during scan");
+                    var oldIds=captured.geometryKeys().stream().map(k->k.substring(0,k.lastIndexOf('.'))).toList();
+                    var newIds=now.geometryKeys().stream().map(k->k.substring(0,k.lastIndexOf('.'))).toList();
+                    check(oldIds.equals(newIds)!=changeTerrain,"fixture distinguishes revision-only changes from material/page-order changes");
+                    if(pressure==1){disk.manager.save();disk=disk.reopen();store=disk.store;}
+                    // Cold resume must retain the captured list, not reinterpret its page
+                    // index against newer sorted keys (including truly changed content).
+                    retry.advance(store,hints,emit);
+                    if(geometryPending)check(retry.read!=null&&retry.read.nextPageIndex()==completed&&retry.read.metadata().geometryKeys().equals(captured.geometryKeys()),"resume keeps immutable page list and cursor together across publications");
+                    else check(retry.read==null&&retry.current==null&&retry.sweep!=null,"publication cannot restart completed geometry while discovery is sweeping");
+                }
+            }
+            check(pressure>=1&&midReadPublication,"fixture interleaves publications both while reading and at backpressure");
+            Set<BlockPos> expectedPages=new HashSet<>();for(var page:geometry.pages()) {var b=page.knownCells().getFirst().bounds();expectedPages.add(new BlockPos((int)b.minX(),(int)b.minY(),(int)b.minZ()));}
+            check(pageVisits.keySet().equals(expectedPages)&&pageVisits.values().stream().allMatch(n->n==1),"every one of 130 captured pages is visited exactly once despite newer revisions");
+            var sweep=new DiscoveryInvalidation.Sweep(bounds);BlockPoint p;
+            while((p=sweep.poll())!=null)check(emitted.contains(new BlockPos((int)p.x(),(int)p.y(),(int)p.z())),"finite retry reaches every discovery sweep window after all geometry pages");
+            check(emitted.contains(cave),"last sweep reaches undiscovered cave beyond the landmark");
+            var discovered=refreshFixture(store,live,rows,cave,steps+1);check(discovered.kind()==Landmark.Kind.CAVE,"reached sweep performs actual cave discovery");
+            disk.manager.save();store=disk.reopen().store;
+            var ownership=new CompletableFuture<SourceOwnership.Region>();var request=new SourceOwnership.Request(store,DIM,Bounds.cube(cave.getX()-1,6,6,3),ownership);
+            for(int n=0;!request.done;n++){check(n<100,"post-sweep ownership read completes");request.advance();}
+            check(ownership.join().ownerAt(cave).orElseThrow().equals(discovered.id()),"new tail cave owns real AIR after cold save/reopen");
+            check(ownership.join().ownerAt(cave.down()).orElseThrow().equals(discovered.id()),"new tail cave owns its actual SOLID support");
+            check(store.geometryReadAvailable(),"completed retry and ownership query release geometry lane");
+        }
+    }
     public static void main(String[] args) throws Exception {
-        hintsAndOverflow();retryOverflowAndCoverage();preparationRefresh();frontierProof();storeStalenessAndRetries();cancelledGenerationAndEdit();cancelledChangedGeometry();coalescedCavesOwnTerrain();
+        hintsAndOverflow();retryOverflowAndCoverage();preparationRefresh();frontierProof();storeStalenessAndRetries();cancelledGenerationAndEdit();cancelledChangedGeometry();coalescedCavesOwnTerrain();publicationBackpressureProgress();
         System.out.println("DiscoveryInvalidationTest: "+checks+" checks passed");
     }
 }

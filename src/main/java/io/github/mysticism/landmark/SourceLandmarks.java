@@ -129,10 +129,10 @@ public final class SourceLandmarks {
                     hint.accept(new BlockPos((int)Math.max(b.minX(),bounds.minX()),(int)Math.max(b.minY(),bounds.minY()),(int)Math.max(b.minZ(),bounds.minZ())));break;
                 }
                 if(read.complete()){
-                    boolean stale=!read.isCurrent();read=null;
-                    if(stale){cursor=null;end=false;headers.clear();current=null;faces=null;}
-                    else current=null;
-                    nextGeometryPage=0;
+                    // These immutable pages supply hints, never current ownership. Ensure
+                    // publications caused by this scan must not restart its own traversal.
+                    // Edits/load events retain separate refresh work for changed terrain.
+                    read=null;current=null;nextGeometryPage=0;
                 }
                 return false;
             }
@@ -147,9 +147,11 @@ public final class SourceLandmarks {
                 var live=store.metadata(current.id());
                 // A queued header may have been deleted/aliased while refresh waited behind
                 // discovery. Never let a retired identity permanently pin this scan.
-                if(live.isEmpty()){current=null;nextGeometryPage=0;return false;}
-                if(!live.get().geometryKeys().equals(current.geometryKeys()))nextGeometryPage=0;
-                current=live.get();read=store.beginGeometryRead(current.id(),bounds,nextGeometryPage);return false;
+                if(live.isEmpty()||!live.get().id().equals(current.id())){current=null;nextGeometryPage=0;return false;}
+                // Keep the captured key list AND its completed-page cursor together. Even
+                // revision-only Ensure publications replace every key; rebasing/restarting
+                // here under hint backpressure can starve later pages and discovery forever.
+                read=store.resumeGeometryRead(current,bounds,nextGeometryPage);return false;
             }
             if(!headers.isEmpty()){current=headers.removeFirst();faces=current.header().geometry().frontiers().iterator();return false;}
             if(!end){var page=store.sourceRangePage(dimension,bounds,cursor,2,2);cursor=page.nextId();end=page.end();headers.addAll(page.landmarks());return false;}

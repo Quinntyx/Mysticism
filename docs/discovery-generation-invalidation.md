@@ -32,7 +32,11 @@ The retained source/queue edits were incomplete and did not compile together.
   closed. No chunks are generated/ticketed and unknown cells never become invented air.
 - Queue backpressure yields a held geometry read at its last completed page boundary, rather
   than deadlocking an Ensure that needs that same lane. A partially decoded page is not counted
-  as complete. Changed geometry references restart that page cursor.
+  as complete. The completed-page cursor stays paired with its captured immutable key list;
+  revision-only Ensure publications cannot restart the scan. Even genuine replacement/reordering
+  cannot reinterpret the saved index against a different list. These pages emit source refresh
+  hints only, never authoritative ownership or collision; normal consumers still check currentness.
+  Edit/load invalidation continues to retain separate work for changed/new source evidence.
 - Source-catalog changes invalidate asynchronous preparation/publication and retain the point
   or, for background refresh, its entire discovery window even before skipped components commit.
   Activity-only CAS can reuse identical geometry references: publication rebases activity,
@@ -42,7 +46,31 @@ The retained source/queue edits were incomplete and did not compile together.
   across the entire missing slab is required to retire it. Frontier budget overflow fails
   explicitly rather than silently truncating persisted discovery work.
 
-## Current review repair: regression/build evidence
+## Latest P1 cursor-progress repair: regression/build evidence
+
+A retry now resumes the same committed immutable page list after geometry-lane backpressure and
+finishes it even if its own Ensure publications advance metadata/page revisions. Completion no
+longer rewinds the catalogue because the hint snapshot is stale. Retired/aliased queued identities
+are skipped; explicitly extended areas still restart their consumed coverage. The store adds a
+package-private captured-list resume path without weakening `GeometryRead.isCurrent()` or changing
+public current-geometry reads, persistence keys, ownership validation or embedding profiles.
+
+The added regression uses **130 geometry pages and the actual 128-entry hint capacity**. It
+interleaves real source preparation/Ensure publications both during a read and after pressure
+releases the lane, including revision-only and genuine material/key-order changes. It cold-reopens
+the store before resuming, asserts every captured page is visited exactly once, reaches all sweep
+windows within a fixed work bound, then discovers a tail cave beyond the original landmark and
+verifies its AIR/support ownership after another cold reopen. It also verifies a stale hint read
+still reports `isCurrent() == false`, so it cannot masquerade as authoritative geometry.
+
+Canonical Gradle 8.13 / Java 21 `--no-daemon --console=plain build` passed: all **five actually
+discovered runtime suites**, **132920 DiscoveryInvalidationTest checks**, packaging/descriptor/
+runner fixtures, remapJar and verifyProductionJar. No exclusions, live game or model inference.
+Build handle: original tmux session `$11`, origin `%2625`, retained pane `%2649`, run
+`450f22edfd7842e392ef3ea6549ccec6`, exit 0. `git diff --check` passed. Existing intentionally
+malformed embedding-persistence fixture warnings and deprecated API/Gradle warnings remain nonfatal.
+
+## Earlier cancellation/component review repair: regression/build evidence
 
 Added runtime regressions cover edit/load/unload cancellation after geometry staging, both new
 and existing seeds, same-revision changed-material publication and exact AIR ownership after cold
