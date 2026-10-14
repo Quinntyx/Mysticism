@@ -418,6 +418,17 @@ public final class SpiritTerrainService {
         Vec3d at=s.shallow?w.origin.add(p.getPos().subtract(s.carrier)):w.origin;
         return w.owners==null || !w.owners.isCurrent(p.getServer()) || !w.owners.bounds().contains(MathHelper.floor(at.x),MathHelper.floor(at.y),MathHelper.floor(at.z));
     }
+    /** Entry may already have real mesh contact while a CURRENT empty ownership snapshot
+     * arrives before ensureSourceLocation has discovered/published the source landmark.
+     * That snapshot is not a terminal discovery result. Navigation bounds this wait and
+     * requires actual floor contact; this state grants no support, mapping or exit authority. */
+    public static boolean entrySupportPending(ServerPlayerEntity p) {
+        Session s=session(p);if(s==null)return false;
+        return entrySupportPending(ownershipPending(p),s.ownerFuture);
+    }
+    static boolean entrySupportPending(boolean ownershipPending,CompletableFuture<?> sourceDiscovery) {
+        return ownershipPending || sourceDiscovery!=null && !sourceDiscovery.isDone();
+    }
     private static Optional<String> exactOwner(ServerPlayerEntity p,Session s,Window w,Vec3d source) {
         BlockPos point=BlockPos.ofFloored(source);
         if(w.owners!=null && w.owners.isCurrent(p.getServer()) && w.owners.bounds().contains(point.getX(),point.getY(),point.getZ()))return w.owners.ownerAt(point);

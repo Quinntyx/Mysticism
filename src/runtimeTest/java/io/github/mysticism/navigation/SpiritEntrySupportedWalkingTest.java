@@ -126,8 +126,8 @@ public final class SpiritEntrySupportedWalkingTest {
         int afterUpdate = source.indexOf("private static void restoreAnchor(ServerPlayerEntity p, Session s) {");
         check(update >= 0 && afterUpdate > update, "update() body must precede restoreAnchor");
         String updateBody = source.substring(update, afterUpdate);
-        check(updateBody.contains("SpiritTerrainService.ownershipPending(p)"),
-                "Shallow stance decision must consult live octree ownership publication state");
+        check(updateBody.contains("SpiritTerrainService.entrySupportPending(p)"),
+                "Shallow stance must consult both source discovery and octree ownership publication");
         check(updateBody.contains("MeshCollision.ground(p).isPresent()"),
                 "Standing detection must use actual visible/collidable mesh contact, not low delta or stale vanilla flags");
         check(Pattern.compile("entryStance\\(").matcher(updateBody).find(),

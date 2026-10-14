@@ -219,14 +219,14 @@ public final class SpiritNavigationService {
 
     /** Pure shallow-stance decision. Entering spirit mode while standing on supported source terrain
      * must begin supported walking, not unconditional flight: while no support or ownership has ever
-     * confirmed for this shallow session and the terrain's octree ownership is still publishing
-     * asynchronously, a player on the real visible mesh floor holds (standing means actual mesh
+     * confirmed for this shallow session and source discovery or octree ownership is still
+     * publishing asynchronously, a player on the real visible mesh floor holds (standing means actual mesh
      * contact, not a stale onGround flag), bounded by {@link #ENTRY_SUPPORT_GRACE_TICKS}, instead
      * of immediately entering freeflight. Ascending takeoff keeps the ordinary 14-tick jump grace;
      * walking over an edge, a confirmed-then-lost stance, and grace expiry all enter freeflight. */
     public static StanceStep entryStance(int unsupported, int entrySupportTicks, boolean everSupported, boolean confirmedOwned,
-            boolean standing, boolean jumping, boolean ownershipPending) {
-        if (standing && !jumping && !everSupported && !confirmedOwned && ownershipPending) {
+            boolean standing, boolean jumping, boolean entrySupportPending) {
+        if (standing && !jumping && !everSupported && !confirmedOwned && entrySupportPending) {
             if (entrySupportTicks < ENTRY_SUPPORT_GRACE_TICKS)
                 return new StanceStep(Stance.HOLD_ENTRY_SUPPORT, 0, entrySupportTicks + 1);
             return new StanceStep(Stance.FREE_FALL, unsupported + 1, entrySupportTicks);
@@ -308,12 +308,12 @@ public final class SpiritNavigationService {
                 if (standing && delta.y <= .01) s.jumping = false;
                 else if (s.unsupported == 0) s.jumping = delta.y > .01;
                 var stance = entryStance(s.unsupported, s.entrySupportTicks, s.everSupported, s.confirmedOwned, standing,
-                        s.jumping, SpiritTerrainService.ownershipPending(p));
+                        s.jumping, SpiritTerrainService.entrySupportPending(p));
                 s.unsupported = stance.unsupportedTicks(); s.entrySupportTicks = stance.entrySupportTicks();
                 if (stance.stance() == Stance.FREE_FALL) { enterDeep(p); return nav.deep() && s.semanticReady; }
                 if (stance.stance() == Stance.HOLD_ENTRY_SUPPORT) {
-                    // Bounded walking hold: octree ownership for this fresh supported stance is still
-                    // publishing. Flight stays off and q keeps tracking real physical movement.
+                    // Bounded walking hold: source discovery or octree ownership for this fresh
+                    // supported stance is still publishing. Flight stays off; q tracks real movement.
                     if (s.semanticReady && Double.isFinite(delta.x) && Double.isFinite(delta.y) && Double.isFinite(delta.z)
                             && delta.lengthSquared() <= 16)
                         TraversalSteering.advance(p.getComponent(MysticismEntityComponents.LATENT_POS).get(),

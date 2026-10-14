@@ -6,10 +6,15 @@ walk-intent-lifetime work. This is not completion of the other nine runtime unit
 ## Behavior
 
 - Entry keeps the real source-identical carrier feet and begins shallow with flight
-  off. While ownership publishes, grace requires contact with the actual visible
-  collision mesh, never zero motion or a stale vanilla `onGround` flag. Grace is
+  off. While source discovery or ownership publishes, grace requires contact with
+  the actual visible collision mesh, never zero motion or a stale vanilla `onGround`
+  flag. Grace is
   bounded to 100 supported waiting ticks and cannot be regained after a confirmed
-  support is lost. Unsupported/off-edge entry still permits ordinary free flight.
+  support is lost. A current empty ownership snapshot does not end that hold while
+  `ensureSourceLocation` remains in flight; it is not a final source-discovery result.
+  Completed-empty/failed/cancelled discovery with settled ownership does end the
+  hold, and a never-completing discovery still cannot exceed the entry budget.
+  Unsupported/off-edge entry still permits ordinary free flight.
 - Entry waiting and the ordinary 14-tick jump grace have separate counters. A jump
   after waiting on ownership gets its normal budget; landing on the pending real
   floor does not replenish the entry lifetime.
@@ -32,16 +37,25 @@ walk-intent-lifetime work. This is not completion of the other nine runtime unit
 ## Regression discovery and limitations
 
 The existing `runtimeSelfTest` runner discovers the three navigation mains under
-`src/runtimeTest/java/io/github/mysticism/navigation`, along with all four configured
-embedding suites. No framework dependencies or suite-selection overrides were added.
+`src/runtimeTest/java/io/github/mysticism/navigation`, the terrain discovery-order
+regression, and all four configured embedding suites. No framework dependencies
+or suite-selection overrides were added.
 
 `SpiritEntrySupportedWalkingTest` exercises the actual pure stance decision and
 checks its production wiring. `WalkIntentLifetimeTest` exercises the production
 lifetime state machine, including slow completion, terminal expiry and a fresh
 retry. `SupportedWalkingIntegrationTest` runs the actual `MeshCollision.Index`
 sweep with integer floors, fractional slab heights and negative coordinates,
-plus airborne/off-edge/hidden-geometry cases. Its navigation/terrain lifecycle
-wiring checks inspect production source; they do not execute Fabric callbacks.
+plus airborne/off-edge/hidden-geometry cases. `EntrySupportDiscoveryTest` completes
+the real resumable ownership request against an empty attached store, then drives
+that current-empty snapshot and an unfinished discovery future through the
+production pending-state combiner and actual mesh contact into the stance decision.
+It covers terminal failure/cancellation, ownership refresh, and the entry grace bound.
+The player-adapter and navigation/terrain lifecycle wiring checks inspect production
+source; they do not execute Fabric callbacks or a live source-discovery operation.
+Ignoring the discovery future in the production combiner was temporarily tested:
+the discovered suite failed on the completed-empty-ownership ordering assertion;
+the fix was restored before canonical verification.
 
 Canonical verification command (installed Gradle 8.13, Java 21):
 
