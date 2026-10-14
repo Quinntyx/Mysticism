@@ -7,7 +7,8 @@ The retained source/queue edits were incomplete and did not compile together.
 ## Behavior
 
 - Edit and chunk load/unload events invalidate an intersecting active observation and retain
-  its original discovery point. Staged immutable pages cannot publish after cancellation.
+  its original discovery point (the whole observation window for background refresh). Staged
+  immutable pages cannot publish after cancellation.
 - Chunk-load scans resume frontiers for **every** landmark kind, including intersecting slabs
   whose minimum corner is outside the chunk. Existing known geometry pages are refreshed too;
   generation can invalidate previously incomplete observations, not only cave frontiers.
@@ -15,6 +16,15 @@ The retained source/queue edits were incomplete and did not compile together.
   same-dimension areas and restarts consumed cursors instead of silently dropping either event.
   Retained memory is <=128 point hints, normally <=64 area retries, plus at most one retry per
   additional loaded source dimension. Unload/stop cancel retained geometry reads.
+- Sweep coverage alone is not discovery: refresh preparation finds unowned AIR/sky components
+  even when the coalesced window is centred in solid stone. It commits one component at a time,
+  refreshing real centre changes first, then retains the **entire original observation area**
+  for follow-up. Subsequent overflow/coalescing cannot drop skipped edge cave components by
+  retaining only a shifted centre. Exact caller destinations are not substituted.
+- Generated immutable geometry page identities include deterministic source-fragment/content
+  digests, independent of CAS revision. Cancellation may leave unreachable staged pages, but
+  changed terrain at the same uncommitted revision gets a different page key. Landmark seeds,
+  anchors, committed CAS rules, old readable page keys and the native-v2 save profile are unchanged.
 - Area scans use <=2 metadata records, <=1 geometry page / 512 leaves, or <=8 frontier faces per
   advancement, every five server ticks. Conservative overflow sweeps use 24-block strides for
   25-cube observations and constant-size cursor state. Refresh-only windows may select actual
@@ -23,7 +33,8 @@ The retained source/queue edits were incomplete and did not compile together.
 - Queue backpressure yields a held geometry read at its last completed page boundary, rather
   than deadlocking an Ensure that needs that same lane. A partially decoded page is not counted
   as complete. Changed geometry references restart that page cursor.
-- Source-catalog changes invalidate asynchronous preparation/publication and re-hint the point.
+- Source-catalog changes invalidate asynchronous preparation/publication and retain the point
+  or, for background refresh, its entire discovery window even before skipped components commit.
   Activity-only CAS can reuse identical geometry references: publication rebases activity,
   claims, base embedding and CAS revision from current metadata under the activity pause.
 - Reading a frontier is not proof of ownership. Unabsorbed faces survive with current revision;
@@ -31,7 +42,37 @@ The retained source/queue edits were incomplete and did not compile together.
   across the entire missing slab is required to retire it. Frontier budget overflow fails
   explicitly rather than silently truncating persisted discovery work.
 
-## Regression/build evidence
+## Current review repair: regression/build evidence
+
+Added runtime regressions cover edit/load/unload cancellation after geometry staging, both new
+and existing seeds, same-revision changed-material publication and exact AIR ownership after cold
+save/reopen. Page identities are checked for deterministic insertion order, revision independence
+and fragment isolation. A real bounded hint/retry overflow is driven through source preparation,
+paged publication, repeat area coalescing and cold ownership reads: both disconnected underground
+caves must own their actual AIR and walls, not merely lie inside an observed window.
+
+The canonical installed Gradle 8.13 / Java 21 `--no-daemon --console=plain build` passed,
+including all **five actually discovered runtime suites**, packaging/descriptor/runner fixtures,
+remapJar and verifyProductionJar. `DiscoveryInvalidationTest` passed **132056 checks**; runner
+output explicitly lists it. Production artifact: `build/libs/mysticism-1.0-SNAPSHOT.jar`.
+Static `git diff --check` passed. No suites or packaging checks were excluded.
+
+The initial helper launch in session `$11`, origin `%2358` failed before Gradle started:
+`respawn pane failed: fork failed: No space left on device` (PTY usage 4094/4096). After the
+user-authorized session restart, PTY capacity was available and that former origin was gone.
+Using the restarted origin `%2549` in the same session, the first real build exposed a test
+fixture's unsupported cold `store.find` call. It was repaired to use the real bounded geometry
+read/hydration API; no production bypass or test exclusion was added.
+
+Successful build handle: session `$11`, origin `%2549`, retained pane `%2551`, run
+`454cba3cbe31424eb5ea40dd90b57544`, exit 0. The earlier failed build used the same pane with
+run `b69c4fb9affb4bc283b8123963dda65b`. An intermediate successful build used
+`153e06f7bc114541a1454da217d04c41`; the final run also covers cancellation-window retention. Existing malformed-embedding persistence fixtures
+intentionally log warnings; deprecated API/Gradle feature warnings are nonfatal. No software
+installation, direct background fallback, foreign-pane cleanup, gameplay or model inference
+verification was performed.
+
+## Retained baseline regression/build evidence (before this review repair)
 
 `src/runtimeTest/java/io/github/mysticism/landmark/DiscoveryInvalidationTest.java` is in the
 **actual current runtime source set**, not the excluded historical `src/test` landmark suites.
