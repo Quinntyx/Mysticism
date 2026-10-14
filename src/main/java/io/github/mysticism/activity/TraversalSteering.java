@@ -2,6 +2,7 @@ package io.github.mysticism.activity;
 
 import io.github.mysticism.navigation.MovementIntegration;
 import io.github.mysticism.vector.*;
+import java.util.function.BiConsumer;
 
 /** Shared server/client movement math. Shallow preserves source-grid axes; deep rotates per player. */
 public final class TraversalSteering {
@@ -19,6 +20,12 @@ public final class TraversalSteering {
     }
     public static void deepStep(Vec384f q, Basis384f basis, Vec384f target, double dx, double dy, double dz,
                                 boolean capturedLanding) {
+        deepStep(q, basis, target, dx, dy, dz, capturedLanding, null);
+    }
+    /** Observe the actual distance-bounded curved path, not a chord between tick endpoints.
+     * The observer must copy live vectors if retaining them; server integration needs no observer. */
+    public static void deepStep(Vec384f q, Basis384f basis, Vec384f target, double dx, double dy, double dz,
+                                boolean capturedLanding, BiConsumer<Vec384f, Basis384f> observer) {
         if (!Double.isFinite(dx) || !Double.isFinite(dy) || !Double.isFinite(dz)) return;
         double distance = Math.sqrt(dx*dx + dy*dy + dz*dz);
         // Same bound the integrators admit: an admitted lag burst must actually advance navigation.
@@ -34,6 +41,7 @@ public final class TraversalSteering {
                     ? Math.min(1, remaining * BLOCKS_PER_SEMANTIC_UNIT * ROTATION_PER_BLOCK * .5) : 1;
             advance(q, basis, sx * scale, sy * scale, sz * scale);
             BasisIntegrator384f.step(basis, q, target, sx * .5, sy * .5, sz * .5, ROTATION_PER_BLOCK);
+            if (observer != null) observer.accept(q, basis);
         }
     }
     public static void advance(Vec384f q, Basis384f basis, double dx, double dy, double dz) {

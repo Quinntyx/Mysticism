@@ -2,6 +2,8 @@ package io.github.mysticism.dimension.spiritworld;
 
 import io.github.mysticism.activity.TraversalSteering;
 import io.github.mysticism.component.MysticismEntityComponents;
+import io.github.mysticism.component.LatentPos;
+import io.github.mysticism.component.LatentBasis;
 import io.github.mysticism.dimension.spiritworld.terrain.MeshCollision;
 import io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService;
 import io.github.mysticism.navigation.MovementIntegration;
@@ -39,12 +41,26 @@ public final class SpiritBasisEvolver {
             var target = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target();
             if (SpiritNavigationService.update(p, delta, semantic)) TraversalSteering.deepStep(q, basis, target, semantic.x, semantic.y, semantic.z,
                     p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION).hasShallowTarget());
-            // Periodic authoritative reconciliation also delivers touch interpolation to a stationary recipient.
-            if (server.getTicks() % 4 == 0) {
+            // Suppressing a disputed overlap window must also retire the client's chosen remainder.
+            // The revision travels in BOTH pose streams; delivery after a predictor tick cannot
+            // disguise this correction as movement lag, nor can a delayed older packet undo it.
+            boolean reconcile = reconcileSuppressedWindow(sample,
+                    p.getComponent(MysticismEntityComponents.LATENT_POS),
+                    p.getComponent(MysticismEntityComponents.LATENT_BASIS));
+            // Periodic authority still delivers touch interpolation to a stationary recipient.
+            if (reconcile || server.getTicks() % 4 == 0) {
                 MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p);
             }
         }
         positions.keySet().retainAll(live);
+    }
+    /** Mark both independent streams whenever the server declined a window the client predicted.
+     * Return whether the caller must broadcast them immediately, even on a non-cadence tick. */
+    public static boolean reconcileSuppressedWindow(MovementIntegration.Sample sample, LatentPos pos, LatentBasis basis) {
+        if (!sample.requiresReconciliation()) return false;
+        pos.markAuthoritativeCorrection();
+        basis.markAuthoritativeCorrection();
+        return true;
     }
     public static void init() {
         if (initialized) return; initialized = true;

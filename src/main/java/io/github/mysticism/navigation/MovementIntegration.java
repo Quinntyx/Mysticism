@@ -13,7 +13,8 @@ public final class MovementIntegration {
     private static final double REPOSITION_LIMIT_SQUARED = REPOSITION_LIMIT * REPOSITION_LIMIT;
 
     /** One measured movement window: state-eligible displacement and semantically integrable displacement. */
-    public record Sample(Vec3d stateDelta, Vec3d semanticDelta) {
+    public record Sample(Vec3d stateDelta, Vec3d semanticDelta, boolean requiresReconciliation) {
+        public Sample(Vec3d stateDelta, Vec3d semanticDelta) { this(stateDelta, semanticDelta, false); }
         public Sample {
             if (stateDelta == null || semanticDelta == null) throw new IllegalArgumentException("movement sample");
         }
@@ -30,7 +31,9 @@ public final class MovementIntegration {
     public static Sample server(Vec3d measured, Vec3d correction, boolean teleported) {
         if (measured == null || correction == null || !finite(measured) || !finite(correction)) return Sample.ZERO;
         if (teleported || measured.lengthSquared() > REPOSITION_LIMIT_SQUARED) return Sample.ZERO;
-        if (correction.lengthSquared() > 0) return new Sample(measured, Vec3d.ZERO);
+        // The client kept its chosen remainder; explicitly retire that disputed prediction window.
+        // Otherwise an unchanged server pose is indistinguishable from lag forever, even at rest.
+        if (correction.lengthSquared() > 0) return new Sample(measured, Vec3d.ZERO, true);
         return new Sample(measured, measured);
     }
 

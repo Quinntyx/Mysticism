@@ -24,6 +24,16 @@ public final class LatentBasis implements ComponentV3, AutoSyncedComponent {
     private Basis384f basis = new Basis384f();
     /** Monotonic per-instance wire sequence for sync ordering; not persisted, session-local. */
     private int syncSequence;
+    // Correction provenance is session-local and travels WITH the pose, not a separate nav packet.
+    private long correctionRevision;
+    private int receivedSequence;
+    private long receivedCorrectionRevision;
+    private Basis384f receivedPose;
+
+    public void markAuthoritativeCorrection() { correctionRevision++; }
+    public int receivedSequence() { return receivedSequence; }
+    public long receivedCorrectionRevision() { return receivedCorrectionRevision; }
+    public Basis384f receivedPose() { return receivedPose == null ? null : receivedPose.clone(); }
 
     public LatentBasis() {}
 
@@ -90,7 +100,15 @@ public final class LatentBasis implements ComponentV3, AutoSyncedComponent {
         LatentBasis incoming = new LatentBasis();
         // The read path ignores the registry lookup; the wire format is self-describing bits.
         incoming.readFromNbt(tag, null);
-        this.set(LatentSync.reconcile(this, sequence, this.basis, incoming.basis));
+        long revision = tag.getLong("poseCorrectionRevision");
+        this.set(LatentSync.reconcile(this, sequence, revision, this.basis, incoming.basis));
+        // Capture authority even when this component is not yet registered as the local predictor.
+        // A later replacement-context initialization inherits its real wire frontier.
+        if (sequence > receivedSequence) {
+            receivedSequence = sequence;
+            receivedCorrectionRevision = revision;
+            receivedPose = incoming.basis.clone();
+        }
     }
 
     /** Embeds the monotonic wire sequence before the basis NBT; see {@link LatentPos#writeSyncPacket}. */
@@ -100,6 +118,7 @@ public final class LatentBasis implements ComponentV3, AutoSyncedComponent {
         buf.writeVarInt(++this.syncSequence);
         NbtCompound tag = new NbtCompound();
         this.writeToNbt(tag, buf.getRegistryManager());
+        tag.putLong("poseCorrectionRevision", correctionRevision);
         buf.writeNbt(tag);
     }
 }

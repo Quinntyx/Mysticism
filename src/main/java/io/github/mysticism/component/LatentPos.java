@@ -14,6 +14,16 @@ public final class LatentPos implements ComponentV3, AutoSyncedComponent {
     private Vec384f v = Vec384f.ZERO();
     /** Monotonic per-instance wire sequence for sync ordering; not persisted, session-local. */
     private int syncSequence;
+    // Correction provenance is session-local and travels WITH the pose, not a separate nav packet.
+    private long correctionRevision;
+    private int receivedSequence;
+    private long receivedCorrectionRevision;
+    private Vec384f receivedPose;
+
+    public void markAuthoritativeCorrection() { correctionRevision++; }
+    public int receivedSequence() { return receivedSequence; }
+    public long receivedCorrectionRevision() { return receivedCorrectionRevision; }
+    public Vec384f receivedPose() { return receivedPose == null ? null : receivedPose.clone(); }
 
     public LatentPos() { }
     public LatentPos(Vec384f initial) { set(initial); }
@@ -61,7 +71,15 @@ public final class LatentPos implements ComponentV3, AutoSyncedComponent {
         LatentPos incoming = new LatentPos();
         // The read path ignores the registry lookup; the wire format is self-describing bits.
         incoming.readFromNbt(tag, null);
-        this.set(LatentSync.reconcile(this, sequence, this.v, incoming.v));
+        long revision = tag.getLong("poseCorrectionRevision");
+        this.set(LatentSync.reconcile(this, sequence, revision, this.v, incoming.v));
+        // Capture authority even when this component is not yet registered as the local predictor.
+        // A later replacement-context initialization inherits its real wire frontier.
+        if (sequence > receivedSequence) {
+            receivedSequence = sequence;
+            receivedCorrectionRevision = revision;
+            receivedPose = incoming.v.clone();
+        }
     }
 
     /**
@@ -75,6 +93,7 @@ public final class LatentPos implements ComponentV3, AutoSyncedComponent {
         buf.writeVarInt(++this.syncSequence);
         NbtCompound tag = new NbtCompound();
         this.writeToNbt(tag, buf.getRegistryManager());
+        tag.putLong("poseCorrectionRevision", correctionRevision);
         buf.writeNbt(tag);
     }
 }

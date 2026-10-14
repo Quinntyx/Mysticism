@@ -104,3 +104,70 @@ dev jar. `git diff --check` also passed.
   dependence; interactive trajectory/landing smoke tests remain necessary.
 - Loom can emit existing CCA source-remapping and missing annotation warnings;
   production compilation and artifact verification determine build success.
+
+
+## Retained review repair — candidate verification BLOCKED
+
+This section concerns the repair AFTER retained merge `dbb1ff2`; the passing
+canonical build above belongs to that older merge, not this candidate.
+
+- Prediction context now registers before movement integration. Each component
+  retains its latest received wire sequence/revision/authoritative pose even
+  before the predictor knows the replacement entity. Context initialization uses
+  that baseline, or a pre-integration baseline if no packet has arrived. First
+  delayed periodic snapshots therefore use normal pending-movement reconciliation.
+- The real shared deep integrator exposes a substep observer. Client history
+  records its distance-bounded curved rotations, not only whole-tick endpoints.
+  Server integration is unchanged; no global/shared basis or new steering control.
+- A suppressed server overlap window explicitly carries `requiresReconciliation`.
+  The server marks BOTH pose components and broadcasts immediately, not only on
+  cadence. Session-local correction revisions travel with each pose payload,
+  after the normal persistence serialization. A newer marked pose is authority
+  even when it resembles movement lag. Position and basis revisions remain
+  independent; old wire sequences cannot undo them. Clean windows retain their
+  measured semantic movement. Disputed windows still exclude travel for collision
+  safety, but no longer silently diverge or hold a resting prediction indefinitely.
+
+`MovementReconciliationSelfTest` uses real steering/classification and actual
+component packets. It covers pre-context component replacement, first-ever sync
+arriving after prediction, +1/-0.7 deep reversals against unequal .07/.29/.5/.73/
+.95/1-block server windows, oblique travel and captured-target easing, independent
+suppressed-window convergence after delayed delivery, 300 resting ticks, resumed
+movement and reordered pre-correction packets. No dummy inference is involved.
+
+Before production edits, `runtimeSelfTest` discovered/executed the new class and
+failed both original probes: pre-context position rollback and intermediate curved
+basis rollback. Other suites reached before that failure passed (embedding
+callback isolation 28, engine safety 184, persistence 90, pipeline 135, mesh
+corrections 30 and classification 31). These are RED-run results, not candidate
+verification. Original session `$11`, origin `%2400`, pane `%2409`, run
+`07db8668d5884c119085d8b64fb17dbf`, exit 1 (39 seconds). That slot was subsequently
+reused by an unsuccessful build start, so its original token is now stale; the
+captured failure is recorded here rather than claiming it remains monitorable.
+
+Candidate canonical command was attempted through the required tmux-jobs helper:
+
+```sh
+/home/zlare/.gradle/wrapper/dists/gradle-8.13-bin/5xuhj0ry160q40clulazy9h7d/gradle-8.13/bin/gradle --offline --no-daemon --console=plain build --rerun-tasks
+```
+
+It could not start: `respawn pane failed: fork failed: No space left on device`.
+The host reported 4,094/4,096 allocated PTYs; disk/inodes were available. The
+failed start left a blank slot that tmux-jobs reports as running, but tmux reports
+no process PID (`-1`): pane `%2440`, run `4e1e37af9b534ceba1d233bacb4a2ef3`,
+window `@1498`, original session `$11`. A later start was refused as busy. No
+command output or canonical exit code exists. No other pane was closed, no host
+limits changed and no software installed. Re-run after resolving this host
+resource issue; do not use the old passing build/artifact as this candidate's
+verification. `git diff --check` passes; production compilation and green
+regressions remain UNVERIFIED, including packaging/production-jar checks.
+
+No gameplay, artificial network-latency test, live mixin execution, native model
+inference or IntelliJ launch was performed. Native v2 embeddings/persistence,
+source ownership/octrees, terrain/collision implementation and independent
+per-player projection are untouched. History is still bounded to 256 endpoints;
+with distance substeps this retains less physical travel than whole-tick history.
+Off-trail corrections without explicit provenance still use the retained fallback
+lag heuristic. Persistent server/client collision disagreement can still require
+repeated authoritative correction; this repair makes each suppression explicit,
+not proof that every terrain disagreement has been eliminated.

@@ -27,10 +27,12 @@ import java.util.Arrays;
  * than the newest snapshot already seen, whatever its divergence from the prediction. A fresh
  * snapshot on the unacknowledged prediction trail is movement lag even when the player has
  * reversed direction: distance to the last received pose alone cannot bound that lag. The trail
- * retains tick endpoints and matches intermediate server steps on their segments; acknowledgment
+ * retains distance-substep endpoints of curved steering and matches intermediate server steps
+ * on their short segments; acknowledgment
  * retires only the prefix actually reached, not later predicted movement. Otherwise the direct,
  * composable distance to the freshest previously received pose still bounds ordinary catch-up.
- * A snapshot outside both explanations is an authoritative correction and is applied immediately.
+ * A snapshot outside both explanations, or carrying a new explicit correction revision, is
+ * authoritative and is applied immediately.
  * Unhealthy contexts —
  * epoch transitions, unprocessed position-look teleports, free flight, peers — always take the
  * authoritative value.
@@ -50,8 +52,10 @@ public final class ClientPoseSync {
     // Wire ordering state: persists across prediction segments, reset on component replacement/disconnect.
     private static int positionSequence;
     private static int basisSequence;
+    private static long positionCorrectionRevision;
+    private static long basisCorrectionRevision;
 
-    // Freshest authoritative pose received (null only before the first sync of the connection).
+    // Freshest received authority, or the pre-integration baseline before the first local sync.
     private static Vec384f positionFrontier;
     private static Basis384f basisFrontier;
 
@@ -72,10 +76,25 @@ public final class ClientPoseSync {
      * lag budget instead of snapping to the first arriving snapshot.
      */
     public static void beginPrediction(LatentPos pos, LatentBasis basis, SpiritNavigation navigation, boolean predicting) {
+        preparePrediction(pos, basis, navigation, predicting);
+    }
+
+    /** Establish authority BEFORE integrating a window, including the very first predicted window. */
+    public static void preparePrediction(LatentPos pos, LatentBasis basis, SpiritNavigation navigation, boolean predicting) {
         // Wire sequences belong to component instances, not the connection. Respawn/replacement
         // can restart a stream at 1; never reject it against the previous entity's frontier.
-        if (localPos != pos) { positionSequence = 0; positionFrontier = null; }
-        if (localBasis != basis) { basisSequence = 0; basisFrontier = null; }
+        if (localPos != pos) {
+            positionSequence = pos.receivedSequence();
+            positionCorrectionRevision = pos.receivedCorrectionRevision();
+            positionFrontier = pos.receivedPose();
+            if (positionFrontier == null) positionFrontier = pos.get().clone();
+        }
+        if (localBasis != basis) {
+            basisSequence = basis.receivedSequence();
+            basisCorrectionRevision = basis.receivedCorrectionRevision();
+            basisFrontier = basis.receivedPose();
+            if (basisFrontier == null) basisFrontier = basis.get().clone();
+        }
         if (!predicting || !ClientPoseSync.predicting || localPos != pos || localBasis != basis
                 || localNavigation != navigation || predictedEpoch != navigation.motionEpoch() || teleported) {
             positionTrail.clear();
@@ -86,11 +105,14 @@ public final class ClientPoseSync {
         localNavigation = navigation;
         predictedEpoch = navigation.motionEpoch();
         ClientPoseSync.predicting = predicting;
-        // Called AFTER integration on every predictor tick, so an outbound endpoint survives a
-        // reversal before the next cadence snapshot arrives. Stored coordinates never alias q/basis.
+        recordPredictionPose(pos.get(), basis.get());
+    }
+
+    /** Record distance-substep endpoints and final tick poses. No coordinate aliases escape. */
+    public static void recordPredictionPose(Vec384f pos, Basis384f basis) {
         if (predicting && !teleported) {
-            positionTrail.record(pos.get().data());
-            basisTrail.record(basisCoordinates(basis.get()));
+            positionTrail.record(pos.data());
+            basisTrail.record(basisCoordinates(basis));
         }
     }
 
@@ -103,6 +125,8 @@ public final class ClientPoseSync {
         teleported = false;
         positionSequence = 0;
         basisSequence = 0;
+        positionCorrectionRevision = 0;
+        basisCorrectionRevision = 0;
         positionFrontier = null;
         basisFrontier = null;
         positionTrail.clear();
@@ -139,12 +163,14 @@ public final class ClientPoseSync {
         return true;
     }
 
-    private static Vec384f reconcilePosition(LatentPos target, int sequence, Vec384f current, Vec384f incoming) {
+    private static Vec384f reconcilePosition(LatentPos target, int sequence, long correctionRevision, Vec384f current, Vec384f incoming) {
         if (target != localPos) return incoming; // peer component: always the authoritative value
         boolean stale = positionSequence != 0 && sequence <= positionSequence;
         if (sequence > positionSequence) positionSequence = sequence;
         if (stale) return current; // reordered/duplicate snapshot: never adopt, whatever its divergence
-        if (!healthy(target, null) || positionFrontier == null) {
+        boolean corrected = correctionRevision != positionCorrectionRevision;
+        positionCorrectionRevision = correctionRevision;
+        if (corrected || !healthy(target, null) || positionFrontier == null) {
             positionFrontier = incoming.clone();
             positionTrail.reset(incoming.data());
             return incoming;
@@ -162,12 +188,14 @@ public final class ClientPoseSync {
         return current;
     }
 
-    private static Basis384f reconcileBasis(LatentBasis target, int sequence, Basis384f current, Basis384f incoming) {
+    private static Basis384f reconcileBasis(LatentBasis target, int sequence, long correctionRevision, Basis384f current, Basis384f incoming) {
         if (target != localBasis) return incoming; // peer component: always the authoritative value
         boolean stale = basisSequence != 0 && sequence <= basisSequence;
         if (sequence > basisSequence) basisSequence = sequence;
         if (stale) return current; // reordered/duplicate snapshot: never adopt, whatever its divergence
-        if (!healthy(null, target) || basisFrontier == null) {
+        boolean corrected = correctionRevision != basisCorrectionRevision;
+        basisCorrectionRevision = correctionRevision;
+        if (corrected || !healthy(null, target) || basisFrontier == null) {
             basisFrontier = incoming.clone();
             basisTrail.reset(basisCoordinates(incoming));
             return incoming;
@@ -193,7 +221,7 @@ public final class ClientPoseSync {
     }
 
     /**
-     * Bounded local tick history, not a movement-distance budget. At most 256 distinct endpoints
+     * Bounded local substep history. At most 256 distinct endpoints
      * per component (~3 MiB combined at native v2 dimensions). At rest no new entry is needed.
      * Very old unacknowledged endpoints may be evicted; the direct frontier fallback remains.
      */

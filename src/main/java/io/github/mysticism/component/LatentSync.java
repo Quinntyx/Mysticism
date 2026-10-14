@@ -18,12 +18,12 @@ import java.util.Objects;
 public final class LatentSync {
     /** @return the pose the client component should adopt for this authoritative position sync. */
     public interface PositionFilter {
-        Vec384f apply(LatentPos target, int sequence, Vec384f current, Vec384f incoming);
+        Vec384f apply(LatentPos target, int sequence, long correctionRevision, Vec384f current, Vec384f incoming);
     }
 
     /** @return the pose the client component should adopt for this authoritative basis sync. */
     public interface BasisFilter {
-        Basis384f apply(LatentBasis target, int sequence, Basis384f current, Basis384f incoming);
+        Basis384f apply(LatentBasis target, int sequence, long correctionRevision, Basis384f current, Basis384f incoming);
     }
 
     private static volatile PositionFilter position;
@@ -41,13 +41,13 @@ public final class LatentSync {
         basis = null;
     }
 
-    static Vec384f reconcile(LatentPos target, int sequence, Vec384f current, Vec384f incoming) {
+    static Vec384f reconcile(LatentPos target, int sequence, long correctionRevision, Vec384f current, Vec384f incoming) {
         PositionFilter filter = position;
-        return filter == null ? incoming : filter.apply(target, sequence, current, incoming);
+        return filter == null ? incoming : filter.apply(target, sequence, correctionRevision, current, incoming);
     }
 
-    static Basis384f reconcile(LatentBasis target, int sequence, Basis384f current, Basis384f incoming) {
+    static Basis384f reconcile(LatentBasis target, int sequence, long correctionRevision, Basis384f current, Basis384f incoming) {
         BasisFilter filter = basis;
-        return filter == null ? incoming : filter.apply(target, sequence, current, incoming);
+        return filter == null ? incoming : filter.apply(target, sequence, correctionRevision, current, incoming);
     }
 }

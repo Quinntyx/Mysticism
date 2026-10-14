@@ -54,18 +54,19 @@ public final class ClientLatentPredictor {
                     && lastEpoch == nav.motionEpoch() && lastDeep == nav.deep() && nav.semanticReady();
             // Consume even during a baseline break: a correction cannot skip a later clean window.
             boolean corrected = ClientPoseSync.consumeTeleportCorrection() || repositioned;
+            // Register the authoritative baseline before any first-window prediction can advance it.
+            ClientPoseSync.preparePrediction(
+                    mc.player.getComponent(MysticismEntityComponents.LATENT_POS),
+                    mc.player.getComponent(MysticismEntityComponents.LATENT_BASIS), nav, predicting && !corrected);
             if (predicting && !corrected) {
                 Vec3d delta = MovementIntegration.clientSemantic(now.subtract(lastPos), correction, false);
                 if (nav.deep() && nav.supportApproach()) TraversalSteering.advance(q, basis, delta.x, delta.y, delta.z);
                 else if (nav.deep() && nav.landingApproach()) TraversalSteering.approachStep(q, target, delta.x, delta.y, delta.z);
-                else if (nav.deep()) TraversalSteering.deepStep(q, basis, target, delta.x, delta.y, delta.z, nav.hasShallowTarget());
+                else if (nav.deep()) TraversalSteering.deepStep(q, basis, target, delta.x, delta.y, delta.z, nav.hasShallowTarget(), ClientPoseSync::recordPredictionPose);
                 else if (!nav.landmarkId().isEmpty()) TraversalSteering.advance(q, basis, delta.x, delta.y, delta.z);
             }
             // Record AFTER integration so a reversed/accumulated movement endpoint is not lost.
-            ClientPoseSync.beginPrediction(
-                    mc.player.getComponent(MysticismEntityComponents.LATENT_POS),
-                    mc.player.getComponent(MysticismEntityComponents.LATENT_BASIS),
-                    nav, predicting && !corrected);
+            ClientPoseSync.recordPredictionPose(q, basis);
             lastPos = now; lastPlayer = mc.player; lastWorld = mc.world;
             lastEpoch = nav.motionEpoch(); lastDeep = nav.deep();
         } else clear();
