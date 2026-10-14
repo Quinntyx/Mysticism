@@ -14,6 +14,7 @@ final class NegativeCoverage extends AbstractSet<BlockPos> {
     private static BlockPos bucket(BlockPos p){return new BlockPos(p.getX()>>4,p.getY()>>4,p.getZ()>>4);}
     private static int index(BlockPos p){return (p.getX()&15)|((p.getY()&15)<<4)|((p.getZ()&15)<<8);}
     boolean canRecord(BlockPos p){return buckets.containsKey(bucket(p)) || buckets.size()<MAX_BUCKETS;}
+    int bucketCount(BlockPos p){BitSet bits=buckets.get(bucket(p));return bits==null?0:bits.cardinality();}
     @Override public boolean add(BlockPos p) {
         if(!canRecord(p))return false;
         BitSet bits=buckets.computeIfAbsent(bucket(p),ignored->new BitSet(4096));int i=index(p);

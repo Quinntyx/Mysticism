@@ -30,9 +30,14 @@ nearest-only prefix. The existing live near samples/negative coverage override
 this reservoir before publication, preserving actual body detail. Both generated
 AIR and SOLID observations mask older persisted leaves; periodic catalog reads
 cannot resurrect an observed AIR block. Masks retain only still-in-range source
-buckets on recenter and have the existing 8192-bucket bound. At exhaustion,
-generated sampling pauses with a visible deferral instead of forgetting masks;
-native catalog work can continue. Mode changes, acquisitions and session cleanup
+buckets on recenter. Fully observed 16-cubes now use one bit each in bounded
+256-cube groups (at most 216 groups / 108 KiB of bits for the maximum 512-block
+horizon). Fragmented/UNKNOWN observations retain the separate 8192-bucket bound.
+An unrepresentable fragmented patch is deferred atomically; it does not stop the
+outward cursor, later complete observations, or periodic sweeps. Promotion to a
+complete observation reclaims its fragmented-mask slot. No UNKNOWN cell is masked
+to make room. Persisted subtraction queries these exact masks without copying the
+whole horizon's bucket map on each read. Mode changes, acquisitions and session cleanup
 cancel pending work. IO retry keeps the previously acquired coherent reservoir.
 
 Geometry uses the same source-identical carrier mapping, frame publication,
@@ -50,7 +55,16 @@ uses the retained stable-hover/owner-velocity delivery and approach cleanup path
 leaving a usable deep pose with a fresh request possible. The contact-only counter
 was removed; the separate missing-support stall budget remains.
 
-## Checks actually performed
+## Immediate post-acquisition jumping
+
+Both successful acquisition paths (`attemptSupport` and targeted `attemptLanding`)
+now seed `supportY` from the validated current carrier feet, and reset the
+unsupported counter before handing off to walking. The previous floor's landing
+envelope can no longer turn a jump packet arriving before the next grounded
+navigation tick straight back into flight. Pose, velocity, projection and source
+ownership validation are unchanged.
+
+## Original retained checks
 
 Using installed Gradle 8.13 / Java 21, offline, with no exclusions or diagnostic
 classpath, canonical command:
@@ -88,13 +102,51 @@ This is progressive bounded coverage, not unlimited complete resident geometry.
 The existing wire budget distributes real visible/collidable cells across the
 footprint; it does not synthesize solid terrain between them. A large cold
 catalog, shared-reader contention, source IO, high render distance or many players
-can delay acquisition. Mask exhaustion explicitly defers further generated
-sampling until recenter/retry; there is no guarantee of sampling an entire large
-source volume immediately. Multiplayer pacing and horizon quality need a live
-playtest at realistic view distances.
+can delay acquisition. Fragmented-mask exhaustion can defer individual incomplete
+patches, but does not pause later complete generated acquisition or periodic
+sweeps. There is no guarantee of sampling an entire large source volume
+immediately. Multiplayer pacing and horizon quality need a live playtest at
+realistic view distances.
 
 No Minecraft client/server, GPU, IntelliJ launch, or model inference was run.
 Fixtures do not prove live Fabric callback/mixin behavior or real source IO
 latency. Expected embedding corruption fixtures log warnings; existing
 annotation/mixin/Gradle deprecation warnings remain. No embedding provider,
 profile, migration, dimensionality or dependency was changed in this repair.
+
+## Scoped review repair verification (2026-10-14)
+
+The same canonical offline Gradle `build` above passed with exit 0, without test
+exclusions, classpath overrides, dependency installation or model downloads.
+Retained tmux-jobs handle: original `%2573`, session `$11`, window `@1582`, pane
+`%2600`, run `30601063928441edb6698b16ed8d0188`.
+
+- All **21** discovered runtime main classes passed (17 runtime sources plus four
+  embedding suites; the standard framework `test` action is intentionally skipped).
+- `ShallowSourceDiscoveryTest`: **15031** checks. The new stationary 32-chunk
+  regression consumes full generated 4096-cell regions, with no persisted
+  geometry, crosses the old 8192-bucket exhaustion boundary, and still acquires
+  the final vertical layer's positive/negative horizon. The bounded reservoir
+  then supplies real mesh publication and matching SAT collision there. It does
+  not substitute a sparse one-cell-per-request fixture for full observations.
+- `ShallowObservationCoverageTest`: **36877** checks. Fragmented exhaustion,
+  later full admission, fragmented-slot reclamation, clipped-patch union,
+  negative coordinates, recenter/teleport pruning, exact AIR/SOLID subtraction
+  and preservation of UNKNOWN persisted cells all pass.
+- `ShallowJumpLandingGraceTest`: **58** checks. Invokes the actual production
+  acquisition-session mutation with stale higher-floor state, then simulates an
+  immediate vanilla jump/landing at three different acquired heights. Source
+  guards pin that mutation before the walk handoff in both success paths.
+- Existing entry recovery, walking correction, jump/landing, handoff, shallow
+  locality, frame continuity, reconnect and expiry regressions remain discovered
+  and passing. `buildSelfTest` and `verifyProductionJar` passed, as did common /
+  client compilation and remapping. `git diff --check` passed.
+
+An initial build failed because the new horizon assertion demanded one exact
+sample at the edge of a spatial admission bin. The regression now checks the
+outer retention/publication bands appropriate to the existing bounded spatial
+admission, plus actual collision, rather than an arbitrary individual sample.
+The final canonical build above passed. Expected embedding-corruption fixture
+warnings and existing Gradle deprecations remain. No live Minecraft, GPU,
+IntelliJ launch or real model inference was performed; embedding providers,
+native-v2 dimensionality, persistence and dependencies were not changed.

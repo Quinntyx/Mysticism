@@ -721,7 +721,7 @@ public final class SpiritTerrainService {
                     return actual!=null?actual:SourceMeshBuilder.stored(cell.material(),at);
                 },material->SourceMeshBuilder.stored(material,BlockPos.ORIGIN));
                 s.shallowDiscovery.advance(w.origin.add(p.getPos().subtract(s.carrier)),world.getBottomY(),world.getTopY(),tick,renderDistance(p));
-                if(s.shallowDiscovery.budgetPaused())status(p,s,"Source horizon samples deferred at the observation-mask budget; existing geometry retained.");
+                if(s.shallowDiscovery.budgetPaused())status(p,s,"Fragmented source samples deferred at mask budget; outward acquisition continues, existing geometry retained.");
             } catch(RuntimeException failure) {
                 // Failed IO must release the shared repository cursor and allow later native retries.
                 if(s.shallowDiscovery!=null)s.shallowDiscovery.retry();

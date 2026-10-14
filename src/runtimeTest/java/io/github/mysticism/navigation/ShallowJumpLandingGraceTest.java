@@ -85,12 +85,49 @@ public final class ShallowJumpLandingGraceTest {
                 "conversion happens at the landing envelope, not on a detection flicker");
     }
 
-    public static void main(String[] args) {
+    /** Both production acquisition paths use the same session mutation. Exercise that actual
+     * mutation with the previous high floor still recorded, then deliver the jump BEFORE any
+     * grounded navigation tick can repair the envelope. No live player/server fixture is needed. */
+    private static void jumpImmediatelyAfterAcquisition() throws Exception {
+        Class<?> type=Class.forName(SpiritNavigationService.class.getName()+"$Session");
+        var constructor=type.getDeclaredConstructor();constructor.setAccessible(true);
+        var height=type.getDeclaredField("supportY");height.setAccessible(true);
+        var unsupported=type.getDeclaredField("unsupported");unsupported.setAccessible(true);
+        var acquire=SpiritNavigationService.class.getDeclaredMethod("recordAcquiredSupport",type,double.class);acquire.setAccessible(true);
+        for(double floor:new double[]{12.25,64,140.5}) {
+            Object session=constructor.newInstance();height.setDouble(session,floor+40);unsupported.setInt(session,37);
+            check(!SpiritNavigationService.holdShallow(false,floor+.34,height.getDouble(session),1),"Fixture must expose the stale previous-floor failure");
+            acquire.invoke(null,session,floor);
+            check(height.getDouble(session)==floor && unsupported.getInt(session)==0,"Acquisition must seed support from current validated carrier feet");
+            double feet=floor,velocity=JUMP_VELOCITY;int airTicks=0;boolean landed=false;
+            for(int tick=0;tick<100 && !landed;tick++) {
+                double next=feet+velocity-GRAVITY;
+                boolean contact=next<=floor && tick>0;
+                feet=contact?floor:next;velocity=contact?0:(velocity-GRAVITY)*DRAG;
+                if(contact)landed=true;
+                else check(SpiritNavigationService.holdShallow(false,feet,height.getDouble(session),++airTicks),
+                        "Immediate jump after lower-floor acquisition incorrectly returned to flight at tick "+tick);
+            }
+            check(landed,"Immediate post-acquisition jump must land back on the acquired floor");
+        }
+        // Pin integration of the tested mutation in BOTH success paths, not merely an unused helper.
+        String source=java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/io/github/mysticism/navigation/SpiritNavigationService.java"));
+        String support=source.substring(source.indexOf("private static void attemptSupport("),source.indexOf("private static float basisError("));
+        String landing=source.substring(source.indexOf("private static boolean attemptLanding("),source.indexOf("public static Optional<SpiritScenePayload.Binding> binding("));
+        for(String path:new String[]{support,landing}) {
+            int seeded=path.indexOf("recordAcquiredSupport(s, p.getY())");
+            check(seeded>path.indexOf("nav.shallow(") && seeded<path.lastIndexOf("flight(p, false)"),
+                    "Each validated acquisition must seed support before the walk handoff");
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
         envelopeHoldsOrdinaryContact();
         flatVanillaJumpStaysShallow(0);
         flatVanillaJumpStaysShallow(1); // Jump Boost I exceeds the previous 14-tick budget
         flatVanillaJumpStaysShallow(2);
         edgeWalkOffEntersDeepBounded();
+        jumpImmediatelyAfterAcquisition();
         System.out.println("ShallowJumpLandingGraceTest: " + checks + " checks passed");
     }
 }

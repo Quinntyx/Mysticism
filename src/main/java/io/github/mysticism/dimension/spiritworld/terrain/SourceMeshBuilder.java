@@ -124,8 +124,13 @@ final class SourceMeshBuilder {
         return replaceNear(base,near,negative.covering(sampled),buckets,center);
     }
     private static List<Node> replaceNear(List<Node> base,List<Node> near,Set<BlockPos> sampled,Map<Long,Integer> buckets,Vec3d center) {
+        return replaceObserved(base,near,sampled::contains,p->buckets.getOrDefault(bucket(p),0),center);
+    }
+    /** Query masks only beneath the bounded incoming nodes, not a horizon-sized bucket map copy. */
+    static List<Node> replaceObserved(List<Node> base,List<Node> near,java.util.function.Predicate<BlockPos> sampled,
+            java.util.function.ToIntFunction<BlockPos> bucketCount,Vec3d center) {
         List<Node> result=new ArrayList<>(near);
-        for(Node node:base)replace(node,sampled,buckets,result);
+        for(Node node:base)replace(node,sampled,bucketCount,result);
         result.sort(Comparator.comparingDouble(n->distanceSquared(nodeBox(n),center)));return List.copyOf(result);
     }
     /** 16-block sampled-volume buckets: nodes never straddle one (sides are powers of two <=16 dividing 16,
@@ -134,32 +139,33 @@ final class SourceMeshBuilder {
     static long bucket(BlockPos p) {
         return ((long)(p.getX()>>4)&0x3FFFFFL)<<42 | ((long)(p.getZ()>>4)&0x3FFFFFL)<<20 | ((long)(p.getY()>>4)&0xFFFFFL);
     }
-    private static void replace(Node n,Set<BlockPos> sampled,Map<Long,Integer> buckets,List<Node> result) {
+    private static void replace(Node n,java.util.function.Predicate<BlockPos> sampled,
+            java.util.function.ToIntFunction<BlockPos> bucketCount,List<Node> result) {
         BlockPos p=n.position();int side=n.side();long cells=(long)side*side*side;
         long sampledVolume=0;
         if(side<=16) {
-            sampledVolume=buckets.getOrDefault(bucket(p),0);
+            sampledVolume=bucketCount.applyAsInt(p);
             if(sampledVolume<=0){result.add(n);return;} // nothing sampled in this bucket: persisted geometry survives
             if(side==16 && sampledVolume>=cells)return; // node coincides with a fully sampled bucket
         } else {
             for(int bx=p.getX()>>4;bx<=(p.getX()+side-1)>>4;bx++)
                 for(int by=p.getY()>>4;by<=(p.getY()+side-1)>>4;by++)
                     for(int bz=p.getZ()>>4;bz<=(p.getZ()+side-1)>>4;bz++)
-                        sampledVolume+=buckets.getOrDefault(bucket(new BlockPos(bx<<4,by<<4,bz<<4)),0);
+                        sampledVolume+=bucketCount.applyAsInt(new BlockPos(bx<<4,by<<4,bz<<4));
             if(sampledVolume<=0){result.add(n);return;} // nothing sampled under this node: survives
             int half=side/2; // some sampled volume: refine instead of scanning up to 64^3 cells
-            for(int child=0;child<8;child++)replace(new Node(p.add((child&1)==0?0:half,(child&2)==0?0:half,(child&4)==0?0:half),half,n.tile(),n.ownerId()),sampled,buckets,result);
+            for(int child=0;child<8;child++)replace(new Node(p.add((child&1)==0?0:half,(child&2)==0?0:half,(child&4)==0?0:half),half,n.tile(),n.ownerId()),sampled,bucketCount,result);
             return;
         }
         boolean any=false,all=true;
         for(BlockPos cell:BlockPos.iterate(p,p.add(side-1,side-1,side-1))) {
-            if(sampled.contains(cell))any=true;else{all=false;if(any)break;}
+            if(sampled.test(cell))any=true;else{all=false;if(any)break;}
         }
         if(!any){result.add(n);return;} // partial bucket without samples under this node: survives
         if(all)return;
         if(side==1)return; // sampled unit leaf: the exact near tile covers it
         int half=side/2;
-        for(int child=0;child<8;child++)replace(new Node(p.add((child&1)==0?0:half,(child&2)==0?0:half,(child&4)==0?0:half),half,n.tile(),n.ownerId()),sampled,buckets,result);
+        for(int child=0;child<8;child++)replace(new Node(p.add((child&1)==0?0:half,(child&2)==0?0:half,(child&4)==0?0:half),half,n.tile(),n.ownerId()),sampled,bucketCount,result);
     }
     /** Refine a persisted coarse leaf only inside the bounded exact-mask window, preserving far geometry. */
     static List<Node> splitOwnership(List<Node> source,Map<BlockPos,String> owners,Bounds range,Vec3d center) {

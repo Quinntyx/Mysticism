@@ -40,7 +40,7 @@ final class ShallowSourceDiscovery {
     private List<SourceMeshBuilder.Node> nodes=List.of();
     // Both AIR and SOLID observations mask later persisted snapshots. Live near samples are
     // overlaid by the service after this reservoir; these masks grant no support/exit authority.
-    private final NegativeCoverage observed=new NegativeCoverage();
+    private final ShallowObservationCoverage observed=new ShallowObservationCoverage();
 
     ShallowSourceDiscovery(Source source,Function<SourceLandmarks.Cell,SourceMeshBuilder.Tile> resolve,
             Function<BlockPalette.State,SourceMeshBuilder.Tile> stored) {
@@ -59,7 +59,7 @@ final class ShallowSourceDiscovery {
                 var node=new SourceMeshBuilder.Node(pos,Math.toIntExact(b.maxX()-b.minX()),stored.apply(page.palette().state(cell.value().paletteIndex())),owner);
                 if(distance(node)<=(double)radius*radius)incoming.add(node);
             }
-            merge(SourceMeshBuilder.replaceNear(incoming,List.of(),Set.of(),observed,focus));
+            merge(SourceMeshBuilder.replaceObserved(incoming,List.of(),observed::contains,observed::bucketCount,focus));
             if(leaves.complete()){leaves=null;page=null;}
             return;
         }
@@ -87,17 +87,17 @@ final class ShallowSourceDiscovery {
             if(generatedEnd && future==null && cells==null){yIndex=ring=edge=0;generatedEnd=false;}}
     }
     private void advanceGenerated(long tick) {
-        if(budgetPaused)return;
         if(cells!=null) {
             int budget=CELL_BUDGET;
             while(cells.hasNext() && budget-->0) {
                 var cell=cells.next();BlockPoint p=cell.position();BlockPos at=new BlockPos(Math.toIntExact(p.x()),Math.toIntExact(p.y()),Math.toIntExact(p.z()));
-                // Mask exhaustion defers this patch, rather than resurrecting stored geometry.
-                if(!observed.canRecord(at)){budgetPaused=true;cells=null;patch.clear();return;}
                 patch.put(at,resolve.apply(cell));
             }
             if(cells.hasNext())return;
-            for(BlockPos at:patch.keySet())observed.add(at);
+            // Full patches cost one compact bit, independent of the fragmented-mask cap. A
+            // fragmented patch that cannot fit is deferred atomically, not a permanent stop of
+            // the outward cursor: subsequent full regions and periodic sweeps must still run.
+            if(!observed.record(patch.keySet())){budgetPaused=true;patch.clear();cells=null;return;}
             var replacement=SourceMeshBuilder.replaceNear(nodes,SourceMeshBuilder.compact(patch,focus),patch.keySet(),focus);
             nodes=List.of();merge(replacement);patch.clear();cells=null;return;
         }

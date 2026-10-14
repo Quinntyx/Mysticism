@@ -609,10 +609,15 @@ public final class SpiritNavigationService {
             return;
         }
         var at = mapped.get(); nav.shallow(at.dimension(), at.landmarkId(), at.position());
-        s.confirmedOwned = true; s.unsupported = 0; endSupportApproach(p, s);
+        s.confirmedOwned = true; recordAcquiredSupport(s, p.getY()); endSupportApproach(p, s);
         SpiritBasisEvolver.resetMotion(p); flight(p, false);
         MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p); sync(p);
         p.sendMessage(Text.literal("Shallow: walking on the current source-owned landmark. Captured attunement retained."), true);
+    }
+    /** Acquisition already validated contact at CURRENT carrier feet. Seed the new floor's
+     * landing envelope before flight/ability handoff: a jump packet can precede our next tick. */
+    private static void recordAcquiredSupport(Session s, double feetY) {
+        s.unsupported = 0; s.supportY = feetY;
     }
     private static float basisError(Basis384f a, Basis384f b) {
         return a.i.squareDistance(b.i) + a.j.squareDistance(b.j) + a.k.squareDistance(b.k);
@@ -684,7 +689,8 @@ public final class SpiritNavigationService {
         if (SpiritTerrainService.tryLandTarget(p, nav.targetDimension(), nav.targetLandmarkId(), nav.targetPosition())) {
             var source = SpiritTerrainService.sourcePosition(p);
             if (source.isPresent()) {
-                var at = source.get(); nav.shallow(at.dimension(), at.landmarkId(), at.position()); s.unsupported = 0;
+                var at = source.get(); nav.shallow(at.dimension(), at.landmarkId(), at.position());
+                recordAcquiredSupport(s, p.getY());
                 endApproach(p, s); SpiritBasisEvolver.resetMotion(p); flight(p, false);
                 MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p); sync(p);
             }

@@ -23,7 +23,7 @@ public final class ShallowSourceDiscoveryTest {
         final List<Bounds> queries=new ArrayList<>();
         final List<LandmarkMetadata> metadata=new ArrayList<>();
         final Map<String,GeometryPage> pages=new HashMap<>();
-        boolean busy,delayed,failed,emptyCatalog;
+        boolean busy,delayed,failed,emptyCatalog,fullRegions;
         CompletableFuture<SourceLandmarks.Region> held;
         BlockPoint airObservation;
         int reads,cancels;
@@ -66,6 +66,14 @@ public final class ShallowSourceDiscoveryTest {
             check(volume<=4096,"Outward generated query exceeds production IO budget");
             if(delayed){held=new CompletableFuture<>();return held;}
             if(failed){failed=false;return CompletableFuture.failedFuture(new IllegalStateException("fixture IO failure"));}
+            if(fullRegions) {
+                List<SourceLandmarks.Cell> cells=new ArrayList<>();
+                for(long x=range.minX();x<range.maxX();x++)for(long y=range.minY();y<range.maxY();y++)for(long z=range.minZ();z<range.maxZ();z++) {
+                    boolean marker=x==range.minX()+8 && y==range.minY() && z==range.minZ()+8;
+                    cells.add(new SourceLandmarks.Cell(new BlockPoint(x,y,z),marker?STATE:new BlockPalette.State("minecraft:air",Map.of()),"fixture",true));
+                }
+                return CompletableFuture.completedFuture(new SourceLandmarks.Region(DIM,range,cells,true));
+            }
             // One known surface sample per patch; UNKNOWN space is never filled in by the algorithm.
             List<SourceLandmarks.Cell> cells=new ArrayList<>();
             if(range.minY()<=63 && range.maxY()>63)cells.add(new SourceLandmarks.Cell(new BlockPoint(range.minX()+8,63,range.minZ()+8),STATE,"fixture",true));
@@ -158,6 +166,36 @@ public final class ShallowSourceDiscoveryTest {
         check(masks.size()==1 && masks.contains(inside) && !masks.contains(outside),
                 "Recentered observation retention leaked old source buckets or forgot still-visible negative observations");
     }
+    /** A stationary 32-chunk observer with no persisted geometry. Every generated request
+     * returns ALL 4096 cells, not the old one-cell fixture that hid the mask-cap deadlock.
+     * Three complete source layers exceed 8192 buckets; acquisition must still reach the last
+     * layer's horizon and publish real collidable terrain without a recenter/retry. */
+    private static void fullRegionExhaustion() {
+        Fixture io=new Fixture();io.emptyCatalog=true;io.fullRegions=true;var d=discovery(io);
+        int tick=0;
+        while(tick<1_000_000) {
+            d.advance(FOCUS,32,80,tick++,512);
+            if((tick&63)==0 && io.queries.size()>NegativeCoverage.MAX_BUCKETS
+                    && d.snapshot().stream().anyMatch(n->n.position().getY()==64 && n.position().getX()>=480 && Math.abs(n.position().getZ())<=32)
+                    && d.snapshot().stream().anyMatch(n->n.position().getY()==64 && n.position().getX()<=-480 && Math.abs(n.position().getZ())<=32))break;
+        }
+        check(tick<1_000_000,"Full generated regions stopped before the final-layer horizon: queries="+io.queries.size()+", deferred="+d.budgetPaused()+", nodes="+d.snapshot().size());
+        check(io.queries.size()>NegativeCoverage.MAX_BUCKETS,"Regression never crossed the old full-region exhaustion boundary");
+        check(!d.budgetPaused(),"Complete generated regions must fit compact masks throughout the maximum horizon");
+        check(d.snapshot().size()<=ShallowSourceDiscovery.MAX_NODES,"Full-region exhaustion escaped the node retention budget");
+        List<TerrainMeshFrame.Material> materials=new ArrayList<>();List<TerrainMeshFrame.Cell> cells=new ArrayList<>();
+        MeshPublication.append(d.snapshot(),DIM,FOCUS,FOCUS,new Vec3d(1,0,0),new Vec3d(0,1,0),new Vec3d(0,0,1),FOCUS,1,1024,
+                materials,new HashMap<>(),cells,new HashSet<>(),512);
+        var frame=new TerrainMeshFrame(2,true,DIM,FOCUS,FOCUS,materials,cells);var collision=new MeshCollision.Index(frame);
+        for(int sign:new int[]{-1,1}) {
+            // The 1024-cell wire budget uses spatial bins, so require the outer 64-block
+            // horizon band, not one particular sample within the final bin.
+            var horizon=cells.stream().filter(c->c.sourceMin().x*sign>=448 && Math.abs(c.sourceMin().z)<=64 && c.sourceMin().y==64).findFirst();
+            check(horizon.isPresent(),"Post-exhaustion generated horizon lost render publication in direction "+sign);
+            Vec3d point=horizon.orElseThrow().min();
+            check(!collision.clearRay(point.add(.5,2,.5),point.add(.5,.5,.5)),"Post-exhaustion visible horizon lacks matching SAT collision");
+        }
+    }
     private static void serviceWiring() throws Exception {
         String source=Files.readString(Path.of("src/main/java/io/github/mysticism/dimension/spiritworld/terrain/SpiritTerrainService.java"));
         check(source.contains("c.advanceShallow();c.advanceNear();c.advanceGeometry();"),"Production tick does not run outward acquisition");
@@ -166,7 +204,7 @@ public final class ShallowSourceDiscoveryTest {
         check(source.contains("store.sourceRangePage(w.dimension,range,cursor,4,4)"),"Production shallow catalog is not bounded/source-native");
     }
     public static void main(String[] args) throws Exception {
-        nativeCatalogHorizon();generatedHorizonAndLifecycle();actualRenderDistance();movingAcquisitionAndRetry();observationMasks();serviceWiring();
+        nativeCatalogHorizon();generatedHorizonAndLifecycle();actualRenderDistance();movingAcquisitionAndRetry();observationMasks();fullRegionExhaustion();serviceWiring();
         System.out.println("ShallowSourceDiscoveryTest: "+checks+" checks passed (production source acquisition / mesh / SAT)");
     }
 }
