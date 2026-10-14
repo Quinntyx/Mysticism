@@ -17,7 +17,7 @@ public final class NaturalLandingContactTest {
         restingContact();
         airborneAbove();
         fadedTerrainIsNotSupport();
-        naturalLandingGateUsesWalkAcquisitionNormal();
+        tiltedContactCanStartValidationButNotAcquire();
         System.out.println("natural landing contact checks: " + checks);
     }
 
@@ -47,7 +47,7 @@ public final class NaturalLandingContactTest {
         check(hit != null, "a deep player settled on a visible floor measures resting contact");
         check(hit.normal().y >= NaturalLandingPolicy.MIN_GROUND_NORMAL_Y,
                 "flat floor contact satisfies the natural-landing normal gate, got " + hit.normal().y);
-        // Walk acquisition additionally requires normal.y >= .99; both paths agree on flat floors.
+        // Final walk acquisition remains stricter than contact admission.
         check(hit.normal().y >= .99, "flat floor contact also admits walk acquisition");
     }
 
@@ -63,9 +63,9 @@ public final class NaturalLandingContactTest {
         check(contact(index, 129) == null, "a fully faded floor is invisible and non-solid for landing");
     }
 
-    private static void naturalLandingGateUsesWalkAcquisitionNormal() {
-        // A 45-degree ramp (top face tilted around Z): contact exists but its surface normal is
-        // far from horizontal-up, so neither natural landing nor walk acquisition may commit.
+    private static void tiltedContactCanStartValidationButNotAcquire() {
+        // A tilted top face has ground contact and can start source discovery/alignment.
+        // Contact admission alone must not be confused with final shallow acquisition.
         double a = Math.sqrt(.5);
         var index = new MeshCollision.Index(frame(cell(1, new Vec3d(0, 127, 0), new Vec3d(a, a, 0), new Vec3d(0, 1, 0), 1f)));
         // The tilted top face satisfies y = 128 + x for x in [0, .7071]. The body stays fully on the
@@ -74,7 +74,8 @@ public final class NaturalLandingContactTest {
         var hit = contactAt(index, 128.75, .05);
         check(hit != null, "sloped terrain still stops a descending player");
         check(hit.normal().y > .3, "the ramp registers as generic ground contact");
-        check(hit.normal().y < NaturalLandingPolicy.MIN_GROUND_NORMAL_Y,
-                "steep contact refuses natural landing like walk acquisition, got " + hit.normal().y);
+        check(hit.normal().y > NaturalLandingPolicy.MIN_GROUND_NORMAL_Y,
+                "tilted ground contact admits bounded natural validation, got " + hit.normal().y);
+        check(hit.normal().y < .99, "tilted contact still fails the final acquisition normal gate");
     }
 }

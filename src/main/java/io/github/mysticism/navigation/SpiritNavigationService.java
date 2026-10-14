@@ -310,21 +310,30 @@ public final class SpiritNavigationService {
     /** A deep-flying player who settles onto available owned custom terrain lands instead of hovering above support. */
     private static void naturalLanding(ServerPlayerEntity p, Session s, Vec3d delta) {
         var nav = state(p);
-        var ground = MeshCollision.ground(p);
-        if (ground.isEmpty()) { s.airborne = true; s.restingTicks = 0; return; }
-        if (!s.airborne) { s.restingTicks = 0; return; } // standing takeoff grace: flight continues until real airtime
-        boolean resting = ground.get().normal().y >= NaturalLandingPolicy.MIN_GROUND_NORMAL_Y
-                && delta.y <= NaturalLandingPolicy.MAX_REST_VERTICAL;
-        if (!resting) { s.restingTicks = 0; return; }
-        var action = NaturalLandingPolicy.evaluate(nav.deep(), s.airborne, s.supportPending, s.blendTo != null,
-                nav.landingApproach(), resting, s.restingTicks);
-        if (action != NaturalLandingPolicy.Action.LAND) { ++s.restingTicks; return; }
-        s.restingTicks = 0;
+        if (naturalLandingAction(s, nav.deep(), nav.landingApproach(), MeshCollision.ground(p), delta)
+                != NaturalLandingPolicy.Action.LAND) return;
         // Contact is real visible/collidable terrain, but its source ownership may still need
         // discovery. Start the same bounded acquisition as an explicit walk; attemptSupport
         // discovers the inverse-mapped source body and never commits unknown geometry.
         beginSupportApproach(p, s, true);
         feedback(p, s, true, "Natural landing: validating the terrain below; flight remains active until ready.");
+    }
+    /** Measured-contact/cadence seam shared with runtime regressions; this grants only an intent,
+     * never shallow mode. Source discovery, guarded alignment and acquisition still follow. */
+    static NaturalLandingPolicy.Action naturalLandingAction(Session s, boolean deep, boolean landingApproach,
+            Optional<MeshCollision.Hit> ground, Vec3d delta) {
+        if (ground.isEmpty()) { s.airborne = true; s.restingTicks = 0; return NaturalLandingPolicy.Action.NONE; }
+        if (!s.airborne) { s.restingTicks = 0; return NaturalLandingPolicy.Action.NONE; } // standing takeoff needs real airtime
+        // Admission uses ordinary mesh ground, not final walking's .99 normal: a projected
+        // source-flat floor may need this very approach to align it back to horizontal.
+        boolean resting = ground.get().normal().y > NaturalLandingPolicy.MIN_GROUND_NORMAL_Y
+                && delta.y <= NaturalLandingPolicy.MAX_REST_VERTICAL;
+        if (!resting) { s.restingTicks = 0; return NaturalLandingPolicy.Action.NONE; }
+        var action = NaturalLandingPolicy.evaluate(deep, s.airborne, s.supportPending, s.blendTo != null,
+                landingApproach, resting, s.restingTicks);
+        if (action != NaturalLandingPolicy.Action.LAND) ++s.restingTicks;
+        else s.restingTicks = 0;
+        return action;
     }
     private static void endSupportApproach(ServerPlayerEntity p, Session s) {
         endSupportApproach(p, s, false);

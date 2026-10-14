@@ -197,7 +197,39 @@ public final class WalkDiscoveryRuntimeTest {
                 "Natural acquisition retains independent producer ownership and current source target");
     }
 
+    private static void tiltedContactDoesNotBypassAcquisition() {
+        Fixture f = new Fixture(false);
+        TerrainMeshFrame alignedFrame = f.session.frame;
+        double slope = Math.tan(Math.toRadians(10));
+        // Source-flat floor sheared by projection, positioned so the real AABB rests on its
+        // high edge. Exact source floor/body ownership and extraction proof are still present.
+        var tilted = new TerrainMeshFrame.Cell(11, 0, f.b.id(), new Vec3d(100, 63, 200),
+                new Vec3d(-.1, -.9 * slope, 0), new Vec3d(1, 1, 1),
+                new Vec3d(1, slope, 0), new Vec3d(0, 1, 0), new Vec3d(0, 0, 1),
+                0xffffff, 0xf000f0, 1, List.of(UNIT));
+        f.session.frame = frame(3, false, List.of(tilted));
+        var hit = f.ground().orElseThrow();
+        check(hit.normal().y > io.github.mysticism.navigation.NaturalLandingPolicy.MIN_GROUND_NORMAL_Y
+                && hit.normal().y < .99, "10-degree projected contact admits validation, but not walking");
+        check(f.discover(), "tilted contact retains a real discovered source owner");
+        var support = f.support();
+        check(support.normal().y < .99 && f.session.walkProbe.ready,
+                "candidate/proof can be ready before the displayed floor is aligned");
+        check(!acquireCurrentSupport(f.session, f, support),
+                "final acquisition refuses tilted contact even with matching grid and source proof");
+        check(!f.session.shallow && f.published == 0 && f.session.walkTarget != null,
+                "pre-alignment rejection preserves deep flight and retryable discovered target");
+        // The accepted frame supplied by renderer I/O now represents aligned geometry. This
+        // fixture tests acquisition, not actual canAlign/server mesh generation or gameplay.
+        f.session.frame = alignedFrame;
+        check(acquireCurrentSupport(f.session, f, f.support()),
+                "same discovered target acquires only once current displayed support is aligned");
+        check(f.session.shallow && f.session.local.id.equals(f.b.id()) && f.producer.id.equals(f.a.id()),
+                "post-alignment acquisition keeps source ownership independent");
+    }
+
     public static void main(String[] args) {
+        tiltedContactDoesNotBypassAcquisition();
         naturalContactBeforeDiscovery();
         crossOwnerAcquisition(false);crossOwnerAcquisition(true);
         candidateInvalidation();acquisitionGuardsAndRollback();

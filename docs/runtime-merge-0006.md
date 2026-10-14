@@ -1,5 +1,7 @@
 # Runtime navigation merge 0006
 
+Follow-up scoped review repair and verification: [tilted natural landing](tilted-natural-landing-repair.md).
+
 Scope: retained `feat-runtime-merge-0006`, for eventual integration into **dev**, never main.
 The retained checkout was mid-merge: HEAD `927bae4ee877414cf338d505720a4066360be383`
 with merge parent `d393144f3e5faee8b21647c69a31e9a976f06579` and one unresolved

@@ -32,7 +32,8 @@ public final class NaturalLandingPolicyTest {
         check(decide(true, true, false, false, false, true, NaturalLandingPolicy.REST_TICKS - 1)
                 == NaturalLandingPolicy.Action.LAND, "sustained rest triggers natural landing");
         check(NaturalLandingPolicy.REST_TICKS == 10, "rest window is half a second");
-        check(NaturalLandingPolicy.MIN_GROUND_NORMAL_Y >= .99, "natural landing ground normal matches walk acquisition");
+        check(NaturalLandingPolicy.MIN_GROUND_NORMAL_Y == .3,
+                "natural validation starts from ordinary mesh ground, before source-grid alignment");
         check(NaturalLandingPolicy.MAX_REST_VERTICAL >= 0 && NaturalLandingPolicy.MAX_REST_VERTICAL < .01,
                 "rest excludes real ascending motion but tolerates collision settle jitter");
     }
