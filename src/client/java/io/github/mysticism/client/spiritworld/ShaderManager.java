@@ -46,6 +46,8 @@ public final class ShaderManager {
     private static boolean missingHookReported;
     private static SpiritRenderSettings.Quality quality = initialQuality();
     private static SpiritRenderSettings.FogRange fogRange = SpiritRenderSettings.DEFAULT_FOG_RANGE;
+    private static boolean kuwaharaEnabled = Boolean.parseBoolean(
+            System.getProperty("mysticism.spirit.kuwahara", "true"));
     private static String status = "starting";
 
     private ShaderManager() {}
@@ -94,7 +96,8 @@ public final class ShaderManager {
                 KUWAHARA_SHADER.setUniformValue("OpaqueRadius", (float) fogRange.opaqueRadius());
                 KUWAHARA_SHADER.setUniformValue("HorizonOpticalDepth", (float) SpiritRenderSettings.HORIZON_OPTICAL_DEPTH);
                 KUWAHARA_SHADER.setUniformValue("FogSteps", quality.fogSteps);
-                KUWAHARA_SHADER.setUniformValue("KernelRadius", quality.kernelRadius);
+                KUWAHARA_SHADER.setUniformValue("KernelRadius", kuwaharaEnabled ? quality.kernelRadius : 0);
+                KUWAHARA_SHADER.setUniformValue("SampleStride", SpiritRenderSettings.painterlyStride(main.textureHeight));
                 KUWAHARA_SHADER.setUniformValue("Saturation", SpiritRenderSettings.saturation(
                         (System.nanoTime() - enteredAt) * 1.0e-9));
                 frame.prepare(surface(main));
@@ -227,6 +230,9 @@ public final class ShaderManager {
     public static void setQuality(SpiritRenderSettings.Quality value) {
         quality = java.util.Objects.requireNonNull(value);
     }
+
+    /** Independent A/B switch: fog and saturation still run when painterly filtering is off. */
+    public static void setKuwaharaEnabled(boolean enabled) { kuwaharaEnabled = enabled; }
 
     public static String status() { return status; }
 

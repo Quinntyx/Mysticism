@@ -134,6 +134,15 @@ public final class SpiritFogRangeSelfTest {
                 && manager.contains("frame.captureDepth(surface(client.getFramebuffer()))")
                 && manager.contains("frame.consume(surface(main))"), "wider fog only runs with same-surface captured depth");
         check(manager.contains("if (frame.ready() && !failed && effectStrength()>=.999f)"), "vanilla fog suppression uses lifecycle readiness");
+        check(manager.contains("System.getProperty(\"mysticism.spirit.kuwahara\", \"true\")"), "painterly filtering remains enabled by default after resource/fog merge");
+        check(manager.contains("setUniformValue(\"KernelRadius\", kuwaharaEnabled ? quality.kernelRadius : 0)")
+                && manager.contains("setUniformValue(\"SampleStride\", SpiritRenderSettings.painterlyStride(main.textureHeight))"),
+                "live quality and actual resized pixel height drive the filter, not a status-only toggle");
+        check(manager.contains("setUniformValue(\"FogSteps\", quality.fogSteps)"), "same live quality also drives wider fog");
+        int render = manager.indexOf("KUWAHARA_SHADER.render(");
+        check(render > manager.indexOf("frame.consume(surface(main))")
+                && manager.indexOf("KUWAHARA_SHADER.render(", render + 1) < 0,
+                "one executable shared fog/filter chain, only after valid same-frame depth consumption");
         check(mesh.contains("ShaderManager.fogRange().containsDistanceSquared(distanceSquared(b.bounds,camera))"), "real mesh renderer shares fog range");
         check(!mesh.contains(">64*64"), "no old mesh-locality cutoff");
         for (String name : new String[]{"VisibleRadius", "OpaqueRadius", "HorizonOpticalDepth"}) {

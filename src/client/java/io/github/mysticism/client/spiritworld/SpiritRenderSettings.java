@@ -52,6 +52,11 @@ public final class SpiritRenderSettings {
 
     private SpiritRenderSettings() {}
 
+    /** Bounded brush spacing in framebuffer pixels, independent of GUI scale. */
+    public static int painterlyStride(int framebufferHeight) {
+        return Math.max(1, Math.min(4, Math.round(framebufferHeight / 540.0f)));
+    }
+
     /** Smooth, independent of frame count, game ticks, fog and painterly quality. */
     public static float saturation(double elapsedSeconds) {
         double t = Math.max(0, Math.min(1, elapsedSeconds / SATURATION_FADE_SECONDS));
