@@ -182,7 +182,7 @@ bound its original restart pane `%2547`, window `@1552`, in the same session
 
 The canonical Gradle 8.13 `--offline --no-daemon --console=plain build
 --rerun-tasks` command then PASSED, exit 0, 31 seconds, all 14 tasks executed.
-Retained job: pane `%2550`, window `@1555`, run
+Job used: pane `%2550`, window `@1555`, run
 `f903da39178d4b3b9f70fa403a90099c`, origin `%2547`. It compiled production/client
 and runtime tests, executed all **11 discovered** runtime main-based classes,
 ran build/descriptor/packaging/runner self-tests and verified the remapped
@@ -200,3 +200,28 @@ The earlier PTY/canonical verification blocker is resolved. The original red
 probe and interrupted-start history above remains an audit trail, not a current
 candidate failure. Source/CI success still does not establish live Minecraft
 behavior or real native model inference; the limits above remain in force.
+
+
+### Pre-context ordering boundary regression
+
+A final initialization-path check found that an older packet could still replace
+the component's pose before predictor registration, despite the new cache retaining
+the newer authority. `LatentPos` and `LatentBasis` now reject stale/duplicate
+sequences at their component boundary, before reconciliation, including replacement
+and peer packets. Newly received peer authority still applies normally. The cache
+and live baseline therefore cannot disagree merely because packets reordered
+before the local prediction context existed.
+
+The added actual-packet regression failed before the guard with
+`pre-context reordered position cannot replace the newest received baseline`.
+Red `runtimeSelfTest`: exit 1, 11 seconds, pane `%2558`, window `@1555`, run
+`09727d6b07c3415ca5408adae8f950f0`, origin `%2547`, session `$11`.
+
+After the guard, the canonical full `build --rerun-tasks` PASSED again: exit 0,
+33 seconds, all 14 tasks executed, all 11 runtime suites plus packaging and
+production-jar verification. Reconciliation now passes **81** checks; other suite
+counts are unchanged. Build pane `%2550`, run `92186f0f3a7f47138603488c4e3d19ab`
+(historical handle; the same stable build pane is reused for final-HEAD verification).
+The final delivery report carries the latest pane/run token. All substantive
+retained commits/review feedback remain preserved; no review round was restarted
+or child agent created during this continuation.

@@ -97,6 +97,9 @@ public final class LatentBasis implements ComponentV3, AutoSyncedComponent {
         int sequence = buf.readVarInt();
         NbtCompound tag = buf.readNbt();
         if (tag == null) return;
+        // Ordering already applies before this instance is recognized as the local predictor.
+        // Otherwise a stale replacement/peer packet can leave pose and cached frontier disagreeing.
+        if (receivedSequence != 0 && sequence <= receivedSequence) return;
         LatentBasis incoming = new LatentBasis();
         // The read path ignores the registry lookup; the wire format is self-describing bits.
         incoming.readFromNbt(tag, null);

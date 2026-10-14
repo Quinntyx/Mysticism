@@ -65,6 +65,26 @@ public final class MovementReconciliationSelfTest {
         check(error(b.get(), predictedB) == 0, "pre-context basis snapshot must seed authority, not overwrite later prediction");
         check(q.receivedSequence() == 2 && b.receivedSequence() == 2, "replacement owns independent restarted wire streams");
     }
+    private static void preContextReorder() {
+        // Replacement packets may reorder before the predictor identifies this component as local.
+        var q = new LatentPos(); var b = new LatentBasis();
+        var serverQ = new LatentPos(); var serverB = new LatentBasis();
+        RegistryByteBuf oldQ = packet(serverQ), oldB = packet(serverB);
+        try {
+            TraversalSteering.deepStep(serverQ.get(), serverB.get(), target(1), .5, 0, 0);
+            deliver(serverQ, q); deliver(serverB, b);
+            q.applySyncPacket(oldQ); b.applySyncPacket(oldB);
+            check(q.get().squareDistance(serverQ.get()) == 0, "pre-context reordered position cannot replace the newest received baseline");
+            check(error(b.get(), serverB.get()) == 0, "pre-context reordered basis cannot replace the newest received baseline");
+            check(q.receivedSequence() == 2 && b.receivedSequence() == 2, "pre-context stale packets do not rewind wire frontiers");
+            var nav = new SpiritNavigation();
+            predict(q, b, nav, target(1), new Vec3d(.3, 0, 0), false);
+            Vec384f predictedQ = q.get().clone(); Basis384f predictedB = b.get().clone();
+            deliver(serverQ, q); deliver(serverB, b);
+            check(q.get().squareDistance(predictedQ) == 0 && error(b.get(), predictedB) == 0,
+                    "prediction initialized after packet reorder starts from matching authoritative pose and frontier");
+        } finally { oldQ.release(); oldB.release(); }
+    }
     private static void firstPacketAfterPrediction() {
         var q = new LatentPos(); var b = new LatentBasis(); var nav = new SpiritNavigation();
         predict(q, b, nav, target(1), new Vec3d(1, 0, 0), false);
@@ -152,6 +172,7 @@ public final class MovementReconciliationSelfTest {
     public static void main(String[] args) {
         int failures = 0;
         for (Runnable regression : new Runnable[] {MovementReconciliationSelfTest::beforeContext,
+                MovementReconciliationSelfTest::preContextReorder,
                 MovementReconciliationSelfTest::firstPacketAfterPrediction,
                 MovementReconciliationSelfTest::curvedReversal,
                 MovementReconciliationSelfTest::suppressedWindowConvergesAtRest}) {
