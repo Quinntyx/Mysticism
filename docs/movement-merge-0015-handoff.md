@@ -225,3 +225,60 @@ counts are unchanged. Build pane `%2550`, run `92186f0f3a7f47138603488c4e3d19ab`
 The final delivery report carries the latest pane/run token. All substantive
 retained commits/review feedback remain preserved; no review round was restarted
 or child agent created during this continuation.
+
+
+## Teleport-suppressed prediction review repair
+
+Retained starting HEAD: `5fd110f036d748138074534f2ce5352d44c54f2e`, clean branch
+`feat-runtime-merge-0015`. The previous session JSONL remains absent at the supplied
+path; review used this saved conversation, retained source, commits and handoff.
+No retained commit or user edit was discarded and no other checkout was edited.
+
+The scoped finding is confirmed: `MovementIntegration.server` returned unmarked
+`Sample.ZERO` for `requestTeleport` suppression. A rejected carrier window can
+already have advanced the client's semantic pose. Position-look re-baselines
+carrier movement/history, not semantic q/basis; after prediction resumes,
+unchanged unmarked server authority has divergence equal to the fallback lag
+bound and can be held forever.
+
+Explicit teleport provenance now returns a zero-state/zero-semantic sample with
+`requiresReconciliation=true` BEFORE displacement validation. This covers a
+zero measured delta from the TAIL re-baseline hook, small movement corrections,
+large command teleports and unavailable/invalid measured samples. The existing
+server evolver then increments BOTH pose correction revisions and immediately
+syncs BOTH components, even off cadence. The revisions travel with each pose,
+so delivery after a prediction restart still restores server semantic authority.
+No correction displacement is integrated; clean later windows retain their
+chosen movement. No new protocol, navigation mode or embedding migration.
+
+`MovementReconciliationSelfTest` now covers actual component packets with rejected
+deep movement, server/client provenance draining, position-look history reset,
+20 resumed prediction ticks BEFORE authority delivery, both stream delivery
+orders, zero/small/large measured teleport windows, 300 resting cadence ticks,
+clean resumed travel and reordered pre-correction/duplicate correction packets.
+`MovementIntegrationSelfTest` asserts reconciliation provenance without travel,
+also for unavailable/invalid displacement samples. These exercise real shared
+classifier/steering/reconciliation methods, NOT live Minecraft mixin execution.
+
+RED evidence: before production edits, the new test was discovered by
+`runtimeSelfTest` and failed `delayed teleport position must reconcile after
+prediction resumes`. Exit 1, 16 seconds, session `$11`, origin `%2619`, pane
+`%2628`, window `@1596`, run `780cc0c6c5bd4dcb9cad511f5c33a943`.
+
+GREEN source verification: canonical installed Gradle 8.13 `--offline --no-daemon
+--console=plain build --rerun-tasks` passed, exit 0, 28 seconds, all 14 tasks
+executed. All 11 runtime suites were discovered/executed: reconciliation **171**
+checks, classification **42**; other suite counts unchanged. Build/descriptor/
+packaging/runner self-tests and `verifyProductionJar` also passed. Job origin
+`%2619`, session `$11`, window `@1596`, pane `%2640`, run
+`670ea6a546204875bb80d35a065252ae` (historical handle; reused for exact committed
+HEAD verification, whose current token is reported at delivery).
+`git diff --check` passed. Existing nonfatal compiler/Gradle warnings and expected
+corrupt-data test warnings persist.
+
+All earlier limits still apply. No gameplay, live position-look mixin execution,
+real network-latency experiment, IntelliJ launch or native model inference was
+performed. Independent per-player projection, source/octree ownership, custom
+terrain collision/render behavior and native v2 embedding implementation/profile
+are untouched. This narrowly closes teleport-suppression reconciliation, not a
+claim that the other ten runtime problem areas were repaired here.

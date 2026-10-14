@@ -54,13 +54,21 @@ public final class MovementIntegrationSelfTest {
                 "body-overlap corrections must pause semantic advance instead of chasing the dispute");
     }
     private static void teleportsNeverIntegrateAtAnySize() {
-        for (Vec3d measured : new Vec3d[] {WALK, BURST, new Vec3d(3, 64, 0)}) {
+        for (Vec3d measured : new Vec3d[] {Vec3d.ZERO, WALK, BURST, new Vec3d(3, 64, 0)}) {
             var sample = MovementIntegration.server(measured, Vec3d.ZERO, true);
             checkEquals(Vec3d.ZERO, sample.stateDelta(), "teleport window must not run state machines");
             checkEquals(Vec3d.ZERO, sample.semanticDelta(), "teleports are not chosen movement at any size");
             check(MovementIntegration.clientSemantic(measured, Vec3d.ZERO, true).equals(Vec3d.ZERO),
                     "client correction windows are inert");
+            check(sample.requiresReconciliation(), "teleport suppression must reconcile previous prediction even with zero measured travel");
         }
+        check(MovementIntegration.server(null, Vec3d.ZERO, true).requiresReconciliation(),
+                "explicit teleport provenance survives an unavailable displacement sample");
+        check(MovementIntegration.server(WALK, new Vec3d(Double.NaN, 0, 0), true).requiresReconciliation(),
+                "explicit teleport provenance survives an invalid collision sample");
+        check(!MovementIntegration.Sample.ZERO.requiresReconciliation(), "ordinary idle sample has no correction provenance");
+        check(!MovementIntegration.server(WALK, Vec3d.ZERO, false).requiresReconciliation(),
+                "clean travel without teleport provenance is not forced authority");
     }
     private static void impossibleWindowsAreRepositioning() {
         Vec3d beyond = new Vec3d(9, 0, 0);

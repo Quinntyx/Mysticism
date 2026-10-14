@@ -41,7 +41,7 @@ public final class SpiritBasisEvolver {
             var target = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target();
             if (SpiritNavigationService.update(p, delta, semantic)) TraversalSteering.deepStep(q, basis, target, semantic.x, semantic.y, semantic.z,
                     p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION).hasShallowTarget());
-            // Suppressing a disputed overlap window must also retire the client's chosen remainder.
+            // Suppressed overlap or teleport windows must also retire the client's earlier prediction.
             // The revision travels in BOTH pose streams; delivery after a predictor tick cannot
             // disguise this correction as movement lag, nor can a delayed older packet undo it.
             boolean reconcile = reconcileSuppressedWindow(sample,

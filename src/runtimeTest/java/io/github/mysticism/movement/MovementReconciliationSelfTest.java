@@ -5,6 +5,8 @@ import io.github.mysticism.client.spiritworld.ClientPoseSync;
 import io.github.mysticism.component.*;
 import io.github.mysticism.dimension.spiritworld.SpiritBasisEvolver;
 import io.github.mysticism.navigation.MovementIntegration;
+import io.github.mysticism.navigation.MovementProvenance;
+import java.util.UUID;
 import io.github.mysticism.vector.*;
 import io.netty.buffer.Unpooled;
 import net.minecraft.nbt.NbtCompound;
@@ -169,13 +171,105 @@ public final class MovementReconciliationSelfTest {
             check(!basisTag.contains("poseCorrectionRevision"), "basis correction provenance also remains session-local");
         } finally { oldQ.release(); oldB.release(); }
     }
+    private static void teleportSuppressionConvergesAfterPredictionResumes() {
+        // requestTeleport's TAIL hook can re-baseline measured travel to ZERO before the evolver
+        // drains its HEAD provenance mark. Neither size nor an overlap signal can identify this.
+        for (Vec3d measured : new Vec3d[] {Vec3d.ZERO, new Vec3d(.2, 0, 0), new Vec3d(3, 64, 0)}) {
+            for (boolean basisFirst : new boolean[] {false, true}) {
+                ClientPoseSync.clear();
+                UUID player = UUID.randomUUID();
+                var q = new LatentPos(); var b = new LatentBasis(); var nav = new SpiritNavigation();
+                var serverQ = new LatentPos(); var serverB = new LatentBasis();
+                RegistryByteBuf oldQ = null, oldB = null, correctedQ = null, correctedB = null;
+                try {
+                    ClientPoseSync.preparePrediction(q, b, nav, true);
+                    deliver(serverQ, q); deliver(serverB, b);
+                    // Client has already predicted movement which vanilla then rejects.
+                    predict(q, b, nav, target(1), new Vec3d(.6, 0, 0), false);
+                    Vec384f rejectedQ = q.get().clone(); Basis384f rejectedB = b.get().clone();
+                    check(rejectedQ.squareDistance(serverQ.get()) > 0 && error(rejectedB, serverB.get()) > 0,
+                            "rejected motion fixture diverges in both semantic streams");
+                    oldQ = packet(serverQ); oldB = packet(serverB);
+                    MovementProvenance.markServerTeleport(player);
+                    var sample = MovementIntegration.server(measured, Vec3d.ZERO,
+                            MovementProvenance.drainServerTeleport(player));
+                    check(sample.stateDelta().equals(Vec3d.ZERO) && sample.semanticDelta().equals(Vec3d.ZERO),
+                            "teleport rejection still excludes carrier displacement from state and semantic movement");
+                    boolean broadcast = SpiritBasisEvolver.reconcileSuppressedWindow(sample, serverQ, serverB);
+                    correctedQ = packet(serverQ); correctedB = packet(serverB); // delay both after carrier correction
+                    check(!MovementProvenance.drainServerTeleport(player), "requestTeleport provenance is drained once");
+
+                    // Real position-look hooks invalidate history/re-baseline physical movement, but do
+                    // NOT magically restore semantic q/basis. A later tick resumes healthy prediction.
+                    ClientPoseSync.markTeleport();
+                    MovementProvenance.markClientRepositioned(player);
+                    boolean repositioned = MovementProvenance.drainClientRepositioned(player);
+                    boolean corrected = ClientPoseSync.consumeTeleportCorrection();
+                    check(repositioned && corrected && !ClientPoseSync.consumeTeleportCorrection(),
+                            "position-look correction resets the carrier window once");
+                    check(MovementIntegration.clientSemantic(new Vec3d(-.6, 0, 0), Vec3d.ZERO,
+                            corrected || repositioned).equals(Vec3d.ZERO), "carrier rollback is never semantic travel");
+                    ClientPoseSync.preparePrediction(q, b, nav, false);
+                    check(q.get().squareDistance(rejectedQ) == 0 && error(b.get(), rejectedB) == 0,
+                            "position-look alone leaves the earlier semantic prediction intact");
+                    for (int tick = 0; tick < 20; tick++) predict(q, b, nav, target(1), Vec3d.ZERO, false);
+                    q.applySyncPacket(oldQ); b.applySyncPacket(oldB);
+                    check(q.get().squareDistance(rejectedQ) == 0 && error(b.get(), rejectedB) == 0,
+                            "unchanged unmarked authority is held as lag after prediction resumes (regression precondition)");
+                    if (basisFirst) {
+                        b.applySyncPacket(correctedB);
+                        check(error(b.get(), serverB.get()) == 0, "delayed teleport basis must reconcile after prediction resumes");
+                        check(q.get().squareDistance(rejectedQ) == 0, "basis correction keeps position stream independent");
+                        predict(q, b, nav, target(1), Vec3d.ZERO, false);
+                        q.applySyncPacket(correctedQ);
+                    } else {
+                        q.applySyncPacket(correctedQ);
+                        check(q.get().squareDistance(serverQ.get()) == 0, "delayed teleport position must reconcile after prediction resumes");
+                        check(error(b.get(), rejectedB) == 0, "position correction keeps basis stream independent");
+                        predict(q, b, nav, target(1), Vec3d.ZERO, false);
+                        b.applySyncPacket(correctedB);
+                    }
+                    check(q.get().squareDistance(serverQ.get()) == 0 && error(b.get(), serverB.get()) == 0,
+                            "both delayed teleport pose streams converge independent of delivery order");
+                    check(broadcast && sample.requiresReconciliation(), "teleport-suppressed window triggers immediate authority on both streams");
+                    for (int tick = 0; tick < 300; tick++) {
+                        predict(q, b, nav, target(1), Vec3d.ZERO, false);
+                        if (tick % 4 == 0) { deliver(serverQ, q); deliver(serverB, b); }
+                    }
+                    check(q.get().squareDistance(serverQ.get()) == 0 && error(b.get(), serverB.get()) == 0,
+                            "stationary cadence does not retain rejected teleport prediction indefinitely");
+                    var clean = MovementIntegration.server(new Vec3d(.15, 0, 0), Vec3d.ZERO,
+                            MovementProvenance.drainServerTeleport(player));
+                    check(!clean.requiresReconciliation() && clean.semanticDelta().x == .15,
+                            "drained teleport cannot suppress the next clean movement window");
+                    predict(q, b, nav, target(1), clean.semanticDelta(), false);
+                    TraversalSteering.deepStep(serverQ.get(), serverB.get(), target(1), .15, 0, 0);
+                    deliver(serverQ, q); deliver(serverB, b);
+                    Vec384f resumedQ = q.get().clone(); Basis384f resumedB = b.get().clone();
+                    oldQ.readerIndex(0); oldB.readerIndex(0);
+                    correctedQ.readerIndex(0); correctedB.readerIndex(0);
+                    q.applySyncPacket(oldQ); b.applySyncPacket(oldB);
+                    q.applySyncPacket(correctedQ); b.applySyncPacket(correctedB);
+                    check(q.get().squareDistance(resumedQ) == 0 && error(b.get(), resumedB) == 0,
+                            "reordered pre-teleport authority and duplicate correction cannot undo resumed travel");
+                    check(q.get().squareDistance(serverQ.get()) == 0 && error(b.get(), serverB.get()) == 0,
+                            "clean movement stays matched after teleport reconciliation");
+                } finally {
+                    if (oldQ != null) oldQ.release(); if (oldB != null) oldB.release();
+                    if (correctedQ != null) correctedQ.release(); if (correctedB != null) correctedB.release();
+                    MovementProvenance.clear(player);
+                }
+            }
+        }
+    }
     public static void main(String[] args) {
         int failures = 0;
         for (Runnable regression : new Runnable[] {MovementReconciliationSelfTest::beforeContext,
                 MovementReconciliationSelfTest::preContextReorder,
                 MovementReconciliationSelfTest::firstPacketAfterPrediction,
                 MovementReconciliationSelfTest::curvedReversal,
-                MovementReconciliationSelfTest::suppressedWindowConvergesAtRest}) {
+                MovementReconciliationSelfTest::suppressedWindowConvergesAtRest,
+                MovementReconciliationSelfTest::teleportSuppressionConvergesAfterPredictionResumes}) {
             ClientPoseSync.clear(); ClientPoseSync.install();
             try { regression.run(); }
             catch (AssertionError failed) { failures++; System.err.println(failed.getMessage()); }

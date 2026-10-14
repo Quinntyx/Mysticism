@@ -29,8 +29,13 @@ public final class MovementIntegration {
      *  advance pauses instead of chasing the disagreement (repeated overshoot correction).
      *  State machines still see the measured movement so mode/safety logic stays physical. */
     public static Sample server(Vec3d measured, Vec3d correction, boolean teleported) {
+        // requestTeleport may reject motion the client ALREADY predicted. Its baseline hook can
+        // erase measured displacement, but not that prediction. Keep both deltas suppressed and
+        // force semantic authority even if pose delivery follows the client's prediction restart.
+        // Explicit provenance remains valid regardless of the measured window's size/validity.
+        if (teleported) return new Sample(Vec3d.ZERO, Vec3d.ZERO, true);
         if (measured == null || correction == null || !finite(measured) || !finite(correction)) return Sample.ZERO;
-        if (teleported || measured.lengthSquared() > REPOSITION_LIMIT_SQUARED) return Sample.ZERO;
+        if (measured.lengthSquared() > REPOSITION_LIMIT_SQUARED) return Sample.ZERO;
         // The client kept its chosen remainder; explicitly retire that disputed prediction window.
         // Otherwise an unchanged server pose is indistinguishable from lag forever, even at rest.
         if (correction.lengthSquared() > 0) return new Sample(measured, Vec3d.ZERO, true);
