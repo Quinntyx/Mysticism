@@ -1,0 +1,2 @@
+# Preserve the SHA-pinned, byte-identical upstream Unicode conformance data.
+src/runtimeTest/resources/nomic-v2-grapheme-break-test.txt whitespace=-blank-at-eol
