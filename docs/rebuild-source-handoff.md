@@ -65,10 +65,51 @@ No tests/build run for this bounded hook, per parent instruction. Terrain wiring
 
 ## Bounds / honest remaining limits
 
-One active source operation/server, request queue 64, hint queue 128, frontier-retry queue 64, worker queue 4. Live reads <=512 cells and stop after ~1.5ms between cell samples; this is **not** a hard whole-tick deadline for metadata/NBT page IO/publication. Region volume <=32768 and <=16 chunk IO adapters; local overlap operation <=64 parents, <=512 hydrated pages/parent, expanded topology <=131072 cells. These are per-operation limits, not a global catalog cap. Oversized operations fail visibly through futures/status rather than fabricate coverage.
+One active source operation/server, request queue 64, ordinary hint queue 128 plus a reserved 25-seed loaded-source backfill lane, frontier-retry queue 64, worker queue 4. Live reads <=512 cells and stop after ~1.5ms between cell samples; this is **not** a hard whole-tick deadline for metadata/NBT page IO/publication. Region volume <=32768 and <=16 chunk IO adapters; local overlap operation <=64 parents, <=512 hydrated pages/parent, expanded topology <=131072 cells. These are per-operation limits, not a global catalog cap. Oversized operations fail visibly through futures/status rather than fabricate coverage.
 
 Live gameplay, new save/reload cycles, actual Nomic inference, multiplayer entry, projected meshes/collision and terrain coupling were **not exercised** in this worktree. Parent performs integrated validation. Source and semantic catalog paging are resumable linear traversal, not spatial/high-dimensional acceleration indexes; large catalogs may take many ticks and cold metadata page reads still happen on the owner thread. A single operation waiting for descriptor inference can also delay later queued source reads. Old immutable generated blob files are not garbage-collected. Raw SourceSelector intentionally does not choose representatives itself. Natural neighboring cave union currently requires semantic convergence too; temporarily separate provisional owners can remain. The worker's individual-feature expansion/page caps can stop growth of very large caves. Source edits revise occupancy/material but do not repartition one historical cave ID into new air-component IDs after a new wall splits its air. Safe-air support recognizes a conservative floor whitelist and may reject otherwise valid modded/slab floors. Stored coarse far material detail requires successful near refinement before full fidelity. Nearby chest sampling covers at most two loaded chests and 16 slots/chest per sample. A full-air observation with no real item fallback must await a working descriptor model.
 
-## Validation actually run
+## Loaded-source entry backfill follow-up
+
+`SourceLandmarks.discoverLoaded(server, dimension, center, maxSeeds)` selects at most
+25 already-loaded chunk-center surface seeds in a closest-first radius-2 neighborhood.
+Spirit terrain entry/restore calls it best-effort; it neither loads nor generates chunks.
+The seeds feed the existing readiness-gated `Ensure` extraction/publication pipeline,
+not a second geometry/ownership implementation.
+
+A saturated ordinary chunk/edit/frontier hint queue now cannot drop one full entry
+plan: `SourceDiscoveryHints` reserves a separate 25-seed lane. Both lanes deduplicate
+by dimension and immutable position, drain FIFO with alternating turns, and clear on
+dimension unload/server shutdown. Readiness delays retain queued seeds; continuous
+ordinary discovery cannot starve backfill (or vice versa). `pending` includes both
+lanes. Existing operation/request/worker budgets are unchanged.
+
+`discoverLoaded` counts only retained seeds (including already queued duplicates).
+Additional distinct entries may still exhaust the combined 153-seed capacity;
+there is no unbounded retry list and no guarantee of admission for an unlimited
+entry burst. Extra backfill uses any free ordinary capacity without eviction.
+Extraction still depends on real embedding/item-index readiness, and a retained
+hint is not a claim that a landmark has already been published. The executable
+`SourceDiscoveryHintsTest` in the discovered `runtimeTest` source set covers a full
+ordinary queue plus all 25 entry seeds, repeat entry/dedup, continuous ordinary
+pressure, honest overflow, FIFO/fairness, immutable positions, unload and shutdown.
+No live gameplay or model inference is implied by these queue regressions.
+
+## Validation of the loaded-source follow-up
+
+Canonical Gradle `--no-daemon --console=plain build` passed with installed Gradle
+8.13 and Java 21. `runtimeSelfTest` discovered and executed all six main-based
+runtime suites, including `LoadedSourceBackfillTest` (78 checks) and
+`SourceDiscoveryHintsTest` (1208 checks). `buildSelfTest` passed metadata,
+descriptor, packaging and runner-discovery regressions; `verifyProductionJar`
+validated the remapped production jar. An initial nested-class resource lookup
+failure in the wiring regression was corrected before the passing build.
+
+Retained build job: original pane `%2085`, session `$11`, window `@1347`, job pane
+`%2101`, run `2cc396eedbd041fdafd5f72bd28b84f3`, exit 0. `git diff --check` also
+passed. These are executable queue/planning/wiring and packaging checks, not
+Minecraft gameplay, save/reload, multiplayer or real native-v2 inference verification.
+
+## Earlier source-rebuild validation (historical)
 
 No new tests added and no Gradle run during concurrent rebuild (parent instruction). Scoped Java21 `javac --release 21 -proc:none` compilation of all SOURCE-owned landmark/activity classes against cached mapped Fabric/Yarn 1.21.1 classpath plus the read-only NAV LatentAttunement source. Interactive tmux pane `%463`, script `/tmp/mysticism-source-rebuild-check.sh`; output displayed, not redirected. `git diff --check`. This is compile validation, **not** evidence that live runtime behaviors above have passed.

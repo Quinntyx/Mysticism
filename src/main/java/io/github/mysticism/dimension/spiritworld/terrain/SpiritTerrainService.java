@@ -81,6 +81,7 @@ public final class SpiritTerrainService {
             Session s=new Session(w,player.getPos());s.created=c.tick;c.sessions.put(player.getUuid(),s);
             BuiltMesh initial=buildMesh(player,s,0,basis(player));s.frame=initial.frame();s.frameProducers=initial.producers(); // actual local mesh exists BEFORE dimension teleport
             discoverOwner(player,s);requestSource(player,s,player.getPos(),32);
+            backfillLoadedSource(player,w.dimension,player.getPos());
             return true;
         } catch(RuntimeException failure) {
             cancelEnter(player);player.sendMessage(Text.literal("Spirit source mesh unavailable: "+failure.getMessage()),false);return false;
@@ -97,7 +98,8 @@ public final class SpiritTerrainService {
             if(c.sessions.size()>=64)return false;
             Window w=new Window(nav.sourceDimension(),nav.sourcePosition(),q(player),basis(player),nav.landmarkId());
             Session s=new Session(w,player.getPos());s.shallow=!nav.deep();s.entered=true;s.created=c.tick;
-            s.anchorDelivered=nav.semanticReady() && player.getComponent(MysticismEntityComponents.LATENT_POS).hasCoordinate();
+            s.anchorDelivered=SourceAnchorDelivery.canRestoreAnchor(nav.semanticReady(),
+                    player.getComponent(MysticismEntityComponents.LATENT_POS).hasCoordinate());
             LandmarkMetadata owner=nav.landmarkId().isEmpty()?null:c.store.metadata(nav.landmarkId()).orElse(null);
             if(owner!=null){w.owner=owner;w.supportEmbedding=owner.header().baseEmbedding().vector();
                 // Until accepted anchoring, keep the physical carrier's existing coordinate. notifyAnchor
@@ -112,6 +114,7 @@ public final class SpiritTerrainService {
             c.sessions.put(player.getUuid(),s);
             if(owner==null)discoverOwner(player,s); // Known native source anchors need exact ownership, not fresh inference.
             requestOwnership(player,s,w,w.origin);requestSource(player,s,w.origin,32);publish(player,s,true);
+            backfillLoadedSource(player,w.dimension,w.origin);
             if(nav.hasShallowTarget())prefetchTarget(player,nav.targetDimension(),nav.targetLandmarkId(),nav.targetPosition(),player.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target(),nav.targetBasis());
             return true;
         } catch(RuntimeException failure){cancelEnter(player);player.sendMessage(Text.literal("Spirit mesh restore deferred: "+failure.getMessage()),false);return false;}
@@ -405,6 +408,13 @@ public final class SpiritTerrainService {
     // Kept for the existing tiny production-shape smoke fixture, not an overlay lookup.
     static boolean contact(VoxelShape shape,BlockPos pos,Box body,double feet){return shape.getBoundingBoxes().stream().anyMatch(b->contact(b.offset(pos),body,feet));}
     private static boolean contact(Box b,Box body,double feet){return Math.abs(b.maxY-feet)<=.12 && b.maxX>body.minX+1e-4 && b.minX<body.maxX-1e-4 && b.maxZ>body.minZ+1e-4 && b.minZ<body.maxZ-1e-4;}
+    /** Best-effort backfill of source discovery for chunks that were already loaded before this
+     * spirit session: entry and restore must never fail because bounded background discovery is
+     * unavailable, so any failure here is swallowed after the session is live. */
+    private static void backfillLoadedSource(ServerPlayerEntity p,String dimension,Vec3d at) {
+        try{io.github.mysticism.landmark.SourceLandmarks.discoverLoaded(p.getServer(),dimension,BlockPos.ofFloored(at),io.github.mysticism.landmark.LoadedSourceBackfill.MAX_SEEDS);}
+        catch(RuntimeException deferred){/* Discovery is bounded background work, not an entry precondition. */}
+    }
     private static void discoverOwner(ServerPlayerEntity p,Session s) {
         if(s.discovery.pending())return; // Includes completion queued for server-thread delivery.
         Window expected=s.local;
