@@ -1,10 +1,12 @@
 # Retained runtime source-discovery repair
 
 Scope: `feat-runtime-discovery-render-distance-discovery`, on top of retained
-`bbd696d` / `4aa35f8`. This repair addresses source discovery/visible coverage,
-including review P1 (nearest-only frame starvation) and P2 (evicted data still
-marked covered). It does not implement the ten independently assigned runtime
-repairs or change embeddings.
+`bbd696d` / `4aa35f8` / `44b98cf`. This repair addresses source discovery/visible
+coverage, retaining the earlier fixes for nearest-only frame starvation and
+budget-evicted data still marked covered. The follow-up fixes sparse near-mask
+replacement, generation-hint starvation and expiration of incomplete results.
+It does not implement the ten independently assigned runtime repairs or change
+embeddings.
 
 ## Behavior
 
@@ -20,7 +22,16 @@ repairs or change embeddings.
   ownership/growth or persisted source data. Air, holes, partial shapes, differing
   owners, material properties, light and tint are not merged. Near sampled air and
   exact ownership refinement correctly split rectangular batches (including odd
-  dimensions) instead of treating a slab as a cube.
+  dimensions) instead of treating a slab as a cube. Near replacement uses an
+  indexed mask of **actually sampled cells**, including air, rather than the
+  bounding box of sparse patches: unknown gaps retain their far material,
+  ownership provenance and mesh/collision geometry.
+- The serialized source lane yields after a bounded discovery-read streak to
+  both explicit ownership/landing requests and the separate chunk-load/frontier
+  generation-hints queue. Those gated lanes alternate when both wait. Reads
+  still bypass unavailable embedding/index readiness; hints are consumed and
+  converted into real Ensure operations only when selected and ready. This
+  bounds operation starts, not inference or publication completion time.
 - Local frame admission preserves the old exact near allowance (1024 shallow /
   640 deep) plus the separate bounded 256-cell far lane. Projected spatial buckets
   round-robin far observations instead of admitting only the nearest 256 cells.
@@ -32,7 +43,11 @@ repairs or change embeddings.
 - Budget eviction removes scheduler coverage and queues real rediscovery with a
   stationary cooldown. Cumulative player movement (>16 source blocks), or a view
   change, promotes evicted tiles immediately. Expiration/cancellation remain
-  bounded by the window lifecycle. Changes in retained data dirty compaction.
+  bounded by the window lifecycle. Incomplete/empty results, failed requests and
+  pending reads expire too, not only covered tiles. Expired pending futures are
+  removed before cancellation, and completion removes a pending entry only when
+  its future still matches; a stale callback cannot displace a fresh request for
+  the same tile. Changes in retained data dirty compaction.
 
 ## Regressions and checks
 
@@ -50,6 +65,17 @@ projection and spatial-admission helpers through actual `TerrainMeshFrame`s:
 - Budget eviction followed by slow movement while still inside retention reissues
   the tile; freeing budget retains it; stationary cooldown avoids immediate
   thrashing. View-box corners stay covered and the effective player view is used.
+- Widely separated sparse patches replace only sampled air/changed partial
+  solids, preserving the floor and real SAT collision between patches. Dense,
+  checkerboard and odd-sized masks across signed grid boundaries preserve every
+  unsampled source cell exactly once and produce deterministic output.
+
+`SourceLaneFairnessSelfTest` exercises sustained discovery plus simultaneous
+explicit requests and generation hints, verifies bounded yields for both gated
+lanes, lazy hint consumption, and readiness-independent reads.
+`SourceDiscoverySelfTest` additionally covers 80 movements with incomplete empty
+and partial results under zero-node retention, pending/failed expiry and fresh
+requests when returning to expired source terrain.
 
 The existing `SourceDiscoverySelfTest` still tests full schedules, region-volume
 bounds, retries/cancellation, far-field conversion and near supersede. A bare JVM
@@ -67,6 +93,16 @@ Canonical command (existing Gradle 8.13, Java 21; run via `tmux-jobs`):
 `build` runs discovered `runtimeSelfTest` suites, packaging/runner `buildSelfTest`,
 common/client compilation, remapping and `verifyProductionJar`. It does not use
 Gradle's disabled framework `Test` action as proof of tests.
+
+The follow-up canonical build passed; a second build with `--rerun-tasks`
+passed in 25 seconds (all 14 actionable tasks executed, no compilation or
+packaging task reused). Both builds had all seven main-based runtime classes
+discovered and run with assertions: `DiscoveryFrameSelfTest` (7,982 checks),
+`SourceDiscoverySelfTest` (296,336), `SourceLaneFairnessSelfTest` (73), and the
+four existing embedding callback/engine/persistence/pipeline suites. Packaging,
+descriptor, metadata and runner regressions passed; `verifyProductionJar`
+accepted `build/libs/mysticism-1.0-SNAPSHOT.jar`. Expected invalid-persistence
+fixtures log rejection warnings/stack traces; they are not inference tests.
 
 ## Limits / unverified
 

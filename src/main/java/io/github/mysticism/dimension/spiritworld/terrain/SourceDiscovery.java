@@ -22,8 +22,7 @@ public final class SourceDiscovery {
     /** One bounded SourceLandmarks region volume per tile (checkBounds cap is 32768 cells). */
     static final int TILE = 32;
     static final int MIN_RADIUS = TILE;
-    /** Bounded worst case (a 16-chunk view distance). Larger client view distances still discover
-     * progressively outward to this extent; nothing depends on the far tail being complete. */
+    /** Full vanilla client slider (32 chunks); discovery beyond that remains bounded. */
     static final int MAX_RADIUS = 32 * 16; // Full vanilla client slider, including 32-chunk views.
     static final int MAX_VERTICAL_RADIUS = 64;
     /** Mesh cull tracks the visible horizon instead of a fixed 128-block locality. */
@@ -261,6 +260,10 @@ public final class SourceDiscovery {
         /** Re-plan around the current source position; retains prior coverage inside the extent and
          * re-queues everything else center-out. Returns tiles whose retention expired (caller drops data). */
         List<Bounds> replan(Vec3d source, int viewChunks) {
+            // Capture lifecycle keys before movement clears budget-eviction backoff. Even those
+            // keys must be returned when outside the extent (including a subsequently failed read).
+            Set<Bounds> tracked=new HashSet<>(covered);
+            tracked.addAll(retryAt.keySet());tracked.addAll(budgetEvicted);tracked.addAll(inFlight);
             // Movement promotes previously evicted tiles without waiting for stationary backoff.
             if(budgetEvictionCenter!=null && (budgetEvictionCenter.squaredDistanceTo(source)>256 || viewChunks!=viewDistanceChunks)) {
                 for(var tile:budgetEvicted)retryAt.remove(tile);
@@ -268,14 +271,13 @@ public final class SourceDiscovery {
             }
             center = source;
             viewDistanceChunks = viewChunks;
-            List<Bounds> expired = new ArrayList<>();
-            for (java.util.Iterator<Bounds> it = covered.iterator(); it.hasNext(); ) {
-                Bounds tile = it.next();
-                if (beyond(tile, center, viewChunks)) {expired.add(tile); it.remove();}
-            }
-            retryAt.keySet().removeIf(tile -> beyond(tile, center, viewChunks));
-            budgetEvicted.removeIf(tile -> beyond(tile, center, viewChunks));
-            inFlight.removeIf(tile -> beyond(tile, center, viewChunks));
+            // Partial/empty results are retained by the caller too, although not covered. Return
+            // every expired lifecycle key so they cannot evade the node budget indefinitely.
+            // Include pending reads: the caller cancels them before late completion can restore data.
+            List<Bounds> expired=tracked.stream().filter(tile->beyond(tile,center,viewChunks))
+                    .sorted(Comparator.comparingLong(Bounds::minX).thenComparingLong(Bounds::minY).thenComparingLong(Bounds::minZ)).toList();
+            covered.removeAll(expired);retryAt.keySet().removeAll(expired);
+            budgetEvicted.removeAll(expired);inFlight.removeAll(expired);
             queue.clear();
             for (Bounds tile : plan(center, viewChunks)) if (!covered.contains(tile) && !inFlight.contains(tile)) queue.add(tile);
             return expired;

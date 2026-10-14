@@ -133,6 +133,59 @@ public final class DiscoveryFrameSelfTest {
         for(var n:refined)check(n.ownerId().equals("left")?n.position().getX()+n.size().x<=4:n.ownerId().equals("right") && n.position().getX()>=4,"prism ownership is exact after refinement");
         check(SourceMeshBuilder.key("",Vec3d.ZERO,new Vec3d(8,1,8))!=SourceMeshBuilder.key("",Vec3d.ZERO,new Vec3d(8,2,8)),"prism keys include all source dimensions");
     }
+    private static void sparseNearReplacement() {
+        // Two tiny observed patches in a much wider persisted/discovered surface, with observed
+        // air at one end and a changed partial solid at the other. Their bounding box is NOT coverage.
+        var air=new SourceMeshBuilder.Tile(new TerrainMeshFrame.Material("minecraft:air",Map.of()),List.of(),0,0,true,false);
+        var slab=new SourceMeshBuilder.Tile(DIRT.material(),List.of(new Box(0,0,0,1,.5,1)),0xffffff,0xf000f0,false,false);
+        List<SourceMeshBuilder.Node> base=List.of(
+                new SourceMeshBuilder.Node(new BlockPos(-32,63,-16),new Vec3d(32,1,32),STONE,"left"),
+                new SourceMeshBuilder.Node(new BlockPos(0,63,-16),new Vec3d(32,1,32),STONE,"right"));
+        Map<BlockPos,SourceMeshBuilder.Tile> sampled=new HashMap<>();
+        sampled.put(new BlockPos(-31,63,0),air);sampled.put(new BlockPos(30,63,0),slab);
+        var near=SourceMeshBuilder.compact(sampled,Vec3d.ZERO);
+        var result=SourceMeshBuilder.replaceNear(base,near,sampled.keySet(),Vec3d.ZERO);
+        check(result.containsAll(near),"sparse solid/slab near nodes are preserved unchanged");
+        check(result.stream().mapToDouble(n->n.size().x*n.size().y*n.size().z).sum()==2047,"only observed air removes solid volume, not the sparse bounding box");
+        for(int x=-32;x<32;x++)for(int z=-16;z<16;z++) {
+            final int px=x,pz=z;
+            var hits=result.stream().filter(n->sourceContains(n,px,63,pz)).toList();
+            boolean removed=x==-31 && z==0;
+            check(hits.size()==(removed?0:1),"every unknown gap retains exactly one original source cell at "+x+","+z);
+            if(!removed) {
+                var n=hits.getFirst();boolean changed=x==30 && z==0;
+                check(n.tile().equals(changed?slab:STONE),"only sampled solid changes material/collision");
+                check(changed?n.ownerId().isEmpty():n.ownerId().equals(x<0?"left":"right"),"unsampled far provenance remains unchanged");
+            }
+        }
+        var f=frame(result,new Vec3d(.5,64,.5),4,true,X,Y,Z);
+        Box gapBody=new Box(-.3,64.1,-.3,.3,65.9,.3);
+        check(new MeshCollision.Index(f).sweep(gapBody,new Vec3d(0,-.2,0)).isPresent(),"unknown gap between sparse patches still has rendered SAT floor collision");
+        var reverse=new LinkedHashSet<>(sampled.keySet().stream().sorted(Comparator.comparingLong((BlockPos p)->p.asLong()).reversed()).toList());
+        check(result.equals(SourceMeshBuilder.replaceNear(base,near,reverse,Vec3d.ZERO)),"sparse-mask compaction is deterministic");
+        check(base.equals(SourceMeshBuilder.replaceNear(base,List.of(),Set.of(),Vec3d.ZERO)),"empty observations preserve every base node");
+        // Dense coverage, negative coordinates and odd prism extents use the same exact mask path.
+        var odd=new SourceMeshBuilder.Node(new BlockPos(-3,-2,-3),new Vec3d(7,3,7),STONE,"odd");
+        Set<BlockPos> mask=new HashSet<>();
+        for(BlockPos p:BlockPos.iterate(-2,-2,-2,2,-1,2))mask.add(p.toImmutable());
+        var pieces=SourceMeshBuilder.replaceNear(List.of(odd),List.of(),mask,Vec3d.ZERO);
+        check(pieces.stream().mapToDouble(n->n.size().x*n.size().y*n.size().z).sum()==97,"odd prism subtracts exactly 50 sampled cells across signed grid boundaries");
+        for(int x=-3;x<4;x++)for(int y=-2;y<1;y++)for(int z=-3;z<4;z++) {
+            int px=x,py=y,pz=z;
+            long hits=pieces.stream().filter(n->sourceContains(n,px,py,pz)).count();
+            check(hits==(mask.contains(new BlockPos(x,y,z))?0:1),"dense mask neither fills observed air nor removes unknown cells");
+        }
+        Set<BlockPos> all=new HashSet<>();for(BlockPos p:BlockPos.iterate(-3,-2,-3,3,0,3))all.add(p.toImmutable());
+        check(SourceMeshBuilder.replaceNear(List.of(odd),List.of(),all,Vec3d.ZERO).isEmpty(),"fully sampled air removes the whole odd prism");
+        // Fragmented observations cannot rely on a single rectangle or uniform octree parent.
+        var cube=new SourceMeshBuilder.Node(new BlockPos(64,64,64),16,STONE,"cube");
+        Set<BlockPos> checker=new HashSet<>();
+        for(BlockPos p:BlockPos.iterate(64,64,64,79,79,79))if((p.getX()+p.getY()+p.getZ())%2==0)checker.add(p.toImmutable());
+        var shell=SourceMeshBuilder.replaceNear(List.of(cube),List.of(),checker,Vec3d.ZERO);
+        check(shell.size()==2048 && shell.stream().allMatch(n->n.size().equals(new Vec3d(1,1,1))),"fragmented mask retains exact unsampled octree cells");
+        check(shell.stream().noneMatch(n->checker.contains(n.position())),"fragmented sampled air never reappears");
+    }
+
     private static void evictionMovement() {
         Vec3d center=new Vec3d(.5,64,.5);var scheduler=new SourceDiscovery.Scheduler();scheduler.replan(center,2);
         Bounds own=SourceDiscovery.tile(center,0,0,0),evicted=SourceDiscovery.tile(center,1,0,0);
@@ -159,7 +212,7 @@ public final class DiscoveryFrameSelfTest {
             check(full.stream().anyMatch(b->b.contains(probe[0],probe[1],probe[2])),"32-chunk source-distance edges are scheduled");
     }
     public static void main(String[] args) {
-        layeredGround();spatialAdmission();exactBatching();evictionMovement();
+        layeredGround();spatialAdmission();exactBatching();sparseNearReplacement();evictionMovement();
         System.out.println("DiscoveryFrameSelfTest: "+checks+" checks passed");
     }
 }

@@ -120,6 +120,71 @@ final class SourceMeshBuilder {
         List<Node> result=new ArrayList<>(near);for(Node node:base)outside(node,cut,result);
         result.sort(Comparator.comparingDouble(n->distanceSquared(nodeBox(n),center)));return List.copyOf(result);
     }
+    /** Sparse near observation mask. Air counts as sampled; unknown gaps do not. Index at bounded
+     * aligned octree levels so unit far nodes do not scan every near sample on each compaction. */
+    static List<Node> replaceNear(List<Node> base,List<Node> near,Set<BlockPos> sampled,Vec3d center) {
+        var mask=new SampledMask(sampled);
+        List<Node> result=new ArrayList<>(near);
+        for(Node node:base)outsideSamples(node,mask,result);
+        result.sort(Comparator.comparingDouble((Node n)->distanceSquared(nodeBox(n),center))
+                .thenComparingLong(n->n.position().asLong()).thenComparingDouble(n->n.size().x)
+                .thenComparingDouble(n->n.size().y).thenComparingDouble(n->n.size().z));
+        return List.copyOf(result);
+    }
+    private static void outsideSamples(Node node,SampledMask mask,List<Node> result) {
+        Bounds box=nodeBounds(node);long sampled=mask.count(box);
+        if(sampled==0){result.add(node);return;}
+        if(sampled==(box.maxX()-box.minX())*(box.maxY()-box.minY())*(box.maxZ()-box.minZ()))return;
+        // Bisect exact mesh extents, including odd prisms; never visit every sample for each far
+        // node or repeatedly subtract a growing fragment list for highly fragmented observations.
+        int sx=(int)node.size().x,sy=(int)node.size().y,sz=(int)node.size().z;
+        int hx=Math.max(1,sx/2),hy=Math.max(1,sy/2),hz=Math.max(1,sz/2);
+        for(int x=0;x<sx;x+=hx)for(int y=0;y<sy;y+=hy)for(int z=0;z<sz;z+=hz)
+            outsideSamples(new Node(node.position().add(x,y,z),
+                    new Vec3d(Math.min(hx,sx-x),Math.min(hy,sy-y),Math.min(hz,sz-z)),node.tile(),node.ownerId()),mask,result);
+    }
+    private static final class SampledMask {
+        private static final int ROOT_SIDE=32;
+        private final Map<Key,Integer> counts=new HashMap<>();
+        private Bounds extent;
+        SampledMask(Set<BlockPos> samples) {
+            for(BlockPos p:samples) {
+                Bounds cell=Bounds.cube(p.getX(),p.getY(),p.getZ(),1);
+                extent=extent==null?cell:extent.union(cell);
+                for(int side=1;side<=ROOT_SIDE;side*=2) {
+                    Key key=new Key(Math.floorDiv(p.getX(),side)*side,Math.floorDiv(p.getY(),side)*side,
+                            Math.floorDiv(p.getZ(),side)*side,side);
+                    counts.merge(key,1,Integer::sum);
+                }
+            }
+        }
+        long count(Bounds node) {
+            long result=0;
+            if(extent==null || !extent.intersects(node))return 0;
+            long minX=Math.max(extent.minX(),node.minX()),minY=Math.max(extent.minY(),node.minY()),minZ=Math.max(extent.minZ(),node.minZ());
+            long maxX=Math.min(extent.maxX(),node.maxX()),maxY=Math.min(extent.maxY(),node.maxY()),maxZ=Math.min(extent.maxZ(),node.maxZ());
+            for(long x=Math.floorDiv(minX,ROOT_SIDE)*ROOT_SIDE;x<maxX;x+=ROOT_SIDE)
+                for(long y=Math.floorDiv(minY,ROOT_SIDE)*ROOT_SIDE;y<maxY;y+=ROOT_SIDE)
+                    for(long z=Math.floorDiv(minZ,ROOT_SIDE)*ROOT_SIDE;z<maxZ;z+=ROOT_SIDE)
+                        result+=count(new Key((int)x,(int)y,(int)z,ROOT_SIDE),node);
+            return result;
+        }
+        private long count(Key key,Bounds node) {
+            Integer count=counts.get(key);if(count==null)return 0;
+            Bounds box=Bounds.cube(key.x,key.y,key.z,key.side);
+            if(!box.intersects(node))return 0;
+            if(node.contains(box))return count;
+            if(count==key.side*key.side*key.side)
+                return (Math.min(box.maxX(),node.maxX())-Math.max(box.minX(),node.minX()))
+                        *(Math.min(box.maxY(),node.maxY())-Math.max(box.minY(),node.minY()))
+                        *(Math.min(box.maxZ(),node.maxZ())-Math.max(box.minZ(),node.minZ()));
+            long result=0;int half=key.side/2;
+            for(int child=0;child<8;child++)
+                result+=count(new Key(key.x+((child&1)==0?0:half),key.y+((child&2)==0?0:half),
+                        key.z+((child&4)==0?0:half),half),node);
+            return result;
+        }
+    }
     static Box nodeBox(Node n){BlockPos p=n.position();return new Box(p.getX(),p.getY(),p.getZ(),p.getX()+n.size().x,p.getY()+n.size().y,p.getZ()+n.size().z);}
     private static Bounds nodeBounds(Node n){BlockPos p=n.position();return new Bounds(p.getX(),p.getY(),p.getZ(),p.getX()+(long)n.size().x,p.getY()+(long)n.size().y,p.getZ()+(long)n.size().z);}
     private static void piece(Node n,long x,long y,long z,long xx,long yy,long zz,List<Node> result) {

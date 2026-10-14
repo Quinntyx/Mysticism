@@ -449,9 +449,9 @@ public final class SpiritTerrainService {
             sorted.sort(Comparator.comparingDouble((SourceMeshBuilder.Node n)->nodeDistance(n,sortCenter)).thenComparingLong(n->n.position().asLong()));
             return List.copyOf(sorted);
         }
-        int minX=Integer.MAX_VALUE,minY=minX,minZ=minX,maxX=Integer.MIN_VALUE,maxY=maxX,maxZ=maxX;
-        for(BlockPos p:w.tiles.keySet()){minX=Math.min(minX,p.getX());minY=Math.min(minY,p.getY());minZ=Math.min(minZ,p.getZ());maxX=Math.max(maxX,p.getX());maxY=Math.max(maxY,p.getY());maxZ=Math.max(maxZ,p.getZ());}
-        return SourceMeshBuilder.replaceNear(base,near,new Bounds(minX,minY,minZ,(long)maxX+1,(long)maxY+1,(long)maxZ+1),center);
+        // Sliding/live/generated samples can be sparse. Unknown cells between observed patches
+        // must keep their far geometry; only actually observed cells (including air) supersede it.
+        return SourceMeshBuilder.replaceNear(base,near,w.tiles.keySet(),center);
     }
     private static Window windowFor(Session s,TerrainMeshFrame.Cell cell) {
         // Server-local provenance belongs to the accepted frame, not mutable ownership or latest compaction.
@@ -485,7 +485,11 @@ public final class SpiritTerrainService {
         s.viewHorizon=SourceDiscovery.meshHorizon(view);
         if(w.discoveryCenter==null || view!=w.discoveryView || w.discoveryCenter.squaredDistanceTo(source)>256 || c.tick-w.discoveryPlanned>=40) {
             w.discoveryPlanned=c.tick;w.discoveryCenter=source;w.discoveryView=view;
-            for(var expired:w.discovery.replan(source,view))w.discovered.remove(expired);
+            for(var expired:w.discovery.replan(source,view)) {
+                w.discovered.remove(expired);
+                var pending=w.discoveryPending.remove(expired);
+                if(pending!=null)pending.cancel(false); // remove before cancellation can deliver a callback
+            }
             refreshDiscovered(w,c.tick);
         }
         if(c.tick%2==0)issueDiscovery(p,s,w);
@@ -507,7 +511,7 @@ public final class SpiritTerrainService {
             catch(RuntimeException rejected){return;} // bounded queues are busy; the tile stays queued for the next attempt
             w.discoveryPending.put(tile,future);w.discovery.pending(tile);
             future.whenComplete((region,error)->p.getServer().execute(()->{
-                if(w.discoveryPending.remove(tile)!=future)return;
+                if(!w.discoveryPending.remove(tile,future))return;
                 if(!live(p,s) || !c.retained(s,w)){w.discovery.cancel(tile);return;}
                 if(error!=null || region==null){w.discovery.failed(tile,c.tick);return;}
                 Vec3d center=new Vec3d(tile.minX()+SourceDiscovery.TILE/2.0,tile.minY()+SourceDiscovery.TILE/2.0,tile.minZ()+SourceDiscovery.TILE/2.0);

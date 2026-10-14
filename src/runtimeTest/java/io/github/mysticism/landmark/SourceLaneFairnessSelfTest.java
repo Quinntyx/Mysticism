@@ -78,8 +78,40 @@ public final class SourceLaneFairnessSelfTest {
         check(READ.test(l.pick(q,READ,true)),"reads resume after the gated Ensure completes");
     }
 
+    private static void generationHintsShareTheYield() {
+        var l=lane();var q=new ArrayDeque<Op>();var hints=new ArrayDeque<Op>();
+        for(int n=0;n<12;n++)hints.add(new Op("hint-frontier-"+n));
+        for(int n=0;n<2;n++) {
+            q.addFirst(new Op("read-not-ready-"+n));
+            check(READ.test(l.pick(q,READ,false,true,hints::removeFirst)),"unready hints never gate discovery reads");
+        }
+        check(hints.size()==12,"unready hints remain queued, without creating Ensure operations");
+        check(l.pick(q,READ,false,true,hints::removeFirst)==null,"hints alone await real embedding readiness");
+        q.addFirst(new Op("read-ready"));
+        check(l.pick(q,READ,true,true,hints::removeFirst).id.equals("hint-frontier-0"),"accumulated read streak immediately yields to newly ready hints");
+        // Keep replenishing both requests and hints as production chunk-load/frontier traffic does.
+        int lastGated=0,lastHint=0,lastRequest=0,hintCount=0,requestCount=0;
+        for(int pick=1;pick<=60;pick++) {
+            q.addFirst(new Op("read-discovery-"+pick));
+            q.addLast(new Op("ensure-landing-"+pick));
+            hints.addLast(new Op("hint-chunk-"+pick));
+            Op selected=l.pick(q,READ,true,!hints.isEmpty(),hints::removeFirst);
+            if(READ.test(selected))continue;
+            check(pick-lastGated<=3,"every bounded read streak yields even with hints in a separate queue");lastGated=pick;
+            if(selected.id.startsWith("hint")) {
+                check(pick-lastHint<=6,"explicit Ensure traffic cannot starve generation hints");lastHint=pick;hintCount++;
+            } else {
+                check(pick-lastRequest<=6,"generation hints cannot starve explicit landing/ownership requests");lastRequest=pick;requestCount++;
+            }
+        }
+        check(hintCount==10 && requestCount==10,"both ready gated lanes share sustained discovery yields");
+        var alone=lane();q.clear();hints.clear();hints.add(new Op("hint-alone"));
+        check(alone.pick(q,READ,true,true,hints::removeFirst).id.equals("hint-alone"),"ready hint starts without queued requests");
+        check(alone.pick(q,READ,true,false,hints::removeFirst)==null,"empty hint supplier is never called");
+    }
+
     public static void main(String[] args) {
-        readsKeepPriorityAndBypassReadiness();discoveryNeverStarvesEnsure();yieldAlternatesUnderLoad();notReadyEnsureDoesNotConsumeTheYield();
+        readsKeepPriorityAndBypassReadiness();discoveryNeverStarvesEnsure();yieldAlternatesUnderLoad();notReadyEnsureDoesNotConsumeTheYield();generationHintsShareTheYield();
         System.out.println("SourceLaneFairnessSelfTest: "+checks+" checks passed");
     }
 }

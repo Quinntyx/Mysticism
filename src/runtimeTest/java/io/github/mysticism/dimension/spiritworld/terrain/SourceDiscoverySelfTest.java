@@ -182,6 +182,36 @@ public final class SourceDiscoverySelfTest {
         check(reissued.contains(4112L,80L,4112L),"the new center's own tile is re-issued first");
     }
 
+    private static void expireIncompleteResults() {
+        var scheduler=new SourceDiscovery.Scheduler();
+        Map<Bounds,List<SourceMeshBuilder.Node>> retained=new HashMap<>();
+        Vec3d center=new Vec3d(.5,64,.5);
+        for(int step=0;step<80;step++) {
+            center=new Vec3d(step*1024+.5,64,.5);
+            List<Bounds> expired=scheduler.replan(center,2);
+            for(var tile:expired)retained.remove(tile);
+            check(retained.isEmpty(),"all prior partial/empty results expire on travel, step="+step);
+            Bounds first=scheduler.next(step);scheduler.pending(first);
+            retained.put(first,List.of());scheduler.completed(first,false,step); // incomplete absent generated source
+            Bounds second=scheduler.next(step);scheduler.pending(second);
+            retained.put(second,List.of(new SourceMeshBuilder.Node(pos((long)second.minX(),64,(long)second.minZ()),1,cube(STONE))));
+            scheduler.completed(second,false,step); // partial solid samples
+            check(SourceDiscovery.retain(retained,scheduler,center,0,step).isEmpty(),"zero budget still retains incomplete empty observations");
+            check(retained.size()==1 && retained.containsKey(first),"empty result evades node budget but remains lifecycle-tracked");
+        }
+        check(scheduler.replan(center,2).isEmpty(),"stationary incomplete results keep their cooldown and samples");
+        check(retained.size()==1,"stationary incomplete empty result remains one entry");
+        var pending=scheduler.next(1000);scheduler.pending(pending);
+        var failed=scheduler.next(1000);scheduler.pending(failed);scheduler.failed(failed,1000);
+        var removed=scheduler.replan(center.add(4096,0,0),2);
+        check(removed.contains(pending),"expired in-flight tile is returned so caller cancels its future");
+        check(removed.contains(failed),"failed tile also expires its lifecycle state");
+        check(removed.containsAll(retained.keySet()),"incomplete retained data is returned even though never covered");
+        check(scheduler.replan(center.add(4096,0,0),2).isEmpty(),"expired lifecycle keys are dropped exactly once");
+        scheduler.replan(center,2);
+        check(pending.equals(scheduler.next(1000)),"returning to expired pending terrain permits a fresh read, not a stale in-flight marker");
+    }
+
     private static void observedNodes() {
         Vec3d tileCenter=new Vec3d(16,80,16);
         // A uniform unowned 16^3 stone body (octree-aligned) plus a surface variation; air never reaches conversion.
@@ -250,7 +280,7 @@ public final class SourceDiscoverySelfTest {
     }
 
     public static void main(String[] args) {
-        extents();planning();extentFilter();scheduler();eventualFullCoverage();localAdmission();observedNodes();farFieldSupersede();
+        extents();planning();extentFilter();scheduler();expireIncompleteResults();eventualFullCoverage();localAdmission();observedNodes();farFieldSupersede();
         System.out.println("SourceDiscoverySelfTest: "+checks+" checks passed");
     }
 }
