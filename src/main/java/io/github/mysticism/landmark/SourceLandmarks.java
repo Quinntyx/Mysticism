@@ -89,6 +89,13 @@ public final class SourceLandmarks {
         Session s=SESSIONS.get(world.getServer());if(s!=null){s.invalidate(world.getRegistryKey().getValue().toString(),pos);s.hint(world.getRegistryKey().getValue().toString(),pos.toImmutable());}
     }
     public static int pending(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.requests.size()+s.hints.size()+(s.active==null?0:1);}
+    /** Immediate availability signal for runtime consumers (terrain selection/navigation): fired on
+     * the server thread when an Ensure publishes a new or grown landmark. Previous lists the
+     * pre-publication identities (empty for a seed); replacement lists the canonical live IDs. */
+    static void notifyCommitted(MinecraftServer server,List<String> previous,List<String> replacement){
+        if(replacement==null || replacement.isEmpty())return;
+        LandmarkExtractionService.COMMITTED_TOPOLOGY.invoker().committed(server,previous,replacement);
+    }
     public static int lastSampledCells(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.lastCells;}
     public static String status(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?"Stopped":s.status;}
     private static Session session(MinecraftServer server){if(!server.isOnThread())throw new IllegalStateException("source server thread");Session s=SESSIONS.get(server);if(s==null)throw new IllegalStateException("source service not initialized");return s;}
@@ -157,6 +164,7 @@ public final class SourceLandmarks {
             if(mutation!=null){mutation.advance(1,512);if(mutation.complete()){
                 if(history!=null){history.commit();history=null;}
                 var metadata=s.store.metadata(published.id());complete(metadata);
+                notifyCommitted(s.server,value.prior==null?List.of():List.of(value.prior.id()),List.of(published.id()));
                 if(published.kind()==Landmark.Kind.CAVE)for(var face:published.geometry().frontiers()){var b=face.missingBounds();s.hint(dimension,new BlockPos((int)b.minX(),(int)b.minY(),(int)b.minZ()));}
                 if(value.adjoining!=null)s.offer(new Transfer(s,published.id(),value.adjoining,activity?bounds:null,true,activity,new CompletableFuture<>()));
             }return;}
