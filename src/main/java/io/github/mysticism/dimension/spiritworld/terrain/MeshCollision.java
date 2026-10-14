@@ -158,25 +158,76 @@ public final class MeshCollision {
             for(Box collision:cell.collision())if(penetration(strict,new Shape(cell,collision,cell.bounds(collision)))!=null)return false;
         return true;
     }
-    /** Conservative continuous affine-motion guard: the union of endpoint AABBs contains EVERY intermediate
-     * vertex under linear affine interpolation. An ambiguous swept/body overlap is held, never sampled through. */
+    /** Continuous affine-motion guard. Endpoint AABBs are only broad phase: a resting body can
+     * overlap a tilted floor's AABB without touching its affine interior. The narrow phase proves
+     * a separating plane for the ENTIRE interpolation interval, never just sampled endpoints. */
     public static boolean transitionClear(TerrainMeshFrame old,TerrainMeshFrame next,Box body) {
         if(old==null)return true;
         Map<Long,TerrainMeshFrame.Cell> previous=new HashMap<>();for(var c:old.cells())previous.put(c.key(),c);
-        Box local=body.expand(5),strict=body.expand(-1e-5);
+        Box strict=body.expand(-1e-5);
         for(var c:next.cells()) {
             var before=previous.get(c.key());
             if(before!=null && c.min().equals(before.min()) && c.axisX().equals(before.axisX()) && c.axisY().equals(before.axisY())
                     && c.axisZ().equals(before.axisZ()) && c.collision().equals(before.collision()))continue;
-            if(!c.bounds().intersects(local) && (before==null || !before.bounds().intersects(local)))continue;
             if(before==null) {for(Box b:c.collision())if(penetration(strict,new Shape(c,b,c.bounds(b)))!=null)return false;continue;}
             if(c.collision().isEmpty())continue;
             for(Box collision:c.collision()) {
                 Box swept=c.bounds(collision).union(before.bounds(collision));
-                if(swept.intersects(strict))return false;
+                if(swept.intersects(strict) && (!before.collision().equals(c.collision())
+                        || !affineSeparated(before,c,collision,strict)))return false;
             }
         }
         return true;
+    }
+    /** An affine face normal is quadratic in time. Its signed distance from each moving
+     * shape vertex to each fixed body vertex is cubic. Nonnegative Bernstein coefficients
+     * certify separation at ALL times (convex-hull property), including interior extrema.
+     * Failure to certify is a hold, not permission to pass through an ambiguous transition. */
+    private static boolean affineSeparated(TerrainMeshFrame.Cell from,TerrainMeshFrame.Cell to,Box shape,Box body) {
+        Vec3d[] start=vertices(from,shape),end=vertices(to,shape),fixed=vertices(body);
+        Vec3d[] a={from.axisX(),from.axisY(),from.axisZ()},b={to.axisX(),to.axisY(),to.axisZ()};
+        Vec3d[] world={new Vec3d(1,0,0),new Vec3d(0,1,0),new Vec3d(0,0,1)};
+        for(Vec3d w:world)if(separates(start,end,fixed,w,w,w))return true;
+        for(int i=0;i<3;i++) {
+            int j=(i+1)%3,k=(i+2)%3;
+            // Degree-two Bernstein controls for cross(linear edge j, linear edge k).
+            if(separates(start,end,fixed,a[j].crossProduct(a[k]),
+                    a[j].crossProduct(b[k]).add(b[j].crossProduct(a[k])).multiply(.5),
+                    b[j].crossProduct(b[k])))return true;
+            for(Vec3d w:world) {
+                Vec3d n0=w.crossProduct(a[i]),n2=w.crossProduct(b[i]);
+                if(separates(start,end,fixed,n0,n0.add(n2).multiply(.5),n2))return true;
+            }
+        }
+        return false;
+    }
+    private static boolean separates(Vec3d[] from,Vec3d[] to,Vec3d[] body,Vec3d n0,Vec3d n1,Vec3d n2) {
+        Vec3d direction=n0.add(n1.multiply(2)).add(n2).multiply(.25);
+        // A zero/collapsing candidate is not a separating plane. This positive projection
+        // certificate also prevents a normal flipping orientation between endpoints.
+        if(direction.lengthSquared()<1e-18 || n0.dotProduct(direction)<=1e-18
+                || n1.dotProduct(direction)<=1e-18 || n2.dotProduct(direction)<=1e-18)return false;
+        boolean positive=true,negative=true;
+        for(int i=0;i<from.length;i++)for(Vec3d corner:body) {
+            Vec3d v0=from[i].subtract(corner),v1=to[i].subtract(corner);
+            double d0=n0.dotProduct(v0),d1=(n0.dotProduct(v1)+2*n1.dotProduct(v0))/3,
+                    d2=(2*n1.dotProduct(v1)+n2.dotProduct(v0))/3,d3=n2.dotProduct(v1);
+            positive &= Math.min(Math.min(d0,d1),Math.min(d2,d3))>=0;
+            negative &= Math.max(Math.max(d0,d1),Math.max(d2,d3))<=0;
+            if(!positive && !negative)return false;
+        }
+        return positive || negative;
+    }
+    private static Vec3d[] vertices(TerrainMeshFrame.Cell cell,Box box) {
+        Vec3d[] corners=vertices(box);
+        for(int i=0;i<corners.length;i++){var v=corners[i];corners[i]=cell.point(v.x,v.y,v.z);}
+        return corners;
+    }
+    private static Vec3d[] vertices(Box box) {
+        Vec3d[] corners=new Vec3d[8];
+        for(int i=0;i<8;i++)corners[i]=new Vec3d((i&1)==0?box.minX:box.maxX,
+                (i&2)==0?box.minY:box.maxY,(i&4)==0?box.minZ:box.maxZ);
+        return corners;
     }
     private static Vec3d penetration(Box body,Shape shape) {
         var c=shape.cell;Box b=shape.local;

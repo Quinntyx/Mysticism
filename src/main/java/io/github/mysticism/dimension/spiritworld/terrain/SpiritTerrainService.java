@@ -488,8 +488,15 @@ public final class SpiritTerrainService {
         return true;
     }
     private static boolean hasCachedFloor(Window w,Vec3d at) {
-        BlockPos pos=BlockPos.ofFloored(at.add(0,-.05,0));var tile=w.tiles.get(pos);if(tile==null)return false;
-        return tile.collision().stream().anyMatch(b->contact(b.offset(pos),body(at),at.y));
+        // Alignment can leave feet a few centimetres above the source floor (a tilted
+        // contact rests on the AABB's high edge). Inspect the full existing .12 contact
+        // band, not just feet-.05, which can still be the known AIR body voxel.
+        for(int y=MathHelper.floor(at.y-.12);y<=MathHelper.floor(at.y);y++) {
+            BlockPos pos=new BlockPos(MathHelper.floor(at.x),y,MathHelper.floor(at.z));
+            var tile=w.tiles.get(pos);if(tile!=null && tile.collision().stream()
+                    .anyMatch(b->contact(b.offset(pos),body(at),at.y)))return true;
+        }
+        return false;
     }
     // Kept for the existing tiny production-shape smoke fixture, not an overlay lookup.
     static boolean contact(VoxelShape shape,BlockPos pos,Box body,double feet){return shape.getBoundingBoxes().stream().anyMatch(b->contact(b.offset(pos),body,feet));}
@@ -637,7 +644,11 @@ public final class SpiritTerrainService {
         return p.getPos().add(delta.dot(b.i)*SCALE,delta.dot(b.j)*SCALE,delta.dot(b.k)*SCALE);
     }
     public static boolean canAlign(ServerPlayerEntity p,Basis384f proposed) {
-        Session s=session(p);return s!=null && MeshCollision.transitionClear(s.frame,build(p,s,s.revision+1,proposed),p.getBoundingBox());
+        Session s=session(p);return s!=null && canAlign(s,build(p,s,s.revision+1,proposed),p.getBoundingBox());
+    }
+    /** The same current/proposed-frame guard used by navigation and frame publication. */
+    static boolean canAlign(Session s,TerrainMeshFrame proposed,Box body) {
+        return MeshCollision.bodyClear(proposed,body) && MeshCollision.transitionClear(s.frame,proposed,body);
     }
     private static TerrainMeshFrame build(ServerPlayerEntity p,Session s,long revision) {return build(p,s,revision,basis(p));}
     record BuiltMesh(TerrainMeshFrame frame,Map<Long,Window> producers) {}
@@ -700,7 +711,7 @@ public final class SpiritTerrainService {
                 && s.frame.materials().equals(frame.materials()) && s.frame.cells().equals(frame.cells())) {
             s.frameProducers=built.producers();confirmTargetFade(s);return true;
         }
-        if(!MeshCollision.transitionClear(s.frame,frame,p.getBoundingBox())) {
+        if(!canAlign(s,frame,p.getBoundingBox())) {
             status(p,s,"Terrain transition held: moving surface intersects your body; move clear to continue.");return false;
         }
         acceptFrame(p,s,built);confirmTargetFade(s);return true;

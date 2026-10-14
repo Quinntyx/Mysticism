@@ -197,39 +197,95 @@ public final class WalkDiscoveryRuntimeTest {
                 "Natural acquisition retains independent producer ownership and current source target");
     }
 
+    /** Deterministic projection I/O: same source-offset/observer-column map as append(),
+     * with a fixed producer placement and q. No hand-authored aligned replacement frame. */
+    private static BuiltMesh projectSupport(Fixture f,Basis384f observer) {
+        Basis384f source=f.producer.sourceBasis;
+        Vec3d ax=new Vec3d(source.i.dot(observer.i),source.i.dot(observer.j),source.i.dot(observer.k)),
+                ay=new Vec3d(source.j.dot(observer.i),source.j.dot(observer.j),source.j.dot(observer.k)),
+                az=new Vec3d(source.k.dot(observer.i),source.k.dot(observer.j),source.k.dot(observer.k));
+        Vec3d sourceMin=new Vec3d(FLOOR.getX(),FLOOR.getY(),FLOOR.getZ()),offset=sourceMin.subtract(f.producer.origin);
+        Vec3d min=PLAYER.add(ax.multiply(offset.x)).add(ay.multiply(offset.y)).add(az.multiply(offset.z));
+        var floor=new TerrainMeshFrame.Cell(11,0,f.b.id(),sourceMin,min,new Vec3d(1,1,1),
+                ax,ay,az,0xffffff,0xf000f0,1,List.of(UNIT));
+        return new BuiltMesh(frame(f.session.revision+1,false,List.of(floor)),Map.of(11L,f.producer));
+    }
+
     private static void tiltedContactDoesNotBypassAcquisition() {
-        Fixture f = new Fixture(false);
-        TerrainMeshFrame alignedFrame = f.session.frame;
-        double slope = Math.tan(Math.toRadians(10));
-        // Source-flat floor sheared by projection, positioned so the real AABB rests on its
-        // high edge. Exact source floor/body ownership and extraction proof are still present.
-        var tilted = new TerrainMeshFrame.Cell(11, 0, f.b.id(), new Vec3d(100, 63, 200),
-                new Vec3d(-.1, -.9 * slope, 0), new Vec3d(1, 1, 1),
-                new Vec3d(1, slope, 0), new Vec3d(0, 1, 0), new Vec3d(0, 0, 1),
-                0xffffff, 0xf000f0, 1, List.of(UNIT));
-        f.session.frame = frame(3, false, List.of(tilted));
-        var hit = f.ground().orElseThrow();
-        check(hit.normal().y > io.github.mysticism.navigation.NaturalLandingPolicy.MIN_GROUND_NORMAL_Y
-                && hit.normal().y < .99, "10-degree projected contact admits validation, but not walking");
-        check(f.discover(), "tilted contact retains a real discovered source owner");
-        var support = f.support();
-        check(support.normal().y < .99 && f.session.walkProbe.ready,
-                "candidate/proof can be ready before the displayed floor is aligned");
-        check(!acquireCurrentSupport(f.session, f, support),
-                "final acquisition refuses tilted contact even with matching grid and source proof");
-        check(!f.session.shallow && f.published == 0 && f.session.walkTarget != null,
-                "pre-alignment rejection preserves deep flight and retryable discovered target");
-        // The accepted frame supplied by renderer I/O now represents aligned geometry. This
-        // fixture tests acquisition, not actual canAlign/server mesh generation or gameplay.
-        f.session.frame = alignedFrame;
-        check(acquireCurrentSupport(f.session, f, f.support()),
-                "same discovered target acquires only once current displayed support is aligned");
+        Fixture f=new Fixture(false);
+        var source=f.producer.sourceBasis.clone();
+        double angle=Math.toRadians(10);float c=(float)Math.cos(angle),s=(float)Math.sin(angle);
+        f.grid.i=source.i.clone().mul(c).sub(source.j.clone().mul(s));
+        f.grid.j=source.i.clone().mul(s).add(source.j.clone().mul(c));
+        var from=f.grid.clone();
+        // A real .6-wide resting body touches the high edge of the 10-degree floor.
+        // Its source feet remain .052 blocks above the floor as the frame levels.
+        f.producer.origin=SOURCE.add(0,.3*s,0);
+        var initial=projectSupport(f,from);
+        acceptFrame(f.session,initial,ignored->{});
+        var hit=f.ground().orElseThrow();
+        check(Math.abs(hit.normal().y-Math.cos(angle))<1e-6 && hit.normal().y<.99,
+                "measured real 10-degree source-flat contact starts below final acquisition normal");
+        check(MeshCollision.bodyClear(f.session.frame,BODY),"tilted floor does not actually penetrate resting body");
+        check(f.session.frame.cells().getFirst().bounds().intersects(BODY.expand(-1e-5)),
+                "regression reproduces the conservative AABB false overlap");
+        check(f.discover(),"tilted contact discovers real separate source owner");
+        var support=f.support();
+        check(!acquireCurrentSupport(f.session,f,support) && !f.session.shallow && f.published==0,
+                "discovery/proof alone cannot authorize walking on unaligned support");
+        Vec384f unchangedQ=f.q.clone();Vec3d unchangedOrigin=f.producer.origin;
+        for(int step=1;step<=40;step++) {
+            var proposed=io.github.mysticism.activity.TraversalSteering.blend(from,source,step/40f);
+            BuiltMesh built=projectSupport(f,proposed);
+            check(canAlign(f.session,built.frame(),BODY),"actual navigation alignment guard advances at step "+step);
+            check(MeshCollision.transitionClear(f.session.frame,built.frame(),BODY),
+                    "actual publication guard accepts the same continuous step "+step);
+            // Basis application follows the guard, then the normal frame-publication transaction.
+            f.grid.i=proposed.i;f.grid.j=proposed.j;f.grid.k=proposed.k;
+            f.accept(built);
+            check(!f.session.shallow && f.ground().isPresent(),"flight retains real support during alignment "+step);
+            check(f.support().landmarkId().equals(f.b.id()),"support ownership survives frame transition "+step);
+        }
+        support=f.support();
+        check(support.normal().y>=.99 && f.published==40,"alignment makes progress and publishes before acquisition");
+        check(support.sourcePosition().y>64.05 && support.sourcePosition().y<64.12,
+                "resting high-edge contact needs the existing full source-floor snap tolerance");
+        check(acquireCurrentSupport(f.session,f,support),"guarded tilted-to-aligned transition acquires real support");
         check(f.session.shallow && f.session.local.id.equals(f.b.id()) && f.producer.id.equals(f.a.id()),
                 "post-alignment acquisition keeps source ownership independent");
+        check(f.published==41 && f.q.squareDistance(unchangedQ)==0 && f.producer.origin.equals(unchangedOrigin),
+                "no semantic attraction, source-placement rewrite or skipped publication to force landing");
+    }
+
+    private static void sourceFloorContactBandStillNeedsProof() {
+        for(double gap:new double[]{.11,.121}) {
+            Fixture f=new Fixture(false);
+            f.producer.origin=SOURCE.add(0,gap,0);
+            acceptFrame(f.session,projectSupport(f,f.grid),ignored->{});
+            check(f.ground().isPresent(),"visible mesh ground probe includes source gap "+gap);
+            check(f.discover(),"contact-band fixture discovers real owner");
+            var support=f.support();
+            check(acquireCurrentSupport(f.session,f,support)==(gap<.12),
+                    "source-floor proof retains the existing .12 tolerance, not the broader mesh probe: "+gap);
+        }
+        Fixture unknown=new Fixture(false);
+        unknown.producer.origin=SOURCE.add(0,.11,0);
+        acceptFrame(unknown.session,projectSupport(unknown,unknown.grid),ignored->{});
+        unknown.discover();var support=unknown.support();unknown.session.walkProbe.tiles.remove(FLOOR);
+        check(!acquireCurrentSupport(unknown.session,unknown,support),
+                "full contact-band lookup does not turn missing source proof into a floor");
+        Fixture blocked=new Fixture(false);blocked.discover();support=blocked.support();
+        var accepted=blocked.session.frame;var producers=blocked.session.frameProducers;
+        var obstacle=cell(12,new Vec3d(0,1.1,0),new Vec3d(0,0,1),blocked.b.id());
+        check(!canAlign(blocked.session,frame(4,false,List.of(accepted.cells().getFirst(),obstacle)),BODY),
+                "alignment remains held when proposed scene contains a real body obstruction");
+        check(blocked.session.frame==accepted && blocked.session.frameProducers==producers && blocked.published==0,
+                "held alignment does not advance accepted frame/provenance or publication");
     }
 
     public static void main(String[] args) {
         tiltedContactDoesNotBypassAcquisition();
+        sourceFloorContactBandStillNeedsProof();
         naturalContactBeforeDiscovery();
         crossOwnerAcquisition(false);crossOwnerAcquisition(true);
         candidateInvalidation();acquisitionGuardsAndRollback();

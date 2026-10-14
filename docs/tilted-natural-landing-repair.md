@@ -1,5 +1,9 @@
 # Retained navigation review repair
 
+Historical record of the initial admission-gate repair. The subsequent continuous
+alignment fix and its guarded end-to-end acquisition regression are documented in
+[guarded-landing-transition-repair.md](guarded-landing-transition-repair.md).
+
 Branch: `feat-runtime-merge-0006`; eventual target **dev**, never main.
 
 The retained checkout began clean at `7e8d3b2` (the completed navigation merge),
