@@ -33,16 +33,24 @@ public final class EmbeddedRuntimeResources {
     private EmbeddedRuntimeResources() {}
 
     public static Bundle resolve(ClassLoader loader) throws IOException {
+        return resolveIfPresent(loader).orElseThrow(() -> new IOException("Embedded v2 runtime/model bundle not provisioned: " + RESOURCE
+                + " (or configure an absolute " + BUNDLE_PROPERTY + "); no external service fallback"));
+    }
+
+    /** Only an absent bundle permits the bundled JNI provider's normal pinned-file path.
+     * An explicitly configured or discovered broken/ambiguous bundle must still fail closed.
+     * Call on the preparation worker, not during provider construction.
+     */
+    public static Optional<Bundle> resolveIfPresent(ClassLoader loader) throws IOException {
         String directory = System.getProperty(BUNDLE_PROPERTY);
-        if (directory != null) return resolveDirectory(absolute(directory, BUNDLE_PROPERTY));
+        if (directory != null) return Optional.of(resolveDirectory(absolute(directory, BUNDLE_PROPERTY)));
         List<URL> manifests = Collections.list(loader.getResources(RESOURCE));
-        if (manifests.isEmpty()) throw new IOException("Embedded v2 runtime/model bundle not provisioned: " + RESOURCE
-                + " (or configure an absolute " + BUNDLE_PROPERTY + "); no external service fallback");
+        if (manifests.isEmpty()) return Optional.empty();
         if (manifests.size() != 1) throw new IOException("Ambiguous embedded bundles: " + manifests);
         String cache = System.getProperty(CACHE_PROPERTY);
         Path cachePath = cache == null ? Path.of(System.getProperty("java.io.tmpdir"), "mysticism-embedding-resources")
                 .toAbsolutePath() : absolute(cache, CACHE_PROPERTY);
-        return resolveResource(manifests.getFirst(), cachePath);
+        return Optional.of(resolveResource(manifests.getFirst(), cachePath));
     }
 
     public static Bundle resolveDirectory(Path directory) throws IOException {

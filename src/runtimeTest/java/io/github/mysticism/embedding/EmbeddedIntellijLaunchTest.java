@@ -38,16 +38,25 @@ public final class EmbeddedIntellijLaunchTest {
                         throw new AssertionError("Resource/model startup ran on Minecraft caller thread");
                     record("open");
                     return new EmbeddingProvider() {
+                        private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
                         public EmbeddingProfile profile() { return EmbeddingProfile.current(); }
                         public void checkReady() throws Exception {
                             record("probe");
+                            if (Boolean.getBoolean("fixture.cancel")) {
+                                long end = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+                                while (!closed.get() && System.nanoTime() < end) {
+                                    try { Thread.sleep(5); } catch (InterruptedException ignored) { /* native-like load */ }
+                                }
+                                if (!closed.get()) throw new AssertionError("Startup delegate was not cancelled");
+                                record("cancelled");
+                            }
                             throw new IllegalStateException("EXPECTED_RESOURCE_PROBE: native inference intentionally absent");
                         }
                         public Vec384f getEmbedding(String text) {
                             throw new AssertionError("Diagnostic fixture must never invent embeddings");
                         }
                         public void close() {
-                            try { record("close"); } catch (Exception error) { throw new RuntimeException(error); }
+                            try { record("close"); closed.set(true); } catch (Exception error) { throw new RuntimeException(error); }
                         }
                     };
                 }
@@ -55,7 +64,11 @@ public final class EmbeddedIntellijLaunchTest {
             """;
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 0) { child(Path.of(args[0])); return; }
+        if (args.length != 0) {
+            if (Boolean.getBoolean("fixture.cancel")) cancelChild(Path.of(args[0]));
+            else child(Path.of(args[0]));
+            return;
+        }
         String prior = System.getProperty(EmbeddingProviders.PROVIDER_PROPERTY);
         try {
             System.clearProperty(EmbeddingProviders.PROVIDER_PROPERTY);
@@ -108,7 +121,7 @@ public final class EmbeddedIntellijLaunchTest {
         }
         Path cwd = Files.createDirectories(root.resolve("unrelated Minecraft run directory"));
         Path cache = Files.createDirectories(root.resolve("native resource cache"));
-        for (String mode : List.of("directory", "exploded", "jar")) {
+        for (String mode : List.of("directory", "exploded", "jar", "directory-cancel")) {
             Path marker = root.resolve(mode + "-calls.txt");
             String classpath = System.getProperty("java.class.path");
             if (mode.equals("exploded")) classpath += java.io.File.pathSeparator + exploded;
@@ -116,7 +129,8 @@ public final class EmbeddedIntellijLaunchTest {
             List<String> command = new ArrayList<>(List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
                     "-ea", "-Dmysticism.embedding.resourceCache=" + cache, "-Dfixture.marker=" + marker,
                     "-Dmysticism.embedding.endpoint=http://127.0.0.1:1/"));
-            if (mode.equals("directory")) command.add("-Dmysticism.embedding.bundle=" + bundle);
+            if (mode.startsWith("directory")) command.add("-Dmysticism.embedding.bundle=" + bundle);
+            if (mode.endsWith("cancel")) command.add("-Dfixture.cancel=true");
             command.addAll(List.of("-cp", classpath, EmbeddedIntellijLaunchTest.class.getName(), marker.toString()));
             Process child = new ProcessBuilder(command).directory(cwd.toFile()).inheritIO().start();
             if (!child.waitFor(15, TimeUnit.SECONDS)) {
@@ -124,9 +138,26 @@ public final class EmbeddedIntellijLaunchTest {
                 throw new AssertionError("Child launch timeout: " + mode);
             }
             check(child.exitValue() == 0, "Child launch regression failed: " + mode);
-            check(Files.readString(marker).equals("open\nprobe\nclose\n"), "Startup failure must close runtime exactly once: " + mode);
+            String expected = mode.endsWith("cancel") ? "open\nprobe\nclose\ncancelled\n" : "open\nprobe\nclose\n";
+            check(Files.readString(marker).equals(expected), "Startup failure/cancellation must close runtime exactly once: " + mode);
         }
         System.out.println("EmbeddedIntellijLaunchTest: directory/exploded/jar child launches passed from unrelated cwd; no inference/game launch");
+    }
+    private static void cancelChild(Path marker) throws Exception {
+        EmbeddingHelper.initializeServer(1);
+        var readiness = EmbeddingHelper.readiness();
+        try {
+            long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+            while ((!Files.exists(marker) || !Files.readString(marker).contains("probe\n")) && System.nanoTime() < end)
+                Thread.sleep(5);
+            check(Files.exists(marker) && Files.readString(marker).contains("probe\n"), "Startup did not enter delegate");
+            EmbeddingHelper.shutdown();
+            end = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+            while (!Files.readString(marker).contains("cancelled\n") && System.nanoTime() < end) Thread.sleep(5);
+            check(Files.readString(marker).equals("open\nprobe\nclose\ncancelled\n"), "Bridge shutdown did not promptly cancel native-like startup exactly once");
+            check(readiness.isCompletedExceptionally(), "Cancelled startup revived readiness");
+            check(!EmbeddingHelper.isReady(), "Shutdown provider remains ready");
+        } finally { EmbeddingHelper.shutdown(); }
     }
     private static void child(Path marker) throws Exception {
         ClassLoader previous = Thread.currentThread().getContextClassLoader();

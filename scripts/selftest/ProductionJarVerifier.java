@@ -14,6 +14,12 @@ import java.util.zip.ZipInputStream;
 /** JDK-only checks on the actual remapJar output, including Jar-in-Jar contents. */
 public final class ProductionJarVerifier {
     private static final int MAX_ENTRY_BYTES = 64 * 1024 * 1024;
+    private static final String NATIVE_JAR = "META-INF/jars/llama-5.1.0.jar";
+    private static final java.util.Set<String> NATIVE_RESOURCES = java.util.Set.of(
+            "net/ladenthin/llama/Linux/x86_64/libjllama.so",
+            "net/ladenthin/llama/Linux/aarch64/libjllama.so",
+            "net/ladenthin/llama/Mac/aarch64/libjllama.dylib",
+            "net/ladenthin/llama/Windows/x86_64/jllama.dll");
     // Minecraft 1.21.1 preserves these names in intermediary. Derived from the
     // official common/client jars and net.fabricmc:intermediary:1.21.1:v2.
     static final java.util.Set<String> STABLE_MINECRAFT_NAMES = java.util.Set.of(
@@ -64,6 +70,18 @@ public final class ProductionJarVerifier {
         require(!entries.containsKey("assets/mysticism/en_us.json"), "Language file outside lang/");
         required(entries, "io/github/mysticism/Mysticism.class");
         required(entries, "io/github/mysticism/client/MysticismClient.class");
+        required(entries, "io/github/mysticism/embedding/EmbeddedEmbeddingService.class");
+        required(entries, "io/github/mysticism/embedding/LlamaEmbeddingModel.class");
+        Map<String, byte[]> nativeEntries = inspectArchive(required(entries, NATIVE_JAR), 1);
+        required(nativeEntries, "net/ladenthin/llama/LlamaModel.class");
+        for (String nativeResource : NATIVE_RESOURCES) {
+            require(required(nativeEntries, nativeResource).length > 0, "Empty native runtime: " + nativeResource);
+        }
+        for (String dependency : new String[]{"jackson-core-", "jackson-databind-", "jackson-annotations-", "jspecify-"}) {
+            require(entries.keySet().stream().anyMatch(name -> name.startsWith("META-INF/jars/" + dependency)
+                    && metadata.contains('"' + name + '"')), "Missing nested inference dependency: " + dependency);
+        }
+        require(metadata.contains('"' + NATIVE_JAR + '"'), "Unregistered native inference jar");
 
         var strings = Pattern.compile("\"([^\"]+)\"").matcher(metadata);
         while (strings.find()) {
@@ -88,8 +106,12 @@ public final class ProductionJarVerifier {
                 require(!lower.contains("ai/djl/") && !lower.contains("ai.djl")
                         && !lower.contains("pytorch") && !lower.contains("tokenizers"),
                         "Local model runtime in production jar: " + name);
-                byte[] content = zip.readNBytes(MAX_ENTRY_BYTES + 1);
-                require(content.length <= MAX_ENTRY_BYTES, "Oversized archive entry: " + name);
+                require(!lower.endsWith(".gguf") && !lower.endsWith(".safetensors"), "Model weights must not be bundled: " + name);
+                require(!lower.startsWith("meta-inf/jars/slf4j-") && !lower.startsWith("meta-inf/jars/logback-")
+                        && !lower.startsWith("ch/qos/logback/"), "Duplicate Minecraft logging API/provider: " + name);
+                int limit = depth == 0 && name.equals(NATIVE_JAR) ? 128 * 1024 * 1024 : MAX_ENTRY_BYTES;
+                byte[] content = zip.readNBytes(limit + 1);
+                require(content.length <= limit, "Oversized archive entry: " + name);
                 require(entries.put(name, content) == null, "Duplicate archive entry: " + name);
                 if (name.endsWith(".class")) verifyClass(content);
                 if (name.endsWith(".jar")) inspectArchive(content, depth + 1);

@@ -111,11 +111,12 @@ public final class EmbeddedRuntimeResourcesTest {
                     rejects(() -> provider.getEmbedding("must not reach inference"), "Resource discovery alone is not readiness");
                     try {
                         provider.checkReady();
-                        throw new AssertionError("Model bytes without runtime adapter must not become ready");
-                    } catch (IllegalStateException expected) {
-                        check(expected.getMessage().contains("No in-process EmbeddedRuntimeFactory"), "Missing adapter fails without a service fallback");
+                        throw new AssertionError("Unapproved fixture weights must not become ready");
+                    } catch (IOException expected) {
+                        check(expected.getMessage().contains("Pinned Nomic v2 GGUF size mismatch"),
+                                "Built-in JNI adapter must verify approved weights, not require an external adapter/service");
                     }
-                    check(Thread.currentThread().getContextClassLoader() == previous, "Missing adapter must restore caller classloader");
+                    check(Thread.currentThread().getContextClassLoader() == previous, "Failed built-in startup must restore caller classloader");
                     rejects(() -> provider.getEmbedding("must remain unavailable"), "Failed adapter startup cannot expose inference");
                 }
             }
@@ -124,12 +125,13 @@ public final class EmbeddedRuntimeResourcesTest {
                 rejects(() -> EmbeddedRuntimeResources.resolve(loader), "Ambiguous bundle discovery");
             }
             try (URLClassLoader loader = new URLClassLoader(new URL[0], null)) {
-                rejects(() -> EmbeddedRuntimeResources.resolve(loader), "No implicit checkout/cache/server model search");
+                check(EmbeddedRuntimeResources.resolveIfPresent(loader).isEmpty(), "Absent bundle permits the built-in pinned model path");
+                rejects(() -> EmbeddedRuntimeResources.resolve(loader), "Required bundle resolution still reports absence");
                 Files.writeString(directory.resolve("bundle.properties"), manifest);
                 System.setProperty(EmbeddedRuntimeResources.BUNDLE_PROPERTY, directory.toString());
                 check(EmbeddedRuntimeResources.resolve(loader).require("model").equals(directory.resolve("model.gguf")), "Explicit provisioned directory needs no classpath resources");
                 System.setProperty(EmbeddedRuntimeResources.BUNDLE_PROPERTY, "relative");
-                rejects(() -> EmbeddedRuntimeResources.resolve(loader), "System property paths are cwd independent");
+                rejects(() -> EmbeddedRuntimeResources.resolveIfPresent(loader), "Invalid explicit bundle must never fall back to default model provisioning");
             }
         } finally {
             restore(EmbeddedRuntimeResources.BUNDLE_PROPERTY, priorBundle);

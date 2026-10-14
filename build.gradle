@@ -13,16 +13,33 @@ base {
 // Resolve provisioned resources relative to the Gradle project exactly once. Generated
 // IntelliJ launches use run/ as their cwd, not the checkout; never pass a relative model path.
 // No runtime/model downloads or external-service launch tasks are introduced here.
-def embeddedBundle = providers.gradleProperty('mysticismEmbeddingBundle')
-        .map { file(it).absoluteFile.toPath().normalize().toString() }
+def embeddedPaths = [
+        'mysticism.embedding.bundle': 'mysticismEmbeddingBundle',
+        'mysticism.embedding.modelPath': 'mysticismEmbeddingModelPath',
+        'mysticism.embedding.resourceCache': 'mysticismEmbeddingResourceCache'
+].collectEntries { systemProperty, gradleProperty ->
+    [(systemProperty): providers.gradleProperty(gradleProperty)
+            .map { file(it).absoluteFile.toPath().normalize().toString() }]
+}
+def embeddedOptions = [
+        'mysticism.embedding.download': 'mysticismEmbeddingDownload',
+        'mysticism.embedding.preparationDeadlineMillis': 'mysticismEmbeddingPreparationDeadlineMillis',
+        'mysticism.embedding.nativeThreads': 'mysticismEmbeddingNativeThreads'
+].collectEntries { systemProperty, gradleProperty ->
+    [(systemProperty): providers.gradleProperty(gradleProperty)]
+}
+def embeddedLaunchArguments = {
+    (embeddedPaths + embeddedOptions).findAll { key, value -> value.isPresent() }
+            .collect { key, value -> "-D${key}=${value.get()}".toString() }
+}
 
 loom {
     splitEnvironmentSourceSets()
     runs {
         configureEach {
             // Data generation inherits client arguments; adding to it again duplicates JVM properties.
-            if (name in ['client', 'server'] && embeddedBundle.isPresent()) {
-                vmArg "-Dmysticism.embedding.bundle=${embeddedBundle.get()}"
+            if (name in ['client', 'server']) {
+                embeddedLaunchArguments().each { vmArg it }
             }
         }
     }
@@ -65,6 +82,22 @@ dependencies {
     include "org.ladysnake.cardinal-components-api:cardinal-components-entity:${project.cca_version}"
     modImplementation "org.ladysnake:satin:${project.satin_version}"
     include "org.ladysnake:satin:${project.satin_version}"
+
+    // The same real JNI runtime is on IntelliJ/Loom's classpath AND nested in production.
+    // Minecraft supplies SLF4J; never ship a duplicate logging API/provider.
+    implementation("net.ladenthin:llama:${project.llama_version}") {
+        exclude group: 'org.slf4j'
+        exclude group: 'ch.qos.logback'
+    }
+    include("net.ladenthin:llama:${project.llama_version}") { transitive = false }
+    ['jackson-core', 'jackson-databind'].each { artifact ->
+        implementation "com.fasterxml.jackson.core:${artifact}:${project.jackson_version}"
+        include "com.fasterxml.jackson.core:${artifact}:${project.jackson_version}"
+    }
+    implementation "com.fasterxml.jackson.core:jackson-annotations:${project.jackson_annotations_version}"
+    include "com.fasterxml.jackson.core:jackson-annotations:${project.jackson_annotations_version}"
+    implementation "org.jspecify:jspecify:${project.jspecify_version}"
+    include "org.jspecify:jspecify:${project.jspecify_version}"
 }
 
 processResources {
@@ -105,16 +138,17 @@ apply from: 'scripts/selftest.gradle'
 
 tasks.register('verifyEmbeddedLaunchConfiguration') {
     group = 'verification'
-    description = 'Check client/server Loom and generated IntelliJ bundle path wiring (not inference).'
+    description = 'Check client/server Loom and generated IntelliJ model/resource/runtime wiring (not inference).'
     doLast {
         loom.runs.each { run ->
             def name = run.name
-            def arguments = run.vmArgs.findAll { it.startsWith('-Dmysticism.embedding.bundle=') }
-            def expected = embeddedBundle.isPresent()
-                    ? ["-Dmysticism.embedding.bundle=${embeddedBundle.get()}".toString()] : []
-            if (arguments != expected) throw new GradleException("Incorrect ${name} embedded bundle launch path: ${arguments}")
-            if (embeddedBundle.isPresent() && !new File(embeddedBundle.get()).isAbsolute()) {
-                throw new GradleException('IDE embedded bundle path must be absolute')
+            def keys = (embeddedPaths + embeddedOptions).keySet()
+            def arguments = run.vmArgs.findAll { argument -> keys.any { argument.startsWith("-D${it}=") } }
+            def expected = embeddedLaunchArguments()
+            if (arguments != expected) throw new GradleException("Incorrect ${name} embedded launch arguments: ${arguments}")
+            embeddedPaths.each { key, value ->
+                if (value.isPresent() && !new File(value.get()).isAbsolute())
+                    throw new GradleException("IDE ${key} path must be absolute")
             }
             // Exercise Loom's actual IntelliJ XML serializer without overwriting user IDE files.
             def config = net.fabricmc.loom.configuration.ide.RunConfig.runConfig(project, run)
@@ -125,17 +159,25 @@ tasks.register('verifyEmbeddedLaunchConfiguration') {
             def options = document.getElementsByTagName('option')
             def vm = (0..<options.length).collect { options.item(it) }
                     .find { it.getAttribute('name') == 'VM_PARAMETERS' }.getAttribute('value')
-            if (vm.count('-Dmysticism.embedding.bundle=') != expected.size()) {
-                throw new GradleException("Incorrect ${name} IntelliJ embedded bundle properties: ${vm}")
+            keys.each { key ->
+                def count = expected.count { it.startsWith("-D${key}=") }
+                if (vm.count("-D${key}=") != count)
+                    throw new GradleException("Incorrect ${name} IntelliJ ${key} properties: ${vm}")
             }
-            if (embeddedBundle.isPresent()) {
-                def argument = expected.first()
-                def quoted = embeddedBundle.get().any { Character.isWhitespace(it as char) }
-                        ? "\"${argument}\"" : argument
-                if (!vm.contains(quoted)) throw new GradleException("Incorrect ${name} IntelliJ path quoting: ${vm}")
+            expected.each { argument ->
+                def quoted = argument.any { Character.isWhitespace(it as char) } ? "\"${argument}\"" : argument
+                if (!vm.contains(quoted)) throw new GradleException("Incorrect ${name} IntelliJ argument quoting: ${vm}")
             }
         }
-        logger.lifecycle('Client/server/data-generation embedded bundle paths and IntelliJ XML verified (no model inference)')
+        // Production nesting alone does not put a dependency on an IDE runtime classpath.
+        def runtime = sourceSets.main.runtimeClasspath.files*.name
+        ['llama-', 'jackson-core-', 'jackson-databind-', 'jackson-annotations-', 'jspecify-'].each { prefix ->
+            if (!runtime.any { it.startsWith(prefix) && it.endsWith('.jar') })
+                throw new GradleException("Missing IntelliJ embedded runtime dependency: ${prefix}")
+        }
+        if (runtime.any { it.startsWith('logback-') })
+            throw new GradleException('Embedded runtime must not override Minecraft logging with Logback')
+        logger.lifecycle('Client/server/data-generation embedded paths, IntelliJ XML and JNI classpath verified (no model inference)')
     }
 }
 tasks.named('check') { dependsOn tasks.named('verifyEmbeddedLaunchConfiguration') }

@@ -12,7 +12,7 @@ public final class EmbeddedEmbeddingProvider implements EmbeddingProvider {
     private final ClassLoader parent;
     private boolean starting, closed;
     private int active;
-    private Handle handle;
+    private Handle handle, preparing;
 
     public EmbeddedEmbeddingProvider() { this(EmbeddedEmbeddingProvider.class.getClassLoader()); }
     public EmbeddedEmbeddingProvider(ClassLoader parent) { this.parent = parent; }
@@ -27,22 +27,29 @@ public final class EmbeddedEmbeddingProvider implements EmbeddingProvider {
         Handle loaded = null;
         URLClassLoader loader = null;
         try {
-            var bundle = EmbeddedRuntimeResources.resolve(parent);
-            var urls = new java.net.URL[bundle.runtimeJars().size()];
-            for (int i = 0; i < urls.length; i++) urls[i] = bundle.runtimeJars().get(i).toUri().toURL();
+            var bundle = EmbeddedRuntimeResources.resolveIfPresent(parent).orElse(null);
+            var jars = bundle == null ? java.util.List.<java.nio.file.Path>of() : bundle.runtimeJars();
+            var urls = new java.net.URL[jars.size()];
+            for (int i = 0; i < urls.length; i++) urls[i] = jars.get(i).toUri().toURL();
             loader = new URLClassLoader(urls, parent);
             URLClassLoader runtimeLoader = loader;
-            EmbeddedRuntimeFactory factory = withLoader(runtimeLoader, () -> {
+            EmbeddingProvider delegate = withLoader(runtimeLoader, () -> {
+                // The normal launch already has the pinned JNI runtime on Loom's classpath.
+                // A resource bundle needs no separately provisioned adapter for this model.
+                if (bundle == null) return new EmbeddedEmbeddingService();
                 var factories = ServiceLoader.load(EmbeddedRuntimeFactory.class, runtimeLoader).iterator();
-                if (!factories.hasNext()) throw new IllegalStateException("No in-process EmbeddedRuntimeFactory in bundle " + bundle.origin());
+                if (!factories.hasNext()) return EmbeddedEmbeddingService.fromBundle(bundle);
                 EmbeddedRuntimeFactory found = factories.next();
                 if (factories.hasNext()) throw new IllegalStateException("Ambiguous in-process EmbeddedRuntimeFactory in bundle " + bundle.origin());
-                return found;
+                return found.open(bundle);
             });
-            EmbeddingProvider delegate = withLoader(runtimeLoader, () -> factory.open(bundle));
             if (delegate == null) throw new IllegalStateException("Embedded runtime returned no provider");
             loaded = new Handle(delegate, loader);
             loader = null; // Handle now owns classloader on every success/failure path.
+            synchronized (this) {
+                if (closed) throw new IllegalStateException("Embedded provider closed during startup");
+                preparing = loaded;
+            }
             if (!profile().equals(withLoader(runtimeLoader, delegate::profile))) throw new IllegalArgumentException("Embedded runtime profile mismatch");
             // TCCL also exposes engine/service/native resources to dependencies of the runtime.
             withLoader(runtimeLoader, () -> { delegate.checkReady(); return null; });
@@ -50,9 +57,11 @@ public final class EmbeddedEmbeddingProvider implements EmbeddingProvider {
             synchronized (this) {
                 if (closed) throw new IllegalStateException("Embedded provider closed during startup");
                 handle = loaded;
+                preparing = null;
                 loaded = null;
             }
         } finally {
+            synchronized (this) { if (preparing == loaded) preparing = null; }
             if (loaded != null) loaded.close();
             if (loader != null) loader.close();
         }
@@ -80,13 +89,17 @@ public final class EmbeddedEmbeddingProvider implements EmbeddingProvider {
     }
 
     @Override public void close() {
-        Handle dispose = null;
+        Handle dispose = null, cancel;
         synchronized (this) {
             if (closed) return;
             closed = true;
+            cancel = preparing;
             // Do not unload native resources while an inference is still using them.
             if (active == 0) { dispose = handle; handle = null; }
         }
+        // Cancel loading/download promptly, but leave the startup worker owning its
+        // classloader until readiness unwinds. The built-in JNI delegate defers native disposal.
+        if (cancel != null) cancel.cancel();
         if (dispose != null) dispose.close();
     }
 
@@ -99,10 +112,19 @@ public final class EmbeddedEmbeddingProvider implements EmbeddingProvider {
         finally { thread.setContextClassLoader(previous); }
     }
 
-    private record Handle(EmbeddingProvider provider, URLClassLoader loader) {
+    private record Handle(EmbeddingProvider provider, URLClassLoader loader,
+                          java.util.concurrent.atomic.AtomicBoolean cancelled) {
+        Handle(EmbeddingProvider provider, URLClassLoader loader) {
+            this(provider, loader, new java.util.concurrent.atomic.AtomicBoolean());
+        }
+        void cancel() {
+            if (!cancelled.compareAndSet(false, true)) return;
+            try { withLoader(loader, () -> { provider.close(); return null; }); }
+            catch (Exception error) { throw new IllegalStateException("Closing embedded runtime", error); }
+        }
         void close() {
             RuntimeException failure = null;
-            try { withLoader(loader, () -> { provider.close(); return null; }); }
+            try { cancel(); }
             catch (Exception error) { failure = new IllegalStateException("Closing embedded runtime", error); }
             finally {
                 try { loader.close(); }
