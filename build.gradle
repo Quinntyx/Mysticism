@@ -51,6 +51,21 @@ dependencies {
     include "org.ladysnake.cardinal-components-api:cardinal-components-entity:${project.cca_version}"
     modImplementation "org.ladysnake:satin:${project.satin_version}"
     include "org.ladysnake:satin:${project.satin_version}"
+
+    // Pinned llama.cpp JNI/CPU runtime (Nomic v2 MoE support, bundled tokenizer).
+    // Minecraft already supplies SLF4J; never nest another logging API/provider.
+    implementation("net.ladenthin:llama:${project.llama_version}") {
+        exclude group: 'org.slf4j'
+    }
+    include("net.ladenthin:llama:${project.llama_version}") { transitive = false }
+    ['jackson-core', 'jackson-databind'].each { artifact ->
+        implementation "com.fasterxml.jackson.core:${artifact}:${project.jackson_version}"
+        include "com.fasterxml.jackson.core:${artifact}:${project.jackson_version}"
+    }
+    implementation "com.fasterxml.jackson.core:jackson-annotations:${project.jackson_annotations_version}"
+    include "com.fasterxml.jackson.core:jackson-annotations:${project.jackson_annotations_version}"
+    implementation "org.jspecify:jspecify:${project.jspecify_version}"
+    include "org.jspecify:jspecify:${project.jspecify_version}"
 }
 
 processResources {
