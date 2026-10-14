@@ -1,9 +1,9 @@
 {
-  "targets": ["fogged", "painted", "saturated"],
+  "targets": ["painted", "fogged", "saturated"],
   "passes": [
-    {"name": "mysticism:spirit_fog", "intarget": "minecraft:main", "outtarget": "fogged"},
-    {"name": "mysticism:kuwahara", "intarget": "fogged", "outtarget": "painted"},
-    {"name": "mysticism:spirit_saturation", "intarget": "painted", "outtarget": "saturated"},
+    {"name": "mysticism:kuwahara", "intarget": "minecraft:main", "outtarget": "painted"},
+    {"name": "mysticism:spirit_fog", "intarget": "painted", "outtarget": "fogged"},
+    {"name": "mysticism:spirit_saturation", "intarget": "fogged", "outtarget": "saturated"},
     {"name": "mysticism:spirit_transition", "intarget": "saturated", "outtarget": "minecraft:main"}
   ]
 }

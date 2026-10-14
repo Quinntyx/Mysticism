@@ -206,7 +206,7 @@ public final class SpiritTerrainService {
     }
     /** Exit is exact current shallow mapping, never saved entry/spawn or safe-air substitution. */
     public record WalkSupport(String landmarkId,String sourceDimension,Vec3d sourcePosition,
-            Basis384f sourceBasis,Vec384f sourceCoordinate,Vec3d normal,long windowIdentity,long ownershipRevision) {
+            Basis384f sourceBasis,Vec384f sourceCoordinate,Vec3d normal,Vec3d sourceNormal,long windowIdentity,long ownershipRevision) {
         public WalkSupport{sourceBasis=sourceBasis.clone();sourceCoordinate=sourceCoordinate.clone();}
         @Override public Basis384f sourceBasis(){return sourceBasis.clone();}
         @Override public Vec384f sourceCoordinate(){return sourceCoordinate.clone();}
@@ -227,7 +227,8 @@ public final class SpiritTerrainService {
                 .add(w.sourceBasis.i.clone().mul((float)(offset.x/SCALE)))
                 .add(w.sourceBasis.j.clone().mul((float)(offset.y/SCALE)))
                 .add(w.sourceBasis.k.clone().mul((float)(offset.z/SCALE)));
-        WalkSupport support=new WalkSupport(owner.get(),w.dimension,feet,w.sourceBasis,coordinate,hit.normal(),w.identity,w.owners.ownershipRevision());
+        WalkSupport support=new WalkSupport(owner.get(),w.dimension,feet,w.sourceBasis,coordinate,hit.normal(),
+                cell.sourceNormal(hit.normal()),w.identity,w.owners.ownershipRevision());
         ensureWalkProof(p,s,w,support);return Optional.of(new WalkCandidate(w,support));
     }
     private static boolean ownedBody(ServerPlayerEntity p,Session s,Window w,Vec3d at,String id) {

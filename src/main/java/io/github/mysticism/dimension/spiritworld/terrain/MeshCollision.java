@@ -157,7 +157,12 @@ public final class MeshCollision {
     public static boolean clearRay(ServerPlayerEntity player,Vec3d from,Vec3d to) {
         Index i=index(player);return i!=null && from.distanceTo(to)<=128 && i.clearRay(from,to);
     }
-    /** Actual affine SAT body clearance, including a newly acquired source window. */
+    /** No carrier blocks, entity boxes or world border may substitute for observer-local terrain. */
+    public static boolean bodyClear(PlayerEntity player,Box body) {
+        Index i=index(player);
+        return i==null || bodyClear(i.frame,body);
+    }
+    /** Actual affine SAT body clearance, including shapes extending outside the unit model. */
     public static boolean bodyClear(TerrainMeshFrame frame,Box body) {
         Box strict=body.expand(-1e-5);
         for(var cell:frame.cells())if(cell.opacity()>0)
@@ -166,6 +171,22 @@ public final class MeshCollision {
                 if(bounds.intersects(strict) && penetration(strict,new Shape(cell,collision,bounds))!=null)return false;
             }
         return true;
+    }
+    /** Vanilla's packet endpoint guard rejects NEW intersections, not an existing overlap being escaped.
+     * Movement itself is already swept by move(); retain that guard without rebuilding block voxels. */
+    public static boolean newlyColliding(PlayerEntity player,Box before,Box after) {
+        Index i=index(player);
+        return i!=null && newlyColliding(i.frame,before,after);
+    }
+    public static boolean newlyColliding(TerrainMeshFrame frame,Box before,Box after) {
+        Box oldBody=before.expand(-1e-5),newBody=after.expand(-1e-5);
+        for(var cell:frame.cells())if(cell.opacity()>0)
+            for(Box collision:cell.collision()) {
+                Shape shape=new Shape(cell,collision,cell.bounds(collision));
+                if(shape.bounds.intersects(newBody) && penetration(newBody,shape)!=null
+                        && penetration(oldBody,shape)==null)return true;
+            }
+        return false;
     }
     /** Conservative continuous affine-motion guard: the union of endpoint AABBs contains EVERY intermediate
      * vertex under linear affine interpolation. An ambiguous swept/body overlap is held, never sampled through. */

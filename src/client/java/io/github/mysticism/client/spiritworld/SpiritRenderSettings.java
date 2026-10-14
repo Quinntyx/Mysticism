@@ -8,6 +8,8 @@ public final class SpiritRenderSettings {
     public static final double MIN_LOADING_RADIUS = 80.0;
     public static final double MAX_TRANSMITTANCE = 0.001;
     public static final double NEAR_BUBBLE = 5.0;
+    // Normalized path-average extinction; the shader integrates a near-clear radial ramp
+    // whose integral over NEAR_BUBBLE..OPAQUE_RADIUS is exactly that interval's length.
     public static final double MIN_EXTINCTION = -Math.log(MAX_TRANSMITTANCE) / (OPAQUE_RADIUS - NEAR_BUBBLE);
     public static final FogHorizons HORIZONS = new FogHorizons(40, OPAQUE_RADIUS, MIN_LOADING_RADIUS);
     public static final double SATURATION_FADE_SECONDS = 2.5;
@@ -25,6 +27,11 @@ public final class SpiritRenderSettings {
     }
 
     private SpiritRenderSettings() {}
+
+    /** A prepared transformed branch owns fog even while blending with the source snapshot. */
+    public static boolean useVolumetricFog(boolean framePrepared, boolean failed, float strength) {
+        return framePrepared && !failed && strength > .001f;
+    }
 
     /** Smooth, independent of frame count, game ticks, fog and painterly quality. */
     public static float saturation(double elapsedSeconds) {

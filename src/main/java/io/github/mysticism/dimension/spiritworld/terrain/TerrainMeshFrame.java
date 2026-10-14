@@ -59,6 +59,16 @@ public record TerrainMeshFrame(long revision, boolean shallow, String sourceDime
         public Vec3d point(double x,double y,double z) {
             return min.add(axisX.multiply(x)).add(axisY.multiply(y)).add(axisZ.multiply(z));
         }
+        /** Pull back a projected contact normal (a covector) to source-block coordinates.
+         * Positions use the inverse transform; normals use the forward transform's transpose. Dividing each
+         * column by source size also handles compacted/nonuniform cells. This distinguishes a
+         * projected source floor from a source wall tilted upward; world normal Y alone cannot. */
+        public Vec3d sourceNormal(Vec3d projectedNormal) {
+            Vec3d pulled = new Vec3d(axisX.dotProduct(projectedNormal) / size.x,
+                    axisY.dotProduct(projectedNormal) / size.y, axisZ.dotProduct(projectedNormal) / size.z);
+            double length = pulled.length();
+            return Double.isFinite(length) && length > 1e-12 ? pulled.multiply(1 / length) : Vec3d.ZERO;
+        }
         public Box bounds(Box b) {
             Vec3d base=point(b.minX,b.minY,b.minZ);
             double xx=axisX.x*b.getLengthX(),yx=axisY.x*b.getLengthY(),zx=axisZ.x*b.getLengthZ();

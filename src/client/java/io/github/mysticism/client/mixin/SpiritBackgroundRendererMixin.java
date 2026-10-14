@@ -14,7 +14,7 @@ public abstract class SpiritBackgroundRendererMixin {
     @Inject(method = "applyFog", at = @At("RETURN"))
     private static void mysticism$spiritFog(Camera camera, BackgroundRenderer.FogType type,
             float viewDistance, boolean thickFog, float tickDelta, CallbackInfo ci) {
-        ShaderManager.applySpiritFog();
+        ShaderManager.applySpiritFog(type == BackgroundRenderer.FogType.FOG_TERRAIN);
     }
 
     @Inject(method = "applyFogColor", at = @At("RETURN"))
