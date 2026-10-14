@@ -106,7 +106,7 @@ dev jar. `git diff --check` also passed.
   production compilation and artifact verification determine build success.
 
 
-## Retained review repair — candidate verification BLOCKED
+## Retained review repair — initial verification blocked (resolved below)
 
 This section concerns the repair AFTER retained merge `dbb1ff2`; the passing
 canonical build above belongs to that older merge, not this candidate.
@@ -171,3 +171,32 @@ Off-trail corrections without explicit provenance still use the retained fallbac
 lag heuristic. Persistent server/client collision disagreement can still require
 repeated authoritative correction; this repair makes each suppression explicit,
 not proof that every terrain disagreement has been eliminated.
+
+### Authorized restart: canonical verification passed
+
+The authorized restart preserved repair commit
+`41ede75f84ea72686e87960a06cfa86444ba125e` and its clean checkout. Host PTY use
+had fallen to 146; the prior origin `%2400` no longer existed. The continuation
+bound its original restart pane `%2547`, window `@1552`, in the same session
+`$11`. No host resource or other agent's workspace was changed.
+
+The canonical Gradle 8.13 `--offline --no-daemon --console=plain build
+--rerun-tasks` command then PASSED, exit 0, 31 seconds, all 14 tasks executed.
+Retained job: pane `%2550`, window `@1555`, run
+`f903da39178d4b3b9f70fa403a90099c`, origin `%2547`. It compiled production/client
+and runtime tests, executed all **11 discovered** runtime main-based classes,
+ran build/descriptor/packaging/runner self-tests and verified the remapped
+production jar `build/libs/mysticism-1.0-SNAPSHOT.jar`.
+
+Runtime results: new reconciliation **77** checks, timing 30, ordering 55,
+hooks 17 (offline contracts), classification 31, mesh corrections 30, burst
+advancement 15; embedding callback isolation 28, safety 184, persistence 90,
+pipeline 135. The corrupt-data persistence tests deliberately emit warnings and
+caught-error traces; the runner completed all suites successfully. Existing
+missing-annotation, mixin-target and Gradle-deprecation warnings remain nonfatal.
+`git diff --check` also passes.
+
+The earlier PTY/canonical verification blocker is resolved. The original red
+probe and interrupted-start history above remains an audit trail, not a current
+candidate failure. Source/CI success still does not establish live Minecraft
+behavior or real native model inference; the limits above remain in force.
