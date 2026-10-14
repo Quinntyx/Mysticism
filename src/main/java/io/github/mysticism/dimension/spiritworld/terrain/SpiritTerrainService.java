@@ -712,7 +712,16 @@ public final class SpiritTerrainService {
         Session(Window local,Vec3d carrier){this.local=local;this.carrier=carrier;}
         void cancel(){if(ownerFuture!=null)ownerFuture.cancel(false);if(sourceFuture!=null)sourceFuture.cancel(false);if(targetFuture!=null)targetFuture.cancel(false);if(targetOwnerFuture!=null)targetOwnerFuture.cancel(false);if(walkFuture!=null)walkFuture.cancel(false);cancelWindow(local);if(target!=null)cancelWindow(target);for(var w:regions.values())cancelWindow(w);for(var w:prepared.values())cancelWindow(w);regions.clear();prepared.clear();}
     }
-    private static void cancelWindow(Window w){if(w.ownershipFuture!=null)w.ownershipFuture.cancel(false);if(w.nearFuture!=null)w.nearFuture.cancel(false);w.discoveryPending.values().forEach(f->f.cancel(false));w.discoveryPending.clear();w.discovered.clear();w.discoveredNodes=List.of();w.stream=null;w.nearCells=null;w.nearSamples=null;}
+    private static void cancelWindow(Window w) {
+        if(w.ownershipFuture!=null)w.ownershipFuture.cancel(false);
+        if(w.nearFuture!=null)w.nearFuture.cancel(false);
+        // cancel() can run whenComplete -> server.execute inline. Invalidate every pending entry
+        // before invoking callbacks, and iterate a snapshot rather than the mutable values view.
+        var pending=List.copyOf(w.discoveryPending.values());
+        w.discoveryPending.clear();
+        pending.forEach(f->f.cancel(false));
+        w.discovered.clear();w.discoveredNodes=List.of();w.stream=null;w.nearCells=null;w.nearSamples=null;
+    }
     private static final class Context {
         final MinecraftServer server;final LandmarkStore store;final Map<UUID,Session> sessions=new HashMap<>();
         long tick;int playerCursor;LandmarkStore.GeometryRead read;Session readingSession;Window readingWindow;

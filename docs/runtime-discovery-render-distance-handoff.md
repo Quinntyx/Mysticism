@@ -94,7 +94,7 @@ Canonical command (existing Gradle 8.13, Java 21; run via `tmux-jobs`):
 common/client compilation, remapping and `verifyProductionJar`. It does not use
 Gradle's disabled framework `Test` action as proof of tests.
 
-The follow-up canonical build passed; a second build with `--rerun-tasks`
+At retained `c71d118`, the follow-up canonical build passed; a second build with `--rerun-tasks`
 passed in 25 seconds (all 14 actionable tasks executed, no compilation or
 packaging task reused). Both builds had all seven main-based runtime classes
 discovered and run with assertions: `DiscoveryFrameSelfTest` (7,982 checks),
@@ -103,6 +103,31 @@ four existing embedding callback/engine/persistence/pipeline suites. Packaging,
 descriptor, metadata and runner regressions passed; `verifyProductionJar`
 accepted `build/libs/mysticism-1.0-SNAPSHOT.jar`. Expected invalid-persistence
 fixtures log rejection warnings/stack traces; they are not inference tests.
+
+## Cancellation review follow-up
+
+`cancelWindow` now snapshots discovery futures and clears `discoveryPending`
+**before** cancelling the snapshot. Cancelling a `CompletableFuture` can invoke
+its completion handler synchronously, and `MinecraftServer.execute` can execute
+that handler inline on the server thread. The old mutable `values().forEach`
+iteration could throw `ConcurrentModificationException` when handlers removed
+pending entries, aborting the remaining window/session cleanup. Clearing first
+also invalidates all completion identity guards before any cancellation callback.
+
+The discovered `DiscoveryCancellationSelfTest` invokes the actual private window
+teardown via reflection, without a Minecraft server or embedding engine. Its 21
+checks cover both pending reads with synchronous handlers, complete cleanup of
+retained nodes/near samples, deferred handlers racing a fresh same-tile request,
+repeated teardown, empty maps and already-completed futures. It inspects callback
+outcomes so swallowed callback assertion failures cannot be counted as success.
+
+The canonical command with `--rerun-tasks build` passed in 27 seconds: all 14
+actionable tasks executed, all **eight** runtime classes discovered and passed,
+packaging/metadata/descriptor/runner fixtures passed, and the remapped production
+jar verified. Retained build handle: origin `%2587`, pane `%2593`, run
+`614017d4756b46c082f1bccb9ab6d48f`, exit 0. Existing API Guardian/mixin/deprecation
+warnings remain nonfatal. This is bare-JVM teardown coverage, not a live
+world-change/server-stop play test or native v2 inference verification.
 
 ## Limits / unverified
 
