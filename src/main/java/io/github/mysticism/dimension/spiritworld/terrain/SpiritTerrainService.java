@@ -201,7 +201,9 @@ public final class SpiritTerrainService {
         if(w!=s.local || !cell.landmarkId().isEmpty() && !cell.landmarkId().equals(ownerId(p,w)))return false;
         Vec3d contact=p.getPos().add(0,.025-.15*ground.get().time(),0).subtract(ground.get().normal().multiply(.001));
         Vec3d source=sourceContact(cell,contact);
-        if(!ownershipPendingAt(p,w,source))return false; // Current unowned ground is not pending.
+        // An empty snapshot can arrive BEFORE initial source discovery creates ownership. Hold
+        // walking until discovery has been applied on the server; it is not capture/exit proof.
+        if(!w.discovery.groundPending(ownershipPendingAt(p,w,source)))return false;
         requestOwnership(p,s,w,source);return true;
     }
     /** Exit is exact current shallow mapping, never saved entry/spawn or safe-air substitution. */
@@ -414,13 +416,15 @@ public final class SpiritTerrainService {
     private static boolean contact(Box b,Box body,double feet){return Math.abs(b.maxY-feet)<=.12 && b.maxX>body.minX+1e-4 && b.minX<body.maxX-1e-4 && b.maxZ>body.minZ+1e-4 && b.minZ<body.maxZ-1e-4;}
     private static void discoverOwner(ServerPlayerEntity p,Session s) {
         Window expected=s.local;
-        s.ownerFuture=SourceLandmarks.ensureSourceLocation(p.getServer(),expected.dimension,BlockPos.ofFloored(expected.origin)).whenComplete((found,error)->p.getServer().execute(()->{
+        s.ownerFuture=expected.discovery.await(
+                ()->SourceLandmarks.ensureSourceLocation(p.getServer(),expected.dimension,BlockPos.ofFloored(expected.origin)),
+                p.getServer(),(found,error)->{
             if(!live(p,s) || s.local!=expected || error!=null || found==null || found.isEmpty())return;
             Window w=expected;var m=found.get();w.id=m.id();w.owner=m;w.supportEmbedding=m.header().baseEmbedding().vector();
             // Attach ownership without moving geometry. Deliver NAV anchoring only after exact octree ownership is current.
             Vec3d source=s.shallow?w.origin.add(p.getPos().subtract(s.carrier)):w.origin;
             requestOwnership(p,s,w,source);notifyAnchor(p,s,w);publish(p,s,true);
-        }));
+        });
     }
     /** NAV may wait on this transient async state instead of treating an invalidated snapshot as walking off a region. */
     public static boolean ownershipPending(ServerPlayerEntity p) {
@@ -638,6 +642,7 @@ public final class SpiritTerrainService {
     }
     private static final class Window {
         final long identity=WINDOW_IDS.incrementAndGet();final String dimension;Vec3d origin;Vec384f semantic,supportEmbedding;final Vec384f captured;final Basis384f sourceBasis;
+        final InitialSourceDiscovery discovery=new InitialSourceDiscovery();
         boolean proofValid;List<String> proofKeys=List.of();SourceOwnership.Region owners;CompletableFuture<SourceOwnership.Region> ownershipFuture;long nextOwnerRequest;
         String id;LandmarkMetadata owner;boolean ready,dirty,confirmedOrigin,replacing,nearReady,retired;float alpha=1,publishedAlpha;int refreshCursor;
         TerrainGeometryStream stream;long metadataChecked,observedOwnership=-1;
