@@ -53,7 +53,7 @@ boolean isCurrent(MinecraftServer server);
 
 Call on server thread after normal source init. Result is an immutable map of exact native source blocks to canonical source IDs. Both observed AIR and SOLID octree leaves count; UNKNOWN/unowned blocks have **no entry**. AABBs only select candidate/page IO, never assign ownership. Full requested volume must fit `maxCells <=32768`; no partial/truncated success. Conflict between different source masks fails rather than guessing. No source-world access, chunk loads, inference, or readiness dependency. Completed maps are detached immutable snapshots; `isCurrent(server)` checks same store instance and a runtime source-topology stamp. Creation, growth, transfer, merge, split, delete or reset invalidates old maps; activity-only CAS does not. This adds no saved schema/migration.
 
-One ownership request advances/server tick alongside extraction: <=4 metadata records **or** <=1 geometry page with <=512 reconstructed leaves **or** <=256 octree node visits/128 staged leaves **or** <=256 block-map insertions. Queue <=8 including the active request; at most one retained page and 128 staged leaf ranges. Cancellation is polled on tick; dimension unload/server stop cancel queued/active reads and release the shared repository geometry cursor. A concurrent source publication fails the request as stale; consumer re-requests. Cold NBT IO remains synchronous and page-bounded, not a hard wall-clock guarantee. Entire catalogue traversal is resumable; a large catalogue or shared reader contention can delay completion.
+One ownership request advances/server tick alongside extraction: <=4 metadata records **or** <=1 geometry page with <=512 reconstructed leaves **or** <=256 octree node visits/128 staged leaves **or** <=256 block-map insertions. Queue <=8 including the active request; at most one retained page and 128 staged leaf ranges. Cancellation is polled on tick; dimension unload/server stop cancel queued/active reads and release the ownership cursor. Ownership proofs have one dedicated store cursor alongside (not instead of) the exclusive discovery cursor; see the ownership latency repair below. A concurrent source publication fails the request as stale; consumer re-requests. Cold NBT IO remains synchronous and page-bounded, not a hard wall-clock guarantee. Entire catalogue traversal is resumable; a large catalogue or queued ownership requests can still delay completion.
 
 **Terrain consumption required (not edited in SOURCE worktree):** request this mask for the exact local/target sliding source bounds in parallel with `region(...)`, retaining/cancelling the future with the Window/session. Check `mask.isCurrent(server)` and matching dimension/bounds before publishing labels or granting support/exit. Label each unit source sample from `mask.ownerAt(pos)`, never from `Window.id`; absent means empty/unowned, not retained-owner permission. Compaction must not merge different owner IDs or owned with unowned voxels: split nonuniform ownership down to unit cells. `sourcePosition` must verify actual mapped foot/body sample ownership against the resolved retained ID; support must use the actual floor-contact cell's map owner, and exit must fail while ownership is absent/stale/outside the queried region. Replace the AABB-only authority check at SpiritTerrainService.sourcePosition (terrain 87510e0 lines 136–141). Do not retune/re-anchor from a changed owner. Current authoritative map is usable only within its requested bounds; refresh after walking outside or topology invalidation.
 
@@ -107,9 +107,10 @@ owner and release its cursor/mutation/pause through the existing operation lifec
 
 The per-tick geometry/publication budgets remain one page and 512 reconstructed
 leaves. No new concurrency or store schema, projection, terrain/collision, source
-ownership or embedding policy is introduced. The independent ownership-map request
-lane still shares the store cursor; this fix removes discovery-stage blocking of
-movement `Read` operations, not every kind of shared-cursor contention.
+ownership or embedding policy is introduced. At that scheduling revision the
+independent ownership-map request lane still shared the store cursor; the fix
+removed discovery-stage blocking of movement `Read` operations, not every kind of
+shared-cursor contention. The ownership latency repair below addresses that remainder.
 
 `SourceDiscoveryReadLatencyTest` drives the actual Session scheduling step, real
 Ensure operations, real 100-page LandmarkStore geometry/publication and actual
@@ -130,6 +131,57 @@ build pane `%2146`, run `cff3248e153140298b2aca9481d424ee` (exit 0). The initial
 failed only on the new fixture's hard-coded legacy vector dimension; the fixture
 now follows the current native vector size without altering production vectors.
 No gameplay, GPU, multiplayer launch or real native-model inference was performed.
+
+## Async-discovery ownership latency repair
+
+The real ownership proof used by terrain support/walk acquisition no longer waits for
+an entire discovery geometry read. `SourceOwnership.Request` uses one dedicated
+package-private `LandmarkStore` cursor slot, independent of the exclusive public
+geometry cursor. Both are server-thread confined over immutable page versions and
+share the existing eight-page/65,536-leaf decoded LRU. No competing discovery or
+second ownership decoder is admitted. Completion/cancellation releases only the
+matching cursor instance, including repeated cancellation of a superseded cursor.
+A suspended partial decoder is discarded if the other cursor completes and caches
+that same immutable page, so it cannot be reused against the next page key.
+
+The existing ownership queue, source revision checks and per-tick budgets are
+unchanged: one request phase, at most four metadata records or one geometry page/
+512 decoded leaves or 256 octree node visits/128 staged leaves or 256 known voxel
+insertions. AIR and SOLID grant exact native source-coordinate ownership; UNKNOWN
+and AABB-only overlap do not. Concurrent source publication still fails the proof
+and requires a fresh request. No source-world generation, inference, save-schema
+migration, projection or mesh/collision policy was changed.
+
+`SourceDiscoveryReadLatencyTest` now drives a real ownership Request before the
+actual Session scheduling step, matching tick ordering, during a real 100-page
+Ensure read with sustained generated-terrain reads. Before this repair, the proof
+was still pending at tick 200. With both requested and background discovery, it
+finishes in 105 simulated ticks while discovery still holds its cursor (six pages
+completed); sustained movement reads still take at most four ticks and competing
+discovery never starts. The fixture also checks exact far-page ownership and the
+unowned neighbor, rather than merely future completion or status messages.
+
+`SourceOwnershipCursorTest` covers interleaved partial decoders in both directions,
+cache adoption followed by a different cold page, AIR/SOLID/UNKNOWN and clipped
+masks, bounded decode/expansion/cache work, source-revision invalidation,
+request cancellation, independent cursor release, superseded-cursor cancellation
+and off-thread rejection. These use real store NBT and real Request paths but do
+not launch Minecraft, flush a new save/reload cycle, or run an embedding model.
+
+Validation: cached Gradle 8.13 `--offline --no-daemon --console=plain --rerun-tasks
+build` passed, all 14 tasks executed, with all **nine** discovered runtime classes,
+build/packaging fixtures, common/client compilation, remapping and production-jar
+verification. The discovery latency regression passed 13,390 checks and the new
+ownership cursor regression 542; retained pane `%2579`, run
+`1d205d8996fc49af807afb03ffed9633`, exit 0. Client compilation still emits existing
+API Guardian/mixin warnings; malformed embedding persistence fixtures intentionally
+log rejection errors. Neither is a failed task. `git diff --check` also passed.
+
+Cold metadata/compressed-NBT IO and worker latency remain non-wall-clock-bounded.
+Large catalogues, many-page intersecting features and queued ownership requests
+can still exceed a walk deadline; this removes discovery cursor contention, not
+all possible latency. Live gameplay, GPU rendering, multiplayer and actual native
+v2 model inference have not been verified by this scoped repair.
 
 ## Validation actually run (historical concurrent rebuild)
 

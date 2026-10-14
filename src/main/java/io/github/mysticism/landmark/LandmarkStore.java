@@ -36,6 +36,9 @@ public final class LandmarkStore extends PersistentState {
     private transient PendingMutation pending;
     private transient Path dataDirectory;
     private transient GeometryRead activeRead;
+    /** One additional bounded cursor for movement-critical ownership proofs. Discovery keeps
+     * its exclusive slot; both cursors are server-thread-only over immutable page versions. */
+    private transient GeometryRead ownershipRead;
     private transient long ownershipRevision;
     /** Runtime snapshot stamp for source masks/aliases/catalogue; activity-only CAS retains it.
      * Not a save-schema version. Compare only against this same store instance. */
@@ -189,26 +192,36 @@ public final class LandmarkStore extends PersistentState {
         return state.payload; // private read-only codecs; never exposed to callers
     }
     public boolean geometryReadAvailable(){checkThread();return activeRead==null;}
+    boolean ownershipReadAvailable(){checkThread();return ownershipRead==null;}
+    /** Ownership proofs must not wait for a many-page discovery cursor held across ticks.
+     * This separate slot does not admit another discovery, bypass revision checks, or add
+     * off-thread store access. Request still budgets every decode, query and voxel expansion. */
+    GeometryRead beginOwnershipRead(String id,Bounds range) {return beginGeometryRead(id,Objects.requireNonNull(range),0,true);}
     public GeometryRead beginGeometryRead(String id) {return beginGeometryRead(id,null);}
     /** Bounds-gated cold geometry traversal: skip unrelated page leaves, one header per operation. */
     public GeometryRead beginGeometryRead(String id,Bounds range) {return beginGeometryRead(id,range,0);}
     /** Resume only at a completed/skipped page boundary against the caller's immutable key list. */
-    public GeometryRead beginGeometryRead(String id,Bounds range,int nextPageIndex) {
-        checkThread(); if(activeRead!=null) throw new IllegalStateException("another geometry read is active");
+    public GeometryRead beginGeometryRead(String id,Bounds range,int nextPageIndex) {return beginGeometryRead(id,range,nextPageIndex,false);}
+    private GeometryRead beginGeometryRead(String id,Bounds range,int nextPageIndex,boolean ownership) {
+        checkThread(); if((ownership?ownershipRead:activeRead)!=null) throw new IllegalStateException("another "+(ownership?"ownership":"geometry")+" read is active");
         LandmarkMetadata value=metadata(id).orElseThrow(()->new IllegalStateException("missing landmark"));
         if(nextPageIndex<0 || nextPageIndex>value.geometryKeys().size()) throw new IllegalArgumentException("geometry page cursor");
-        activeRead=new GeometryRead(value,range,nextPageIndex); return activeRead;
+        var read=new GeometryRead(value,range,nextPageIndex,ownership);
+        if(ownership)ownershipRead=read;else activeRead=read;
+        return read;
     }
-    /** One active read; batches hold <=8 pages. Drain before advancing. Budgets count cache hits too. */
+    /** At most one discovery and one ownership read; batches hold <=8 pages each. Drain
+     * before advancing. Budgets count cache hits too; the decoded cache is shared and bounded. */
     public final class GeometryRead {
         private final LandmarkMetadata metadata;
         private final Bounds range;
+        private final boolean ownership;
         private final List<GeometryPage> ready=new ArrayList<>();
         private int cursor;
         private LandmarkNbt.GeometryDecoder decoder;
         private boolean cancelled;
         public boolean isCurrent() { checkThread(); Ref ref=records.get(metadata.id()); return ref!=null && ref.revision==metadata.revision(); }
-        private GeometryRead(LandmarkMetadata metadata,Bounds range,int nextPageIndex) { this.metadata=metadata;this.range=range;this.cursor=nextPageIndex; }
+        private GeometryRead(LandmarkMetadata metadata,Bounds range,int nextPageIndex,boolean ownership) { this.metadata=metadata;this.range=range;this.cursor=nextPageIndex;this.ownership=ownership; }
         /** Does not advance while the current page is partially decoded. */
         public int nextPageIndex() { checkThread(); return cursor; }
         public LandmarkMetadata metadata() { checkThread(); return metadata; }
@@ -219,6 +232,9 @@ public final class LandmarkStore extends PersistentState {
             int pages=0,leaves=0;
             while(!complete() && pages<maxPages && leaves<maxLeaves) {
                 String key=metadata.geometryKeys().get(cursor); CachedPage cached=decoded.get(key); GeometryPage page=cached==null?null:cached.page;
+                // The other cursor may have completed this immutable page while our decoder
+                // was suspended. Discard that partial decoder before moving to the next key.
+                if(page!=null)decoder=null;
                 if(page==null) {
                     if(decoder==null) decoder=new LandmarkNbt.GeometryDecoder(load(key));
                     if(range!=null && !range.intersects(decoder.bounds())){decoder=null;cursor++;pages++;continue;}
@@ -232,11 +248,15 @@ public final class LandmarkStore extends PersistentState {
                 if(!metadata.header().bounds().contains(page.bounds())) throw new IllegalStateException("page outside landmark");
                 ready.add(page); cursor++; pages++;
             }
-            if(complete()) activeRead=null;
+            if(complete()) release();
             return leaves;
         }
+        private void release() {
+            if(ownership){if(ownershipRead==this)ownershipRead=null;}
+            else if(activeRead==this)activeRead=null;
+        }
         public List<GeometryPage> drain() { checkThread(); List<GeometryPage> out=List.copyOf(ready); ready.clear(); return out; }
-        public void cancel() { checkThread(); cancelled=true; decoder=null; ready.clear(); if(activeRead==this) activeRead=null; }
+        public void cancel() { checkThread(); cancelled=true; decoder=null; ready.clear(); release(); }
     }
     private void cache(String key,GeometryPage page,int leaves) {
         CachedPage old=decoded.put(key,new CachedPage(page,leaves)); residentLeaves+=leaves-(old==null?0:old.leaves);

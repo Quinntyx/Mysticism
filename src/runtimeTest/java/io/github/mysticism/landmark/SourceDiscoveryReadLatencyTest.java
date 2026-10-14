@@ -18,6 +18,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.util.*;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -212,8 +213,52 @@ public final class SourceDiscoveryReadLatencyTest {
             store.stagePut(landmark,-1).cancel();
         }
     }
+    /** Terrain support needs BOTH region samples and exact persisted ownership. Exercise the
+     * real Request phase before the real scheduled op, in the same order as Session.tick.
+     * A far-page proof also bounds the skipped-page scan, not just a lucky resident first page. */
+    private static void ownershipDuringDiscovery(boolean background) throws Exception {
+        var store=store();var landmark=landmark();
+        var put=store.stagePut(landmark,-1);while(!put.complete())put.advance(8);
+        var schedule=new SourceSchedule<Object>(SourceLandmarks.DISCOVERY_FAIR_SHARE,READ::isInstance,op->{
+            try{return field(OPERATION,"background").getBoolean(op);}catch(ReflectiveOperationException failure){throw new AssertionError(failure);}
+        });
+        var session=session(store,schedule);var owner=ensure(session);var later=ensure(session);
+        field(OPERATION,"background").setBoolean(owner,background);
+        var geometry=store.beginGeometryRead(landmark.id());field(OPERATION,"geometryRead").set(owner,geometry);
+        field(SESSION,"active").set(session,owner);schedule.discover(later);
+        var bounds=new Bounds(PAGE_COUNT-1,0,0,PAGE_COUNT+1,1,1);
+        var future=new CompletableFuture<SourceOwnership.Region>();
+        var request=new SourceOwnership.Request(store,DIMENSION,bounds,future);
+        CompletableFuture<SourceLandmarks.Region> read=null;int readStart=0,ticks=0,maxLatency=0,streamReads=0;
+        try(var worker=Executors.newSingleThreadExecutor(Thread.ofPlatform().daemon().name("ownership-latency-regression").factory())){
+            field(SESSION,"worker").set(session,worker);
+            for(;ticks<200&&!future.isDone();ticks++){
+                if(read==null){read=queueRead(session,schedule);readStart=ticks;}
+                request.advance();
+                invoke(ADVANCE,session,true);
+                check(!geometry.complete()&&!store.geometryReadAvailable(),"ownership progresses before discovery releases its 100-page cursor");
+                check(field(ENSURE,"prepared").get(later)==null&&field(OPERATION,"geometryRead").get(later)==null,"ownership progress never admits competing discovery");
+                if(read.isDone()){
+                    validateRead(read);int latency=ticks-readStart+1;maxLatency=Math.max(maxLatency,latency);
+                    check(latency<=4,"ownership work preserves bounded movement-read scheduler latency");
+                    read=null;streamReads++;
+                }
+            }
+            check(future.isDone()&&!future.isCompletedExceptionally(),"real ownership proof completes before the 200-tick walk deadline while discovery still holds its cursor (ticks="+ticks+")");
+            var result=future.join();
+            check(result.owners().equals(Map.of(new BlockPos(PAGE_COUNT-1,0,0),landmark.id())),"far-page proof grants exact known ownership, not AABB ownership of the unknown neighbor");
+            check(result.bounds().equals(bounds)&&result.ownershipRevision()==store.ownershipRevision(),"proof preserves exact request bounds and topology revision");
+            check(geometry.nextPageIndex()>0&&streamReads>20,"discovery and real movement reads both progress while the ownership proof runs");
+            check(store.cacheStats().pages()<=LandmarkStore.DECODED_PAGE_LIMIT&&store.cacheStats().leaves()<=LandmarkStore.DECODED_LEAF_LIMIT,"ownership shares the bounded decoded-page cache");
+            System.out.println("SourceDiscoveryReadLatencyTest: ownership/"+(background?"background":"requested")+", proof="+ticks+" ticks, sustained read max="+maxLatency+" ticks, discovery pages="+geometry.nextPageIndex());
+        }finally{
+            request.cancel(new CancellationException("fixture finished"));geometry.cancel();
+        }
+    }
     public static void main(String[] args) throws Exception {
-        SharedConstants.createGameVersion();multiPage(false);multiPage(true);
+        SharedConstants.createGameVersion();
+        ownershipDuringDiscovery(false);ownershipDuringDiscovery(true);
+        multiPage(false);multiPage(true);
         invalidatedSuspendedOwner(false);invalidatedSuspendedOwner(true);
         System.out.println("SourceDiscoveryReadLatencyTest: "+checks+" checks passed");
     }
