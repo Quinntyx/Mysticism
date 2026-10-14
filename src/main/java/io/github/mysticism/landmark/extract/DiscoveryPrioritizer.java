@@ -7,11 +7,13 @@ import java.util.function.Predicate;
 /** Bounded owner-thread discovery scheduling; no source IO or ownership decisions here.
  * Reads and player-blocking discovery precede frontier growth and visible-locality backfill.
  * Admitted work ages across BOTH queues, so continuous reads/player churn cannot starve
- * retained background work. Scheduling is non-preemptive: an active mutation is never torn
- * down for priority, and latency still includes that operation's IO/model/publication time. */
+ * retained background work. Aged background dispatches yield to waiting READ/PLAYER work
+ * after one turn, across both queues. Scheduling is non-preemptive: an active mutation is
+ * never torn down for priority; latency still includes its IO/model/publication time. */
 public final class DiscoveryPrioritizer {
     public static final int READ=-1,PLAYER=0,FRONTIER=1,BACKFILL=2;
     public static final long AGING_TICKS=200;
+    public static final int MAX_CONSECUTIVE_BACKGROUND_DISPATCHES=1;
     public record Anchor(String dimension,BlockPoint pos) {}
     public record Key(String dimension,BlockPoint pos) {}
     public interface Scheduled {
@@ -21,6 +23,7 @@ public final class DiscoveryPrioritizer {
     public record Hint(Key key,int tier,long enqueuedTick) implements Scheduled {}
     private final int capacity;
     private final ArrayList<Hint> entries=new ArrayList<>();
+    private int consecutiveBackgroundDispatches;
     public DiscoveryPrioritizer(int capacity) {
         if(capacity<1)throw new IllegalArgumentException("discovery capacity");
         this.capacity=capacity;
@@ -67,8 +70,12 @@ public final class DiscoveryPrioritizer {
     /** Highest tier/nearest observer normally; oldest admitted hint after bounded aging.
      * An observer in a different dimension never makes a hint nearer. */
     public Hint peek(List<Anchor> anchors,long now,long agingTicks) {
+        return peek(anchors,now,agingTicks,entry->true);
+    }
+    private Hint peek(List<Anchor> anchors,long now,long agingTicks,Predicate<Hint> eligible) {
         Hint best=null;
         for(Hint entry:entries) {
+            if(!eligible.test(entry))continue;
             if(best==null) {best=entry;continue;}
             int order=compare(entry,best,now,agingTicks);
             if(order<0 || order==0 && !aged(entry,now,agingTicks)
@@ -83,20 +90,42 @@ public final class DiscoveryPrioritizer {
         remove(best);return best.key();
     }
     /** The production dispatch policy: hint and explicit request ages share the same clock.
-     * Model-unready discovery is excluded BEFORE selection, so it cannot head-block reads. */
+     * After a background turn, eligible urgent work gets the next opportunity even if every
+     * older background entry is aged. With sustained urgent churn, aging still grants oldest
+     * background work alternate turns. No urgent work means background drains without idling.
+     * Model-unready discovery is excluded BEFORE selection, so it cannot head-block reads.
+     * Selection is read-only; call dispatched ONLY once an operation is actually activated. */
     public <T extends Scheduled> Scheduled next(List<T> requests,List<Anchor> anchors,long now,
                                                long agingTicks,boolean discoveryReady) {
-        Scheduled request=selectNext(requests,now,agingTicks,op->discoveryReady||op.tier()==READ);
-        Hint hint=discoveryReady?peek(anchors,now,agingTicks):null;
+        if(consecutiveBackgroundDispatches>=MAX_CONSECUTIVE_BACKGROUND_DISPATCHES) {
+            Scheduled urgent=next(requests,anchors,now,agingTicks,discoveryReady,true);
+            if(urgent!=null)return urgent;
+        }
+        return next(requests,anchors,now,agingTicks,discoveryReady,false);
+    }
+    private <T extends Scheduled> Scheduled next(List<T> requests,List<Anchor> anchors,long now,
+                                                long agingTicks,boolean discoveryReady,boolean urgentOnly) {
+        Scheduled request=selectNext(requests,now,agingTicks,
+                op->(discoveryReady||op.tier()==READ) && (!urgentOnly||op.tier()<=PLAYER));
+        Hint hint=discoveryReady?peek(anchors,now,agingTicks,op->!urgentOnly||op.tier()<=PLAYER):null;
         if(request==null)return hint;
         if(hint==null)return request;
         int order=compare(hint,request,now,agingTicks);
         // Within an unaged tier, preserve request FIFO; hints use distance within their queue.
         return order<0 || order==0 && hint.enqueuedTick()<request.enqueuedTick()?hint:request;
     }
+    /** Account an actual dispatch from EITHER queue, not a peek or a cancelled queued item.
+     * Count all background starts so a fresh urgent arrival after background-only draining
+     * need not wait for another background turn. Saturate to avoid overflow on idle servers. */
+    public void dispatched(Scheduled op) {
+        Objects.requireNonNull(op,"dispatched operation");
+        if(op.tier()<=PLAYER)consecutiveBackgroundDispatches=0;
+        else consecutiveBackgroundDispatches=Math.min(MAX_CONSECUTIVE_BACKGROUND_DISPATCHES,
+                consecutiveBackgroundDispatches+1);
+    }
     public int size() {return entries.size();}
     public boolean isEmpty() {return entries.isEmpty();}
-    public void clear() {entries.clear();}
+    public void clear() {entries.clear();consecutiveBackgroundDispatches=0;}
     public void removeDimension(String dimension) {entries.removeIf(entry->entry.key().dimension().equals(dimension));}
     private static double distance(List<Anchor> anchors,Key key) {return distance(anchors,key.dimension(),key.pos());}
     public static double distance(List<Anchor> anchors,String dimension,BlockPoint pos) {

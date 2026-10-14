@@ -220,6 +220,9 @@ public final class SourceLandmarks {
                     active=new Ensure(this,key.dimension(),new BlockPos((int)key.pos().x(),(int)key.pos().y(),(int)key.pos().z()),null,false,new CompletableFuture<>(),hint.tier());
                     active.enqueued=hint.enqueuedTick();
                 }else if(chosen instanceof Operation<?> op){requests.remove(op);active=op;}
+                // One shared dispatch budget for hints AND explicit operations. Merely peeking,
+                // waiting for readiness or pruning cancelled requests must not consume turns.
+                if(active!=null)hints.dispatched(active);
             }
             if(active==null)return;
             try{if(active.future.isCancelled())active.cancel(new CancellationException());if(!active.done)active.advance();if(active.done){active.release();active=null;status="Ready";}}
