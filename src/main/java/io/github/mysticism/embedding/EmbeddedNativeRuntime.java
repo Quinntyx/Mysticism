@@ -10,6 +10,7 @@ import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
 import net.ladenthin.llama.LlamaModel;
 
@@ -39,6 +40,13 @@ final class EmbeddedNativeRuntime {
             new Platform("Mac", "aarch64", "libjllama.dylib", 17868080L, "889cc12882ab14eb819456fbca3aa26291348ef8c11ce99b9a9c738a43f4fd21"),
             new Platform("Windows", "x86_64", "jllama.dll", 12889600L, "891e3b7891467cf37b47c308123cd24905d5134b32eac8136d2dafa7fff36a52"),
             new Platform("Windows", "aarch64", "jllama.dll", 14706176L, "ce8c90590a95adb84ad7086fe0f5334c6cf86b6acf66fbf59c8d4b53ba6b2464"));
+    // This exact Linux x64 payload is NOT a baseline-x86 or dynamically dispatched build.
+    // In particular its ggml_cpu_has_* methods return compile-time constants, not CPUID.
+    // Linux's avx flag means the kernel has enabled XSAVE/YMM state, unlike raw CPUID.
+    // abm is Linux's LZCNT flag; BMI2/LZCNT are also present in the pinned machine code.
+    static final List<String> LINUX_X64_FLAGS = List.of(
+            "pni", "ssse3", "sse4_1", "sse4_2", "xsave", "avx", "avx2", "fma", "f16c", "bmi2", "abm");
+    private static final int MAX_CPU_INFO_BYTES = 4 * 1024 * 1024;
     private static String buildInfo;
     private static IOException terminalFailure;
     private static Path library;
@@ -59,6 +67,12 @@ final class EmbeddedNativeRuntime {
     }
 
     static synchronized String prepare() throws IOException {
+        return prepare(EmbeddedNativeRuntime::linuxCpuInfo);
+    }
+
+    // Package-private reader seam for fresh-JVM regressions, not a user-configurable ISA bypass.
+    @FunctionalInterface interface CpuInfo { String read() throws IOException; }
+    static synchronized String prepare(CpuInfo cpuInfo) throws IOException {
         if (terminalFailure != null) throw terminalFailure;
         if (buildInfo != null) return buildInfo;
         interrupted();
@@ -73,6 +87,9 @@ final class EmbeddedNativeRuntime {
             throw failure("CONFIGURATION", platform, "Remove -Dnet.ladenthin.llama.backend=" + backend + "; this backend requires the bundled CPU runtime.", null);
         Path root = null;
         try {
+            // Must precede extraction, loader properties, System.load/JNI_OnLoad and asset IO.
+            // A SIGILL cannot be caught as a Java LinkageError after entering the library.
+            validateCpu(platform, cpuInfo);
             String configured = System.getProperty(DIRECTORY, System.getProperty("net.ladenthin.llama.tmpdir"));
             root = configured == null ? Path.of(System.getProperty("user.home"), ".cache", "mysticism", "native") : Path.of(configured);
             Path directory = privateDirectory(root);
@@ -109,6 +126,62 @@ final class EmbeddedNativeRuntime {
             terminalFailure = failure("INITIALIZATION", platform, "JNI initialization failed; restart Minecraft after fixing the runtime. " + error, error);
             throw terminalFailure;
         }
+    }
+
+    private static String linuxCpuInfo() throws IOException {
+        try (InputStream input = Files.newInputStream(Path.of("/proc/cpuinfo"))) {
+            // proc files report size zero; bound the actual stream, not Files.size().
+            byte[] bytes = input.readNBytes(MAX_CPU_INFO_BYTES + 1);
+            if (bytes.length > MAX_CPU_INFO_BYTES) throw new IOException("/proc/cpuinfo exceeds the 4 MiB safety bound");
+            return new String(bytes, java.nio.charset.StandardCharsets.US_ASCII);
+        }
+    }
+
+    static void validateCpu(Platform platform, CpuInfo cpuInfo) throws IOException {
+        if (!platform.os.equals("Linux") || !platform.arch.equals("x86_64")) return;
+        String info;
+        try { info = cpuInfo.read(); }
+        catch (IOException | SecurityException error) {
+            throw cpuInfoFailure(platform, "Cannot read /proc/cpuinfo: " + error.getMessage(), error);
+        }
+        if (info == null || info.isBlank() || info.length() > MAX_CPU_INFO_BYTES)
+            throw cpuInfoFailure(platform, "Empty or oversized /proc/cpuinfo", null);
+        int processors = 0;
+        // Do not use \\R\\R: regex backtracking can split a single CRLF into two separators.
+        for (String stanza : info.split("\\r?\\n[ \\t]*\\r?\\n")) {
+            if (stanza.isBlank()) continue;
+            String processor = null;
+            Set<String> flags = null;
+            for (String line : stanza.split("\\R")) {
+                int colon = line.indexOf(':');
+                if (colon < 0) continue;
+                String key = line.substring(0, colon).strip(), value = line.substring(colon + 1).strip();
+                if (key.equals("processor")) {
+                    if (processor != null || !value.matches("[0-9]+"))
+                        throw cpuInfoFailure(platform, "Malformed/duplicate processor record", null);
+                    processor = value;
+                } else if (key.equals("flags")) {
+                    if (flags != null || value.isEmpty()) throw cpuInfoFailure(platform, "Empty/duplicate CPU flags record", null);
+                    flags = Set.copyOf(List.of(value.split("\\s+")));
+                }
+            }
+            if (processor == null || flags == null || flags.isEmpty())
+                throw cpuInfoFailure(platform, "Incomplete processor/flags record", null);
+            processors++;
+            Set<String> available = flags;
+            var missing = LINUX_X64_FLAGS.stream().filter(flag -> !available.contains(flag)).toList();
+            if (!missing.isEmpty()) throw failure("UNSUPPORTED_CPU", platform,
+                    "Pinned llama-5.1.0 CPU payload requires OS-enabled SSE3/SSSE3/SSE4, AVX/AVX2, FMA, F16C, BMI2 and LZCNT (XSAVE/YMM state). " +
+                    "Processor " + processor + " lacks Linux flags " + missing + ". Use a CPU/VM exposing these features on every online CPU " +
+                    "(check VM CPUID masks and kernel AVX support), then restart Minecraft. No ISA override, alternate model or external-server fallback.", null);
+        }
+        if (processors == 0) throw cpuInfoFailure(platform, "No online processor records", null);
+    }
+
+    private static IOException cpuInfoFailure(Platform platform, String detail, Throwable cause) {
+        return failure("CPU_FEATURES_UNAVAILABLE", platform, detail + ". Native execution is refused before JNI because this pinned x86 payload requires AVX2/FMA/F16C/BMI2/LZCNT. " +
+                "Run on a Linux desktop with readable kernel /proc/cpuinfo and OS-enabled CPU flags; fix the proc mount/security policy or VM CPU configuration and restart Minecraft. " +
+                "Do not bypass the check or rely on the library's compile-time capability report.", cause);
     }
 
     static Path privateDirectory(Path root) throws IOException {

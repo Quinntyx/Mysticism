@@ -18,7 +18,8 @@ manifest**, not a different conversion or a moving Hugging Face/Ollama tag:
 - Source: `https://registry.ollama.ai/v2/library/nomic-embed-text-v2-moe/blobs/sha256:a5db3381f2e514d3490a3a31fe70eb1a65e95016c85c6c2c23223b810806594f`
 
 Provider construction does no asset IO/native loading. On the embedding worker,
-preparation first validates the desktop/JVM and loads the bundled CPU JNI ABI,
+preparation first validates the desktop/JVM (including Linux x86_64 kernel
+CPU/OS ISA flags before any JNI execution) and loads the bundled CPU JNI ABI,
 then verifies a configured/cached file, or downloads the pinned blob on first use.
 Unsupported platforms, broken native dependencies and extraction permissions fail
 before a gigabyte of weights can be downloaded. The download is not inference over HTTP and needs no running service.

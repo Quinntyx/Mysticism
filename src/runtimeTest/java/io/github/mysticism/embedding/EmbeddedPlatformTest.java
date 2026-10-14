@@ -93,27 +93,33 @@ public final class EmbeddedPlatformTest {
     }
     private static void workerPreflight() throws Exception {
         AtomicInteger assetReads = new AtomicInteger(), modelLoads = new AtomicInteger();
-        IOException failure = new IOException("Embedded CPU runtime [UNSUPPORTED_PLATFORM]: fixture");
+        var failure = new java.util.concurrent.atomic.AtomicReference<IOException>();
+        var platform = EmbeddedNativeRuntime.select("Linux", "amd64", 21, "64");
         Thread owner = Thread.currentThread();
         var asset = new EmbeddedEmbeddingService.Asset() {
             public Path resolve() { assetReads.incrementAndGet(); return Path.of("must-not-provision.gguf"); }
             public void close() {}
         };
         var loader = new EmbeddedEmbeddingService.Loader() {
-            public void prepare() throws Exception { check(Thread.currentThread() != owner, "Preflight on game/lifecycle thread"); throw failure; }
+            public void prepare() throws Exception {
+                check(Thread.currentThread() != owner, "Preflight on game/lifecycle thread");
+                try { EmbeddedNativeRuntime.validateCpu(platform, () -> "processor: 0\nflags: pni ssse3 sse4_1 sse4_2\n"); }
+                catch (IOException rejected) { failure.set(rejected); throw rejected; }
+                throw new AssertionError("Unsupported CPU accepted on preparation worker");
+            }
             public EmbeddedEmbeddingService.Model load(Path path, java.util.function.BooleanSupplier cancelled) { modelLoads.incrementAndGet(); throw new AssertionError("Native model executed on unsupported platform"); }
         };
         try (var provider = new EmbeddedEmbeddingService(asset, loader)) {
             check(assetReads.get() == 0 && modelLoads.get() == 0, "Eager constructor");
             try (var engine = new AsyncEmbeddingEngine(provider, 1, 4, 4, Duration.ofSeconds(2))) {
                 try { engine.readiness().get(3, TimeUnit.SECONDS); throw new AssertionError("False ready"); }
-                catch (ExecutionException expected) { check(expected.getCause() == failure, "Actionable preflight cause lost"); }
+                catch (ExecutionException expected) { check(expected.getCause() == failure.get(), "Actionable preflight cause lost"); }
                 check(!engine.isReady() && assetReads.get() == 0 && modelLoads.get() == 0, "Platform failure provisions gigabyte weights");
                 try { engine.embed("oak log").get(3, TimeUnit.SECONDS); throw new AssertionError("Fallback inference"); }
                 catch (ExecutionException expected) {
-                    check(expected.getCause() instanceof IllegalStateException && expected.getCause().getCause() == failure,
+                    check(expected.getCause() instanceof IllegalStateException && expected.getCause().getCause() == failure.get(),
                             "Failed inference lost platform cause");
-                    check(expected.getCause().getMessage().contains("UNSUPPORTED_PLATFORM"), "Embedding rejection hides platform action");
+                    check(expected.getCause().getMessage().contains("UNSUPPORTED_CPU"), "Embedding rejection hides CPU action");
                 }
             }
         }

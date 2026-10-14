@@ -17,11 +17,13 @@ public final class EmbeddedPackagedRuntimeTest {
         Path isolated = Files.createTempDirectory(root, "case-");
         Path nested = Files.createDirectory(isolated.resolve("nested"));
         Path harness = Files.createDirectory(isolated.resolve("harness"));
-        Path probe = harness.resolve(EmbeddedPackagedProbe.class.getName().replace('.', '/') + ".class");
-        Files.createDirectories(probe.getParent());
-        try (var input = EmbeddedPackagedRuntimeTest.class.getResourceAsStream("EmbeddedPackagedProbe.class")) {
-            if (input == null) throw new AssertionError("Missing probe bytecode");
-            Files.copy(input, probe);
+        for (Class<?> probeClass : List.of(EmbeddedPackagedProbe.class, EmbeddedCpuBootstrapProbe.class)) {
+            Path probe = harness.resolve(probeClass.getName().replace('.', '/') + ".class");
+            Files.createDirectories(probe.getParent());
+            try (var input = EmbeddedPackagedRuntimeTest.class.getResourceAsStream(probeClass.getSimpleName() + ".class")) {
+                if (input == null) throw new AssertionError("Missing probe bytecode: " + probeClass);
+                Files.copy(input, probe);
+            }
         }
         List<String> classpath = new ArrayList<>(List.of(harness.toString(), jar.toString()));
         // Do not reuse the Gradle/runtime test classpath: that would mask a missing nested dependency.
@@ -37,6 +39,15 @@ public final class EmbeddedPackagedRuntimeTest {
         }
         // SLF4J API is deliberately provided by Minecraft rather than duplicated in the mod.
         classpath.add(Path.of(org.slf4j.LoggerFactory.class.getProtectionDomain().getCodeSource().getLocation().toURI()).toString());
+        for (String fixture : List.of("no-avx", "unreadable")) {
+            Process rejected = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-ea",
+                    "-Dos.name=Linux", "-Dos.arch=amd64", "-cp", String.join(java.io.File.pathSeparator, classpath),
+                    EmbeddedCpuBootstrapProbe.class.getName(), fixture).inheritIO().start();
+            try {
+                if (!rejected.waitFor(20, TimeUnit.SECONDS)) throw new AssertionError("Packaged CPU rejection hung");
+                if (rejected.exitValue() != 0) throw new AssertionError("Packaged unsupported CPU entered JNI/failed: " + rejected.exitValue());
+            } finally { if (rejected.isAlive()) rejected.destroyForcibly(); }
+        }
         Process child = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-ea",
                 "-Dmysticism.embedding.nativeDirectory=" + isolated.resolve("native"),
                 "-cp", String.join(java.io.File.pathSeparator, classpath), EmbeddedPackagedProbe.class.getName(),
@@ -45,6 +56,6 @@ public final class EmbeddedPackagedRuntimeTest {
             if (!child.waitFor(20, TimeUnit.SECONDS)) throw new AssertionError("Isolated packaged JNI bootstrap hung");
             if (child.exitValue() != 0) throw new AssertionError("Isolated packaged JNI bootstrap failed: " + child.exitValue());
         } finally { if (child.isAlive()) child.destroyForcibly(); }
-        System.out.println("EmbeddedPackagedRuntimeTest passed: isolated remapped jar + five nested runtime jars; no weights");
+        System.out.println("EmbeddedPackagedRuntimeTest passed: isolated remapped jar + five nested runtime jars; CPU rejection before JNI and supported-host bootstrap; no weights");
     }
 }
