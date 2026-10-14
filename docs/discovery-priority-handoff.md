@@ -41,3 +41,55 @@ can still delay near-terrain availability.
 
 No Minecraft gameplay, GPU, live server tick, or real model inference was tested.
 Other runtime/model restoration units are outside this repair's assigned scope.
+
+## Chunk-load availability follow-up
+
+Follow-up to `adcd833d7dc97be3331d57a14df3cf3f17eb04d6`:
+
+- CHUNK_LOAD now invalidates completed background coverage and marks overlapping
+  active observations for refresh, rather than exceptionally completing the
+  caller's future. Loads coalesce until the owner-thread tick.
+- A fresh Read/Ensure attempt retains the exact original future, source query,
+  preferred owner, activity flag and priority tier. The one-shot owner-binding
+  callback therefore receives fresh success instead of a terminal cancellation
+  that unrelated background backfill cannot repair.
+- Old observation/preparation/catalog state is discarded; existing reader/work,
+  geometry/mutation/history cancellation and mutation-pause release are reused.
+  A detached, non-cancellable worker cannot deliver through the old attempt.
+- Retries reenter the shared scheduler, aging from requeue time so a repeatedly
+  invalidated background operation cannot monopolize oldest-aged dispatches.
+- Restart uses the vacated active slot, never ordinary overflow admission or
+  caller eviction. With a full 64-request queue, the reserved active slot may
+  temporarily be the 65th queued entry; the scheduler must activate a retained
+  request before activating another hint. Repeated active-hint invalidations
+  cannot grow the queue. Once reclaimed, hints again share normal scheduling.
+- Caller cancellation, source edits/unloads, shutdown and non-observation
+  topology invalidation remain terminal. Ownership, projection, rendering,
+  collision and embedding formats/inference are unchanged.
+
+Verification on this follow-up:
+
+- New automatically discovered `SourceAvailabilityRestartTest`: **1,434 checks**.
+  Covers retained binding callback, fresh state, detached worker completion,
+  repeated/coalesced loads, Read.advance refreshed result, readiness, completed
+  and nonoverlapping operations, full admission, budget bounds under sustained
+  active-hint load churn, background fairness and terminal cancellation.
+- Isolated negative mutation restoring terminal availability cancellation failed
+  as expected: `neighbor load must not consume caller callback`. This uses a
+  copied source/classpath under ignored `build/discovery-availability-regression`,
+  not any reset or replacement of retained tracked files.
+- Canonical cached Gradle 8.13 / Java 21 command
+  `gradle --no-daemon --console=plain --rerun-tasks build` succeeded, exit 0:
+  all **10 discovered runtime mains**, packaging/runner self-tests, and remapped
+  production-jar verification passed; all **14 actionable tasks executed**.
+  The existing fairness suite still passed 2,330 checks. `git diff --check` passed.
+- Final build retained in session `$11`, pane `%2633`, run
+  `82b2102c829d47a5b80fb65f979d7089`, originating pane `%2607`.
+  Negative mutation retained in pane `%2655`, run
+  `fade39490aa944efa056fc4af21f5728` (expected exit 1).
+
+These are server-free lifecycle/scheduling tests with explicit metadata fixtures,
+not a live Minecraft chunk-event, store transaction, gameplay or model-inference
+verification. Continual overlapping availability changes can delay completion
+until the source stabilizes; caller intent is retained, but no wall-clock latency
+bound is claimed. Non-cancellable worker work can continue until it finishes.

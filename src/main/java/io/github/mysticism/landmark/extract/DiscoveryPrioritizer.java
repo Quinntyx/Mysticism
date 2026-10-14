@@ -97,17 +97,23 @@ public final class DiscoveryPrioritizer {
      * Selection is read-only; call dispatched ONLY once an operation is actually activated. */
     public <T extends Scheduled> Scheduled next(List<T> requests,List<Anchor> anchors,long now,
                                                long agingTicks,boolean discoveryReady) {
+        return next(requests,anchors,now,agingTicks,discoveryReady,true);
+    }
+    /** A restarted active operation may temporarily occupy its reserved slot in the request
+     * queue. Until that slot is dispatched, new hint activations cannot expand the live budget. */
+    public <T extends Scheduled> Scheduled next(List<T> requests,List<Anchor> anchors,long now,
+                                               long agingTicks,boolean discoveryReady,boolean hintsEligible) {
         if(consecutiveBackgroundDispatches>=MAX_CONSECUTIVE_BACKGROUND_DISPATCHES) {
-            Scheduled urgent=next(requests,anchors,now,agingTicks,discoveryReady,true);
+            Scheduled urgent=next(requests,anchors,now,agingTicks,discoveryReady,true,hintsEligible);
             if(urgent!=null)return urgent;
         }
-        return next(requests,anchors,now,agingTicks,discoveryReady,false);
+        return next(requests,anchors,now,agingTicks,discoveryReady,false,hintsEligible);
     }
     private <T extends Scheduled> Scheduled next(List<T> requests,List<Anchor> anchors,long now,
-                                                long agingTicks,boolean discoveryReady,boolean urgentOnly) {
+                                                long agingTicks,boolean discoveryReady,boolean urgentOnly,boolean hintsEligible) {
         Scheduled request=selectNext(requests,now,agingTicks,
                 op->(discoveryReady||op.tier()==READ) && (!urgentOnly||op.tier()<=PLAYER));
-        Hint hint=discoveryReady?peek(anchors,now,agingTicks,op->!urgentOnly||op.tier()<=PLAYER):null;
+        Hint hint=discoveryReady&&hintsEligible?peek(anchors,now,agingTicks,op->!urgentOnly||op.tier()<=PLAYER):null;
         if(request==null)return hint;
         if(hint==null)return request;
         int order=compare(hint,request,now,agingTicks);
