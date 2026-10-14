@@ -41,6 +41,10 @@ public final class SpiritNetworkingClient {
         if(initialized)return;initialized=true;ClientTickEvents.START_CLIENT_TICK.register(SpiritNetworkingClient::observe);
         ClientPlayConnectionEvents.JOIN.register((h,s,c)->{handler=null;world=null;player=null;clear();SpiritSceneClient.resetConnection();observe(c);});
         ClientPlayConnectionEvents.DISCONNECT.register((h,c)->{clear();SpiritSceneClient.resetConnection();handler=world=player=null;});
+        ClientPlayNetworking.registerGlobalReceiver(SpiritTransitionPayload.ID,(payload,context)->{
+            // Fabric invokes this on the render thread. Queueing again could let respawn overtake it.
+            io.github.mysticism.client.spiritworld.SpiritTransitionClient.offer(context.player().networkHandler,payload.handoff());
+        });
         ClientPlayNetworking.registerGlobalReceiver(SpiritScenePayload.ID,(payload,context)->{
             var c=context.client();var h=context.player().networkHandler;var w=c.world;var p=context.player();
             c.execute(()->{observe(c);if(!current(c,h,w,p,payload.session()))return;var old=SpiritSceneClient.session();if(!SpiritSceneClient.accept(payload))return;if(old.isEmpty()||!old.get().equals(payload.session()))geometryClear();ClientPlayNetworking.send(new SpiritSessionAckPayload(payload.session().connection(),payload.session().generation()));});

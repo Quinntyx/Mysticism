@@ -34,10 +34,15 @@ public final class EmbeddingHelper {
         }
     }
     public static EmbeddingProfile profile(){return EmbeddingProfile.current();}
-    public static CompletableFuture<Void> readiness(){return readiness.copy();}
+    public static CompletableFuture<Void> readiness(){
+        AsyncEmbeddingEngine e=engine;
+        // Independent delivery reservations: one listener must not pin all world-entry listeners
+        // on a single shared future's synchronous completion stack.
+        return e==null?readiness.copy():e.readiness();
+    }
     public static boolean isReady(){AsyncEmbeddingEngine e=engine;return e!=null && e.isReady();}
     /** Compatibility only. Never call on a server tick/startup thread. */
-    public static void awaitReady(){readiness.join();}
+    public static void awaitReady(){readiness().join();}
     public static void shutdown(){
         AsyncEmbeddingEngine stopped;
         synchronized(EmbeddingHelper.class){
@@ -49,7 +54,13 @@ public final class EmbeddingHelper {
     }
     public static CompletableFuture<Vec384f> getEmbedding(String descriptor){AsyncEmbeddingEngine e=engine;return e==null?CompletableFuture.failedFuture(new IllegalStateException("Embeddings unavailable")):e.embed(descriptor);}
     public static Optional<Vec384f> getEmbeddingBlocking(String descriptor){try{return Optional.of(getEmbedding(descriptor).get());}catch(InterruptedException e){Thread.currentThread().interrupt();return Optional.empty();}catch(Exception e){return Optional.empty();}}
-    public static CompletableFuture<Vec384f> composeDescriptors(List<DescriptorVectors.WeightedDescriptor> descriptors){return DescriptorVectors.embed(descriptors);}
+    public static CompletableFuture<Vec384f> composeDescriptors(List<DescriptorVectors.WeightedDescriptor> descriptors){
+        AsyncEmbeddingEngine e=engine;
+        // Never switch to a replacement server's provider part-way through an old composition.
+        return DescriptorVectors.embed(descriptors,e==null
+                ? ignored->CompletableFuture.failedFuture(new IllegalStateException("Embeddings unavailable"))
+                : e::embed);
+    }
     public static String getInitializationStatus(){return failure;}
     public static int getCacheSize(){AsyncEmbeddingEngine e=engine;return e==null?0:e.cacheSize();}
     public static int getInflightSize(){AsyncEmbeddingEngine e=engine;return e==null?0:e.inflightSize();}
