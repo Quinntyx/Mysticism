@@ -99,12 +99,17 @@ checks, or an embedding-service integration test.
 
 On `feat-runtime-merge-0017`, the canonical cached Gradle command
 `--no-daemon --console=plain build --rerun-tasks` passed with both Java source sets,
-all **13 discovered runtime suites**, build/packaging fixtures, Loom remapping
+all **14 discovered runtime suites**, build/packaging fixtures, Loom remapping
 and `verifyProductionJar`. Movement coverage includes repeated sub-block packet
 acceptance at walls/floors/ceilings, descending support handoff, local reconciliation
-mode changes and stale destination/capture wiring. These are deterministic JVM
-and bytecode-wiring checks, not a live Fabric launch or model inference. The
-scoped integration does not change the embedding backend or profile.
+mode changes and stale destination/capture wiring. The contact-alignment review
+regression adds **5,437 checks** against the actual continuous mesh transition
+guard, including safely touching tilted/slab surfaces, two-tick publication cadence,
+unsafe swept crossings and sheared transition spot checks. Its pre-fix run reproduced
+200 held steps and request expiry. These are deterministic JVM and bytecode-wiring
+checks, not a live Fabric launch or model inference. The scoped integration does
+not change the embedding backend or profile. See `docs/rebuild-navigation-handoff.md`
+for the retained build handle and remaining limits.
 
 ## Historical build-portability integration status (not the current branch)
 

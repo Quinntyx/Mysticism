@@ -180,3 +180,54 @@ Embedding persistence/pipeline tests use fixtures, not model execution; this sco
 changes neither the backend nor native-v2 profile rules. Slow source readiness can
 still exhaust a bounded request and legitimately retain deep flight. Singular,
 unsafe, stale or unowned support remains refused instead of granting walking.
+
+
+## Contact-alignment review repair
+
+The retained pace recovery did not resolve a safely touching tilted floor whose
+world AABB already overlapped the player's body. Every proposed step still
+contained that old AABB, so halving the pace could consume all 200 ticks without
+changing the basis. The new `MeshTransitionAlignmentTest` reproduced exactly
+that expiry against `MeshCollision.transitionClear` before the repair.
+
+`MeshCollision.transitionClear` now keeps the endpoint swept AABB as broadphase
+and refines ambiguous, corresponding affine collision shapes using continuous
+separating-axis certificates. A direction must separate the body from **both**
+endpoint boxes on the same side: it then separates every intermediate vertex
+under linear affine interpolation, not just sampled poses. Ambiguous intervals
+are recursively bisected (depth <=16, <=128 interval checks per ambiguous shape).
+Every half-interval needs a certificate; an exhausted budget still refuses the
+transition. Local collision topology changes retain the conservative hold. The
+existing 10-micrometer strict-body tolerance is unchanged. This is not a bypass,
+forced basis snap, player relocation, or early grant of walking.
+
+The five-block endpoint-nearness shortcut was also removed: two distant clear
+endpoints can still sweep a surface through the player. Existing contact/source
+ownership/proof gates, source-coordinate projection, per-player frames, movement
+acceptance/prediction, and destination epochs are unchanged.
+
+The regression uses actual dot-product-projected floor frames, the production
+blend/pacing policy and transition guard, and real mesh ground/clearance/movement
+queries. Positive/negative initial tilts start with affine-safe ground contact
+despite AABB overlap, reach the exact source grid within 41 ticks, and retain
+upright support for acquisition; it also covers the two-tick publication cadence.
+Fractional slab contact, thin moving-wall crossings (including off-midpoint and
+distant-endpoint crossings), unsafe final/new geometry, and deterministic sheared
+transition spot checks guard against weakening collision safety. Synthetic pace
+unit tests remain explicitly separate from these real-geometry regressions.
+
+No game launch, live ownership readiness, Fabric injection, GPU behavior,
+multiplayer measurement or model inference is established by these JVM checks.
+Embeddings/backend/native-v2 profile behavior is not modified in this scoped repair.
+
+Actual review-repair validation: cached Gradle 8.13 / Java 21,
+`--no-daemon --console=plain build --rerun-tasks`, exit 0 (14 tasks executed).
+All **14** current runtime suites were discovered and passed;
+`MeshTransitionAlignmentTest` passed **5,437** checks. Build self-tests passed
+runner discovery/order/assertion/failure fixtures, metadata, descriptor and
+packaging checks. `verifyProductionJar` accepted
+`build/libs/mysticism-1.0-SNAPSHOT.jar`. Retained handle: original session `$11`,
+origin `%2362`, job pane `%3066`, run `996f807538b1427aaef2b2ada4d27104`.
+Earlier PTY exhaustion cleared before this run; the earlier inaccessible job
+is not counted as verification. Nonfatal API Guardian/Mixin/deprecation warnings
+and expected corrupt-embedding fixture logs remain.

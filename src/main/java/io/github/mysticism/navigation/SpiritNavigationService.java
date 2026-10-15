@@ -390,10 +390,10 @@ public final class SpiritNavigationService {
         }
         if (s.supportTargetSnapshot.squareDistance(attunementTarget) > 0) s.supportTargetSnapshot = attunementTarget;
         var found = SpiritTerrainService.currentSupport(p);
-        // Alignment must not wait for actual contact: the transition guard can only rotate rendered
-        // terrain while near-surface cells stay clear of the body, so the guarded source-grid blend
-        // runs against the SAME owned support discovered below a descending actor and the arrival
-        // completes the moment real contact exists. This discovery carries no acquisition authority.
+        // Prepare alignment before contact against the SAME owned support below a descending actor.
+        // At contact, the affine transition guard can also prove safe rotation away from the body;
+        // an overlapping world AABB alone must not strand the request. Discovery carries no
+        // acquisition authority: real contact and the source proof still commit arrival.
         var support = found.isPresent() ? found.get()
                 : SpiritTerrainService.approachSupport(p, WALK_APPROACH_DEPTH).orElse(null);
         if (support == null) return; // Terrain starts/reuses bounded exact source-cell proof, never a join.
@@ -419,9 +419,9 @@ public final class SpiritNavigationService {
                 return;
             }
             if (!SpiritTerrainService.canAlign(p, proposed)) {
-                // A refused step must re-plan, never freeze: re-anchor at the live basis and halve
-                // the pace so the retry's swept motion fits under the transition guard. Freezing
-                // here deadlocked every approach taken with a rotated deep basis until expiry.
+                // Re-anchor and retry a smaller guarded step. Pace reduction may resolve an
+                // ambiguous interval, but never overrides an unsafe/unproven transition. Safe tilted
+                // contact is handled by MeshCollision's continuous affine certificates, not pacing.
                 s.supportFrom = before.clone(); s.supportProgress = 0;
                 s.supportPace = SupportApproachAlignment.paceOnHold(s.supportPace);
                 return;

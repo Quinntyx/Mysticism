@@ -4,7 +4,10 @@ import io.github.mysticism.activity.TraversalSteering;
 import io.github.mysticism.vector.Basis384f;
 import io.github.mysticism.vector.Vec384f;
 
-/** Regressions for guarded source-grid alignment pacing. Two failure modes are covered:
+/** Unit regressions for source-grid alignment pacing under synthetic guard responses. Actual mesh
+ * clearance and contact-to-source-grid completion are covered by MeshTransitionAlignmentTest;
+ * component-distance guards here are not evidence that a tilted surface transition is safe.
+ * Two pacing failure modes are covered:
  * (1) the pre-fix fixed-anchor/(step+1)/40 schedule FROZE on the first refused step — the terrain
  * transition guard refuses any rotation whose swept render motion reaches the body, exactly the
  * state of an actor hovering over the support it asked to walk on, so every walk request taken with
