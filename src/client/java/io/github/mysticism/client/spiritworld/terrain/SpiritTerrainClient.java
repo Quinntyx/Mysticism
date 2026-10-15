@@ -106,12 +106,13 @@ public final class SpiritTerrainClient {
         try {
             if(dirty)upload(client);
             Vec3d camera=context.camera().getPos();Vec3d offset=frame.carrierOrigin().subtract(camera);
+            int viewDistanceChunks=client.options.getClampedViewDistance();
             Matrix4f view=new Matrix4f(context.positionMatrix()).translate((float)offset.x,(float)offset.y,(float)offset.z);
             client.getFramebuffer().beginWrite(false);RenderSystem.enableDepthTest();RenderSystem.depthMask(true);
             LAYER.startDrawing();
             try {
                 for(Batch b:gpu) {
-                    if(distanceSquared(b.bounds,camera)>64*64 || context.frustum()!=null && !context.frustum().isVisible(b.bounds))continue;
+                    if(!TerrainVisibility.isVisible(b.bounds,camera,viewDistanceChunks,context.frustum()))continue;
                     b.buffer.bind();b.buffer.draw(view,context.projectionMatrix(),RenderSystem.getShader());
                 }
             } finally{VertexBuffer.unbind();LAYER.endDrawing();}
@@ -123,7 +124,6 @@ public final class SpiritTerrainClient {
             GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER,oldDraw);GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER,oldRead);
         }
     }
-    private static double distanceSquared(Box b,Vec3d p){double x=Math.max(Math.max(b.minX-p.x,0),p.x-b.maxX),y=Math.max(Math.max(b.minY-p.y,0),p.y-b.maxY),z=Math.max(Math.max(b.minZ-p.z,0),p.z-b.maxZ);return x*x+y*y+z*z;}
     private static void publishMedium(MinecraftClient client,TerrainMeshFrame f) {
         if(client.player==null)return;Vec3d center=client.player.getEyePos();float[] medium=new float[4096];int work=0;
         outer:for(var cell:f.cells())for(Box local:cell.collision()) {
