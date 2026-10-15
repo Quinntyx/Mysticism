@@ -174,6 +174,9 @@ public final class SourceDiscovery {
             var tile=node.tile();
             return new TerrainMeshFrame.Cell(key,material,node.ownerId(),source,min,node.size(),x,y,z,tile.color(),tile.light(),alpha,tile.collision());
         }
+        TerrainMeshFrame.Cell cell(int material,long key,float alpha,Vec3d shift,Vec3d viewer,double strength) {
+            return ShallowTerrainProjection.distort(cell(material,key,alpha),shift,viewer,strength);
+        }
     }
     static Candidate project(SourceMeshBuilder.Node node,Vec3d sourceOrigin,Vec3d root,Vec3d ax,Vec3d ay,Vec3d az,Vec3d viewer) {
         var at=node.position();Vec3d source=new Vec3d(at.getX(),at.getY(),at.getZ()),offset=source.subtract(sourceOrigin);

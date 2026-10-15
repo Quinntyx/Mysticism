@@ -69,7 +69,7 @@ public final class DiscoveryMeshCompletionSelfTest {
             requests=(Map<Bounds,CompletableFuture<SourceLandmarks.Region>>)field(WINDOW,"discoveryPending").get(window);
             retained=(Map<Bounds,List<SourceMeshBuilder.Node>>)field(WINDOW,"discovered").get(window);
             scheduler=(SourceDiscovery.Scheduler)field(WINDOW,"discovery").get(window);
-            pipeline=new DiscoveryMeshPipeline(scheduler,requests,retained,(cell,at)->{
+            pipeline=new DiscoveryMeshPipeline(DIM,scheduler,requests,retained,(cell,at)->{
                 check(Thread.currentThread()==owner,"registry/collision-shape materialization stays on the server thread");materialized++;
                 if(fail)throw new IllegalArgumentException("bad material fixture");
                 return cell.material().blockId().equals("minecraft:stone")?STONE:DIRT;
@@ -77,8 +77,11 @@ public final class DiscoveryMeshCompletionSelfTest {
             field(WINDOW,"discoveryMeshes").set(window,pipeline);pipeline.refresh(Vec3d.ZERO,false);
         }
         CompletableFuture<SourceLandmarks.Region> source(Bounds tile,List<SourceLandmarks.Cell> cells,boolean complete){
+            return source(tile,new SourceLandmarks.Region(DIM,tile,cells,complete));
+        }
+        CompletableFuture<SourceLandmarks.Region> source(Bounds tile,SourceLandmarks.Region region){
             var f=new CompletableFuture<SourceLandmarks.Region>();requests.put(tile,f);scheduler.pending(tile);
-            f.complete(new SourceLandmarks.Region(DIM,tile,cells,complete));return f;
+            f.complete(region);return f;
         }
         @SuppressWarnings("unchecked") List<SourceMeshBuilder.Node> nodes() throws Exception{return (List<SourceMeshBuilder.Node>)field(WINDOW,"discoveredNodes").get(window);}
         boolean nodesUncheckedEmpty(){try{return nodes().isEmpty();}catch(Exception e){throw new AssertionError(e);}}
@@ -171,13 +174,40 @@ public final class DiscoveryMeshCompletionSelfTest {
         f.pipeline.advance(budget,h.worker,0);
         check(f.materialized==2&&budget.remaining()==254,"elapsed budget stops materialization before the cell-count cap");
         invoke(CANCEL,null,f.window);var air=new BlockPalette.State("minecraft:air",Map.of());
-        var cells=new ArrayList<SourceLandmarks.Cell>();for(int i=0;i<1000;i++)cells.add(new SourceLandmarks.Cell(new BlockPoint(i,0,0),air,"minecraft:plains",true));
+        var cells=new ArrayList<SourceLandmarks.Cell>();for(int i=0;i<1000;i++)cells.add(new SourceLandmarks.Cell(new BlockPoint(i%32,i/1024,(i/32)%32),air,"minecraft:plains",true));
         f.source(tile,cells,true);budget=unlimited();f.pipeline.advance(budget,h.worker,1);
         check(budget.remaining()==256-DiscoveryMeshPipeline.CELLS_PER_WINDOW,"air scanning is budgeted too, not an unbounded zero-shape loop");
         check(f.materialized==2,"air never invokes the registry/collision adapter");
     }
+    private static void dimensionScopedCompletion() throws Exception {
+        var h=new Harness();var f=h.window();Bounds tile=Bounds.cube(0,0,0,32),prior=Bounds.cube(64,0,0,32);
+        f.retained.put(prior,List.of(new SourceMeshBuilder.Node(new BlockPos(64,0,0),1,STONE)));
+        f.scheduler.replan(Vec3d.ZERO,4);
+        var observed=cells(tile,8);
+        // Identical source coordinates/material cannot make a foreign completed region local.
+        f.source(tile,new SourceLandmarks.Region("minecraft:the_nether",tile,observed,true));
+        h.step();
+        check(f.materialized==0 && f.requests.isEmpty(),"foreign completed region rejected before registry work");
+        h.worker.runOne();h.step();
+        check(!f.retained.containsKey(tile) && f.retained.containsKey(prior),"foreign completion cannot publish or replace local terrain");
+        Bounds next;while((next=f.scheduler.next(h.tick))!=null){
+            check(!tile.equals(next),"foreign result schedules real error cooldown, not false coverage");f.scheduler.pending(next);
+        }
+        check(tile.equals(f.scheduler.next(h.tick+SourceDiscovery.RETRY_ERROR_TICKS)),"foreign result never grants scheduler coverage");
+        f.source(tile,new SourceLandmarks.Region(DIM,prior,observed,true));h.step();
+        check(f.materialized==0 && f.requests.isEmpty(),"wrong source range rejected before registry work");
+        f.source(tile,observed,true);
+        for(int i=0;i<20&&!f.requests.isEmpty();i++){h.step();h.worker.runOne();}
+        check(f.materialized==8 && f.requests.isEmpty() && f.retained.containsKey(tile),"correct namespace still publishes after rejected completion");
+
+        // Exercise the real Window constructor too (the fixture otherwise replaces its adapter).
+        var wc=WINDOW.getDeclaredConstructor(String.class,Vec3d.class,Vec384f.class,Basis384f.class,String.class);wc.setAccessible(true);
+        Object w=wc.newInstance("minecraft:the_end",Vec3d.ZERO,Vec384f.ZERO(),new Basis384f(),"");
+        var production=(DiscoveryMeshPipeline)field(WINDOW,"discoveryMeshes").get(w);
+        check(field(DiscoveryMeshPipeline.class,"dimension").get(production).equals("minecraft:the_end"),"window binds discovery pipeline to its immutable source namespace");
+    }
     public static void main(String[] args) throws Exception {
-        fullTileThroughProductionContext();sharedBudgetAndHeldWorker();revisionsCancellationAndFailure();deadlineAndAirBudget();
+        fullTileThroughProductionContext();sharedBudgetAndHeldWorker();revisionsCancellationAndFailure();deadlineAndAirBudget();dimensionScopedCompletion();
         System.out.println("DiscoveryMeshCompletionSelfTest: "+checks+" checks passed");
     }
 }

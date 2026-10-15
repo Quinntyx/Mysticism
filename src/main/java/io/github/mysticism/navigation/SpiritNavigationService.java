@@ -167,7 +167,7 @@ public final class SpiritNavigationService {
         if (!spirit(p) || !nav.active() || s.semanticReady || source.landmarkId().isEmpty()
                 || !source.dimension().equals(nav.sourceDimension())
                 || (!nav.landmarkId().isEmpty() && !nav.landmarkId().equals(source.landmarkId()))) return;
-        var found = LandmarkStore.get(p.getServer()).metadata(source.landmarkId());
+        var found = LandmarkStore.get(p.getServer()).metadata(source.landmarkId(),source.dimension());
         if (found.isEmpty()) return;
         var metadata = found.get();
         if (!metadata.header().dimension().equals(source.dimension()) || !metadata.header().bounds().contains(
@@ -303,11 +303,22 @@ public final class SpiritNavigationService {
         if (s.checkedRestore) return; s.checkedRestore = true;
         endSupportApproach(p, s);
         var nav = state(p); Vec384f q = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
+        // An ID may resolve to a perfectly valid landmark in the wrong source namespace.
+        // Preserve physical mode/pose/target, but rediscover that binding before granting semantic authority.
+        boolean invalidBinding = !nav.landmarkId().isEmpty()
+                && LandmarkStore.get(p.getServer()).metadata(nav.landmarkId(),nav.sourceDimension()).isEmpty();
+        if (invalidBinding) {
+            boolean wasDeep = nav.deep();
+            nav.shallow(nav.sourceDimension(), "", nav.sourcePosition());
+            if (wasDeep) nav.enterDeep();
+            s.semanticReady = false; nav.setSemanticReady(false); sync(p);
+            return;
+        }
         // Physical pose survives model reset, but discarded q/IDs cannot authorize semantic travel.
         s.semanticReady = nav.active() && nav.semanticReady();
         if (nav.modelCompatible() && nav.active() && nav.deep() && q.length() > 1e-6) s.semanticReady = true;
         if (nav.modelCompatible() && nav.active() && !nav.landmarkId().isEmpty()
-                && LandmarkStore.get(p.getServer()).metadata(nav.landmarkId()).isPresent()) s.semanticReady = true;
+                && LandmarkStore.get(p.getServer()).metadata(nav.landmarkId(),nav.sourceDimension()).isPresent()) s.semanticReady = true;
         if (nav.semanticReady() != s.semanticReady) { nav.setSemanticReady(s.semanticReady); sync(p); }
         // Terrain restores its source window and runs initial discovery; no duplicate entry extraction here.
     }
@@ -520,6 +531,9 @@ public final class SpiritNavigationService {
             if (!live(p, s) || s.captureNonce != nonce) return;
             if (error != null || found == null || found.isEmpty()) { p.sendMessage(Text.literal("No captured source landmark available."), false); return; }
             var metadata = found.get();
+            if (!metadata.header().dimension().equals(dimension)) {
+                p.sendMessage(Text.literal("Discovered landmark belongs to another source dimension."), false); return;
+            }
             if (!requiredId.isEmpty() && !LandmarkStore.get(server).resolve(requiredId).equals(metadata.id())) {
                 p.sendMessage(Text.literal("Requested landmark does not own the captured source location."), false); return;
             }

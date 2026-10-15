@@ -29,6 +29,7 @@ final class DiscoveryMeshPipeline {
         private boolean submit(){if(submissions==0)return false;submissions--;return true;}
     }
     private final Thread owner=Thread.currentThread();
+    private final String dimension;
     private final SourceDiscovery.Scheduler scheduler;
     private final Map<Bounds,CompletableFuture<SourceLandmarks.Region>> requests;
     private final Map<Bounds,List<SourceMeshBuilder.Node>> retained;
@@ -48,15 +49,15 @@ final class DiscoveryMeshPipeline {
     private record Prepared(List<SourceMeshBuilder.Node> compacted,SourceDiscovery.Retention retained) {}
     private record Work(Job job,long revision,CompletableFuture<Prepared> future) {}
 
-    DiscoveryMeshPipeline(SourceDiscovery.Scheduler scheduler,Map<Bounds,CompletableFuture<SourceLandmarks.Region>> requests,
+    DiscoveryMeshPipeline(String dimension,SourceDiscovery.Scheduler scheduler,Map<Bounds,CompletableFuture<SourceLandmarks.Region>> requests,
                           Map<Bounds,List<SourceMeshBuilder.Node>> retained){
-        this(scheduler,requests,retained,(cell,at)->SourceMeshBuilder.stored(cell.material(),at));
+        this(dimension,scheduler,requests,retained,(cell,at)->SourceMeshBuilder.stored(cell.material(),at));
     }
     /** Registry adapter seam only; tests drive this same production pipeline without a game registry. */
-    DiscoveryMeshPipeline(SourceDiscovery.Scheduler scheduler,Map<Bounds,CompletableFuture<SourceLandmarks.Region>> requests,
+    DiscoveryMeshPipeline(String dimension,SourceDiscovery.Scheduler scheduler,Map<Bounds,CompletableFuture<SourceLandmarks.Region>> requests,
                           Map<Bounds,List<SourceMeshBuilder.Node>> retained,
                           BiFunction<SourceLandmarks.Cell,BlockPos,SourceMeshBuilder.Tile> materialize){
-        this.scheduler=scheduler;this.requests=requests;this.retained=retained;this.materialize=materialize;
+        this.dimension=Objects.requireNonNull(dimension);this.scheduler=scheduler;this.requests=requests;this.retained=retained;this.materialize=materialize;
     }
     private void onOwner(){if(Thread.currentThread()!=owner)throw new IllegalStateException("discovery mesh owner thread");}
     List<SourceMeshBuilder.Node> nodes(){return nodes;}
@@ -89,7 +90,10 @@ final class DiscoveryMeshPipeline {
             if(jobs.containsKey(entry.getKey())||!entry.getValue().isDone())continue;
             try{
                 var region=entry.getValue().getNow(null);
-                if(region==null)throw new IllegalArgumentException("missing discovery observation");
+                // A completed future is not authority by itself. Keep the producing window's
+                // immutable namespace through the polled/worker path, before registry or mesh work.
+                if(region==null || !dimension.equals(region.dimension()) || !entry.getKey().equals(region.bounds()))
+                    throw new IllegalArgumentException("discovery observation namespace/range mismatch");
                 jobs.put(entry.getKey(),new Job(entry.getKey(),entry.getValue(),region));
             }catch(RuntimeException failed){requests.remove(entry.getKey(),entry.getValue());scheduler.failed(entry.getKey(),tick);}
         }
