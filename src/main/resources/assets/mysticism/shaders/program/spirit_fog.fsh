@@ -25,14 +25,15 @@ vec3 sceneOffset(vec2 uv, float depth) {
 }
 
 // Continuous, periodic world-space medium (integer wave numbers prevent wrap discontinuities).
-// A strictly positive extinction floor proves T(64) <= 0.001, even in the thinnest region.
+// A density floor plus the normalized radial optical depth proves T(64) <= 0.001.
 float density(vec3 p) {
     vec3 phase = p * (TAU / PERIOD);
     return 1.0 + 0.5 * (0.5 + 0.5 * sin(phase.x * 83.0 + phase.y * 29.0)
                                     * sin(phase.z * 61.0 - phase.y * 17.0));
 }
 
-// Terrain-published occupied voxels, not generated on render/tick. Nearest packed atlas.
+// Current observer-mesh density hints; no source-world reads. Nearest packed atlas.
+// Density is conservative/coarse; scene depth, NOT occupancy, terminates the ray.
 float occupancy(vec3 offset) {
     if (HasOccupancy == 0) return 0.0;
     ivec3 cell = ivec3(floor((offset + OccupancyCameraOffset + vec3(64.0)) / 8.0));
@@ -41,7 +42,19 @@ float occupancy(vec3 offset) {
     return texelFetch(OccupancySampler, pixel, 0).r;
 }
 
+// Integral of 2*smoothstep(0, 1, t): zero slope at the near bubble, unit integral
+// at the opaque horizon. Unlike constant extinction, this retains nearby terrain detail.
+// Use exact segment integrals rather than midpoint radial samples so LOW quality still
+// reaches the same opaque horizon. World density/occupancy is sampled at each midpoint.
+float radialIntegral(float distanceAlongRay) {
+    float span = max(OpaqueRadius - NearBubble, 0.00001);
+    float t = clamp((distanceAlongRay - NearBubble) / span, 0.0, 1.0);
+    return span * t * t * t * (2.0 - t);
+}
+
 void main() {
+    // DiffuseSampler is the painted scene, NOT already-fogged color. DepthSampler is
+    // always the original world snapshot: painterly gathering cannot shorten this ray.
     vec4 scene = texture(DiffuseSampler, texCoord);
     // Exact color/alpha bypass; do not reconstruct depth or sample the medium when off.
     if (FogEnabled == 0) { fragColor = scene; return; }
@@ -61,11 +74,14 @@ void main() {
     vec3 scattering = vec3(0.0);
     for (int i = 0; i < 64; ++i) {
         if (i >= count || transmittance <= 0.001) break;
-        vec3 offset = direction * (NearBubble + (float(i) + 0.5) * stepLength);
+        float segmentStart = NearBubble + float(i) * stepLength;
+        float segmentEnd = NearBubble + float(i + 1) * stepLength;
+        vec3 offset = direction * (segmentStart + 0.5 * stepLength);
         vec3 worldSample = CameraModulo + offset;
         float occupied = occupancy(offset);
         float sigma = MinExtinction * (density(worldSample) + 0.7 * occupied);
-        float segmentTransmittance = exp(-sigma * stepLength);
+        float opticalLength = radialIntegral(segmentEnd) - radialIntegral(segmentStart);
+        float segmentTransmittance = exp(-sigma * opticalLength);
         // In-scattering varies throughout the world-space participating medium, not at the endpoint.
         float light = 0.94 + 0.06 * sin(worldSample.y * (TAU * 7.0 / PERIOD));
         scattering += transmittance * (1.0 - segmentTransmittance) * FOG_COLOR * light;

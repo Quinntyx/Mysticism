@@ -17,6 +17,8 @@ public final class MeshCollision {
     public static void clear(UUID player) { SERVER.remove(player); CLIENT.remove(player); }
     public static void clearClient() { CLIENT.clear(); }
     public record Hit(double time, Vec3d normal, TerrainMeshFrame.Cell cell) {}
+    /** Point lies on the contacted affine shape, not the player's center or a proxy AABB. */
+    public record GroundContact(Hit hit, Vec3d point, Vec3d interiorPoint) {}
     private record Bucket(int x,int y,int z) {}
     private record Shape(TerrainMeshFrame.Cell cell,Box local,Box bounds) {}
     public static final class Index {
@@ -50,6 +52,24 @@ public final class MeshCollision {
             for(Shape s:nearby(body.stretch(delta).expand(1e-5))) {
                 Hit hit=intersect(body,delta,s);
                 if(hit!=null && (best==null || hit.time<best.time))best=hit;
+            }
+            return Optional.ofNullable(best);
+        }
+        public Optional<GroundContact> ground(Box body) {
+            Box raised=body.offset(0,.025,0);Vec3d down=new Vec3d(0,-.15,0);
+            GroundContact best=null;
+            for(Shape shape:nearby(raised.stretch(down).expand(1e-5))) {
+                Hit hit=intersect(raised,down,shape);
+                // A simultaneous wall contact must not mask a real supporting floor.
+                if(hit==null || hit.normal.y<=.3 || best!=null && hit.time>=best.hit.time)continue;
+                var point=MeshContact.point(shape.cell,shape.local,raised.offset(down.multiply(hit.time)));
+                if(point.isPresent()) {
+                    // A fixed world-space inset can cross an entire thin/distorted primitive.
+                    // Convex interpolation towards its own center stays inside the contacted shape.
+                    Vec3d center=shape.cell.point((shape.local.minX+shape.local.maxX)/2,
+                            (shape.local.minY+shape.local.maxY)/2,(shape.local.minZ+shape.local.maxZ)/2);
+                    best=new GroundContact(hit,point.get(),point.get().lerp(center,1e-6));
+                }
             }
             return Optional.ofNullable(best);
         }
@@ -105,6 +125,10 @@ public final class MeshCollision {
         if(i==null)return wanted;
         return predicted(i,player.getBoundingBox(),wanted,player.getAbilities().flying,player.isOnGround(),player.getStepHeight());
     }
+    /** Compatibility entry for callers; prediction, live entities and tests use one core. */
+    public static Vec3d move(Index i,Box body,Vec3d wanted,boolean flying,boolean onGround,float stepHeight) {
+        return predicted(i,body,wanted,flying,onGround,stepHeight);
+    }
     /** Deterministic replay of the same movement core used by live entities on both sides. */
     public static Vec3d simulate(TerrainMeshFrame frame,Box body,Vec3d wanted,boolean flying,boolean onGround,double stepHeight) {
         return predicted(new Index(frame),body,wanted,flying,onGround,stepHeight);
@@ -131,16 +155,24 @@ public final class MeshCollision {
         Vec3d piece=wanted.multiply(1.0/pieces);
         for(int p=0;p<pieces;p++)result=result.add(i.slide(body.offset(result),piece));
         if(!flying && (onGround || wanted.y<0 && result.y>wanted.y+1e-5)
-                && result.subtract(wanted).horizontalLengthSquared()>1e-8) {
-            if(stepHeight>0) {
-                Vec3d up=i.slide(body,new Vec3d(0,stepHeight,0));
-                Vec3d over=i.slide(body.offset(up),new Vec3d(wanted.x,0,wanted.z));
-                Vec3d down=i.slide(body.offset(up).offset(over),new Vec3d(0,wanted.y-up.y,0));
-                Vec3d stepped=up.add(over).add(down);
-                if(stepped.horizontalLengthSquared()>result.horizontalLengthSquared()+1e-8)result=stepped;
-            }
+                && result.subtract(wanted).horizontalLengthSquared()>1e-8 && stepHeight>0) {
+            // Stepping continues from the already-resolved pose: depenetration and horizontal progress
+            // are never discarded (discarding them re-embeds the body and rubber bands across steps),
+            // and the per-axis horizontal budget is never re-spent, so the step cannot exceed the
+            // originally requested displacement.
+            Vec3d budget=new Vec3d(remaining(result.x,wanted.x),0,remaining(result.z,wanted.z));
+            Box base=body.offset(result);
+            Vec3d up=i.slide(base,new Vec3d(0,stepHeight,0));
+            Vec3d over=i.slide(base.offset(up),budget);
+            Vec3d down=i.slide(base.offset(up).offset(over),new Vec3d(0,wanted.y-result.y-up.y,0));
+            Vec3d stepped=up.add(over).add(down);
+            if(stepped.horizontalLengthSquared()>1e-8)result=result.add(stepped);
         }
         return result;
+    }
+    /** Unspent requested displacement on one axis, never reversing against the request. */
+    private static double remaining(double spent,double wanted) {
+        return wanted>=0?Math.max(0,wanted-spent):Math.min(0,wanted-spent);
     }
     /** Vanilla's carrier-air ledge check would prevent all sneaking; use the real mesh below the future footprint. */
     public static Vec3d sneak(PlayerEntity p,Vec3d wanted,MovementType type) {
@@ -156,23 +188,28 @@ public final class MeshCollision {
     }
     private static boolean supported(Index i,Box body,Vec3d down){return i.sweep(body,down).filter(h->h.normal.y>.3).isPresent();}
     private static double trim(double x){return Math.abs(x)<=.05?0:x-Math.copySign(.05,x);}
-    public static Optional<Hit> ground(PlayerEntity player) {
-        Index i=index(player);
-        return i==null?Optional.empty():i.sweep(player.getBoundingBox().offset(0,.025,0),new Vec3d(0,-.15,0))
-                .filter(h->h.normal.y>.3);
+    public static Optional<GroundContact> groundContact(PlayerEntity player) {
+        Index i=index(player);return i==null?Optional.empty():i.ground(player.getBoundingBox());
     }
+    public static Optional<Hit> ground(PlayerEntity player) {return groundContact(player).map(GroundContact::hit);}
+    /** Supporting shape wins even when a wall is contacted simultaneously. */
+    public static Optional<Hit> ground(Index index,Box body) {return index.ground(body).map(GroundContact::hit);}
     public static boolean clearRay(ServerPlayerEntity player,Vec3d from,Vec3d to) {
         Index i=index(player);return i!=null && from.distanceTo(to)<=128 && i.clearRay(from,to);
     }
-    /** Actual affine SAT body clearance, including a newly acquired source window. */
+    /** No carrier blocks, entity boxes or world border may substitute for observer-local terrain. */
+    public static boolean bodyClear(PlayerEntity player,Box body) {
+        Index i=index(player);
+        return i==null || bodyClear(i.frame,body);
+    }
+    /** Actual affine SAT body clearance, including shapes extending outside the unit model. */
     public static boolean bodyClear(TerrainMeshFrame frame,Box body) {
         Box strict=body.expand(-1e-5);
-        for(var cell:frame.cells()) {
-            // Faded cells have no collision anywhere (broadphase rule); the verdict must match movement.
-            if(cell.opacity()<=0)continue;
-            if(cell.bounds().intersects(strict))
-                for(Box collision:cell.collision())if(penetration(strict,new Shape(cell,collision,cell.bounds(collision)))!=null)return false;
-        }
+        for(var cell:frame.cells())if(cell.opacity()>0)
+            for(Box collision:cell.collision()) {
+                Box bounds=cell.bounds(collision);
+                if(bounds.intersects(strict) && penetration(strict,new Shape(cell,collision,bounds))!=null)return false;
+            }
         return true;
     }
     /** Bound for a claimed destination's shallow overlap that the client's own next collision tick resolves. */
@@ -198,25 +235,98 @@ public final class MeshCollision {
         Index i=index(player);
         return i!=null && movementRejected(i.frame,previous,destination);
     }
-    /** Conservative continuous affine-motion guard: the union of endpoint AABBs contains EVERY intermediate
-     * vertex under linear affine interpolation. An ambiguous swept/body overlap is held, never sampled through. */
+    /** Vanilla's packet endpoint guard rejects NEW intersections, not an existing overlap being escaped.
+     * Movement itself is already swept by move(); retain that guard without rebuilding block voxels. */
+    public static boolean newlyColliding(PlayerEntity player,Box before,Box after) {
+        Index i=index(player);
+        return i!=null && newlyColliding(i.frame,before,after);
+    }
+    public static boolean newlyColliding(TerrainMeshFrame frame,Box before,Box after) {
+        Box oldBody=before.expand(-1e-5),newBody=after.expand(-1e-5);
+        for(var cell:frame.cells())if(cell.opacity()>0)
+            for(Box collision:cell.collision()) {
+                Shape shape=new Shape(cell,collision,cell.bounds(collision));
+                if(shape.bounds.intersects(newBody) && penetration(newBody,shape)!=null
+                        && penetration(oldBody,shape)==null)return true;
+            }
+        return false;
+    }
+    /** Continuous affine-motion guard. Endpoint AABBs are broad phase only; the narrow phase
+     * certifies a separating plane over the entire interpolation, never just sampled endpoints. */
     public static boolean transitionClear(TerrainMeshFrame old,TerrainMeshFrame next,Box body) {
         if(old==null)return true;
         Map<Long,TerrainMeshFrame.Cell> previous=new HashMap<>();for(var c:old.cells())previous.put(c.key(),c);
-        Box local=body.expand(5),strict=body.expand(-1e-5);
+        Box strict=body.expand(-1e-5);
         for(var c:next.cells()) {
+            if(c.opacity()<=0)continue;
             var before=previous.get(c.key());
+            if(before!=null && before.opacity()<=0)before=null;
             if(before!=null && c.min().equals(before.min()) && c.axisX().equals(before.axisX()) && c.axisY().equals(before.axisY())
                     && c.axisZ().equals(before.axisZ()) && c.collision().equals(before.collision()))continue;
-            if(!c.bounds().intersects(local) && (before==null || !before.bounds().intersects(local)))continue;
-            if(before==null) {for(Box b:c.collision())if(penetration(strict,new Shape(c,b,c.bounds(b)))!=null)return false;continue;}
+            // Do not gate on endpoint model bounds: even distant endpoints can sweep through
+            // the body, and source collision shapes can extend outside the unit baked model.
+            if(before==null) {for(Box b:c.collision()) {
+                Box bounds=c.bounds(b);
+                if(bounds.intersects(strict) && penetration(strict,new Shape(c,b,bounds))!=null)return false;
+            }continue;}
             if(c.collision().isEmpty())continue;
             for(Box collision:c.collision()) {
                 Box swept=c.bounds(collision).union(before.bounds(collision));
-                if(swept.intersects(strict))return false;
+                if(swept.intersects(strict) && (!before.collision().equals(c.collision())
+                        || !affineSeparated(before,c,collision,strict)))return false;
             }
         }
         return true;
+    }
+    /** An affine face normal is quadratic in time. Its signed distance from each moving
+     * shape vertex to each fixed body vertex is cubic. Nonnegative Bernstein coefficients
+     * certify separation at ALL times (convex-hull property), including interior extrema.
+     * Failure to certify is a hold, not permission to pass through an ambiguous transition. */
+    private static boolean affineSeparated(TerrainMeshFrame.Cell from,TerrainMeshFrame.Cell to,Box shape,Box body) {
+        Vec3d[] start=vertices(from,shape),end=vertices(to,shape),fixed=vertices(body);
+        Vec3d[] a={from.axisX(),from.axisY(),from.axisZ()},b={to.axisX(),to.axisY(),to.axisZ()};
+        Vec3d[] world={new Vec3d(1,0,0),new Vec3d(0,1,0),new Vec3d(0,0,1)};
+        for(Vec3d w:world)if(separates(start,end,fixed,w,w,w))return true;
+        for(int i=0;i<3;i++) {
+            int j=(i+1)%3,k=(i+2)%3;
+            // Degree-two Bernstein controls for cross(linear edge j, linear edge k).
+            if(separates(start,end,fixed,a[j].crossProduct(a[k]),
+                    a[j].crossProduct(b[k]).add(b[j].crossProduct(a[k])).multiply(.5),
+                    b[j].crossProduct(b[k])))return true;
+            for(Vec3d w:world) {
+                Vec3d n0=w.crossProduct(a[i]),n2=w.crossProduct(b[i]);
+                if(separates(start,end,fixed,n0,n0.add(n2).multiply(.5),n2))return true;
+            }
+        }
+        return false;
+    }
+    private static boolean separates(Vec3d[] from,Vec3d[] to,Vec3d[] body,Vec3d n0,Vec3d n1,Vec3d n2) {
+        Vec3d direction=n0.add(n1.multiply(2)).add(n2).multiply(.25);
+        // A zero/collapsing candidate is not a separating plane. This positive projection
+        // certificate also prevents a normal flipping orientation between endpoints.
+        if(direction.lengthSquared()<1e-18 || n0.dotProduct(direction)<=1e-18
+                || n1.dotProduct(direction)<=1e-18 || n2.dotProduct(direction)<=1e-18)return false;
+        boolean positive=true,negative=true;
+        for(int i=0;i<from.length;i++)for(Vec3d corner:body) {
+            Vec3d v0=from[i].subtract(corner),v1=to[i].subtract(corner);
+            double d0=n0.dotProduct(v0),d1=(n0.dotProduct(v1)+2*n1.dotProduct(v0))/3,
+                    d2=(2*n1.dotProduct(v1)+n2.dotProduct(v0))/3,d3=n2.dotProduct(v1);
+            positive &= Math.min(Math.min(d0,d1),Math.min(d2,d3))>=0;
+            negative &= Math.max(Math.max(d0,d1),Math.max(d2,d3))<=0;
+            if(!positive && !negative)return false;
+        }
+        return positive || negative;
+    }
+    private static Vec3d[] vertices(TerrainMeshFrame.Cell cell,Box box) {
+        Vec3d[] corners=vertices(box);
+        for(int i=0;i<corners.length;i++){var v=corners[i];corners[i]=cell.point(v.x,v.y,v.z);}
+        return corners;
+    }
+    private static Vec3d[] vertices(Box box) {
+        Vec3d[] corners=new Vec3d[8];
+        for(int i=0;i<8;i++)corners[i]=new Vec3d((i&1)==0?box.minX:box.maxX,
+                (i&2)==0?box.minY:box.maxY,(i&4)==0?box.minZ:box.maxZ);
+        return corners;
     }
     private static Vec3d penetration(Box body,Shape shape) {
         var c=shape.cell;Box b=shape.local;

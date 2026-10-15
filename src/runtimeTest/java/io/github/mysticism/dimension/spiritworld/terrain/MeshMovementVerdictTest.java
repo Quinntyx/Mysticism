@@ -67,14 +67,16 @@ public final class MeshMovementVerdictTest {
         }
         check(climbed,"client sweep math actually climbs the 1.0 ledge (valid grounded movement retained)");
         check(walker.onGround&&Math.abs(claim.y-1)<0.05,"client lands and stands on the ledge after the climb");
-        // Server re-simulation of the landing claim: the straight delta cuts the ledge face, which is
-        // higher than step height, so the one-shot swept move cannot reproduce the climbed endpoint.
+        // Re-simulating the aggregate climb used to cut the ledge face. The retained step fix now
+        // continues from resolved progress and may reach it exactly; do not demand that old snag
+        // to keep this verdict test green. The detour fixture below still forces a real divergence.
         Box previous=body(1,0,1);
         Box destination=body(claim.x,claim.y,claim.z);
         Vec3d delta=claim.subtract(foot(previous));
         Vec3d serverEndpoint=foot(previous.offset(MeshCollision.simulate(frame,previous,delta,false,true,STEP_HEIGHT)));
         double divergence=serverEndpoint.distanceTo(claim);
-        check(divergence>0.25,"reproduction: straight re-simulation of the ledge climb diverges beyond vanilla's 0.0625 squared 'moved wrongly' limit (divergence "+divergence+")");
+        check(Double.isFinite(divergence) && divergence < delta.length(),
+                "aggregate climb re-simulation remains bounded while improved stepping may eliminate its old divergence");
         // Vanilla void-world consequence: the block verdict is constant false there, so bl4 always
         // requestTeleports. The mesh verdict accepts the collision-clear climbed endpoint instead.
         check(!MeshCollision.movementRejected(frame,previous,destination),"collision-clear climbed endpoint is accepted, not teleported back");
@@ -87,6 +89,26 @@ public final class MeshMovementVerdictTest {
         // An already-overlapping body may keep claiming nearby positions (recovery, no teleport oscillation).
         check(!MeshCollision.movementRejected(frame,body(2.5,0.4,1),body(2.5,0.45,1)),"recovery claims from an already-overlapping body are accepted");
         check(!MeshCollision.movementRejected((TerrainMeshFrame)null,previous,destination),"unpublished geometry never fabricates a correction (entry window stays seamless)");
+    }
+    /** A delayed endpoint after turning around a pillar cannot be reproduced by one straight sweep.
+     * Unlike the old ledge snag, this is a geometric divergence even with correct step traversal. */
+    private static void directionChangeReproducer() {
+        var cells = new java.util.ArrayList<TerrainMeshFrame.Cell>();
+        for (int y=0; y<3; y++) cells.add(cell(200+y,new Vec3d(0,y,0),
+                new Vec3d(1,0,0),new Vec3d(0,1,0),new Vec3d(0,0,1),1f));
+        var frame = new TerrainMeshFrame(2,true,"minecraft:overworld",Vec3d.ZERO,Vec3d.ZERO,List.of(stone()),cells);
+        Box previous = body(-1,0,.5), moved = previous;
+        for (Vec3d leg : List.of(new Vec3d(0,0,2),new Vec3d(3,0,0),new Vec3d(0,0,-2))) {
+            Vec3d resolved = MeshCollision.simulate(frame,moved,leg,false,true,STEP_HEIGHT);
+            check(resolved.squaredDistanceTo(leg)<1e-8,"each chosen detour leg is collision-free");
+            moved=moved.offset(resolved);
+        }
+        Vec3d claim=foot(moved), delta=claim.subtract(foot(previous));
+        Vec3d replay=foot(previous.offset(MeshCollision.simulate(frame,previous,delta,false,true,STEP_HEIGHT)));
+        check(replay.distanceTo(claim)>.25,"direction-changing path really differs from straight server replay");
+        check(MeshCollision.bodyClear(frame,moved),"detour endpoint is supported by real clearance, not a proxy");
+        check(!MeshCollision.movementRejected(frame,previous,moved),"valid delayed direction-change endpoint is not rubber-banded");
+        check(MeshCollision.movementRejected(frame,previous,body(.5,0,.5)),"pillar-intersecting endpoint remains rejected");
     }
     /** Ordinary grounded walking along distorted (sheared) terrain: every endpoint accepted, real progress. */
     private static void slopeWalkingSequence() {
@@ -234,6 +256,7 @@ public final class MeshMovementVerdictTest {
     public static void main(String[] args) throws Exception {
         SharedConstants.createGameVersion();
         ledgeJumpReproducer();
+        directionChangeReproducer();
         slopeWalkingSequence();
         fadedCellConsistency();
         completeHandlerDecision();

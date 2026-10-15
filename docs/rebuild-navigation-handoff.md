@@ -9,12 +9,77 @@ Authority: `docs/spirit-world-approved-design.md`, prior bounded navigation revi
 `SpiritFlightToggleMixin` now routes the actual Yarn ability packet through `SpiritNavigationService.onFlightToggle(player, packet.isFlying())`.
 
 - True enters deep/freeflight as before. False while deep records a **current-support** request, not a remembered-entry or explicit-target landing. Flight remains enabled until the real terrain operation succeeds.
-- One session-local request/player, 200-tick deadline; repeated packets cannot restart its budget or duplicate the request. A guarded source-grid alignment takes at most 40 accepted steps; already-aligned support can acquire immediately. Source/window/owner/grid change, retarget, touch, flight-on, capture, logout, respawn, dimension exit/unload and shutdown cancel/clear the transient request. Saved/wire mode flags do not resume an old request after reload.
+- One session-local request/player, 200-tick deadline; repeated packets cannot restart its budget or duplicate the request. A guarded source-grid alignment takes at most 40 accepted steps; already-aligned support can acquire immediately. Source/window/owner/grid change, retarget, flight-on, capture, logout, respawn, dimension exit/unload and shutdown cancel/clear the transient request. Saved/wire mode flags do not resume an old request after reload.
+- **Per-player touch independence:** an incoming deep touch from another player no longer cancels the recipient's own pending walk request, landing approach or in-progress blend. `TouchReception` (pure policy, regression-tested without a booted game) rejects the touch while the recipient carries any of those own intents; the initiator's per-actor throttle still applies and the approved blend-over-one-second mechanic is unchanged for a free deep recipient. Movement, expiry and the recipient's own actions keep cancelling intents normally, so one player can never silently trap another in deep flight by repeatedly re-touching during its own mode transition.
 - Every pending movement tick advances q only by **actual physical delta in the current basis**, with finite/teleport bounds. It does not converge to the support coordinate, replace q, change position or mutate captured attunement. Client prediction has a separate `supportApproach` path using the same ordinary translation, not captured-target homing.
 - Navigation consumes the sibling terrain’s **real** `currentSupport` / `acquireCurrentSupport(player, expected)` APIs. It retains stable producing-window identity, exact owner, dimension and source grid. It checks each proposed basis step for discontinuity and calls the real `SpiritTerrainService.canAlign` before applying it. Final acquisition rechecks real contact, source ownership revision, source body/floor proof, projected 1 mm alignment and whole-frame collision/render continuity in terrain.
 - Success rechecks terrain’s resulting source mapping, binds those **current exact feet**, clears flight and resets the motion baseline. Captured target/dimension/basis/vector remain unchanged. No safety floor, target teleport, entry rebinding or `setShallow(true)` shortcut. If terrain cannot validate the support, the actor stays deep and sees pending/expiry/cancellation status.
 
 This now has a real implementation for arbitrary representative support. It is **not runtime-confirmed**. A normal successful handoff still depends on the terrain-owned proof/transition becoming ready; nav does not override a refusal. An actor can keep moving during alignment; stationary-only or centimeter-position targeting is not imposed on this path.
+
+### Deep walk locality while moving through the projection
+
+A deep-flying player who requests a walk is still moving: descending, grazing slopes and crossing
+several projected source localities before settling. `DeepWalkAttachment` (pure policy, no Minecraft
+types) now governs which locality the pending request attaches to in `attemptSupport`:
+
+- Attachment and final acquisition have **different** normal gates. The contact must be real
+  projected ground (`normal.y > .3`) and its **source-space** normal must identify a floor
+  (`sourceNormal.y >= .99`). `TerrainMeshFrame.Cell.sourceNormal` pulls the contact covector back
+  through the same accepted affine cell that collision/rendering use: normalized dot products
+  with `axisX/size.x`, `axisY/size.y`, `axisZ/size.z`. This works for sheared and compacted cells;
+  inverse position math would be wrong for normals. A tilted horizontal source floor now starts
+  alignment even when its projected `normal.y < .99`. A source wall/edge graze remains `WAIT`,
+  including a wall distorted into an apparently horizontal projected surface.
+- The original projected `.99` check remains in terrain's **final acquisition** transaction, along
+  with the fully aligned source basis, identity/revision, body/floor proof and continuous scene
+  checks. Starting alignment is not permission to land. The reviewed pre-alignment `.99` gate
+  deadlocked source floors: pending requests suppress ordinary deep basis evolution, and WAIT
+  returned before guarded source-grid alignment could improve the measured projected normal.
+- While the player keeps physically moving (per-tick delta above the shared movement epsilon), a
+  changed contacted locality is `FOLLOW`ed: the request re-attaches to the locality actually under
+  the player (window identity, landmark, source dimension, grid basis) instead of cancelling, so a
+  descent across representative windows no longer produces repeated "support window changed"
+  failures. `FOLLOW` restarts only the bounded 40-step grid alignment from the current basis; the
+  200-tick request budget, attunement gate, discontinuity guard, `canAlign` and the full
+  `acquireCurrentSupport` revalidation are unchanged.
+- Only a locality change under a settled player cancels the request (terrain genuinely changed
+  underfoot; a fresh request must validate the new support), preserving the previous cancel
+  message and semantics. Non-finite deltas count as settled.
+
+Regression coverage: `DeepWalkAttachmentTest` checks separate attachment/acquisition boundaries,
+all locality decisions, invalid normals and evolving projected normals. `DeepWalkContactPremiseTest`
+drives the real basis blend, per-step discontinuity check, swept-AABB ground query and continuous
+transition/body guards from a 35-degree tilted source floor to the source grid. It crosses to a
+second locality before the normal is acquisition-compatible, follows it without WAIT/cancellation,
+and completes 40 accepted steps on that locality. Other cases reject an upward-projected source
+wall, exercise covector pullback with shear/nonuniform source size, and refuse an obstructed
+transition. These are numerical/geometry regressions, not a live player/session acquisition test.
+
+#### Retained-unit validation (source-floor gate repair)
+
+Canonical command: the installed cached Gradle 8.13 binary with
+`--no-daemon --console=plain build`, in the owned checkout via `tmux-jobs`, original pane `%2138`.
+Retained build handle: session `$11`, window `@1381`, pane `%2156`, run
+`553d6451a2d943f088755b6df9b9bb4f`. **Exit 0, BUILD SUCCESSFUL**.
+
+- Common and client compilation, `runtimeSelfTest` discovery of all **six** main-based suites:
+  deep-walk geometry/alignment **293** checks, deep-walk attachment **47** checks;
+  embedding callback isolation **28**, engine safety **184**, persistence **90**, pipeline **135**.
+- `buildSelfTest` packaging/descriptor/runner checks and `verifyProductionJar` passed; artifact
+  `build/libs/mysticism-1.0-SNAPSHOT.jar`. `git diff --check` passed.
+- Existing missing API Guardian annotation and mixin/deprecation warnings remain nonfatal.
+  Embedding persistence's malformed-data warnings/stack traces are expected rejection fixtures.
+- No live Fabric player tick, client/server launch, renderer/GPU or real model inference performed.
+  Terrain's real acquisition transaction still requires source proof/ownership and safe geometry;
+  these tests do not prove it completes on arbitrary gameplay terrain. Conservative source edge
+  contacts can wait, and blocked/slow proof/alignment can still exhaust the unchanged 200-tick budget.
+- `WalkSupport` adds server-local `sourceNormal`; wire/storage formats, prediction modes, independent
+  per-player projection, source octree ownership, captured attunement and native v2 embeddings are
+  unchanged. No software/models installed, no agents delegated, no dev/main/worktree mutations.
+
+The remaining sections below retain the earlier navigation handoff's historical integration notes;
+its older no-test/build limitations do not describe the retained-unit validation just listed.
 
 ### Effective vectors, frozen snapshots and precise source feet
 
@@ -23,6 +88,16 @@ Both initial source q and newly captured points now call `SpiritActivityService.
 `captureHere` takes actual current `SpiritTerrainService.sourcePosition` while shallow, or exact player feet in the real source world. Only the ownership-discovery seed is floored; captured X/Y/Z remain doubles. Thus slab-standing Y is not changed to a blocked integer. CCA stores `tfx/tfy/tfz`, validated independently; legacy target tags migrate to the old centered-XZ/integer-Y convention. Physical source pose/mode/permissions still survive an incompatible model reset; incompatible generated target/vector/basis/binding data does not.
 
 The real terrain now exposes matching `Vec3d` prefetch/readiness/acquisition overloads and restores/prewarms with `nav.targetPosition()`. Old `BlockPos` APIs remain for explicit integer debug targets. `LandingSafety` also has an exact-foot `Vec3d ready` overload: the default only delegates for an **exact** legacy centered-XZ/integer-Y point and otherwise fails closed; the actual terrain adapter overrides it. No fractional-foot truncation is hidden in an adapter.
+
+### Natural resting landing
+
+Deep flight no longer hovers forever above available owned terrain. While deep, navigation measures real mesh contact (`MeshCollision.ground`) each movement tick:
+
+- Natural landing arms only after the player has actually been airborne during this deep stretch (`Session.airborne`), so a standing flight toggle is never immediately reversed; any ascending tick resets the rest window.
+- After `NaturalLandingPolicy.REST_TICKS` (10) consecutive resting ticks — near-horizontal ground normal (`>= .99`, matching walk acquisition), no ascending motion — and only when `SpiritTerrainService.currentSupport` is really present, the shared validated support approach begins (`naturalSupport` flagged). It uses the identical `beginSupportApproach`/`attemptSupport`/`acquireCurrentSupport` path as an explicit walk request: no q/basis/position snapping, same cancellation and expiry contract.
+- Unknown/unowned geometry below keeps free flight. A naturally triggered approach that expires reports its own expiry text and re-arms only after the player leaves the ground again (`endSupportApproach` clears the airborne arm), so failures cannot retry-loop while resting. Touch basis blending and a captured-target landing approach are never diverted.
+
+Policy constants live in `NaturalLandingPolicy` (pure, regression-covered); the physical resting-contact premise is regression-covered against the real swept-AABB index, including faded (opacity 0) terrain and steep slopes refusing the `.99` gate.
 
 ### Strict captured landing gate
 
@@ -65,7 +140,7 @@ SpiritTerrainService.currentSupport(player); // Optional<WalkSupport>
 SpiritTerrainService.acquireCurrentSupport(player, expectedSupport); // boolean
 SpiritTerrainService.cancelCurrentSupport(player); // clears bounded proof on cancellation/lifecycle
 // WalkSupport: landmarkId, sourceDimension, sourcePosition, sourceBasis,
-// sourceCoordinate, normal, windowIdentity, ownershipRevision
+// sourceCoordinate, projected normal, sourceNormal, windowIdentity, ownershipRevision
 SpiritTerrainService.prefetchTarget(player, dimension, id, Vec3d feet, vector, sourceBasis);
 SpiritTerrainService.landingReady(player, dimension, id, Vec3d feet);
 SpiritTerrainService.tryLandTarget(player, dimension, id, Vec3d feet);

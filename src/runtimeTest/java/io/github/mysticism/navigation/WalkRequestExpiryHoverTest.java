@@ -54,7 +54,7 @@ public final class WalkRequestExpiryHoverTest {
         int expiry = service.indexOf("WalkPolicy.requestExpired(s.supportStartedTick", attempt);
         int lookup = service.indexOf("SpiritTerrainService.currentSupport(p)", attempt);
         check(expiry > attempt && expiry < lookup, "Elapsed expiry must run before missing support/readiness can return");
-        check(service.indexOf("if (s.supportPending) return;") < service.indexOf("s.supportStartedTick = p.getServer().getTicks()"),
+        check(service.indexOf("if (s.supportPending || s.walk.armed()) return;") < service.indexOf("s.supportStartedTick = p.getServer().getTicks()"),
                 "Repeated entry packets must not renew the request deadline");
     }
 

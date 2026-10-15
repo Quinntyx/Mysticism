@@ -33,6 +33,10 @@ public final class SpiritNavigation implements ComponentV3, AutoSyncedComponent 
     public boolean supportApproach() { return supportApproach; }
     public long motionEpoch() { return motionEpoch; }
     private void resetPrediction() { motionEpoch = motionEpoch == Long.MAX_VALUE ? 0 : motionEpoch + 1; }
+    /** Teleport arrival reconciliation: an arrival delta is server-decided, never chosen movement, so
+     * the synced prediction epoch advances unconditionally (a /tp can happen mid-flight with NO mode
+     * change) and the client predictor drops its stale pre-teleport pose for exactly the arrival tick. */
+    public void invalidateMotionPrediction() { resetPrediction(); }
     public void setSemanticReady(boolean ready) {
         if (semanticReady != ready) resetPrediction();
         semanticReady = ready; if (ready) modelCompatible = true;

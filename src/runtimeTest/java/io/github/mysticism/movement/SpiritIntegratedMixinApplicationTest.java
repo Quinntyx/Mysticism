@@ -47,9 +47,9 @@ public final class SpiritIntegratedMixinApplicationTest {
     static InputStream config() {
         boolean client = Boolean.getBoolean("mysticism.test.integratedClient");
         String resource = client ? "mysticism.client.mixins.json" : "mysticism.mixins.json";
-        List<String> retained = client ? List.of("SpiritEntryWorldMixin", "SpiritEntryLoadingMixin")
+        List<String> retained = client ? List.of("SpiritEntryWorldMixin", "SpiritEntryLoadingMixin", "SpiritArrivalReseedMixin", "SpiritCarrierPushMixin")
                 : List.of("SpiritFlightPredictionMixin", "SpiritMeshMovementMixin", "SpiritFlightToggleMixin",
-                        "SpiritMeshCollisionMixin", "SpiritMeshSneakMixin", "SpiritTravelMixin", "EntityFlagAccess");
+                        "SpiritMeshCollisionMixin", "SpiritMeshSneakMixin", "SpiritTravelMixin", "EntityFlagAccess", "SpiritTeleportMixin");
         try (var stream = SpiritIntegratedMixinApplicationTest.class.getClassLoader().getResourceAsStream(resource)) {
             check(stream != null, "Missing production config " + resource);
             var json = JsonParser.parseReader(new InputStreamReader(stream, StandardCharsets.UTF_8)).getAsJsonObject();
@@ -97,14 +97,22 @@ public final class SpiritIntegratedMixinApplicationTest {
             Mixins.addConfiguration(CONFIG);
             var transformer = ((FlightMixinTestService) MixinService.getService()).transformer();
             List<String> targets = client ? List.of("net.minecraft.client.MinecraftClient",
-                    "net.minecraft.client.network.ClientPlayNetworkHandler")
+                    "net.minecraft.client.network.ClientPlayNetworkHandler", "net.minecraft.client.network.ClientPlayerEntity")
                     : List.of("net.minecraft.entity.Entity", "net.minecraft.entity.player.PlayerEntity",
                     "net.minecraft.server.network.ServerPlayNetworkHandler");
             for (String target : targets) {
                 byte[] original = SpiritFlightMixinApplicationTest.bytes(target);
                 var before = SpiritFlightMixinApplicationTest.node(original);
                 var after = SpiritFlightMixinApplicationTest.node(transformer.transformClass(environment, target, original));
-                if (target.endsWith("PlayerEntity")) {
+                if (target.endsWith("ClientPlayerEntity")) {
+                    for (String[] pair : new String[][]{{"autoJump","$noCarrierAutoJump"},
+                            {"tickMovement","$clearCarrierAutoJump"},{"pushOutOfBlocks","$meshOnlyPush"}}) {
+                        var hook=after.methods.stream().filter(m->m.name.endsWith(pair[1])).findFirst().orElseThrow();
+                        check(calls(method(after,pair[0]),after.name,hook.name)==1,"Carrier voxel suppression lost: "+pair[0]);
+                        new Analyzer<>(new BasicVerifier()).analyze(after.name,method(after,pair[0]));
+                        new Analyzer<>(new BasicVerifier()).analyze(after.name,hook);
+                    }
+                } else if (target.endsWith("PlayerEntity")) {
                     var living = SpiritFlightMixinApplicationTest.node(
                             SpiritFlightMixinApplicationTest.bytes("net.minecraft.entity.LivingEntity"));
                     int horizontalScales = 0;
@@ -141,6 +149,14 @@ public final class SpiritIntegratedMixinApplicationTest {
                         check(calls(packet, after.name, hook.name) > 0, "Combined movement path lost " + suffix);
                         new Analyzer<>(new BasicVerifier()).analyze(after.name, hook);
                     }
+                    var teleport=after.methods.stream().filter(m->m.name.equals("requestTeleport")
+                            && m.desc.equals("(DDDFFLjava/util/Set;)V")).findFirst().orElseThrow();
+                    for (String suffix : List.of("$beforeSpiritTeleport","$afterSpiritTeleport")) {
+                        var hook=after.methods.stream().filter(m->m.name.endsWith(suffix)).findFirst().orElseThrow();
+                        check(calls(teleport,after.name,hook.name)==1,"Combined move/arrival path lost "+suffix);
+                        new Analyzer<>(new BasicVerifier()).analyze(after.name,hook);
+                    }
+                    new Analyzer<>(new BasicVerifier()).analyze(after.name,teleport);
                     var meshVerdict = after.methods.stream().filter(m -> m.name.endsWith("$meshVerdict")).findFirst().orElseThrow();
                     check(calls(method(after,"isPlayerNotCollidingWithBlocks"), after.name, meshVerdict.name) == 1,
                             "Walking fallback must call the installed shared mesh verdict");
@@ -148,6 +164,14 @@ public final class SpiritIntegratedMixinApplicationTest {
                             "Walking verdict must use actual production collision validation");
                     new Analyzer<>(new BasicVerifier()).analyze(after.name, packet);
                 } else {
+                    if (target.endsWith("ClientPlayNetworkHandler")) {
+                        var arrival=after.methods.stream().filter(m->m.name.endsWith("$reseedArrivalPrediction")).findFirst().orElseThrow();
+                        check(calls(method(after,"onPlayerPositionLook"),after.name,arrival.name)==1,
+                                "Entry GUI suppression must coexist with actual arrival reseeding");
+                        check(calls(arrival,PREFIX+"client/spiritworld/ClientLatentPredictor","onArrivalApplied")==1,
+                                "Arrival reseeds integrated prediction, not only an epoch model");
+                        new Analyzer<>(new BasicVerifier()).analyze(after.name,arrival);
+                    }
                     String entry = target.endsWith("MinecraftClient") ? "joinWorld" : "startWorldLoading";
                     String vanilla = target.endsWith("MinecraftClient") ? "reset" : "setScreen";
                     String owner = "net/minecraft/client/MinecraftClient";

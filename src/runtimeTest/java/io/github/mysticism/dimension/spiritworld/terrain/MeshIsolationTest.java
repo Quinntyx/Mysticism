@@ -10,7 +10,7 @@ import java.util.List;
 import java.util.UUID;
 
 /** Per-player deep/shallow mesh and collision isolation regressions against the real production
- * projection, stitching and swept-collision code. No server boot, registries or model IO: every
+ * projection, shallow bypass and swept-collision code. No server boot, registries or model IO: every
  * frame is produced through SpiritTerrainService's actual per-observer transform seam and
  * MeshCollision's actual per-player index cache, so a shared-frame regression fails here. */
 public final class MeshIsolationTest {
@@ -185,8 +185,8 @@ public final class MeshIsolationTest {
         check(MeshCollision.index(alice,null,false)==null,"A player without a frame has no index");
     }
 
-    /** Shallow published frames are source-identical and anchored to the LOCAL landmark: no border
-     * deformation, exact collision boxes, and duplicate geometry resolves to the local window. */
+    /** Shallow publication preserves complete source cells and producer identities. Deduplication is
+     * a deep-only optimization: it must not rewrite a shallow locality or invent border deformation. */
     private static void shallowStitchLocal() {
         List<TerrainMeshFrame.Material> palette=List.of(material("minecraft:stone"));
         Vec3d localMin=new Vec3d(10,64,10),foreignMin=new Vec3d(10,64,10);
@@ -195,16 +195,15 @@ public final class MeshIsolationTest {
         TerrainMeshFrame.Cell foreign=cell(2,0,"lm-foreign",new Vec3d(0,0,0),foreignMin,ax,ay,az,List.of(SourceMeshBuilder.UNIT));
         Vec3d eye=localMin.add(2,1,2);
         List<TerrainMeshFrame.Cell> stitched=MeshStitcher.stitch(new ArrayList<>(List.of(local,foreign)),palette,"lm-local",true,eye);
-        check(stitched.size()==1,"Duplicate shallow geometry collapses to one cell");
-        check(stitched.getFirst().landmarkId().equals("lm-local"),"The local landmark keeps the shared surface");
+        check(stitched.equals(List.of(local,foreign)),"Shallow bypass preserves both complete source cells and provenance");
+        check(stitched.getFirst()==local && stitched.getLast()==foreign,"No producer key or owner is rewritten");
         near(stitched.getFirst().min().distanceTo(localMin),0,0,"Shallow frames are never deformed");
         near(stitched.getFirst().axisX().distanceTo(ax),0,0,"Shallow axes stay source-aligned");
         check(stitched.getFirst().collision().equals(List.of(SourceMeshBuilder.UNIT)),"Shallow collision boxes stay exact");
-        // A foreign same-shape cell must NOT displace the local window's cell when the local arrives second.
+        // Input order cannot change either producer's geometry, material, collision or ownership.
         List<TerrainMeshFrame.Cell> reversed=new ArrayList<>(List.of(foreign,local));
         var stitchedReversed=MeshStitcher.stitch(reversed,palette,"lm-local",true,eye);
-        check(stitchedReversed.size()==1 && stitchedReversed.getFirst().landmarkId().equals("lm-local"),
-                "Local anchor wins regardless of append order");
+        check(stitchedReversed.equals(List.of(foreign,local)),"Shallow bypass never substitutes a different producing cell");
         // Non-overlapping foreign geometry survives beside the local window.
         TerrainMeshFrame.Cell distant=new TerrainMeshFrame.Cell(3,0,"lm-foreign",new Vec3d(50,0,50),
                 new Vec3d(60,64,60),new Vec3d(1,1,1),ax,ay,az,0xffffff,0xf000f0,1f,List.of(SourceMeshBuilder.UNIT));

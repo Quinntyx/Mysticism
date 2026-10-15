@@ -59,8 +59,10 @@ public final class SpiritVisualControlsSelfTest {
                     check(plan.fogMode(true, 0f, prepared, failed) == SpiritVisualControls.FogMode.VANILLA,
                             "zero entry strength retains native fog");
                 }
-                check(plan.fogMode(true, .5f, true, false) == SpiritVisualControls.FogMode.VANILLA,
-                        "partial entry retains source fog");
+                for (float strength : new float[]{.002f, .05f, .5f, .998f, 1f})
+                    check(plan.fogMode(true, strength, true, false) == (plan.fog()
+                                    ? SpiritVisualControls.FogMode.VOLUMETRIC : SpiritVisualControls.FogMode.VANILLA),
+                            "volume owns transformed branch throughout fade, but respects fog toggle");
                 var off = settings.withEnabled(false);
                 check(off.fog() == fog && off.kuwahara() == painter && off.saturation() == saturation,
                         "master switch preserves individual preferences");
@@ -175,8 +177,11 @@ public final class SpiritVisualControlsSelfTest {
             check(shader.substring(bypass, shader.indexOf('}', bypass)).contains("return;"), "disabled pass actually returns");
         }
         var chain = json("shaders/post/kuwahara.json").getAsJsonArray("passes");
-        check(chain.size() == 4 && chain.get(0).getAsJsonObject().get("name").getAsString().equals("mysticism:spirit_fog")
-                && chain.get(3).getAsJsonObject().get("outtarget").getAsString().equals("minecraft:main"), "retain fog/filter/saturation/transition chain");
+        check(chain.size() == 4 && chain.get(0).getAsJsonObject().get("name").getAsString().equals("mysticism:kuwahara")
+                && chain.get(1).getAsJsonObject().get("name").getAsString().equals("mysticism:spirit_fog")
+                && chain.get(2).getAsJsonObject().get("name").getAsString().equals("mysticism:spirit_saturation")
+                && chain.get(3).getAsJsonObject().get("outtarget").getAsString().equals("minecraft:main"),
+                "filter unfogged terrain before depth-aware fog, saturation and source transition");
         // Wiring guards supplement behavioral tests; do not stand in for executing GLSL on a GPU.
         String manager = Files.readString(Path.of("src/client/java/io/github/mysticism/client/spiritworld/ShaderManager.java"));
         check(manager.contains("setUniformValue(\"FogEnabled\", framePasses.fog() ? 1 : 0)"), "production fog gate upload");

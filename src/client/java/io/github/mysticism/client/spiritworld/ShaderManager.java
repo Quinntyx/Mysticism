@@ -8,6 +8,7 @@ import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gl.Framebuffer;
 import net.minecraft.client.gl.SimpleFramebuffer;
+import net.minecraft.client.render.FogShape;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
@@ -21,7 +22,7 @@ import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL30;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 
-/** One scene-depth snapshot, one volumetric integration, then painterly + saturation. */
+/** One scene-depth snapshot: painterly terrain, one volumetric integration, saturation, transition. */
 public final class ShaderManager {
     private static final Logger LOGGER = LoggerFactory.getLogger("Mysticism/SpiritRendering");
     private static final Identifier SPIRIT = Identifier.of("mysticism", "spirit");
@@ -41,6 +42,7 @@ public final class ShaderManager {
     private static String failureReason = "shader failed";
     private static final SpiritVisualControls controls = new SpiritVisualControls(initialQuality());
     private static SpiritVisualControls.Passes framePasses = controls.settings().passes(0);
+    private static SpiritSourceFog sourceFog;
 
     private ShaderManager() {}
 
@@ -53,6 +55,8 @@ public final class ShaderManager {
             updateSession(client);
             frameReady = false;
             depthReady = false;
+            fogHookSeen = false; // each prepared world frame must actually bypass analytic terrain fog
+            sourceFog = null;
             meshDepthSeen=false;
             boolean sceneActive = sessionWorld != null && (targetActive || effectStrength() > .001f);
             boolean waiting = sessionWorld != null && !sceneActive
@@ -82,12 +86,6 @@ public final class ShaderManager {
                 KUWAHARA_SHADER.setUniformValue("InverseViewProjection", inverseViewProjection);
                 KUWAHARA_SHADER.setUniformValue("CameraModulo", SpiritRenderSettings.wrap(camera.x),
                         SpiritRenderSettings.wrap(camera.y), SpiritRenderSettings.wrap(camera.z));
-                int medium=framePasses.fog() ? SpiritMediumTexture.prepare() : 0;
-                KUWAHARA_SHADER.setUniformValue("HasOccupancy",medium==0?0:1);
-                // Clear Satin's cached texture ID too: off/on or reload may have deleted the old atlas.
-                KUWAHARA_SHADER.setSamplerUniform("OccupancySampler",medium);
-                var offset=SpiritMediumTexture.offset(camera);
-                KUWAHARA_SHADER.setUniformValue("OccupancyCameraOffset",(float)offset.x,(float)offset.y,(float)offset.z);
                 KUWAHARA_SHADER.setUniformValue("NearBubble",(float)SpiritRenderSettings.NEAR_BUBBLE);
                 KUWAHARA_SHADER.setUniformValue("EffectStrength",effectStrength());
                 KUWAHARA_SHADER.setUniformValue("OpaqueRadius", (float) SpiritRenderSettings.OPAQUE_RADIUS);
@@ -139,7 +137,7 @@ public final class ShaderManager {
                 fail("scene depth snapshot not observed", new IllegalStateException("AFTER_TRANSLUCENT did not supply scene depth"));
                 return;
             }
-            if (framePasses.fog() && !fogHookSeen) {
+            if (framePasses.fog() && (!fogHookSeen || sourceFog == null)) {
                 frameReady = depthReady = false;
                 controls.fallback("fog hook not observed; postprocess skipped, vanilla fog unchanged");
                 if (!missingHookReported) {
@@ -161,8 +159,20 @@ public final class ShaderManager {
                 GL30.glBlitFramebuffer(0,0,main.textureWidth,main.textureHeight,0,0,sceneDepth.textureWidth,sceneDepth.textureHeight,
                         GL11.GL_COLOR_BUFFER_BIT,GL11.GL_NEAREST);
                 main.beginWrite(false);
-                KUWAHARA_SHADER.setSamplerUniform("OriginalSampler",SpiritEntryScene.original(client,sceneDepth.getColorAttachment()));
+                var original = SpiritEntryScene.original(client,sceneDepth.getColorAttachment());
+                KUWAHARA_SHADER.setSamplerUniform("OriginalSampler",original.texture());
+                // With fog disabled native fog was not bypassed: do not
+                // require a saved fog state or apply it a second time to the original scene.
+                var fog = sourceFog == null ? new SpiritSourceFog(0, 1, 0, 0, 0, 0, 0) : sourceFog;
+                KUWAHARA_SHADER.setUniformValue("RestoreSourceFog", original.restoreSourceFog() && sourceFog != null ? 1 : 0);
+                KUWAHARA_SHADER.setUniformValue("SourceFogStart",fog.start());
+                KUWAHARA_SHADER.setUniformValue("SourceFogEnd",fog.end());
+                KUWAHARA_SHADER.setUniformValue("SourceFogShape",fog.shape());
+                KUWAHARA_SHADER.setUniformValue("SourceFogColor",fog.red(),fog.green(),fog.blue(),fog.alpha());
                 KUWAHARA_SHADER.setSamplerUniform("DepthSampler", sceneDepth.getDepthAttachment());
+                // BEFORE_ENTITIES has now drawn and published the current terrain. Binding at START
+                // paired this frame's depth with last frame's density (and lost first-frame occupancy).
+                bindCurrentMedium(context.camera().getPos());
                 KUWAHARA_SHADER.render(context.tickCounter().getTickDelta(false));
                 checkGl("executing postprocess");
             } catch (RuntimeException exception) {
@@ -201,6 +211,15 @@ public final class ShaderManager {
     public static void afterMeshDepth() { meshDepthSeen=true; }
     public static void setMediumSamples(float[] occupancy) { SpiritMediumTexture.publish(occupancy); }
     public static void setMediumSamples(float[] occupancy,Vec3d center) { SpiritMediumTexture.publish(occupancy,center); }
+    public static void clearMediumSamples() { SpiritMediumTexture.clear(); }
+
+    private static void bindCurrentMedium(Vec3d camera) {
+        int medium=SpiritMediumTexture.prepare();
+        KUWAHARA_SHADER.setUniformValue("HasOccupancy",medium==0?0:1);
+        KUWAHARA_SHADER.setSamplerUniform("OccupancySampler",medium); // also unbind deleted/stale texture on clear
+        var offset=SpiritMediumTexture.offset(camera);
+        KUWAHARA_SHADER.setUniformValue("OccupancyCameraOffset",(float)offset.x,(float)offset.y,(float)offset.z);
+    }
     public static float effectStrength() {
         if (transitionAt==0) return 0;
         double t=Math.max(0,Math.min(1,(System.nanoTime()-transitionAt)*1e-9/1.5));
@@ -209,12 +228,17 @@ public final class ShaderManager {
     }
 
     /** Called only from the requested client mixin. Fallback retains vanilla terrain depth/occlusion. */
-    public static void applySpiritFog() {
+    public static void applySpiritFog(boolean terrainFog) {
         if (!inSpiritWorld()) return;
+        if (!terrainFog) return; // Preserve the native sky backdrop.
         fogHookSeen = true;
         switch (framePasses.fogMode(inSpiritWorld(), effectStrength(), frameReady, failed)) {
-            case VANILLA -> { /* Off or partial transition: do not alter native fog. */ }
+            case VANILLA -> { /* Fog disabled: leave native fog unchanged. */ }
             case VOLUMETRIC -> {
+                float[] color = RenderSystem.getShaderFogColor();
+                sourceFog = new SpiritSourceFog(RenderSystem.getShaderFogStart(), RenderSystem.getShaderFogEnd(),
+                        RenderSystem.getShaderFogShape() == FogShape.SPHERE ? 0 : 1,
+                        color[0], color[1], color[2], color[3]);
                 RenderSystem.setShaderFogStart(Float.MAX_VALUE / 4);
                 RenderSystem.setShaderFogEnd(Float.MAX_VALUE / 2);
             }
@@ -333,6 +357,8 @@ public final class ShaderManager {
     private static void release() {
         frameReady = false;
         depthReady = false;
+        fogHookSeen = false;
+        sourceFog = null;
         SpiritMediumTexture.resetGpu();
         SpiritRenderLayers.clear();
         if (sceneDepth != null) {

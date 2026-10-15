@@ -40,7 +40,8 @@ public final class SpiritVisualControls {
         public FogMode fogMode(boolean sceneActive, float strength, boolean prepared, boolean failed) {
             if (!fog || !sceneActive || strength <= .001f) return FogMode.VANILLA;
             if (!prepared || failed) return FogMode.LINEAR_FALLBACK;
-            return strength >= .999f ? FogMode.VOLUMETRIC : FogMode.VANILLA;
+            return SpiritRenderSettings.useVolumetricFog(prepared, failed, strength)
+                    ? FogMode.VOLUMETRIC : FogMode.VANILLA;
         }
     }
 

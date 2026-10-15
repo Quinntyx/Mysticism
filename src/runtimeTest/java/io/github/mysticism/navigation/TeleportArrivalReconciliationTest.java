@@ -1,0 +1,294 @@
+package io.github.mysticism.navigation;
+
+import io.github.mysticism.activity.TraversalSteering;
+import io.github.mysticism.client.spiritworld.ClientLatentPredictor;
+import io.github.mysticism.client.spiritworld.PredictionContinuity;
+import io.github.mysticism.component.SpiritNavigation;
+import io.github.mysticism.vector.Basis384f;
+import io.github.mysticism.vector.Vec384f;
+import net.minecraft.nbt.NbtCompound;
+import net.minecraft.network.packet.s2c.play.PlayerPositionLookS2CPacket;
+import net.minecraft.network.packet.s2c.play.PositionFlag;
+import net.minecraft.registry.RegistryKey;
+import net.minecraft.registry.RegistryKeys;
+import net.minecraft.util.Identifier;
+import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.World;
+
+import java.util.EnumSet;
+
+/** Deterministic regressions for spirit-world teleport arrival reconciliation: an arrival delta is
+ * server-decided, never chosen movement, so stale prediction/movement state must be reset at arrival
+ * instead of being integrated as semantic travel or carried as residual momentum (rubber banding).
+ * Drives the real epoch contract, the real client predictor gate, and the real shared steering math;
+ * no server boot, no test framework. */
+public final class TeleportArrivalReconciliationTest {
+    private static int checks;
+    private static void check(boolean value, String why) { checks++; if (!value) throw new AssertionError(why); }
+
+    private static Vec384f q() { return Vec384f.ZERO(); }
+
+    /** Reconciled arrival integration delta: the evolver/predictor re-seed makes the arrival tick a
+     * ZERO delta regardless of teleport distance, and ordinary movement resumes on the next tick. */
+    private static void arrivalDeltaIsNotSemanticTravel() {
+        // The pre-existing >4-block per-tick clamp only discarded LARGE teleports: a 2-block /tp was
+        // integrated as real movement on both server evolver and client predictor.
+        Basis384f basis = new Basis384f();
+        Vec384f corrupted = q();
+        TraversalSteering.advance(corrupted, basis, 2, 0, 0);
+        check(corrupted.squareDistance(q()) > 0, "Un-reconciled sub-band teleport delta advanced the latent position (the defect)");
+
+        Vec384f deep = q();
+        TraversalSteering.deepStep(deep, basis, q(), 2, 0, 0);
+        check(deep.squareDistance(q()) > 0, "Un-reconciled sub-band teleport delta advanced deep semantic travel (the defect)");
+
+        // Reconciliation re-seeds the last-integrated pose with the arrival pose: delta exactly ZERO.
+        Vec384f reconciled = q();
+        TraversalSteering.advance(reconciled, basis, 0, 0, 0);
+        TraversalSteering.deepStep(reconciled, basis, q(), 0, 0, 0);
+        check(reconciled.squareDistance(q()) == 0, "Reconciled arrival integrates ZERO delta");
+
+        // Ordinary movement immediately after arrival still integrates: no freeze.
+        Vec384f walking = q();
+        TraversalSteering.advance(walking, basis, 0.25, 0, 0);
+        check(walking.squareDistance(q()) > 0, "Post-arrival walking still advances semantic travel");
+
+        // Large teleports stay discarded by the existing integrable band (no double protection change).
+        Vec384f band = q();
+        TraversalSteering.deepStep(band, basis, q(), 30, 0, 0);
+        check(band.squareDistance(q()) == 0, "Teleport-scale movement above the integrable band stays discarded");
+
+        // Residual momentum is likewise not arrival travel: a vanilla falling residue per tick would
+        // integrate as semantic travel if the server kept its stale velocity; reconciliation zeroes it.
+        Vec384f residue = q();
+        TraversalSteering.deepStep(residue, basis, q(), 0, -0.0784, 0);
+        check(residue.squareDistance(q()) > 0, "Residual per-tick velocity would integrate as semantic travel (why server velocity must be zeroed)");
+    }
+
+    /** The synced prediction epoch advances unconditionally at every arrival: a /tp can happen
+     * mid-flight with NO mode change, so mode-switch-only bumping would miss it. */
+    private static void predictionEpochAdvancesOnEveryArrival() {
+        SpiritNavigation nav = new SpiritNavigation();
+        long initial = nav.motionEpoch();
+        nav.setActive(true);
+        nav.enterDeep();
+        long deep = nav.motionEpoch();
+        check(deep != initial, "Mode transition still advances the prediction epoch");
+
+        nav.enterDeep(); // no mode change
+        check(nav.motionEpoch() == deep, "No mode change keeps the epoch stable (only arrival/mode resets bump it)");
+
+        nav.invalidateMotionPrediction();
+        check(nav.motionEpoch() != deep, "Teleport reconciliation advances the epoch with no mode change");
+        long first = nav.motionEpoch();
+        nav.invalidateMotionPrediction();
+        check(nav.motionEpoch() != first, "Repeated teleports each advance the epoch");
+        check(nav.motionEpoch() > first, "Epoch is monotonic within its range");
+
+        nav.shallow("minecraft:overworld", "", new Vec3d(1, 2, 3));
+        long shallow = nav.motionEpoch();
+        nav.invalidateMotionPrediction();
+        check(nav.motionEpoch() != shallow, "Arrival reconciliation also applies in shallow mode");
+        check(nav.deep() == false && nav.active(), "Reconciliation never flips the navigation mode");
+    }
+
+    /** The synced epoch survives persistence, so arrival resets are not lost across a restart. */
+    private static void predictionEpochPersists() {
+        SpiritNavigation nav = new SpiritNavigation();
+        nav.setActive(true); nav.enterDeep(); nav.invalidateMotionPrediction();
+        long epoch = nav.motionEpoch();
+        NbtCompound tag = new NbtCompound();
+        nav.writeToNbt(tag, null);
+        SpiritNavigation restored = new SpiritNavigation();
+        restored.readFromNbt(tag, null);
+        check(restored.motionEpoch() == epoch, "Prediction epoch persists across restart/sync serialization");
+    }
+
+    /** The real client predictor gate: the reconciled epoch drops the stale pre-teleport delta for
+     * exactly the arrival tick, then ordinary movement integration resumes. */
+    private static void predictorGateDropsStaleArrivalDelta() {
+        long epoch = 7;
+        // Unbroken chain with the OLD epoch and a stale pre-teleport pose: this is the defect window —
+        // the predictor would integrate the arrival delta as chosen movement.
+        check(ClientLatentPredictor.integratesMovement(true, true, true, epoch, epoch, true, true, true),
+                "Unbroken pre-arrival chain integrates movement (documents the un-reconciled defect)");
+        // Reconciliation advanced the epoch BEFORE the arrival position packet: the arrival tick is
+        // rejected even though the pose/mode/readiness are otherwise unchanged.
+        check(!ClientLatentPredictor.integratesMovement(true, true, true, epoch, epoch + 1, true, true, true),
+                "Advanced epoch discards the stale pre-teleport delta on the arrival tick");
+        check(ClientLatentPredictor.integratesMovement(true, true, true, epoch + 1, epoch + 1, true, true, true),
+                "The tick after arrival integrates ordinary movement again (no freeze)");
+        // The reset must not mask broken chains: every guard still independently rejects.
+        check(!ClientLatentPredictor.integratesMovement(false, true, true, epoch, epoch, true, true, true), "Player change still resets prediction");
+        check(!ClientLatentPredictor.integratesMovement(true, false, true, epoch, epoch, true, true, true), "World change still resets prediction");
+        check(!ClientLatentPredictor.integratesMovement(true, true, false, epoch, epoch, true, true, true), "Missing last pose still resets prediction");
+        check(!ClientLatentPredictor.integratesMovement(true, true, true, epoch, epoch, false, true, true), "Mode change still resets prediction");
+        check(!ClientLatentPredictor.integratesMovement(true, true, true, epoch, epoch, true, true, false), "Semantic unreadiness still resets prediction");
+    }
+
+    /** The reported race: the synced epoch update is processed ONE CLIENT TICK BEFORE the arrival
+     * position packet. The predictor then records the new epoch against the pre-teleport pose, and a
+     * sub-band arrival passes the matching-epoch gate — unless prediction is re-seeded when the
+     * arrival position is actually applied (SpiritArrivalReseedMixin → PredictionContinuity). */
+    private static void arrivalReseedSurvivesEpochBeforeArrival() {
+        Object player = new Object(), world = new Object();
+        Vec3d pose = new Vec3d(10, 64, 10);
+
+        // Defect demonstration: without the arrival re-seed, the split-tick ordering integrates a
+        // 2-block arrival as chosen movement even though the epoch advance was published first.
+        PredictionContinuity unseeded = new PredictionContinuity();
+        check(unseeded.integrableDelta(player, world, pose, 7, true, true) == null, "Cold start re-baselines");
+        check(unseeded.integrableDelta(player, world, pose.add(0.25, 0, 0), 7, true, true) != null, "Ordinary walking integrates");
+        check(unseeded.integrableDelta(player, world, pose.add(0.25, 0, 0), 8, true, true) == null, "Epoch advance re-baselines (same-tick case closed)");
+        Vec3d defect = unseeded.integrableDelta(player, world, pose.add(2.25, 0, 0), 8, true, true);
+        check(defect != null && Math.abs(defect.x - 2) < 1e-9, "Epoch-before-arrival ordering integrates the 2-block arrival (the reported defect)");
+
+        // Reconciled sequence with the arrival re-seed applied by the client arrival mixin:
+        PredictionContinuity reconciled = new PredictionContinuity();
+        check(reconciled.integrableDelta(player, world, pose, 7, true, true) == null, "Cold start re-baselines");
+        check(reconciled.integrableDelta(player, world, pose.add(0.25, 0, 0), 7, true, true) != null, "Pre-teleport walking integrates");
+        // Tick with the epoch update only (position packet not yet applied): ZERO delta, new epoch
+        // recorded against the pre-teleport pose — the hazard state.
+        check(reconciled.integrableDelta(player, world, pose.add(0.25, 0, 0), 8, true, true) == null, "Epoch-only tick integrates nothing and re-baselines");
+        // Arrival position packet applied client-side → re-seed:
+        reconciled.onArrivalApplied();
+        Vec3d arrival = reconciled.integrableDelta(player, world, pose.add(2.25, 0, 0), 8, true, true);
+        check(arrival == null, "Applied 2-block arrival integrates NOTHING despite the matching epoch");
+        // Ordinary movement resumes on the next tick — no freeze, no suppression of real walking.
+        Vec3d resume = reconciled.integrableDelta(player, world, pose.add(2.5, 0, 0), 8, true, true);
+        check(resume != null && Math.abs(resume.x - 0.25) < 1e-9, "Post-arrival walking integrates normally");
+        // Re-seed is idempotent and safe outside teleports:
+        reconciled.onArrivalApplied();
+        check(reconciled.integrableDelta(player, world, pose.add(2.75, 0, 0), 8, true, true) == null, "Repeated re-seed keeps re-baselining safely");
+        // The re-seed must not mask the epoch gate: a STALE epoch still re-baselines after it.
+        reconciled.onArrivalApplied();
+        check(reconciled.integrableDelta(player, world, pose.add(3.0, 0, 0), 8, true, true) == null, "Re-seeded chain re-baselines once, then resumes");
+        check(reconciled.integrableDelta(player, world, pose.add(3.25, 0, 0), 8, true, true) != null, "Movement after the re-seeded tick integrates");
+    }
+
+    /** 1.21.1 PlayerPositionLook fixture: relative axes retain the old client velocity, absolute
+     * axes zero it. This models vanilla packet application; the subsequent arrival policy and
+     * prediction continuity are the REAL production implementations, not test replacements. */
+    private static Vec3d vanillaArrivalVelocity(PlayerPositionLookS2CPacket packet, Vec3d before) {
+        var flags = packet.getFlags();
+        return new Vec3d(flags.contains(PositionFlag.X) ? before.x : 0,
+                flags.contains(PositionFlag.Y) ? before.y : 0,
+                flags.contains(PositionFlag.Z) ? before.z : 0);
+    }
+
+    private static void relativeTeleportDropsClientMomentum() {
+        RegistryKey<World> spirit = RegistryKey.of(RegistryKeys.WORLD, Identifier.of("mysticism", "spirit"));
+        RegistryKey<World> source = RegistryKey.of(RegistryKeys.WORLD, Identifier.of("minecraft", "overworld"));
+        Vec3d velocity = new Vec3d(0.35, -0.0784, -0.2); // moving AND falling before /tp
+        Vec3d before = new Vec3d(10, 64, 10);
+        // /tp ~2 ~ ~: XYZ remain relative, so vanilla retains ALL three velocity components.
+        var relative = new PlayerPositionLookS2CPacket(2, 0, 0, 0, 0,
+                EnumSet.allOf(PositionFlag.class), 19);
+        Vec3d arrival = before.add(relative.getX(), relative.getY(), relative.getZ());
+        Vec3d retained = vanillaArrivalVelocity(relative, velocity);
+        check(retained.equals(velocity), "Relative teleport preserves nonzero vanilla client momentum (the reported defect)");
+        check(arrival.equals(new Vec3d(12, 64, 10)), "Relative teleport still arrives exactly two blocks away");
+
+        Object player = new Object(), world = new Object();
+        PredictionContinuity historyOnly = new PredictionContinuity();
+        historyOnly.integrableDelta(player, world, before, 8, true, true);
+        historyOnly.onArrivalApplied();
+        check(historyOnly.integrableDelta(player, world, arrival, 8, true, true) == null,
+                "Prediction-history reset discards the arrival itself");
+        Vec3d drift = historyOnly.integrableDelta(player, world, arrival.add(retained), 8, true, true);
+        check(drift != null && drift.squaredDistanceTo(retained) < 1e-20,
+                "History-only reset still integrates stale client momentum next tick");
+        Vec384f corrupted = q();
+        TraversalSteering.deepStep(corrupted, new Basis384f(), q(), drift.x, drift.y, drift.z);
+        check(corrupted.squareDistance(q()) > 0, "Retained relative-teleport momentum corrupts semantic travel");
+
+        // Same epoch-before-arrival ordering, now with BOTH prediction and physical state reset.
+        // Momentum policy is independent of deep/shallow mode and semantic readiness.
+        for (boolean deep : new boolean[] {true, false}) {
+            PredictionContinuity reconciled = new PredictionContinuity();
+            reconciled.integrableDelta(player, world, before, 7, deep, true);
+            reconciled.integrableDelta(player, world, before, 8, deep, true);
+            Vec3d stopped = TeleportReconciliation.velocityAfterArrival(spirit, retained);
+            reconciled.onArrivalApplied();
+            check(reconciled.integrableDelta(player, world, arrival, 8, deep, true) == null,
+                    "Relative arrival re-baselines prediction in either navigation mode");
+            Vec3d next = reconciled.integrableDelta(player, world, arrival.add(stopped), 8, deep, true);
+            check(next != null && next.equals(Vec3d.ZERO), "No stale client drift after relative arrival");
+            Vec384f latent = q();
+            TraversalSteering.advance(latent, new Basis384f(), next.x, next.y, next.z);
+            check(latent.squareDistance(q()) == 0, "Post-arrival rest does not advance semantic position");
+            Vec3d walking = reconciled.integrableDelta(player, world, arrival.add(0.25, 0, 0), 8, deep, true);
+            check(walking != null && walking.equals(new Vec3d(0.25, 0, 0)), "Fresh chosen movement resumes after arrival");
+        }
+
+        // All mixed XYZ combinations, with and without relative rotation. Absolute packets remain
+        // at rest; no relative component escapes spirit reconciliation. Source worlds keep vanilla
+        // semantics, including partial-axis momentum retention; don't rewrite packet flags to stop it.
+        PositionFlag[] axes = {PositionFlag.X, PositionFlag.Y, PositionFlag.Z};
+        for (int mask = 0; mask < 8; mask++) {
+            for (boolean relativeRotation : new boolean[] {false, true}) {
+                EnumSet<PositionFlag> flags = EnumSet.noneOf(PositionFlag.class);
+                for (int axis = 0; axis < 3; axis++) if ((mask & (1 << axis)) != 0) flags.add(axes[axis]);
+                if (relativeRotation) { flags.add(PositionFlag.X_ROT); flags.add(PositionFlag.Y_ROT); }
+                var packet = new PlayerPositionLookS2CPacket(2, 64, 10, 15, -5, flags, 20 + mask);
+                Vec3d vanilla = vanillaArrivalVelocity(packet, velocity);
+                check(TeleportReconciliation.velocityAfterArrival(spirit, vanilla).equals(Vec3d.ZERO),
+                        "Spirit arrivals clear every relative-axis momentum combination");
+                check(TeleportReconciliation.velocityAfterArrival(source, vanilla) == vanilla,
+                        "Non-spirit arrivals preserve vanilla relative/absolute momentum semantics");
+            }
+        }
+    }
+
+    private static void arrivalResetsOnlyArrivingPlayersMovement() {
+        var arriving = new SpiritNavigationService.Session();
+        var other = new SpiritNavigationService.Session();
+        for (var s : new SpiritNavigationService.Session[] {arriving, other}) {
+            s.unsupported = 13;
+            s.supportY = 64;
+            s.movement.record(100, new Vec3d(1,64,1), new Vec3d(1.2,64,1));
+            s.airborne = true; s.restingTicks = 9;
+            s.blendFrom = new Basis384f(); s.blendTo = new Basis384f(); s.blendTick = 15;
+            s.attemptedLanding = true; s.warnedLanding = true;
+            s.semanticReady = true; s.checkedRestore = true;
+            s.targetSnapshot = q(); s.capture = new java.util.concurrent.CompletableFuture<>();
+            s.walkRetry.failed(100);
+        }
+        var captured = arriving.targetSnapshot; var capture = arriving.capture;
+        SpiritNavigationService.resetArrivalMovement(arriving);
+        check(arriving.unsupported == 0,
+                "Arrival drops pre-teleport shallow fall/step history");
+        check(Double.isNaN(arriving.supportY), "Arrival cannot reuse pre-teleport support height in shallow landing envelope");
+        check(arriving.movement.momentum(101,Vec3d.ZERO).equals(Vec3d.ZERO),
+                "Arrival clears accepted pre-teleport handoff momentum");
+        check(other.supportY == 64 && other.movement.momentum(101,Vec3d.ZERO).lengthSquared()>0,
+                "Another player's measured support and accepted momentum remain usable");
+        check(!arriving.airborne && arriving.restingTicks == 0,
+                "Arrival drops pre-teleport contact history, not a natural landing at the old floor");
+        check(arriving.blendFrom == null && arriving.blendTo == null && arriving.blendTick == 0,
+                "Arrival cannot resume a stale pre-teleport touch basis blend");
+        check(!arriving.attemptedLanding && !arriving.warnedLanding,
+                "Arrival may revalidate its new captured-target contact");
+        check(arriving.semanticReady && arriving.checkedRestore && arriving.targetSnapshot == captured
+                        && arriving.capture == capture && !capture.isCancelled(),
+                "Movement reset retains real readiness and the player's captured target/discovery");
+        check(arriving.walkRetry.remaining(100) == 60, "Arrival does not bypass anti-spam cooldown");
+        check(other.unsupported == 13
+                        && other.airborne && other.restingTicks == 9 && other.blendTo != null
+                        && other.blendTick == 15 && other.attemptedLanding && other.semanticReady,
+                "Arrival cannot mutate another player's movement or readiness");
+        SpiritNavigationService.resetArrivalMovement(arriving);
+        check(arriving.semanticReady && arriving.blendTo == null, "Repeated arrival reset is safe");
+    }
+
+    public static void main(String[] args) {
+        arrivalDeltaIsNotSemanticTravel();
+        predictionEpochAdvancesOnEveryArrival();
+        predictionEpochPersists();
+        predictorGateDropsStaleArrivalDelta();
+        arrivalReseedSurvivesEpochBeforeArrival();
+        relativeTeleportDropsClientMomentum();
+        arrivalResetsOnlyArrivingPlayersMovement();
+        System.out.println("TeleportArrivalReconciliationTest: " + checks + " checks passed");
+    }
+}

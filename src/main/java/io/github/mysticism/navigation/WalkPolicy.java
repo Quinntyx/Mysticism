@@ -23,8 +23,8 @@ public final class WalkPolicy {
     /** Ascending takeoff keeps ordinary jump grace; walking off an edge is immediate freeflight. */
     public static final int JUMP_GRACE_TICKS = 14;
     /** How far below the last supported feet height a jump/step-down may fall and still land back
-     * on its supporting projected terrain (one carrier step height). */
-    public static final double LANDING_ENVELOPE = .6;
+     * on its supporting projected terrain (one ordinary source-block descent). */
+    public static final double LANDING_ENVELOPE = 1.0;
     /** Bounded air budget for any continuous unsupported shallow interval, however it arose. */
     public static final int AIR_GRACE_TICKS = 60;
     /** Ticks without any current support candidate before a walk request cancels itself. */
@@ -88,8 +88,11 @@ public final class WalkPolicy {
         return q.clone().converge(target, SLIDE_FRACTION);
     }
 
-    /** During a walk request q integrates along the destination source grid once known. */
+    /** A pending request still moves through the CURRENT observer frame, just like prediction.
+     * The destination grid is for guarded alignment, not a second movement coordinate system:
+     * integrating it early diverges from the client's current mesh on every direction change.
+     * The bounded post-alignment slide closes any source-coordinate residual at acquisition. */
     public static Basis384f integrationBasis(Basis384f current, Basis384f destination) {
-        return destination != null ? destination : current;
+        return current;
     }
 }

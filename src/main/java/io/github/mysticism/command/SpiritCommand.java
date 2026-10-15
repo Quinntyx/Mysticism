@@ -1,8 +1,8 @@
 package io.github.mysticism.command;
 
 import com.mojang.brigadier.CommandDispatcher;
-import io.github.mysticism.component.MysticismEntityComponents;
 import io.github.mysticism.navigation.SpiritNavigationService;
+import io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
@@ -16,6 +16,10 @@ public final class SpiritCommand {
                 .executes(context -> status(context.getSource().getPlayerOrThrow()))
                 .then(literal("enter").executes(context -> SpiritNavigationService.enter(context.getSource().getPlayerOrThrow()) ? 1 : 0))
                 .then(literal("leave").executes(context -> SpiritNavigationService.exit(context.getSource().getPlayerOrThrow()) ? 1 : 0))
+                .then(literal("terrain").executes(context -> {
+                    var p=context.getSource().getPlayerOrThrow();
+                    p.sendMessage(Text.literal(SpiritTerrainService.terrainEvidence(p)),false);return 1;
+                }))
                 .then(literal("deep").executes(context -> {
                     var p = context.getSource().getPlayerOrThrow();
                     SpiritNavigationService.enterDeep(p); return status(p);
@@ -23,11 +27,9 @@ public final class SpiritCommand {
                 .then(literal("capture").executes(context -> SpiritNavigationService.captureHere(context.getSource().getPlayerOrThrow()) ? 1 : 0)));
     }
     private static int status(ServerPlayerEntity p) {
-        var nav = p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION);
-        p.sendMessage(Text.literal("Spirit " + (!nav.active() ? "inactive" : nav.deep() ? "deep" : "shallow")
-                + "; source " + nav.sourceDimension() + " " + nav.landmarkId() + " " + nav.sourcePosition()
-                + "; target " + (nav.hasShallowTarget() ? nav.targetDimension() + " " + nav.targetLandmarkId()
-                + " " + nav.targetBlock().toShortString() : "concept vector")), false);
+        // Real current navigation progress: mode, semantic readiness, live walk-request state,
+        // retry cooldown, landing approach, captured target and pending discovery.
+        p.sendMessage(Text.literal(SpiritNavigationService.status(p)), false);
         return 1;
     }
 }

@@ -130,8 +130,8 @@ public final class ShallowWalkLocalityTest {
         coordinate=addScaled(coordinate,grid.i,p.x);
         double error=worldError(coordinate,q,grid);
         check(error>1e-6,"Movement with a misaligned basis must reproduce the unreachable acquisition gate");
-        // Walk request accepted: integrate along the destination grid and slide the residual closed.
-        check(WalkPolicy.integrationBasis(rotated,grid)==grid,"Pending integration must use the destination grid");
+        // Pending motion uses the visible observer frame; align first, then slide the residual closed.
+        check(WalkPolicy.integrationBasis(rotated,grid)==rotated,"Pending integration must match prediction until alignment actually commits");
         check(WalkPolicy.integrationBasis(rotated,null)==rotated,"Before a destination is known the current basis integrates");
         for(int t=0;t<90 && WalkPolicy.slideNeeded(worldError(coordinate,q,grid));t++)
             q=WalkPolicy.slidToward(q,coordinate);

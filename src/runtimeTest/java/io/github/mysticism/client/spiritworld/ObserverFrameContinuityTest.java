@@ -255,12 +255,35 @@ public final class ObserverFrameContinuityTest {
         } catch (IllegalArgumentException expected) { checks++; }
     }
 
+    /** The support grid may differ while alignment is still held by terrain clearance. Neither
+     * server nor client may integrate movement as if the destination had already committed. */
+    private static void pendingWalkMovementUsesVisibleFrame() {
+        Vec384f server = scaled(0, .01f), target = scaled(2,.1f);
+        Vec384f oldDestinationIntegration = server.clone();
+        Basis384f destination = new Basis384f(axis(2),axis(1),axis(0).mul(-1));
+        for (int tick=0; tick<160; tick++) {
+            Basis384f current = TraversalSteering.blend(IDENTITY,destination, (tick%40)/40f);
+            Vec3d delta = new Vec3d(Math.sin(tick*.3)*.2, Math.cos(tick*.2)*.03, Math.cos(tick*.3)*.2);
+            ClientSpiritCache.clear();
+            ClientSpiritCache.updateNavigation(true,true,"minecraft:overworld",Vec3d.ZERO,EPOCH);
+            ClientLatentPredictor.advanceFrame(server.clone(),current.clone(),target,delta,true,true,false,false,true);
+            TraversalSteering.advance(server,io.github.mysticism.navigation.WalkPolicy.integrationBasis(current,destination),
+                    delta.x,delta.y,delta.z);
+            TraversalSteering.advance(oldDestinationIntegration,destination,delta.x,delta.y,delta.z);
+            near(ClientSpiritCache.playerLatentPos.squareDistance(server),0,1e-12);
+        }
+        check(server.squareDistance(oldDestinationIntegration)>1e-8,
+                "fixture catches early destination-grid integration through changing observer frames");
+        ClientSpiritCache.clear();
+    }
+
     private static SpiritGlyphFrame frame(Vec3d head, float tickDelta) {
         return new SpiritGlyphFrame(ClientSpiritCache.interpolatedPos(tickDelta),
                 ClientSpiritCache.interpolatedBasis(tickDelta), head, ClientSpiritCache.interpolatedOffset(tickDelta));
     }
 
     public static void main(String[] args) {
+        pendingWalkMovementUsesVisibleFrame();
         predictionKeepsSceneWorldFixed();
         movingSyncRevisionIsCompensated();
         stationaryAndTransitionRevisionsSnap();
