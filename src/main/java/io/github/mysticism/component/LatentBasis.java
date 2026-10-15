@@ -20,12 +20,27 @@ public final class LatentBasis implements ComponentV3, AutoSyncedComponent {
 
     // Requires Basis384f to have public constructors.
     private Basis384f basis = new Basis384f();
+    /** True only for client-side player instances: sync application consults prediction. */
+    private final boolean clientSide;
+    /** Client predictor hook; never set on server instances, so persistence is untouched. */
+    private SyncReconciler reconciler;
 
-    public LatentBasis() {}
-
-    public LatentBasis(Basis384f initial) {
-        set(initial);
+    /** Client-side arrival policy for an authoritative sync. Runs on the client main thread. */
+    public interface SyncReconciler {
+        /** @return the basis this component must hold after the sync (may mutate either argument). */
+        Basis384f reconcile(Basis384f serverValue, Basis384f current);
     }
+
+    public LatentBasis() { this(false); }
+
+    public LatentBasis(Basis384f initial) { this(false); set(initial); }
+
+    /** Entity-component factories pass the owning world side; server instances never reconcile. */
+    public LatentBasis(boolean clientSide) { this.clientSide = clientSide; }
+
+    /** Installed by the client predictor on the LOCAL player's component only. */
+    public void setSyncReconciler(SyncReconciler reconciler) { this.reconciler = reconciler; }
+    public boolean hasSyncReconciler() { return reconciler != null; }
 
     /** Returns the live basis (mutable). */
     public Basis384f get() {
@@ -58,11 +73,16 @@ public final class LatentBasis implements ComponentV3, AutoSyncedComponent {
 
     @Override
     public void readFromNbt(NbtCompound tag, RegistryWrapper.WrapperLookup wrapperLookup) {
+        Basis384f decoded = null;
         if (EmbeddingNbt.compatible(tag) && tag.contains("b", NbtElement.INT_ARRAY_TYPE)) {
-            try { this.basis = Basis384f.fromBits(tag.getIntArray("b")); return; }
-            catch (IllegalArgumentException incompatible) { /* Discard obsolete/corrupt semantic data. */ }
+            try { decoded = Basis384f.fromBits(tag.getIntArray("b")); }
+            catch (IllegalArgumentException incompatible) { decoded = null; }
         }
-        this.basis = new Basis384f();
+        if (decoded == null) decoded = new Basis384f();
+        // Server load and non-predicting clients adopt plainly; the predicting client consults
+        // the installed policy so syncs never regress healthy in-flight basis prediction.
+        var policy = clientSide ? reconciler : null;
+        this.basis = policy == null ? decoded : policy.reconcile(decoded, this.basis);
     }
 
     @Override

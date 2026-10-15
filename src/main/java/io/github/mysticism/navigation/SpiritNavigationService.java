@@ -8,12 +8,14 @@ import io.github.mysticism.dimension.spiritworld.terrain.MeshCollision;
 import io.github.mysticism.dimension.spiritworld.SpiritBasisEvolver;
 import io.github.mysticism.landmark.*;
 import io.github.mysticism.net.SpiritScenePayload;
+import io.github.mysticism.net.SpiritFlightCorrectionPayload;
 import io.github.mysticism.vector.*;
 import net.fabricmc.fabric.api.entity.event.v1.*;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerWorldEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.server.MinecraftServer;
@@ -40,12 +42,17 @@ public final class SpiritNavigationService {
     }
     private static LandingSafety landingSafety;
     public static void installLandingSafety(LandingSafety safety) { landingSafety = Objects.requireNonNull(safety); }
+    /** How far below a descending actor an approach may discover the support it will land on, so
+     * guarded source-grid alignment and descent proof prewarming run BEFORE actual contact. */
+    private static final double WALK_APPROACH_DEPTH = 24;
     private SpiritNavigationService() {}
     private static final class Session {
         int unsupported, entrySupportTicks, blendTick, landingTick;
         WalkIntent walkIntent;
         boolean attemptedLanding, semanticReady, checkedRestore, warnedAnchor, prefetched, confirmedOwned, warnedLanding, jumping;
         final WalkingModePolicy.Alignment alignment = new WalkingModePolicy.Alignment();
+        /** Gesture/correction arbitration is independent of the bounded walk lifetime. */
+        final WalkIntentTracker walk = new WalkIntentTracker();
         Vec384f targetSnapshot, supportTargetSnapshot;
         Basis384f blendFrom, blendTo, landingFrom;
         CompletableFuture<?> capture;
@@ -123,10 +130,25 @@ public final class SpiritNavigationService {
     }
     private static void flight(ServerPlayerEntity p, boolean deep) { flight(p, deep, false); }
     private static void flight(ServerPlayerEntity p, boolean deep, boolean acknowledgeToggle) {
-        boolean changed = acknowledgeToggle || !p.getAbilities().allowFlying || p.getAbilities().flying != deep;
+        boolean changed = acknowledgeToggle || !p.getAbilities().allowFlying || p.getAbilities().flying != deep
+                || session(p).walk.correctionConflicts(deep);
         p.getAbilities().allowFlying = true; p.getAbilities().flying = deep;
         p.setNoGravity(false); p.fallDistance = 0;
-        if (changed) p.sendAbilitiesUpdate();
+        if (changed) {
+            p.sendAbilitiesUpdate();
+            // Sending is not receipt. Keep stale off packets suppressed until the client echoes
+            // this ordered barrier, rather than rearming walking during retarget/cancellation.
+            ServerPlayNetworking.send(p, new SpiritFlightCorrectionPayload(session(p).walk.serverCorrected(deep)));
+        }
+    }
+
+    /** Networking verifies the live connection/player before invoking this on the server thread.
+     * Never create a session for a delayed acknowledgment after exit, respawn or disconnect. */
+    public static void acknowledgeFlightCorrection(ServerPlayerEntity p, UUID token) {
+        if (!spirit(p)) return;
+        Map<UUID, Session> sessions = SERVERS.get(p.getServer());
+        Session s = sessions == null ? null : sessions.get(p.getUuid());
+        if (s != null) s.walk.acknowledgeCorrection(token);
     }
 
     public static boolean enter(ServerPlayerEntity p) {
@@ -246,17 +268,24 @@ public final class SpiritNavigationService {
         }
     }
 
-    /** Vanilla false-flight requests current support, not a remembered entry or captured destination. */
+    /** Vanilla false-flight requests current support, not a remembered entry or captured destination.
+     * Only a fresh client gesture (state edge) may start a walk: a retransmitted or stale flight-off
+     * packet must never restart a request or override the latest requested destination. */
     public static void onFlightToggle(ServerPlayerEntity p, boolean flying) {
         if (!spirit(p)) return;
-        if (flying) { enterDeep(p); return; }
+        Session s = session(p);
+        var request = s.walk.flightRequest(flying);
+        // Flight-on is an explicit cancellation even when a server correction recorded the same
+        // state. Conversely stale off packets cannot resurrect a superseded/expired request.
+        if (request == WalkIntentTracker.FlightRequest.DEEP) { enterDeep(p); return; }
         if (!state(p).active()) enterDeep(p);
         if (!state(p).deep()) { flight(p, false); return; }
-        Session s = session(p); restoreAnchor(p, s);
-        // Vanilla may have already rejected flying=false, but the client toggled locally. Always
-        // acknowledge the retained deep flight, even for duplicate requests, exactly once.
+        restoreAnchor(p, s);
+        // Vanilla may reject flight-off, but the client already toggled locally. Acknowledge
+        // retained usable flight through the ordered barrier even for duplicate requests.
         flight(p, true, true);
-        if (!s.alignment.begin()) return;
+        if (s.walk.pending() || request != WalkIntentTracker.FlightRequest.WALK || !s.walk.startWalk()) return;
+        s.alignment.begin();
         endApproach(p, s); s.blendFrom = null; s.blendTo = null;
         s.walkIntent = new WalkIntent();
         s.supportTargetSnapshot = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target();
@@ -266,7 +295,7 @@ public final class SpiritNavigationService {
     private static void endSupportApproach(ServerPlayerEntity p, Session s) {
         // Explicit cancellation also releases proofs retained after bounded expiry.
         SpiritTerrainService.cancelCurrentSupport(p);
-        s.supportTargetSnapshot = null; s.walkIntent = null; s.alignment.reset();
+        s.walk.endWalk(); s.supportTargetSnapshot = null; s.walkIntent = null; s.alignment.reset();
         if (state(p).supportApproach()) { state(p).setSupportApproach(false); sync(p); }
     }
 
@@ -274,7 +303,7 @@ public final class SpiritNavigationService {
      * RETAINED: a repeated walk request reuses it instead of restarting the expensive source
      * fetch. Retry still has to pass all current ownership/contact/continuity checks. */
     private static void expireSupport(ServerPlayerEntity p, Session s, WalkIntent.Reason reason) {
-        s.supportTargetSnapshot = null; s.walkIntent = null; s.alignment.reset();
+        s.walk.endWalk(); s.supportTargetSnapshot = null; s.walkIntent = null; s.alignment.reset();
         flight(p, true, true); // Re-acknowledge usable flight, including the client's local toggle.
         if (state(p).supportApproach()) { state(p).setSupportApproach(false); sync(p); }
         p.sendMessage(Text.literal("Walk request ended: " + reason.message()
@@ -386,54 +415,59 @@ public final class SpiritNavigationService {
     private static void attemptSupport(ServerPlayerEntity p, Session s, Vec3d delta) {
         var nav = state(p); var component = p.getComponent(MysticismEntityComponents.LATENT_BASIS);
         var q = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
-        if (s.semanticReady) WalkingModePolicy.advanceSupport(q, component.get(), delta.x, delta.y, delta.z);
-        if (s.walkIntent == null) { endSupportApproach(p, s); return; }
-        // Cancel invalid intents before spending any discovery/alignment budget.
-        if (s.supportTargetSnapshot.squareDistance(p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target()) > 0) {
+        // Check epochs and explicit re-keys BEFORE spending discovery/alignment budgets or
+        // moving q. Background personal drift is not a newer destination request.
+        if (s.walk.superseded()) {
             endSupportApproach(p, s);
-            p.sendMessage(Text.literal("Walk request cancelled after attunement changed; captured target was not altered by landing."), true);
+            p.sendMessage(Text.literal("Walk request superseded by a newer requested destination; remaining deep."), true);
             return;
         }
-        // Phase 1: late real source discovery has its own bounded wait, not a false no-floor stall.
+        if (s.walkIntent == null) { endSupportApproach(p, s); return; }
+        var attunement = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT);
+        var attunementTarget = attunement.target();
+        if (WalkIntentTracker.attunementSupersedes(s.supportTargetSnapshot, attunementTarget, attunement.explicitTarget())) {
+            endSupportApproach(p, s);
+            p.sendMessage(Text.literal("Walk request cancelled: an explicit destination re-key supersedes it."), true);
+            return;
+        }
+        s.supportTargetSnapshot = attunementTarget;
+        if (s.semanticReady) WalkingModePolicy.advanceSupport(q, component.get(), delta.x, delta.y, delta.z);
+        // Late real source discovery has its own bounded wait, not a false no-floor stall.
         if (!s.semanticReady) {
             if (s.walkIntent.tick(false, false).outcome() == WalkIntent.Outcome.EXPIRED)
                 expireSupport(p, s, s.walkIntent.expiryReason());
             return;
         }
-        // Query once. Actual current-contact proof IO is pending-valid, under the absolute bound.
         var found = SpiritTerrainService.currentSupport(p);
-        boolean proofPending = SpiritTerrainService.currentSupportProofPending(p);
-        var evaluation = s.walkIntent.tick(true, found.isPresent(), proofPending);
+        // A candidate below the actor can prepare alignment/proof before contact, but NEVER
+        // authorizes acquisition. Final commit still requires currentSupport and all terrain gates.
+        var support = found.orElseGet(() -> SpiritTerrainService.approachSupport(p, WALK_APPROACH_DEPTH).orElse(null));
+        boolean proofPending = SpiritTerrainService.currentSupportProofPending(p, WALK_APPROACH_DEPTH);
+        var evaluation = s.walkIntent.tick(true, support != null, proofPending);
         if (evaluation.outcome() == WalkIntent.Outcome.EXPIRED) { expireSupport(p, s, evaluation.reason()); return; }
-        if (found.isEmpty()) return; // Terrain starts/reuses bounded exact source-cell proof, never a join.
-        var support = found.get(); Basis384f destination = support.sourceBasis();
-        // Source IO is not alignment stall. Once a candidate exists, only actual convergence
-        // re-arms this budget; rebinding/oscillation cannot extend it indefinitely. The lifetime
-        // machine still bounds the entire request even if convergence keeps making tiny progress.
+        if (support == null) return;
+        Basis384f destination = support.sourceBasis();
+        // Source IO is not alignment stall. Only actual convergence re-arms the stall window;
+        // rebinding or oscillating contacts cannot extend the absolute request lifetime.
         if (s.alignment.stalled(WalkingModePolicy.Alignment.error(component.get(), destination), proofPending)) {
             expireSupport(p, s, WalkIntent.Reason.UNRESOLVABLE_SUPPORT); return;
         }
-        // First contact binds the request; a changed window/ownership/basis re-bases the SAME request
-        // onto the current support instead of failing it and demanding another flight toggle.
+        // Changed support re-bases the SAME request from the live basis, retaining its budgets.
         s.alignment.bind(component.get(), destination, support.windowIdentity(), support.landmarkId(), support.sourceDimension());
         Basis384f before = component.get();
         boolean aligned = WalkingModePolicy.Alignment.error(before, destination) < WalkingModePolicy.Alignment.ALIGNED;
         Basis384f proposed = s.alignment.proposed(before, destination);
         if (WalkingModePolicy.Alignment.discontinuous(before, proposed)) {
-            // Restart the blend from the actual current basis once; only a genuinely unreachable
-            // source-grid alignment ends the request.
             if (!s.alignment.restartFrom(before, destination)) {
-                endSupportApproach(p, s);
-                p.sendMessage(Text.literal("Source-grid alignment would be discontinuous; remaining deep on current geometry."), true);
-                return;
+                expireSupport(p, s, WalkIntent.Reason.UNRESOLVABLE_SUPPORT); return;
             }
             proposed = s.alignment.proposed(before, destination);
         }
-        // q already represents ACTUAL movement in the previous frame. Validate the joint current-q /
-        // proposed-basis scene before application. No attraction to sourceCoordinate or user target.
-        if (!SpiritTerrainService.canAlign(p, proposed)) return;
+        // Validate the joint current-q / proposed-basis scene before applying. Refusal re-plans
+        // at a smaller pace, acceptance recovers pace; never freeze on the same rejected step.
+        if (!SpiritTerrainService.canAlign(p, proposed)) { s.alignment.held(before); return; }
         if (!aligned) { component.set(proposed); s.alignment.applied(); }
-        if (basisError(component.get(), destination) >= 1e-8f) return;
+        if (basisError(component.get(), destination) >= WalkingModePolicy.Alignment.ALIGNED || found.isEmpty()) return;
         // This real terrain operation rechecks current contact, window identity, ownership revision,
         // source body/floor clearance and whole-frame continuity, and never sets q/basis/body position.
         if (!SpiritTerrainService.acquireCurrentSupport(p, support)) return;
@@ -549,7 +583,9 @@ public final class SpiritNavigationService {
         state(p).target(dimension, id, foot, basis);
         p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).set(embedding.clone());
         sync(p); MysticismEntityComponents.LATENT_ATTUNEMENT.sync(p);
-        Session s = session(p); s.attemptedLanding = false; s.prefetched = true; s.warnedLanding = false;
+        Session s = session(p);
+        s.walk.bumpDestination(); // A newer explicit destination supersedes any pending walk intent.
+        s.attemptedLanding = false; s.prefetched = true; s.warnedLanding = false;
         endSupportApproach(p, s); endApproach(p, s);
         if (spirit(p)) SpiritTerrainService.prefetchTarget(p, dimension, id, foot, embedding, basis);
         else s.prefetched = false;
@@ -579,7 +615,17 @@ public final class SpiritNavigationService {
     private static boolean captureSource(ServerPlayerEntity p, String dimension, Vec3d foot, String requiredId) {
         BlockPos block = BlockPos.ofFloored(foot); // ownership seed only; never the captured feet
         Session s = session(p);
-        if (s.capture != null && !s.capture.isDone()) { p.sendMessage(Text.literal("Source discovery already pending."), false); return false; }
+        if (s.capture != null && !s.capture.isDone()) {
+            // The latest requested destination wins: an older pending discovery never rejects or
+            // outlives a newer capture. Its stale completion is dead via the capture nonce.
+            s.capture.cancel(false);
+            p.sendMessage(Text.literal("Superseding the older pending source discovery with this capture."), false);
+        }
+        // Accepting a capture is a destination request: supersede older navigation intents NOW,
+        // not only when delayed discovery completes, so an older pending walk can never commit
+        // shallow mode against the pre-capture destination in the meantime.
+        state(p).clearTarget();
+        explicitDestinationChange(p);
         var server = p.getServer();
         // Snapshot the source-grid basis before async completion, not a later moving deep basis.
         Basis384f basis = state(p).active() && !state(p).deep() ? p.getComponent(MysticismEntityComponents.LATENT_BASIS).get().clone() : new Basis384f();
@@ -598,6 +644,18 @@ public final class SpiritNavigationService {
             p.sendMessage(Text.literal("Captured " + metadata.id() + " at " + dimension + " " + block.toShortString() + " (vector snapshot)."), false);
         }));
         p.sendMessage(Text.literal("Capturing generated source landmark asynchronously…"), false); return true;
+    }
+    /** An explicit concept/attunement re-key without a new shallow capture (e.g. /myst set attune
+     * or the personal-concept capture) is still a destination request: it supersedes any pending
+     * walk intent or landing pursuit, which must never complete against the older destination. */
+    public static void explicitDestinationChange(ServerPlayerEntity p) {
+        // Keep delayed capture invalidation in the destination API, not only in command callers.
+        // A queued old capture callback must not replace this newer explicit destination.
+        cancelCapture(p);
+        Session s = session(p);
+        s.walk.bumpDestination();
+        endSupportApproach(p, s); endApproach(p, s);
+        s.targetSnapshot = null; s.attemptedLanding = false; s.warnedLanding = false;
     }
     /** Caller validates BOTH projected reach/alignment/collision rays before invoking. */
     public static void touch(ServerPlayerEntity actor, ServerPlayerEntity target) {

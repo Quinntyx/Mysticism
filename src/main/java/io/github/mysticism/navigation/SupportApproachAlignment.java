@@ -1,0 +1,57 @@
+package io.github.mysticism.navigation;
+
+import io.github.mysticism.vector.Basis384f;
+
+/** Guarded source-grid alignment pacing for support approaches.
+ *
+ * A walk request must be able to FINISH once the actual support becomes available. The old
+ * schedule blended from a fixed anchor at a fixed fraction (acceptedStep+1)/40 and simply froze
+ * whenever the terrain transition guard refused a step — but the guard refuses any rotation whose
+ * swept render motion reaches the body, which is exactly the state of an actor hovering just above
+ * the support it asked to walk on. One refused step therefore deadlocked the whole approach until
+ * the 200-tick expiry, so every walk request taken with a genuinely rotated deep basis failed
+ * repeatedly and the actor stayed in flight.
+ *
+ * The policy keeps the bounded guarded-step contract but makes refused steps RE-PLAN instead of
+ * freeze: the controller re-anchors the blend at the live basis and halves the pace (bounded
+ * below), so each refused step retries with a smaller swept motion that can fit under the guard,
+ * and each epoch still converges to the EXACT destination basis (fraction reaches 1), which the
+ * strict acquisition gate requires. */
+public final class SupportApproachAlignment {
+    /** Approved full-pace schedule: an unguarded alignment completes in at most 40 accepted steps. */
+    public static final float INITIAL_PACE = 1 / 40f;
+    /** Refusal ratchet floor: even a full remaining rotation stepped at this pace moves rendered
+     * geometry well under the transition guard's body clearance, so progress never freezes. */
+    public static final float MIN_PACE = 1 / 5120f;
+    /** Single-step discontinuity refusal (squared per-axis component delta), unchanged contract. */
+    public static final float MAX_STEP_SQUARE = .01f;
+    private SupportApproachAlignment() {}
+
+    /** Blend fraction of the CURRENT epoch anchor toward the destination for the next guarded step. */
+    public static float fraction(float progress, float pace) {
+        float next = progress + pace;
+        // Forty float additions of 1/40 can stop just below one. Finish the epoch
+        // exactly, rather than holding a tiny residual forever at the aligned gate.
+        // The proposed final step still passes the same swept/discontinuity guards.
+        return next >= 1f - 1e-6f ? 1f : next;
+    }
+
+    /** A refused step must never repeat identically: halve the pace so the retry sweeps less. */
+    public static float paceOnHold(float pace) {
+        return Math.max(pace / 2f, MIN_PACE);
+    }
+
+    /** A step that passed the terrain guard AND the continuity check proves this pace is safe again:
+     * recover toward full pace so transient refusals never permanently cripple the remaining request
+     * budget. Without recovery, three early refusals strand the pace at 1/320 and a 200-tick request
+     * reaches only interpolation fraction ~0.616 — the approach can never align and always expires. */
+    public static float paceOnAccept(float pace) {
+        return Math.min(INITIAL_PACE, pace * 2f);
+    }
+
+    /** True when applying the proposed basis in one step would be a discontinuous jump. */
+    public static boolean discontinuous(Basis384f before, Basis384f proposed) {
+        return before.i.squareDistance(proposed.i) > MAX_STEP_SQUARE || before.j.squareDistance(proposed.j) > MAX_STEP_SQUARE
+                || before.k.squareDistance(proposed.k) > MAX_STEP_SQUARE;
+    }
+}

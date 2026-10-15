@@ -46,6 +46,8 @@ public final class WalkingModePolicy {
         public String id = "", dimension = "";
         public int stall, alignTick;
         public float stallError = Float.MAX_VALUE;
+        /** Guarded pacing belongs to the same binding epoch as from/grid, not the lifetime. */
+        public float progress, pace = SupportApproachAlignment.INITIAL_PACE;
         private boolean pending;
 
         public boolean pending() { return pending; }
@@ -60,6 +62,7 @@ public final class WalkingModePolicy {
             pending = false;
             from = null; grid = null; window = 0; id = ""; dimension = "";
             stall = 0; alignTick = 0; stallError = Float.MAX_VALUE;
+            progress = 0; pace = SupportApproachAlignment.INITIAL_PACE;
         }
 
         /** Bind (or re-base) this request onto the current support. True means the binding changed;
@@ -68,6 +71,7 @@ public final class WalkingModePolicy {
             if (from == null || this.window != window || !this.id.equals(id) || !this.dimension.equals(dimension)
                     || error(grid, destination) > BINDING) {
                 from = current.clone(); grid = destination.clone(); alignTick = 0;
+                progress = 0; pace = SupportApproachAlignment.INITIAL_PACE;
                 this.window = window; this.id = id; this.dimension = dimension;
                 return true;
             }
@@ -76,17 +80,27 @@ public final class WalkingModePolicy {
 
         public Basis384f proposed(Basis384f current, Basis384f destination) {
             if (error(current, destination) < ALIGNED) return current.clone();
-            return TraversalSteering.blend(from, destination, (alignTick + 1) / (float) ALIGN_STEPS);
+            return TraversalSteering.blend(from, destination, SupportApproachAlignment.fraction(progress, pace));
         }
 
         /** Restart the blend from the actual current basis. False only when even a single minimal
          * step toward the destination would be discontinuous, i.e. alignment is genuinely unreachable. */
         public boolean restartFrom(Basis384f current, Basis384f destination) {
-            from = current.clone(); alignTick = 0;
-            return !discontinuous(current, TraversalSteering.blend(from, destination, 1 / (float) ALIGN_STEPS));
+            from = current.clone(); alignTick = 0; progress = 0;
+            return !discontinuous(current, proposed(current, destination));
         }
 
-        public void applied() { if (alignTick < ALIGN_STEPS) ++alignTick; }
+        /** Refused swept steps re-plan from the live basis, preserving stall/lifetime budgets. */
+        public void held(Basis384f current) {
+            from = current.clone(); progress = 0; alignTick = 0;
+            pace = SupportApproachAlignment.paceOnHold(pace);
+        }
+
+        public void applied() {
+            if (alignTick < ALIGN_STEPS) ++alignTick;
+            progress = SupportApproachAlignment.fraction(progress, pace);
+            pace = SupportApproachAlignment.paceOnAccept(pace);
+        }
 
         /** Records this tick's source-grid alignment error. Real progress re-arms the bounded
          * stall window. @return true when the request expired with no progress for a full window. */

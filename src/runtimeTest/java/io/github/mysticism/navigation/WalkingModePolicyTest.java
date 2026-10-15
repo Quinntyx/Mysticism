@@ -136,6 +136,54 @@ public final class WalkingModePolicyTest {
                 "tiny progress/rebinding cannot make a request immortal");
     }
 
+    /** Refusals, publication changes, duplicate toggles and a late proof must compose in the
+     * same production alignment object, not two competing schedules from the merge parents. */
+    private static void guardedRetryAndRetarget() {
+        var alignment = new WalkingModePolicy.Alignment();
+        var tracker = new WalkIntentTracker();
+        var lifetime = new WalkIntent();
+        var live = unitBasis(.8); var destination = new Basis384f();
+        check(tracker.flightRequest(false) == WalkIntentTracker.FlightRequest.WALK && tracker.startWalk(), "fresh walk starts");
+        alignment.begin(); alignment.bind(live, destination, 1, "floor", "overworld");
+        var refused = alignment.proposed(live, destination);
+        alignment.held(live);
+        check(alignment.pace < SupportApproachAlignment.INITIAL_PACE && alignment.progress == 0,
+                "refusal replans from live basis at a smaller pace");
+        check(WalkingModePolicy.Alignment.error(live, alignment.proposed(live, destination))
+                        < WalkingModePolicy.Alignment.error(live, refused), "retry cannot repeat the held step");
+        for (int tick = 0; tick < 600; tick++) {
+            check(tracker.flightRequest(false) == WalkIntentTracker.FlightRequest.IGNORE,
+                    "duplicates do not restart a pending request");
+            check(!alignment.begin(), "duplicates cannot reset guarded pacing/lifetime");
+            check(lifetime.tick(true, true, true).outcome() != WalkIntent.Outcome.EXPIRED,
+                    "real proof IO survives the old 200-tick deadline");
+            check(!alignment.stalled(1, true), "real proof IO is not failed convergence");
+        }
+        int steps = 0;
+        while (WalkingModePolicy.Alignment.error(live, destination) >= WalkingModePolicy.Alignment.ALIGNED && steps++ < 200) {
+            var proposed = alignment.proposed(live, destination);
+            check(!WalkingModePolicy.Alignment.discontinuous(live, proposed), "retry stays continuous");
+            live = proposed; alignment.applied();
+            check(!alignment.stalled(WalkingModePolicy.Alignment.error(live, destination)), "recovery makes real progress");
+            check(lifetime.tick(true, true).outcome() != WalkIntent.Outcome.EXPIRED, "one request survives late readiness");
+        }
+        check(WalkingModePolicy.Alignment.error(live, destination) < WalkingModePolicy.Alignment.ALIGNED,
+                "held request finishes against actual source grid after proof readiness");
+        tracker.bumpDestination();
+        check(tracker.superseded(), "new destination invalidates even an aligned pending intent");
+        tracker.endWalk(); alignment.reset();
+        var barrier = tracker.serverCorrected(true);
+        check(tracker.flightRequest(false) == WalkIntentTracker.FlightRequest.IGNORE,
+                "stale intent cannot override retarget while correction is in flight");
+        check(tracker.acknowledgeCorrection(barrier), "ordered correction receipt permits genuine retry");
+        check(tracker.flightRequest(false) == WalkIntentTracker.FlightRequest.WALK && tracker.startWalk(),
+                "latest destination remains retryable without unavailable flight");
+        check(alignment.begin(), "retargeted request has a fresh alignment epoch");
+        alignment.bind(live, unitBasis(-.4), 2, "new-floor", "overworld");
+        check(alignment.progress == 0 && alignment.pace == SupportApproachAlignment.INITIAL_PACE,
+                "old guarded pace/progress never leak into newer destination");
+    }
+
     private static void rebinding() {
         var alignment = new WalkingModePolicy.Alignment();
         var source = new Basis384f();
@@ -335,6 +383,7 @@ public final class WalkingModePolicyTest {
         shallowMode();
         stallBudget();
         slowProofAndLifetimeCompose();
+        guardedRetryAndRetarget();
         rebinding();
         alignmentBlending();
         requestLifecycle();

@@ -29,19 +29,13 @@ regenerate wrapper tooling using installed Gradle without fetching a distributio
   --gradle-distribution-sha256-sum 20f1b1176237254a6fc204d8434196fa11a4cfb387567519c61556e8710aed78
 ```
 
-Long-running commands in the assigned development environment must run in a
-visible tmux pane. Example (use the printed pane ID for send/capture):
-
-```sh
-tmux new-window -n mysticism-build -P -F '#{pane_id}' 'bash --noprofile --norc'
-# In that pane, from this checkout:
-"$GRADLE" --no-daemon --console=plain build
-rc=$?
-printf 'BUILD_EXIT=%s\n' "$rc"
-tmux wait-for -S mysticism-build-done
-# Elsewhere: tmux wait-for mysticism-build-done
-# Then: tmux capture-pane -p -t <pane-id> -S -3000
-```
+Long-running commands in the assigned development environment use the
+`tmux-jobs` skill at `/home/zlare/.config/pi/profiles/main/skills/tmux-jobs/SKILL.md`.
+Preserve the original `TMUX` connection and `TMUX_PANE`; pass the original pane
+with `--origin`, the absolute checkout with `run --cwd`, and the executable's
+argument vector after `--`. Monitor with bounded `wait --seconds` calls and
+capture the retained pane using its matching run token. Do not use `send-keys`,
+completion-channel waits or output redirection. Leave completed job panes intact.
 
 ## Tests: no additional framework dependencies
 
@@ -61,17 +55,19 @@ javac --release 21 -d build/build-selftest scripts/selftest/*.java
 java -ea -cp build/build-selftest io.github.mysticism.build.PackagingSelfTest
 ```
 
-**Feature-agent integration contract:** place Java checks in `src/test/java`, with
-class names ending in `Test` (including `SelfTest`) and a
-`public static void main(String[] args)` method. `selfTest` discovers top-level
-classes from the compiled test output, executes them in sorted fully qualified
-name order, and propagates exceptions/`AssertionError` as a failed Gradle task.
-Assertions are explicitly enabled and checked. Do not add JUnit dependencies.
-Test compilation/runtime includes common and client outputs plus their existing
-runtime dependencies. `check`, `test` and `build` run `selfTest` and
-`buildSelfTest`; the framework-based Gradle `Test` action is disabled. An empty
-feature-test set is explicitly reported, not presented as tested functionality.
-Tests must not call live embedding services, download weights, or bootstrap a game.
+**Current runtime integration contract:** place Java checks in `src/runtimeTest/java`,
+with class names ending in `Test` (including `SelfTest`) and a
+`public static void main(String[] args)` method. `runtimeSelfTest` discovers
+compiled top-level classes, executes them in sorted fully qualified name order,
+and propagates exceptions/`AssertionError` as a failed Gradle task. The existing
+`src/test/java/io/github/mysticism/embedding` regressions also participate; other
+historical `src/test` prototypes are not current suites. Assertions are explicitly
+enabled and checked. Do not add JUnit dependencies. Runtime compilation/execution
+includes common and client outputs plus their existing dependencies. `check`
+and `build` run `runtimeSelfTest` and `buildSelfTest`; the framework-based Gradle
+`test` action is disabled and is not a verification command by itself. An empty
+suite is reported explicitly, not presented as tested functionality. Tests must
+not call live embedding services, download weights, or bootstrap a game.
 
 ## Production artifact
 
@@ -99,7 +95,26 @@ runtimes must not enter the production artifact. Artifact checks are static;
 they do not substitute for a dedicated-server/client launch, GUI-scale/reload
 checks, or an embedding-service integration test.
 
-## Branch integration status
+## Current retained integration validation
+
+On `feat-runtime-sol-merge-0060`, the canonical cached Gradle command
+`--no-daemon --console=plain --continue build --rerun-tasks` passed with both Java
+source sets, all **21 discovered runtime suites**, build/packaging fixtures, Loom
+remapping and `verifyProductionJar`. Coverage includes supported entry/recovery,
+repeated sub-block packet acceptance, descent/arrival, local reconciliation and
+latest-destination/correction arbitration. The actual continuous mesh transition
+regression passed **5,917 checks** using the integrated production alignment
+object, including touching tilted/slab surfaces, publication cadence, unsafe
+crossings and sheared transitions. Native-v2 preprocessing passed 8,455 checks
+plus 766 official Unicode grapheme cases. These are deterministic JVM and
+bytecode-wiring checks, not a live Fabric launch or model inference.
+
+See `docs/runtime-sol-merge-0060.md` for conflict decisions, exact checks and the
+retained build handle; `docs/rebuild-navigation-handoff.md` retains parent history.
+The HTTP inference backend remains unchanged: a model-correct local tokenizer
+alone does **not** complete the full no-external-server embedding requirement.
+
+## Historical build-portability integration status (not the current branch)
 
 This build intentionally has no DJL dependencies or local/native model runtime.
 The original source still imports DJL in `EmbeddingService`, `EmbeddingCommand`,

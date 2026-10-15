@@ -111,25 +111,28 @@ public final class SupportedWalkingIntegrationTest {
                         && !clear.contains("removed.supportPending"),
                 "disconnect/respawn cleanup must release retained proof without a live intent");
         String request = method(nav, "public static void onFlightToggle(", "private static void endSupportApproach(");
-        check(request.indexOf("if (!s.alignment.begin()) return") >= 0
-                        && request.indexOf("if (!s.alignment.begin()) return") < request.indexOf("new WalkIntent()"),
+        check(request.indexOf("s.walk.pending() || request != WalkIntentTracker.FlightRequest.WALK || !s.walk.startWalk()") >= 0
+                        && request.indexOf("!s.walk.startWalk()") < request.indexOf("s.alignment.begin()")
+                        && request.indexOf("s.alignment.begin()") < request.indexOf("new WalkIntent()"),
                 "duplicate flight-off packets must not reset request budgets");
         check(!request.contains("cancelCurrentSupport"), "a retry must reuse retained proof, not restart it");
         String attempt = method(nav, "private static void attemptSupport(", "private static float basisError(");
-        check(attempt.indexOf("supportTargetSnapshot.squareDistance") < attempt.indexOf("if (!s.semanticReady)"),
+        check(attempt.indexOf("s.walk.superseded()") >= 0
+                        && attempt.indexOf("WalkIntentTracker.attunementSupersedes(s.supportTargetSnapshot") >= 0
+                        && attempt.indexOf("WalkIntentTracker.attunementSupersedes(s.supportTargetSnapshot") < attempt.indexOf("if (!s.semanticReady)"),
                 "invalid retargets must cancel even while late source discovery is pending");
         String discovery = method(attempt, "if (!s.semanticReady)", "var found = SpiritTerrainService.currentSupport(p)");
         check(!discovery.contains("SpiritTerrainService.currentSupport(p)"), "no source queries before a real semantic anchor");
-        check(attempt.contains("boolean proofPending = SpiritTerrainService.currentSupportProofPending(p)")
-                        && attempt.contains("s.walkIntent.tick(true, found.isPresent(), proofPending)")
+        check(attempt.contains("boolean proofPending = SpiritTerrainService.currentSupportProofPending(p, WALK_APPROACH_DEPTH)")
+                        && attempt.contains("s.walkIntent.tick(true, support != null, proofPending)")
                         && attempt.contains("destination), proofPending)"),
                 "actual source-proof latency must participate in the intent's lifetime");
         check(attempt.contains("acquireCurrentSupport(p, support)") && attempt.contains("s.confirmedOwned = true"),
                 "successful walk retry must use real guarded acquisition and end fresh-entry grace");
         String pending = method(terrain, "public static boolean currentSupportProofPending(", "private static Optional<WalkCandidate> walkCandidate(");
-        check(pending.contains("MeshCollision.ground(p)") && pending.contains("windowFor(s,hit.get().cell())")
+        check(pending.contains("MeshCollision.ground(p,depth)") && pending.contains("windowFor(s,hit.get().cell())")
                         && pending.contains("s.walkField==field.identity") && pending.contains("!s.walkFuture.isDone()"),
-                "pending validity must be tied to actual current frame contact and real in-flight work");
+                "pending validity must be tied to producing geometry in the real approach column and in-flight work");
         check(terrain.contains("s.walkProbe.dimension.equals(dimension)") && terrain.contains("cancelCurrentSupport(p); // Includes proof retained"),
                 "source-world unload must clear even a retained proof from a different local source window");
     }
