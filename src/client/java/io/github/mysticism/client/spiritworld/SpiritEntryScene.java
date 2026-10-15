@@ -44,12 +44,23 @@ final class SpiritEntryScene {
         } finally {main.beginWrite(false);}
         return true;
     }
-    static int original(MinecraftClient client,int live) {
-        if(image==null || client.player==null || handler!=client.getNetworkHandler()
-                || !player.equals(client.player.getUuid()) || !ClientSpiritCache.active()
-                || !dimension.equals(ClientSpiritCache.sourceDimension())
-                || System.nanoTime()-captured>5_000_000_000L || ShaderManager.effectStrength()>=.999f)return live;
-        return image.getColorAttachment();
+    /** A captured entry image is already fogged; live color has had TERRAIN fog bypassed. */
+    record Original(int texture, boolean restoreSourceFog) {}
+
+    static Original original(MinecraftClient client,int live) {
+        boolean sameObserver=image!=null && client.player!=null && handler==client.getNetworkHandler()
+                && player.equals(client.player.getUuid());
+        return selectOriginal(live,image==null?live:image.getColorAttachment(),sameObserver,
+                ClientSpiritCache.active(),image!=null && dimension.equals(ClientSpiritCache.sourceDimension()),
+                System.nanoTime()-captured,ShaderManager.effectStrength());
+    }
+
+    /** Shared by the actual cache-inactive exit path and headless regressions. */
+    static Original selectOriginal(int live,int saved,boolean sameObserver,boolean active,
+            boolean sameSource,long ageNanos,float strength) {
+        boolean useSaved=sameObserver && active && sameSource && ageNanos>=0
+                && ageNanos<=5_000_000_000L && strength<.999f;
+        return new Original(useSaved?saved:live,!useSaved);
     }
     static void clear() {
         if(image!=null)image.delete();image=null;handler=null;player=null;dimension=null;captured=0;

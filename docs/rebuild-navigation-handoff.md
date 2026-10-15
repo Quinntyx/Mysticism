@@ -17,6 +17,70 @@ Authority: `docs/spirit-world-approved-design.md`, prior bounded navigation revi
 
 This now has a real implementation for arbitrary representative support. It is **not runtime-confirmed**. A normal successful handoff still depends on the terrain-owned proof/transition becoming ready; nav does not override a refusal. An actor can keep moving during alignment; stationary-only or centimeter-position targeting is not imposed on this path.
 
+### Deep walk locality while moving through the projection
+
+A deep-flying player who requests a walk is still moving: descending, grazing slopes and crossing
+several projected source localities before settling. `DeepWalkAttachment` (pure policy, no Minecraft
+types) now governs which locality the pending request attaches to in `attemptSupport`:
+
+- Attachment and final acquisition have **different** normal gates. The contact must be real
+  projected ground (`normal.y > .3`) and its **source-space** normal must identify a floor
+  (`sourceNormal.y >= .99`). `TerrainMeshFrame.Cell.sourceNormal` pulls the contact covector back
+  through the same accepted affine cell that collision/rendering use: normalized dot products
+  with `axisX/size.x`, `axisY/size.y`, `axisZ/size.z`. This works for sheared and compacted cells;
+  inverse position math would be wrong for normals. A tilted horizontal source floor now starts
+  alignment even when its projected `normal.y < .99`. A source wall/edge graze remains `WAIT`,
+  including a wall distorted into an apparently horizontal projected surface.
+- The original projected `.99` check remains in terrain's **final acquisition** transaction, along
+  with the fully aligned source basis, identity/revision, body/floor proof and continuous scene
+  checks. Starting alignment is not permission to land. The reviewed pre-alignment `.99` gate
+  deadlocked source floors: pending requests suppress ordinary deep basis evolution, and WAIT
+  returned before guarded source-grid alignment could improve the measured projected normal.
+- While the player keeps physically moving (per-tick delta above the shared movement epsilon), a
+  changed contacted locality is `FOLLOW`ed: the request re-attaches to the locality actually under
+  the player (window identity, landmark, source dimension, grid basis) instead of cancelling, so a
+  descent across representative windows no longer produces repeated "support window changed"
+  failures. `FOLLOW` restarts only the bounded 40-step grid alignment from the current basis; the
+  200-tick request budget, attunement gate, discontinuity guard, `canAlign` and the full
+  `acquireCurrentSupport` revalidation are unchanged.
+- Only a locality change under a settled player cancels the request (terrain genuinely changed
+  underfoot; a fresh request must validate the new support), preserving the previous cancel
+  message and semantics. Non-finite deltas count as settled.
+
+Regression coverage: `DeepWalkAttachmentTest` checks separate attachment/acquisition boundaries,
+all locality decisions, invalid normals and evolving projected normals. `DeepWalkContactPremiseTest`
+drives the real basis blend, per-step discontinuity check, swept-AABB ground query and continuous
+transition/body guards from a 35-degree tilted source floor to the source grid. It crosses to a
+second locality before the normal is acquisition-compatible, follows it without WAIT/cancellation,
+and completes 40 accepted steps on that locality. Other cases reject an upward-projected source
+wall, exercise covector pullback with shear/nonuniform source size, and refuse an obstructed
+transition. These are numerical/geometry regressions, not a live player/session acquisition test.
+
+#### Retained-unit validation (source-floor gate repair)
+
+Canonical command: the installed cached Gradle 8.13 binary with
+`--no-daemon --console=plain build`, in the owned checkout via `tmux-jobs`, original pane `%2138`.
+Retained build handle: session `$11`, window `@1381`, pane `%2156`, run
+`553d6451a2d943f088755b6df9b9bb4f`. **Exit 0, BUILD SUCCESSFUL**.
+
+- Common and client compilation, `runtimeSelfTest` discovery of all **six** main-based suites:
+  deep-walk geometry/alignment **293** checks, deep-walk attachment **47** checks;
+  embedding callback isolation **28**, engine safety **184**, persistence **90**, pipeline **135**.
+- `buildSelfTest` packaging/descriptor/runner checks and `verifyProductionJar` passed; artifact
+  `build/libs/mysticism-1.0-SNAPSHOT.jar`. `git diff --check` passed.
+- Existing missing API Guardian annotation and mixin/deprecation warnings remain nonfatal.
+  Embedding persistence's malformed-data warnings/stack traces are expected rejection fixtures.
+- No live Fabric player tick, client/server launch, renderer/GPU or real model inference performed.
+  Terrain's real acquisition transaction still requires source proof/ownership and safe geometry;
+  these tests do not prove it completes on arbitrary gameplay terrain. Conservative source edge
+  contacts can wait, and blocked/slow proof/alignment can still exhaust the unchanged 200-tick budget.
+- `WalkSupport` adds server-local `sourceNormal`; wire/storage formats, prediction modes, independent
+  per-player projection, source octree ownership, captured attunement and native v2 embeddings are
+  unchanged. No software/models installed, no agents delegated, no dev/main/worktree mutations.
+
+The remaining sections below retain the earlier navigation handoff's historical integration notes;
+its older no-test/build limitations do not describe the retained-unit validation just listed.
+
 ### Effective vectors, frozen snapshots and precise source feet
 
 Both initial source q and newly captured points now call `SpiritActivityService.effectiveEmbedding(server, metadata).vector()`, adding the source-grid offset from the header anchor at 96 blocks/semantic unit. Neither uses the raw header base in navigation anymore. A capture snapshots the effective vector when the async capture completes on the server thread, then clones/stores it once. It never continuously follows activity changes. A real captured ZERO coordinate is not overwritten by initial default-target initialization.
@@ -76,7 +140,7 @@ SpiritTerrainService.currentSupport(player); // Optional<WalkSupport>
 SpiritTerrainService.acquireCurrentSupport(player, expectedSupport); // boolean
 SpiritTerrainService.cancelCurrentSupport(player); // clears bounded proof on cancellation/lifecycle
 // WalkSupport: landmarkId, sourceDimension, sourcePosition, sourceBasis,
-// sourceCoordinate, normal, windowIdentity, ownershipRevision
+// sourceCoordinate, projected normal, sourceNormal, windowIdentity, ownershipRevision
 SpiritTerrainService.prefetchTarget(player, dimension, id, Vec3d feet, vector, sourceBasis);
 SpiritTerrainService.landingReady(player, dimension, id, Vec3d feet);
 SpiritTerrainService.tryLandTarget(player, dimension, id, Vec3d feet);

@@ -70,8 +70,13 @@ public final class WalkTargetAcquisitionTest {
         Class<?> session = Class.forName("io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService$Session");
         var windowFor = SpiritTerrainService.class.getDeclaredMethod("windowFor", session, io.github.mysticism.dimension.spiritworld.terrain.TerrainMeshFrame.Cell.class);
         check(windowFor != null, "discovery must resolve the contacted producer window via windowFor");
-        var sourcePoint = SpiritTerrainService.class.getDeclaredMethod("sourcePoint", io.github.mysticism.dimension.spiritworld.terrain.TerrainMeshFrame.Cell.class, net.minecraft.util.math.Vec3d.class);
-        check(sourcePoint != null, "discovery must inverse-map feet through the contacted cell");
+        // The merged implementation shares exact affine inverse mapping with diagnostic/support
+        // contact witnesses instead of maintaining a second private sourcePoint implementation.
+        Class<?> contact = Class.forName("io.github.mysticism.dimension.spiritworld.terrain.MeshContact");
+        var sourcePoint = contact.getDeclaredMethod("source", io.github.mysticism.dimension.spiritworld.terrain.TerrainMeshFrame.Cell.class, net.minecraft.util.math.Vec3d.class);
+        check(sourcePoint.getReturnType() == net.minecraft.util.math.Vec3d.class
+                        && bytecodeReferences(SpiritTerrainService.class, "MeshContact"),
+                "discovery must share the actual contacted-cell inverse mapping");
         check(bytecodeReferences(SpiritNavigationService.class, "discoverWalkTarget"),
                 "navigation walk loop must reference discoverWalkTarget");
         check(bytecodeReferences(SpiritNavigationService.class, "walkTargetPending"),

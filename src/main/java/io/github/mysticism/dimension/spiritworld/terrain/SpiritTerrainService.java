@@ -121,6 +121,28 @@ public final class SpiritTerrainService {
     private static Basis384f basis(ServerPlayerEntity p){return p.getComponent(MysticismEntityComponents.LATENT_BASIS).get().clone();}
     private static boolean live(ServerPlayerEntity p,Session s){return session(p)==s && p.getServer().getPlayerManager().getPlayer(p.getUuid())==p;}
     public static Optional<TerrainMeshFrame> mesh(ServerPlayerEntity p){Session s=session(p);return s==null?Optional.empty():Optional.ofNullable(s.frame);}
+    /** Read-only accepted-frame evidence. Never probes blocks, queues discovery or treats window.ready as support. */
+    public static String terrainEvidence(ServerPlayerEntity p) {
+        Session s=session(p);
+        if(!p.getWorld().getRegistryKey().equals(WORLD))return "Terrain: outside spirit world.";
+        if(s==null || s.frame==null)return "Terrain: no published mesh; no mesh support evidence.";
+        var evidence=TerrainEvidence.inspect(s.frame,p.getBoundingBox());
+        String summary="Terrain: published revision="+evidence.revision()+"; visible cells="+evidence.visibleCells()
+                +"; affine collision shapes="+evidence.collisionShapes()+" (client draw not acknowledged)";
+        if(evidence.contact().isEmpty())return summary+"; no mesh ground contact (not a source-discovery verdict).";
+        var contact=evidence.contact().get();Window w=s.frameProducers.get(contact.key());
+        String ownership;
+        if(w==null)ownership="producer unavailable";
+        else if(w.owners==null || !w.owners.isCurrent(p.getServer()))ownership="snapshot pending/stale";
+        else {
+            BlockPos at=BlockPos.ofFloored(contact.sourcePosition());
+            if(!w.owners.bounds().contains(at.getX(),at.getY(),at.getZ()))ownership="outside snapshot coverage";
+            else ownership=w.owners.ownerAt(at).map(id->"proven "+id).orElse("unowned in current snapshot");
+        }
+        return summary+"; contact cell="+contact.key()+" mesh label="+contact.meshOwner()
+                +"; source="+(w==null?"unknown":w.dimension)+" "+contact.sourcePosition()
+                +"; normal="+contact.normal()+"; exact ownership="+ownership+" (not walk/exit readiness).";
+    }
     public static boolean clearRay(ServerPlayerEntity p,Vec3d from,Vec3d to){return MeshCollision.clearRay(p,from,to);}
     public static void setShallow(ServerPlayerEntity p,boolean shallow) {
         Session s=session(p);if(s==null)return;
@@ -170,12 +192,12 @@ public final class SpiritTerrainService {
     }
     public static Optional<Support> support(ServerPlayerEntity p) {
         Session s=session(p);if(s==null || !p.getWorld().getRegistryKey().equals(WORLD))return Optional.empty();
-        return MeshCollision.ground(p).flatMap(hit->{
-            var cell=hit.cell();Window w=windowFor(s,cell);
+        return MeshCollision.groundContact(p).flatMap(ground->{
+            var hit=ground.hit();var cell=hit.cell();Window w=windowFor(s,cell);
             if(w==null)return Optional.empty();
-            // Invert the SAME deformed cell used by rendering/SAT, then sample inside the producing source voxel.
-            Vec3d contact=p.getPos().add(0,.025-.15*hit.time(),0).subtract(hit.normal().multiply(.001));
-            Vec3d source=sourceContact(cell,contact);Optional<String> id=exactOwner(p,s,w,source);
+            // Sample the actual shape/footprint intersection, not a center clamped into a producing voxel.
+            Vec3d contact=ground.interiorPoint();
+            Vec3d source=MeshContact.source(cell,contact);Optional<String> id=exactOwner(p,s,w,source);
             if(id.isEmpty())return Optional.empty();
             var metadata=LandmarkStore.get(p.getServer()).metadata(id.get());if(metadata.isEmpty())return Optional.empty();
             var anchor=metadata.get().header().anchor();
@@ -185,7 +207,7 @@ public final class SpiritTerrainService {
     }
     /** Exit is exact current shallow mapping, never saved entry/spawn or safe-air substitution. */
     public record WalkSupport(String landmarkId,String sourceDimension,Vec3d sourcePosition,
-            Basis384f sourceBasis,Vec384f sourceCoordinate,Vec3d normal,long windowIdentity,long ownershipRevision) {
+            Basis384f sourceBasis,Vec384f sourceCoordinate,Vec3d normal,Vec3d sourceNormal,long windowIdentity,long ownershipRevision) {
         public WalkSupport{sourceBasis=sourceBasis.clone();sourceCoordinate=sourceCoordinate.clone();}
         @Override public Basis384f sourceBasis(){return sourceBasis.clone();}
         @Override public Vec384f sourceCoordinate(){return sourceCoordinate.clone();}
@@ -199,7 +221,7 @@ public final class SpiritTerrainService {
         Box boundingBox();
         Basis384f basis();
         Vec384f coordinate();
-        Optional<MeshCollision.Hit> ground();
+        Optional<MeshCollision.GroundContact> groundContact();
         Optional<LandmarkMetadata> metadata(String id);
         Optional<String> exactOwner(Window w,Vec3d at);
         long ownershipRevision(Window w);
@@ -217,7 +239,7 @@ public final class SpiritTerrainService {
             public Box boundingBox(){return p.getBoundingBox();}
             public Basis384f basis(){return SpiritTerrainService.basis(p);}
             public Vec384f coordinate(){return q(p);}
-            public Optional<MeshCollision.Hit> ground(){return MeshCollision.ground(p);}
+            public Optional<MeshCollision.GroundContact> groundContact(){return MeshCollision.groundContact(p);}
             public Optional<LandmarkMetadata> metadata(String id){return LandmarkStore.get(p.getServer()).metadata(id);}
             public Optional<String> exactOwner(Window w,Vec3d at){return SpiritTerrainService.exactOwner(p,s,w,at);}
             public long ownershipRevision(Window w){return w.owners.ownershipRevision();}
@@ -235,10 +257,10 @@ public final class SpiritTerrainService {
     }
     static Optional<WalkCandidate> walkCandidate(Session s,WalkEnvironment env) {
         if(s.shallow || !env.semanticReady())return Optional.empty();
-        var hit=env.ground();if(hit.isEmpty())return Optional.empty();
-        var cell=hit.get().cell();Window w=windowFor(s,cell);if(w==null || !retainedWalkWindow(s,w))return Optional.empty();
-        Vec3d contact=env.position().add(0,.025-.15*hit.get().time(),0).subtract(hit.get().normal().multiply(.001));
-        Optional<String> owner=env.exactOwner(w,sourceContact(cell,contact));if(owner.isEmpty())return Optional.empty();
+        var ground=env.groundContact();if(ground.isEmpty())return Optional.empty();
+        var hit=ground.get().hit();var cell=hit.cell();Window w=windowFor(s,cell);if(w==null || !retainedWalkWindow(s,w))return Optional.empty();
+        Vec3d contact=ground.get().interiorPoint();
+        Optional<String> owner=env.exactOwner(w,MeshContact.source(cell,contact));if(owner.isEmpty())return Optional.empty();
         var metadata=env.metadata(owner.get());if(metadata.isEmpty() || !metadata.get().header().dimension().equals(w.dimension))return Optional.empty();
         // Producer binding is placement/provenance, not the exclusive owner of all its displayed cells.
         // A different exact owner needs a discovery for THIS producer and a still-current geometry revision.
@@ -246,12 +268,13 @@ public final class SpiritTerrainService {
         if(!owner.get().equals(w.id) && (target==null || target.field()!=w
                 || !target.metadata().id().equals(owner.get())
                 || !target.metadata().geometryKeys().equals(metadata.get().geometryKeys())))return Optional.empty();
-        Vec3d feet=sourcePoint(cell,env.position());if(!ownedBody(env,w,feet,owner.get()))return Optional.empty();
+        Vec3d feet=MeshContact.source(cell,env.position());if(!ownedBody(env,w,feet,owner.get()))return Optional.empty();
         Vec3d offset=feet.subtract(w.origin);Vec384f coordinate=w.semantic.clone()
                 .add(w.sourceBasis.i.clone().mul((float)(offset.x/SCALE)))
                 .add(w.sourceBasis.j.clone().mul((float)(offset.y/SCALE)))
                 .add(w.sourceBasis.k.clone().mul((float)(offset.z/SCALE)));
-        WalkSupport support=new WalkSupport(owner.get(),w.dimension,feet,w.sourceBasis,coordinate,hit.get().normal(),w.identity,env.ownershipRevision(w));
+        WalkSupport support=new WalkSupport(owner.get(),w.dimension,feet,w.sourceBasis,coordinate,hit.normal(),
+                cell.sourceNormal(hit.normal()),w.identity,env.ownershipRevision(w));
         env.ensureProof(w,support);return Optional.of(new WalkCandidate(w,support));
     }
     private static boolean ownedBody(WalkEnvironment env,Window w,Vec3d at,String id) {
@@ -259,6 +282,38 @@ public final class SpiritTerrainService {
         for(BlockPos pos:BlockPos.iterate(MathHelper.floor(b.minX),MathHelper.floor(b.minY),MathHelper.floor(b.minZ),MathHelper.floor(b.maxX),MathHelper.floor(b.maxY),MathHelper.floor(b.maxZ)))
             if(!env.exactOwner(w,new Vec3d(pos.getX(),pos.getY(),pos.getZ())).filter(id::equals).isPresent())return false;
         return true;
+    }
+    public enum WalkSourceStatus { READY, PENDING, UNAVAILABLE }
+    /** Query after currentSupport: a candidate starts/reuses material proof but is not proof readiness.
+     * READY permits bounded alignment, NOT landing; acquisition still rechecks the actual body/floor.
+     * A null contact waits only on its producing window (initial local source if no ground exists).
+     * Once a contact is owned and proved, background/far streaming must not delay walking. */
+    public static WalkSourceStatus currentSupportReadiness(ServerPlayerEntity p, WalkSupport contact) {
+        Session s=session(p);if(s==null || s.shallow)return WalkSourceStatus.UNAVAILABLE;
+        if(contact!=null) {
+            Window probe=s.walkProbe;
+            return proofReadiness(probe!=null && s.walkField==contact.windowIdentity() && probe.id.equals(contact.landmarkId()),
+                    probe!=null && probe.ready, s.walkFuture);
+        }
+        Window field=MeshCollision.ground(p).map(hit->windowFor(s,hit.cell())).orElse(s.local);
+        if(field==null || field.retired || world(p.getServer(),field.dimension)==null)return WalkSourceStatus.UNAVAILABLE;
+        // Stale/absent ownership is still a bounded source wait during retry backoff.
+        // A current unowned mask, unlike a stale mask, is not pending discovery.
+        boolean pending=field.owners==null || !field.owners.isCurrent(p.getServer())
+                || field.ownershipFuture!=null && !field.ownershipFuture.isDone()
+                || field.stream!=null && !field.stream.complete
+                || field.nearCells!=null || field.nearFuture!=null && !field.nearFuture.isDone()
+                || walkTargetPending(p)
+                || field==s.local && (s.ingesting!=null || s.sourceFuture!=null && !s.sourceFuture.isDone()
+                    || s.ownerFuture!=null && !s.ownerFuture.isDone());
+        return pending ? WalkSourceStatus.PENDING : WalkSourceStatus.UNAVAILABLE;
+    }
+    /** Publication, not future completion alone, makes the actual source samples available. */
+    static WalkSourceStatus proofReadiness(boolean matchesContact, boolean published, CompletableFuture<?> proof) {
+        if(!matchesContact)return WalkSourceStatus.UNAVAILABLE;
+        if(published)return WalkSourceStatus.READY;
+        return proof!=null && !proof.isCompletedExceptionally() && !proof.isCancelled()
+                ? WalkSourceStatus.PENDING : WalkSourceStatus.UNAVAILABLE;
     }
     public static void cancelCurrentSupport(ServerPlayerEntity p) {
         Session s=session(p);if(s!=null)cancelCurrentSupport(s);
@@ -290,7 +345,7 @@ public final class SpiritTerrainService {
         if(WalkTargetAcquisition.discovery(true,inFlight,c.tick-s.walkDiscoveryTick)==WalkTargetAcquisition.Discovery.WAIT)return;
         s.walkDiscoveryTick=c.tick;
         // Seed from inverse-mapped source feet/body air so connected air+wall extraction owns the body too.
-        BlockPos seed=BlockPos.ofFloored(sourcePoint(hit.get().cell(),p.getPos()));
+        BlockPos seed=BlockPos.ofFloored(MeshContact.source(hit.get().cell(),p.getPos()));
         var future=SourceLandmarks.ensureSourceLocation(p.getServer(),expected.dimension,seed);
         s.walkDiscoveryFuture=future;
         future.whenComplete((found,error)->p.getServer().execute(()->{
@@ -556,16 +611,6 @@ public final class SpiritTerrainService {
         // Server-local provenance belongs to the accepted frame, not mutable ownership or latest compaction.
         // Held frames keep their original producer even after source cells are relabeled or a new stream starts.
         return s.frameProducers.get(cell.key());
-    }
-    private static Vec3d sourcePoint(TerrainMeshFrame.Cell c,Vec3d world) {
-        Vec3d v=world.subtract(c.min());double det=c.axisX().dotProduct(c.axisY().crossProduct(c.axisZ()));
-        return c.sourceMin().add(v.dotProduct(c.axisY().crossProduct(c.axisZ()))/det*c.size().x,
-                v.dotProduct(c.axisZ().crossProduct(c.axisX()))/det*c.size().y,v.dotProduct(c.axisX().crossProduct(c.axisY()))/det*c.size().z);
-    }
-    private static Vec3d sourceContact(TerrainMeshFrame.Cell c,Vec3d world) {
-        Vec3d v=world.subtract(c.min());double det=c.axisX().dotProduct(c.axisY().crossProduct(c.axisZ()));
-        double x=v.dotProduct(c.axisY().crossProduct(c.axisZ()))/det,y=v.dotProduct(c.axisZ().crossProduct(c.axisX()))/det,z=v.dotProduct(c.axisX().crossProduct(c.axisY()))/det;
-        return c.sourceMin().add(Math.max(0,Math.min(1-1e-6,x))*c.size().x,Math.max(0,Math.min(1-1e-6,y))*c.size().y,Math.max(0,Math.min(1-1e-6,z))*c.size().z);
     }
     private static void requestSource(ServerPlayerEntity p,Session s,Vec3d source,int side) {
         if(s.sourceFuture!=null && !s.sourceFuture.isDone())return;

@@ -56,7 +56,7 @@ public final class NavigationReportTest {
                 .walk(true, 84, 200, 12, 40, "landmark-1", "minecraft:overworld")
                 .text();
         check(walking.contains("semantic travel ready")
-                        && walking.contains("walk request pending: validating current support (84/200t)")
+                        && walking.contains("walk request pending: validating current support (84/200 alignment t)")
                         && walking.contains("support landmark-1 @ minecraft:overworld")
                         && walking.contains("grid alignment 12/40"),
                 "Pending walk request must show live progress: " + walking);
@@ -65,12 +65,12 @@ public final class NavigationReportTest {
         // source support is acquired, and distinguish extraction from waiting for an anchor.
         String discovering = NavigationReport.snapshot().mode(true, true, false)
                 .walk(true, 40, 200, 0, 40, "", "").walkDiscovery(true).text();
-        check(discovering.contains("extracting/publishing discovered source target (40/200t)"),
+        check(discovering.contains("extracting/publishing discovered source target (40/200 alignment t)"),
                 "In-flight real discovery must show its current phase: " + discovering);
         check(!discovering.contains("grid alignment"), "Unacquired support has no alignment progress");
         String awaiting = NavigationReport.snapshot().mode(true, true, false)
                 .walk(true, 80, 200, 0, 40, "", "").walkDiscovery(false).text();
-        check(awaiting.contains("awaiting real source anchor (80/200t)"),
+        check(awaiting.contains("awaiting real source anchor (80/200 alignment t)"),
                 "Missing semantic anchor must not be reported as acquired support");
         check(!awaiting.contains("extracting/publishing"), "No pending future means no extraction claim");
         String readyDiscovery = NavigationReport.snapshot().mode(true, true, true)
@@ -80,6 +80,32 @@ public final class NavigationReportTest {
         String ended = NavigationReport.snapshot().mode(true, true, true)
                 .walk(false, 0, 200, 0, 40, "", "").walkDiscovery(true).text();
         check(!ended.contains("walk request pending"), "Ended intents must not report stale progress");
+
+        // The merged controller has independent source/alignment budgets and suspended recovery.
+        // Use its actual clock, not fabricated elapsed ticks, for command progress snapshots.
+        WalkRequestClock clock = new WalkRequestClock(); clock.reissue();
+        for (int i = 0; i < 12; i++) clock.tick(true, false);
+        for (int i = 0; i < 300; i++) clock.tick(false, true);
+        String waiting = NavigationReport.snapshot().mode(true, true, true)
+                .walk(true, 312, 200, 8, 40, "owner", "minecraft:overworld")
+                .walkClock(clock.alignmentTicks(), clock.sourceWaitTicks(), clock.armed(), clock.recoveryWaitTicks())
+                .walkDiscovery(true).text();
+        check(waiting.contains("12/200 alignment t") && waiting.contains("source wait 300/600t")
+                && !waiting.contains("312/200"), "Source waits must not masquerade as alignment failure: " + waiting);
+        for (int i = 300; i <= WalkRequestClock.SOURCE_WAIT_TICKS; i++) clock.tick(false, true);
+        clock.recover(false);
+        String suspended = NavigationReport.snapshot().mode(true, true, true)
+                .walk(false, 0, 200, 8, 40, "owner", "minecraft:overworld")
+                .walkClock(clock.alignmentTicks(), clock.sourceWaitTicks(), clock.armed(), clock.recoveryWaitTicks())
+                .walkDiscovery(true).text();
+        check(suspended.contains("automatic recovery 1/1200t") && !suspended.contains("walk request pending"),
+                "Suspended intent must report real automatic recovery, not active alignment: " + suspended);
+        check(clock.recover(true), "Ready source resumes the same reported intent");
+        String resumed = NavigationReport.snapshot().mode(true, true, true)
+                .walk(true, 0, 200, 0, 40, "owner", "minecraft:overworld")
+                .walkClock(clock.alignmentTicks(), clock.sourceWaitTicks(), clock.armed(), clock.recoveryWaitTicks()).text();
+        check(resumed.contains("0/200 alignment t") && !resumed.contains("automatic recovery")
+                && !resumed.contains("source wait"), "Resume must clear waiting progress: " + resumed);
 
         // Deep after a failed request: cooldown remaining instead of a new silent request.
         String cooldown = NavigationReport.snapshot()

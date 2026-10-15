@@ -43,6 +43,10 @@ public record TerrainMeshFrame(long revision, boolean shallow, String sourceDime
                     || axisX.length()>128 || axisY.length()>128 || axisZ.length()>128
                     || !Float.isFinite(opacity) || opacity<0 || opacity>1)
                 throw new IllegalArgumentException("mesh cell");
+            double volume=axisX.dotProduct(axisY.crossProduct(axisZ));
+            double scale=axisX.length()*axisY.length()*axisZ.length();
+            if(scale==0 || Math.abs(volume)<=1e-12*scale)
+                throw new IllegalArgumentException("collapsed mesh axes");
             collision=List.copyOf(collision);
             if(collision.size()>MAX_SHAPES)throw new IllegalArgumentException("shape budget");
             for(Box b:collision) {
@@ -55,6 +59,16 @@ public record TerrainMeshFrame(long revision, boolean shallow, String sourceDime
         public Vec3d point(double x,double y,double z) {
             return min.add(axisX.multiply(x)).add(axisY.multiply(y)).add(axisZ.multiply(z));
         }
+        /** Pull back a projected contact normal (a covector) to source-block coordinates.
+         * Positions use the inverse transform; normals use the forward transform's transpose. Dividing each
+         * column by source size also handles compacted/nonuniform cells. This distinguishes a
+         * projected source floor from a source wall tilted upward; world normal Y alone cannot. */
+        public Vec3d sourceNormal(Vec3d projectedNormal) {
+            Vec3d pulled = new Vec3d(axisX.dotProduct(projectedNormal) / size.x,
+                    axisY.dotProduct(projectedNormal) / size.y, axisZ.dotProduct(projectedNormal) / size.z);
+            double length = pulled.length();
+            return Double.isFinite(length) && length > 1e-12 ? pulled.multiply(1 / length) : Vec3d.ZERO;
+        }
         public Box bounds(Box b) {
             Vec3d base=point(b.minX,b.minY,b.minZ);
             double xx=axisX.x*b.getLengthX(),yx=axisY.x*b.getLengthY(),zx=axisZ.x*b.getLengthZ();
@@ -65,7 +79,14 @@ public record TerrainMeshFrame(long revision, boolean shallow, String sourceDime
                     base.x+Math.max(0,xx)+Math.max(0,yx)+Math.max(0,zx),
                     base.y+Math.max(0,xy)+Math.max(0,yy)+Math.max(0,zy),base.z+Math.max(0,xz)+Math.max(0,yz)+Math.max(0,zz));
         }
+        /** Unit-model projection bounds. Actual baked-model bounds are measured by the renderer. */
         public Box bounds() { return bounds(new Box(0,0,0,1,1,1)); }
+        /** Conservative body/transition broadphase, including source shapes outside the unit model. */
+        public Box geometryBounds() {
+            Box result=bounds();
+            for(Box shape:collision)result=result.union(bounds(shape));
+            return result;
+        }
     }
     private static void finite(Vec3d p) {
         if(p==null || !Double.isFinite(p.x) || !Double.isFinite(p.y) || !Double.isFinite(p.z)

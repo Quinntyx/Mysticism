@@ -6,6 +6,7 @@
     "SpiritBackgroundRendererMixin",
     "SpiritInteractionMixin",
     "SpiritArrivalReseedMixin",
+    "SpiritCarrierPushMixin",
     "SpiritNativeSceneMixin",
     "SpiritLayerPhasesAccess",
     "SpiritTextureAccess",

@@ -23,7 +23,7 @@ public final class SpiritRenderLayers extends RenderLayer {
                 .program(ENTITY_TRANSLUCENT_PROGRAM).texture(new Texture(texture,false,false))
                 .transparency(TRANSLUCENT_TRANSPARENCY).cull(DISABLE_CULLING)
                 .lightmap(ENABLE_LIGHTMAP).overlay(ENABLE_OVERLAY_COLOR)
-                .target(MAIN_TARGET).writeMaskState(ALL_MASK).build(false));
+                .target(MAIN_TARGET).depthTest(LEQUAL_DEPTH_TEST).writeMaskState(ALL_MASK).build(false));
         layers.put(texture,layer); return layer;
     }
     public static void clear() { layers.clear(); }

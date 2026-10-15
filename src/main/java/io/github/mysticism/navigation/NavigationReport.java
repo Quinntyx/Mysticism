@@ -11,6 +11,8 @@ public final class NavigationReport {
     private int walkTick, walkBudget, walkAlignTick, walkAlignBudget;
     private String walkSupportId = "", walkSupportDimension = "";
     private long walkCooldownTicks;
+    private boolean hasClock, walkSuspended;
+    private int alignmentTicks, sourceWaitTicks, recoveryWaitTicks;
     private boolean landingApproach, hasTarget;
     private String targetDimension = "", targetLandmarkId = "", targetPosition = "";
     private double targetDistance = Double.NaN;
@@ -35,6 +37,10 @@ public final class NavigationReport {
         this.walkSupportId = supportId == null ? "" : supportId;
         this.walkSupportDimension = supportDimension == null ? "" : supportDimension;
         return this;
+    }
+    public NavigationReport walkClock(int alignment, int sourceWait, boolean suspended, int recoveryWait) {
+        hasClock = true; alignmentTicks = alignment; sourceWaitTicks = sourceWait;
+        walkSuspended = suspended; recoveryWaitTicks = recoveryWait; return this;
     }
     public NavigationReport walkDiscovery(boolean pending) { this.walkDiscoveryPending = pending; return this; }
     public NavigationReport walkCooldown(long remainingTicks) { this.walkCooldownTicks = remainingTicks; return this; }
@@ -67,11 +73,16 @@ public final class NavigationReport {
                                 ? "; walk request pending: extracting/publishing discovered source target ("
                                 : !semanticReady ? "; walk request pending: awaiting real source anchor ("
                                 : "; walk request pending: validating current support (")
-                        .append(walkTick).append('/').append(walkBudget).append("t)");
+                        .append(hasClock ? alignmentTicks : walkTick).append('/').append(walkBudget).append(" alignment t)");
+                if (hasClock && sourceWaitTicks > 0) text.append(", source wait ").append(sourceWaitTicks)
+                        .append('/').append(WalkRequestClock.SOURCE_WAIT_TICKS).append('t');
                 if (!walkSupportId.isEmpty()) text.append(", support ").append(walkSupportId)
                         .append(" @ ").append(walkSupportDimension);
                 if (!walkSupportId.isEmpty() && walkAlignBudget > 0) text.append(", grid alignment ").append(walkAlignTick)
                         .append('/').append(walkAlignBudget);
+            } else if (walkSuspended) {
+                text.append("; walk suspended for source readiness: automatic recovery ").append(recoveryWaitTicks)
+                        .append('/').append(WalkRequestClock.RECOVERY_WAIT_TICKS).append('t');
             } else if (walkCooldownTicks > 0) {
                 text.append("; walk retry available in ").append(walkCooldownTicks).append("t");
             }

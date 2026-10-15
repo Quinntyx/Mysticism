@@ -69,7 +69,8 @@ public final class WalkDiscoveryRuntimeTest {
         public Box boundingBox(){return BODY;}
         public Basis384f basis(){return grid.clone();}
         public Vec384f coordinate(){return q.clone();}
-        public Optional<MeshCollision.Hit> ground(){return hasGround?new MeshCollision.Index(session.frame).sweep(BODY.offset(0,.025,0),new Vec3d(0,-.15,0)):Optional.empty();}
+        public Optional<MeshCollision.GroundContact> groundContact(){return hasGround?new MeshCollision.Index(session.frame).ground(BODY):Optional.empty();}
+        Optional<MeshCollision.Hit> ground(){return groundContact().map(MeshCollision.GroundContact::hit);}
         public Optional<LandmarkMetadata> metadata(String id){return Optional.ofNullable(metadata.get(id));}
         public Optional<String> exactOwner(Window w,Vec3d at){return ownershipCurrent?Optional.ofNullable(owners.get(BlockPos.ofFloored(at))):Optional.empty();}
         public long ownershipRevision(Window w){return ownerRevision;}

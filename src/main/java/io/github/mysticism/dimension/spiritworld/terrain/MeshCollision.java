@@ -17,6 +17,8 @@ public final class MeshCollision {
     public static void clear(UUID player) { SERVER.remove(player); CLIENT.remove(player); }
     public static void clearClient() { CLIENT.clear(); }
     public record Hit(double time, Vec3d normal, TerrainMeshFrame.Cell cell) {}
+    /** Point lies on the contacted affine shape, not the player's center or a proxy AABB. */
+    public record GroundContact(Hit hit, Vec3d point, Vec3d interiorPoint) {}
     private record Bucket(int x,int y,int z) {}
     private record Shape(TerrainMeshFrame.Cell cell,Box local,Box bounds) {}
     public static final class Index {
@@ -50,6 +52,24 @@ public final class MeshCollision {
             for(Shape s:nearby(body.stretch(delta).expand(1e-5))) {
                 Hit hit=intersect(body,delta,s);
                 if(hit!=null && (best==null || hit.time<best.time))best=hit;
+            }
+            return Optional.ofNullable(best);
+        }
+        public Optional<GroundContact> ground(Box body) {
+            Box raised=body.offset(0,.025,0);Vec3d down=new Vec3d(0,-.15,0);
+            GroundContact best=null;
+            for(Shape shape:nearby(raised.stretch(down).expand(1e-5))) {
+                Hit hit=intersect(raised,down,shape);
+                // A simultaneous wall contact must not mask a real supporting floor.
+                if(hit==null || hit.normal.y<=.3 || best!=null && hit.time>=best.hit.time)continue;
+                var point=MeshContact.point(shape.cell,shape.local,raised.offset(down.multiply(hit.time)));
+                if(point.isPresent()) {
+                    // A fixed world-space inset can cross an entire thin/distorted primitive.
+                    // Convex interpolation towards its own center stays inside the contacted shape.
+                    Vec3d center=shape.cell.point((shape.local.minX+shape.local.maxX)/2,
+                            (shape.local.minY+shape.local.maxY)/2,(shape.local.minZ+shape.local.maxZ)/2);
+                    best=new GroundContact(hit,point.get(),point.get().lerp(center,1e-6));
+                }
             }
             return Optional.ofNullable(best);
         }
@@ -140,36 +160,64 @@ public final class MeshCollision {
     }
     private static boolean supported(Index i,Box body,Vec3d down){return i.sweep(body,down).filter(h->h.normal.y>.3).isPresent();}
     private static double trim(double x){return Math.abs(x)<=.05?0:x-Math.copySign(.05,x);}
-    public static Optional<Hit> ground(PlayerEntity player) {
-        Index i=index(player);
-        return i==null?Optional.empty():ground(i,player.getBoundingBox());
+    public static Optional<GroundContact> groundContact(PlayerEntity player) {
+        Index i=index(player);return i==null?Optional.empty():i.ground(player.getBoundingBox());
     }
-    /** Mesh ground contact probe: the real mesh below the future footprint, within one snap window. */
-    public static Optional<Hit> ground(Index i,Box body) {
-        return i.sweep(body.offset(0,.025,0),new Vec3d(0,-.15,0)).filter(h->h.normal.y>.3);
-    }
+    public static Optional<Hit> ground(PlayerEntity player) {return groundContact(player).map(GroundContact::hit);}
+    /** Supporting shape wins even when a wall is contacted simultaneously. */
+    public static Optional<Hit> ground(Index index,Box body) {return index.ground(body).map(GroundContact::hit);}
     public static boolean clearRay(ServerPlayerEntity player,Vec3d from,Vec3d to) {
         Index i=index(player);return i!=null && from.distanceTo(to)<=128 && i.clearRay(from,to);
     }
-    /** Actual affine SAT body clearance, including a newly acquired source window. */
+    /** No carrier blocks, entity boxes or world border may substitute for observer-local terrain. */
+    public static boolean bodyClear(PlayerEntity player,Box body) {
+        Index i=index(player);
+        return i==null || bodyClear(i.frame,body);
+    }
+    /** Actual affine SAT body clearance, including shapes extending outside the unit model. */
     public static boolean bodyClear(TerrainMeshFrame frame,Box body) {
         Box strict=body.expand(-1e-5);
-        for(var cell:frame.cells())if(cell.bounds().intersects(strict))
-            for(Box collision:cell.collision())if(penetration(strict,new Shape(cell,collision,cell.bounds(collision)))!=null)return false;
+        for(var cell:frame.cells())if(cell.opacity()>0)
+            for(Box collision:cell.collision()) {
+                Box bounds=cell.bounds(collision);
+                if(bounds.intersects(strict) && penetration(strict,new Shape(cell,collision,bounds))!=null)return false;
+            }
         return true;
     }
-    /** Continuous affine-motion guard. Endpoint AABBs are only broad phase: a resting body can
-     * overlap a tilted floor's AABB without touching its affine interior. The narrow phase proves
-     * a separating plane for the ENTIRE interpolation interval, never just sampled endpoints. */
+    /** Vanilla's packet endpoint guard rejects NEW intersections, not an existing overlap being escaped.
+     * Movement itself is already swept by move(); retain that guard without rebuilding block voxels. */
+    public static boolean newlyColliding(PlayerEntity player,Box before,Box after) {
+        Index i=index(player);
+        return i!=null && newlyColliding(i.frame,before,after);
+    }
+    public static boolean newlyColliding(TerrainMeshFrame frame,Box before,Box after) {
+        Box oldBody=before.expand(-1e-5),newBody=after.expand(-1e-5);
+        for(var cell:frame.cells())if(cell.opacity()>0)
+            for(Box collision:cell.collision()) {
+                Shape shape=new Shape(cell,collision,cell.bounds(collision));
+                if(shape.bounds.intersects(newBody) && penetration(newBody,shape)!=null
+                        && penetration(oldBody,shape)==null)return true;
+            }
+        return false;
+    }
+    /** Continuous affine-motion guard. Endpoint AABBs are broad phase only; the narrow phase
+     * certifies a separating plane over the entire interpolation, never just sampled endpoints. */
     public static boolean transitionClear(TerrainMeshFrame old,TerrainMeshFrame next,Box body) {
         if(old==null)return true;
         Map<Long,TerrainMeshFrame.Cell> previous=new HashMap<>();for(var c:old.cells())previous.put(c.key(),c);
         Box strict=body.expand(-1e-5);
         for(var c:next.cells()) {
+            if(c.opacity()<=0)continue;
             var before=previous.get(c.key());
+            if(before!=null && before.opacity()<=0)before=null;
             if(before!=null && c.min().equals(before.min()) && c.axisX().equals(before.axisX()) && c.axisY().equals(before.axisY())
                     && c.axisZ().equals(before.axisZ()) && c.collision().equals(before.collision()))continue;
-            if(before==null) {for(Box b:c.collision())if(penetration(strict,new Shape(c,b,c.bounds(b)))!=null)return false;continue;}
+            // Do not gate on endpoint model bounds: even distant endpoints can sweep through
+            // the body, and source collision shapes can extend outside the unit baked model.
+            if(before==null) {for(Box b:c.collision()) {
+                Box bounds=c.bounds(b);
+                if(bounds.intersects(strict) && penetration(strict,new Shape(c,b,bounds))!=null)return false;
+            }continue;}
             if(c.collision().isEmpty())continue;
             for(Box collision:c.collision()) {
                 Box swept=c.bounds(collision).union(before.bounds(collision));

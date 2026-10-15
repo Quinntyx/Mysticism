@@ -86,7 +86,52 @@ public final class NaturalLandingTriggerTest {
                 == NaturalLandingPolicy.Action.NONE, "tilted contact cannot divert a captured landing approach");
     }
 
+    private static void asyncRecoveryCannotDuplicateNaturalRequests() {
+        var ground = contact(10, 1);
+        var suspended = new SpiritNavigationService.Session();
+        var other = new SpiritNavigationService.Session();
+        tick(suspended, Optional.empty(), STILL); tick(other, Optional.empty(), STILL);
+        suspended.walk.reissue();
+        for (int i = 0; i <= WalkRequestClock.SOURCE_WAIT_TICKS; i++) suspended.walk.tick(false, true);
+        check(suspended.walk.armed() && !suspended.supportPending,
+                "late-source suspension releases active alignment but retains exactly one intent");
+        for (int i = 0; i < NaturalLandingPolicy.REST_TICKS * 2; i++)
+            check(tick(suspended, ground, STILL) == NaturalLandingPolicy.Action.NONE,
+                    "suspended request must not reissue a natural request or reset recovery allowance");
+        for (int i = 0; i < NaturalLandingPolicy.REST_TICKS - 1; i++) tick(other, ground, STILL);
+        check(tick(other, ground, STILL) == NaturalLandingPolicy.Action.LAND,
+                "one player's suspended intent cannot prevent another player's natural landing");
+        check(suspended.walk.recover(true), "actual late readiness resumes one existing request");
+        suspended.supportPending = true;
+        check(tick(suspended, ground, STILL) == NaturalLandingPolicy.Action.NONE,
+                "resumed request remains exclusive with natural landing");
+        check(suspended.walk.recoveries() == 1 && !suspended.walk.recover(true),
+                "same ready geometry does not duplicate the request");
+    }
+
+    private static void expiredRecoveryReleasesAsyncResources() {
+        var expired = new SpiritNavigationService.Session();
+        var other = new SpiritNavigationService.Session();
+        expired.supportTargetSnapshot = io.github.mysticism.vector.Vec384f.ZERO();
+        other.supportTargetSnapshot = io.github.mysticism.vector.Vec384f.ZERO();
+        expired.walk.reissue(); other.walk.reissue();
+        for (int i = 0; i <= WalkRequestClock.SOURCE_WAIT_TICKS; i++) expired.walk.tick(false, true);
+        for (int i = 0; i <= WalkRequestClock.RECOVERY_WAIT_TICKS; i++) expired.walk.recover(false);
+        check(!expired.walk.armed() && !expired.supportPending,
+                "deadline clears active/armed flags before resource teardown");
+        int[] released = {0};
+        SpiritNavigationService.releaseSupportResources(expired, () -> released[0]++);
+        check(released[0] == 1, "expired intent must cancel retained async discovery/proof despite cleared flags");
+        check(other.supportTargetSnapshot != null && other.walk.recoveries() == 0,
+                "expired player cannot release another player's frozen target or proof");
+        expired.supportTargetSnapshot = null; // endSupportApproach clears this immediately after cancellation
+        SpiritNavigationService.releaseSupportResources(expired, () -> released[0]++);
+        check(released[0] == 1, "completed teardown has no retained resources to cancel again");
+    }
+
     public static void main(String[] args) {
+        expiredRecoveryReleasesAsyncResources();
+        asyncRecoveryCannotDuplicateNaturalRequests();
         tiltedSupportStartsValidation();
         contactAndPlayerIsolation();
         System.out.println("natural landing trigger checks: " + checks);

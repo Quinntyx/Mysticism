@@ -1,9 +1,15 @@
 {
   "vertex": "blit", "fragment": "mysticism:spirit_transition", "attributes": ["Position"],
-  "samplers": [{"name":"DiffuseSampler"},{"name":"OriginalSampler"}],
+  "samplers": [{"name":"DiffuseSampler"},{"name":"OriginalSampler"},{"name":"DepthSampler"}],
   "uniforms": [
     {"name":"ProjMat","type":"matrix4x4","count":16,"values":[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]},
     {"name":"OutSize","type":"float","count":2,"values":[1,1]},
-    {"name":"EffectStrength","type":"float","count":1,"values":[0]}
+    {"name":"EffectStrength","type":"float","count":1,"values":[0]},
+    {"name":"InverseViewProjection","type":"matrix4x4","count":16,"values":[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]},
+    {"name":"RestoreSourceFog","type":"int","count":1,"values":[0]},
+    {"name":"SourceFogStart","type":"float","count":1,"values":[0]},
+    {"name":"SourceFogEnd","type":"float","count":1,"values":[1]},
+    {"name":"SourceFogShape","type":"int","count":1,"values":[0]},
+    {"name":"SourceFogColor","type":"float","count":4,"values":[0,0,0,1]}
   ]
 }
