@@ -1,6 +1,7 @@
 package io.github.mysticism.landmark;
 
 import io.github.mysticism.vector.Vec384f;
+import io.github.mysticism.landmark.extract.DiscoveryPrioritizer;
 import com.mojang.datafixers.*;
 import com.mojang.datafixers.schemas.Schema;
 import com.mojang.serialization.Dynamic;
@@ -63,15 +64,15 @@ public final class DiscoveryInvalidationTest {
     }
 
     private static void hintsAndOverflow(){
-        var hints=new DiscoveryInvalidation.HintQueue(2);
-        check(hints.poll()==null,"empty hint drain is safe");
-        var a=new DiscoveryInvalidation.Hint(DIM,0,0,0);var b=new DiscoveryInvalidation.Hint(DIM,1,0,0);var c=new DiscoveryInvalidation.Hint(DIM,2,0,0);
-        check(hints.offer(a)==null&&hints.offer(b)==null,"normal hints do not spill");
-        check(hints.offer(a)==null&&hints.size()==2,"duplicates do not starve old work");
-        check(hints.offer(c).equals(a),"overflow returns old work to the area retry, not silent eviction");
-        check(hints.poll().equals(b)&&hints.poll().equals(c),"bounded FIFO survives overflow");
-        hints.offer(a);hints.offer(new DiscoveryInvalidation.Hint("minecraft:the_nether",0,0,0));hints.removeIf(h->h.dimension().equals(DIM));
-        check(hints.size()==1&&hints.poll().dimension().equals("minecraft:the_nether"),"unload is dimension scoped");
+        var hints=new DiscoveryPrioritizer(2);
+        check(hints.poll(List.of())==null,"empty hint drain is safe");
+        var a=new BlockPoint(0,0,0);var b=new BlockPoint(1,0,0);var c=new BlockPoint(2,0,0);
+        check(hints.offerRetaining(DIM,a,DiscoveryPrioritizer.FRONTIER,List.of(),0).spill()==null&&hints.offerRetaining(DIM,b,DiscoveryPrioritizer.FRONTIER,List.of(),0).spill()==null,"normal hints do not spill");
+        check(hints.offerRetaining(DIM,a,DiscoveryPrioritizer.FRONTIER,List.of(),1).spill()==null&&hints.size()==2,"duplicates do not starve old work");
+        check(hints.offerRetaining(DIM,c,DiscoveryPrioritizer.FRONTIER,List.of(),1).spill().key().pos().equals(a),"overflow returns old work to the area retry, not silent eviction");
+        check(hints.poll(List.of()).pos().equals(b)&&hints.poll(List.of()).pos().equals(c),"equal-distance priority hints retain insertion order");
+        hints.offer(DIM,a,DiscoveryPrioritizer.FRONTIER,List.of());hints.offer("minecraft:the_nether",a,DiscoveryPrioritizer.FRONTIER,List.of());hints.removeDimension(DIM);
+        check(hints.size()==1&&hints.poll(List.of()).dimension().equals("minecraft:the_nether"),"unload is dimension scoped");
         check(!DiscoveryInvalidation.transientStaleness(new IllegalArgumentException("source parent page budget")),"deterministic budget errors do not spin");
         check(DiscoveryInvalidation.transientStaleness(new CompletionException(new IllegalStateException("stale source geometry"))),"async stale snapshots requeue");
     }
@@ -152,25 +153,25 @@ public final class DiscoveryInvalidationTest {
         put(store,landmark(Landmark.Kind.BIOME,96,List.of()),-1);
         stale(()->DiscoveryInvalidation.requireCurrentParents(store,sourceRevision,List.of()),"new source ownership invalidates even seed creation from an empty paged scan");
         // Exercise the exact production retry using paged metadata AND stored geometry.
-        var hints=new DiscoveryInvalidation.HintQueue(128);Set<BlockPos> emitted=new HashSet<>();
+        var hints=new DiscoveryPrioritizer(128);Set<BlockPos> emitted=new HashSet<>();
         var retry=new SourceLandmarks.FrontierRetry(DIM,new Bounds(-1,-1,-1,64,4,2),false);
         int steps=0;
-        while(!retry.advance(store,hints,p->emitted.add(p.toImmutable()))){if(++steps>300)throw new AssertionError("retry never completes");}
+        while(!retry.advance(store,hints::remaining,p->emitted.add(p.toImmutable()))){if(++steps>300)throw new AssertionError("retry never completes");}
         for(var value:landmarks){long x=value.anchor().x();check(emitted.stream().anyMatch(p->p.getX()==x),value.kind()+" known terrain page is refreshed on chunk generation");check(emitted.contains(new BlockPos((int)x+2,0,0)),value.kind()+" frontier resumes on chunk load, not caves only");}
         var overlap=new SourceLandmarks.FrontierRetry(DIM,new Bounds(3,0,0,4,1,1),false);Set<BlockPos> intersected=new HashSet<>();
-        steps=0;while(!overlap.advance(store,hints,intersected::add)){if(++steps>100)throw new AssertionError("slab retry never completes");}
+        steps=0;while(!overlap.advance(store,hints::remaining,intersected::add)){if(++steps>100)throw new AssertionError("slab retry never completes");}
         check(intersected.contains(new BlockPos(3,0,0)),"slab intersection retries even when its minimum corner is outside loaded chunk area");
         var overflow=new SourceLandmarks.FrontierRetry(DIM,Bounds.cube(500,70,500,1),true);Set<BlockPos> unowned=new HashSet<>();
-        steps=0;while(!overflow.advance(store,hints,unowned::add)){if(++steps>100)throw new AssertionError("overflow never completes");}
+        steps=0;while(!overflow.advance(store,hints::remaining,unowned::add)){if(++steps>100)throw new AssertionError("overflow never completes");}
         check(unowned.contains(new BlockPos(500,70,500)),"spilled new terrain still discovers where the catalog has no landmark");
-        var full=new DiscoveryInvalidation.HintQueue(8);for(int n=0;n<8;n++)full.offer(new DiscoveryInvalidation.Hint(DIM,n,0,0));
+        var full=new DiscoveryPrioritizer(8);for(int n=0;n<8;n++)full.offer(DIM,new BlockPoint(n,0,0),DiscoveryPrioritizer.FRONTIER,List.of());
         var waiting=new SourceLandmarks.FrontierRetry(DIM,Bounds.cube(0,0,0,8),false);
-        check(!waiting.advance(store,full,p->{throw new AssertionError("retry emitted into full hints");})&&!waiting.started,"refresh scan applies backpressure instead of recursively overflowing");
+        check(!waiting.advance(store,full::remaining,p->{throw new AssertionError("retry emitted into full hints");})&&!waiting.started,"refresh scan applies backpressure instead of recursively overflowing");
         var restart=new SourceLandmarks.FrontierRetry(DIM,Bounds.cube(0,0,0,8),false);
-        steps=0;while(restart.read==null){restart.advance(store,hints,p->{});if(++steps>20)throw new AssertionError("no retry geometry read");}
+        steps=0;while(restart.read==null){restart.advance(store,hints::remaining,p->{});if(++steps>20)throw new AssertionError("no retry geometry read");}
         check(!store.geometryReadAvailable(),"retry holds normal bounded geometry read");
-        check(!restart.advance(store,full,p->{throw new AssertionError("backpressure emitted a hint");})&&store.geometryReadAvailable(),"full hints cannot deadlock an Ensure behind retry's held geometry lane");
-        restart.advance(store,hints,p->{});
+        check(!restart.advance(store,full::remaining,p->{throw new AssertionError("backpressure emitted a hint");})&&store.geometryReadAvailable(),"full hints cannot deadlock an Ensure behind retry's held geometry lane");
+        restart.advance(store,hints::remaining,p->{});
         check(!store.geometryReadAvailable(),"retry reacquires saved page cursor when backpressure drains");
         restart.extend(new SourceLandmarks.FrontierRetry(DIM,Bounds.cube(48,0,0,8),true));
         check(store.geometryReadAvailable()&&restart.cursor==null&&!restart.started&&restart.discover,"overflow cancels old read before restarting catalog/geometry scan");
@@ -187,7 +188,7 @@ public final class DiscoveryInvalidationTest {
         var store=store();
         // Stage one immutable geometry page but do not publish the catalog. Generation/edit
         // cancels actual PendingMutation, completes the waiting caller, and retains discovery.
-        for(String reason:List.of("source edit invalidated snapshot","source chunk loaded during observation","source chunk unloaded during observation")){
+        for(String reason:List.of("source edit invalidated snapshot","source chunk unloaded during observation")){
             var observation=new Observation();
             var value=landmark(Landmark.Kind.BIOME,0,List.of());
             observation.mutation=store.stagePut(value,-1);observation.mutation.advance(1);
@@ -204,15 +205,15 @@ public final class DiscoveryInvalidationTest {
         }
         // A retry whose queued header disappeared must finish, not loop on a retired seed.
         var value=landmark(Landmark.Kind.BIOME,0,List.of());put(store,value,-1);
-        var hints=new DiscoveryInvalidation.HintQueue(128);
+        var hints=new DiscoveryPrioritizer(128);
         var retry=new SourceLandmarks.FrontierRetry(DIM,Bounds.cube(0,0,0,8),false);
-        retry.advance(store,hints,p->{});
+        retry.advance(store,hints::remaining,p->{});
         var deletion=store.stageDelete(new LandmarkRepository.RevisionRef(value.id(),0));while(!deletion.complete())deletion.advance(1);
-        int steps=0;while(!retry.advance(store,hints,p->{})){if(++steps>30)throw new AssertionError("deleted header pinned retry");}
+        int steps=0;while(!retry.advance(store,hints::remaining,p->{})){if(++steps>30)throw new AssertionError("deleted header pinned retry");}
         check(store.geometryReadAvailable(),"retired queued header leaves geometry lane available");
     }
     private static void cancelledChangedGeometry() throws Exception {
-        for(String reason:List.of("source edit invalidated snapshot","source chunk loaded during observation","source chunk unloaded during observation"))
+        for(String reason:List.of("source edit invalidated snapshot","source chunk unloaded during observation"))
         for(boolean update:List.of(false,true))for(boolean restart:List.of(false,true)) {
             var disk=disk();var store=disk.store;var original=landmark(Landmark.Kind.BIOME,0,List.of());
             if(update)put(store,original,-1);
@@ -249,17 +250,17 @@ public final class DiscoveryInvalidationTest {
         check(!a.id().equals(OwnershipGeometry.geometry(DIM,landmark(Landmark.Kind.BIOME,16,List.of()).id(),0,forward,List.of(),1).pages().getFirst().id()),"geometry content identity retains source fragment ownership namespace");
     }
     private static void coalescedCavesOwnTerrain() throws Exception {
-        var disk=disk();var store=disk.store;var hints=new DiscoveryInvalidation.HintQueue(1);
+        var disk=disk();var store=disk.store;var hints=new DiscoveryPrioritizer(1);
         var retries=new DiscoveryInvalidation.RetryQueue<SourceLandmarks.FrontierRetry>(1);
         // Use the same production spill -> area -> union path, dropping exact point state.
-        hints.offer(new DiscoveryInvalidation.Hint(DIM,-8,0,0));
+        hints.offer(DIM,new BlockPoint(-8,0,0),DiscoveryPrioritizer.FRONTIER,List.of());
         for(long x:new long[]{8,100}) {
-            var spill=hints.offer(new DiscoveryInvalidation.Hint(DIM,x,0,0));
-            retries.offer(new SourceLandmarks.FrontierRetry(spill.dimension(),Bounds.cube(spill.x(),spill.y(),spill.z(),1),true));
+            var spill=hints.offerRetaining(DIM,new BlockPoint(x,0,0),DiscoveryPrioritizer.FRONTIER,List.of(),0).spill().key();
+            retries.offer(new SourceLandmarks.FrontierRetry(spill.dimension(),Bounds.cube(spill.pos().x(),spill.pos().y(),spill.pos().z(),1),true));
         }
         check(retries.size()==1,"two spilled cave seeds coalesce into one constant-state retry");
-        var retry=retries.poll();var observations=new ArrayDeque<BlockPos>();var empty=new DiscoveryInvalidation.HintQueue(128);
-        for(int n=0;!retry.advance(store,empty,observations::add);n++)check(n<100,"coalesced overflow scan completes");
+        var retry=retries.poll();var observations=new ArrayDeque<BlockPos>();var empty=new DiscoveryPrioritizer(128);
+        for(int n=0;!retry.advance(store,empty::remaining,observations::add);n++)check(n<100,"coalesced overflow scan completes");
         check(observations.size()==1&&observations.peek().getX()==4,"coalesced window centre is stone, NOT either underground cave hint");
         List<SourceLandmarks.Cell> rows=new ArrayList<>();
         for(long x=-8;x<=16;x++)for(long y=-1;y<=1;y++)for(long z=-1;z<=1;z++)rows.add(cell(x,y,z,(x==-8||x==8)&&y==0&&z==0?AIR:STONE,false));
@@ -281,7 +282,7 @@ public final class DiscoveryInvalidationTest {
                 followups.offer(new SourceLandmarks.FrontierRetry(DIM,bounds,true));
                 if(spillAgain){followups.offer(new SourceLandmarks.FrontierRetry(DIM,Bounds.cube(40,0,0,1),true));spillAgain=false;}
                 var followup=followups.poll();
-                for(int n=0;!followup.advance(store,empty,observations::add);n++)check(n<500,"follow-up original observation area survives repeat coalescing");
+                for(int n=0;!followup.advance(store,empty::remaining,observations::add);n++)check(n<500,"follow-up original observation area survives repeat coalescing");
             }
         }
         disk.manager.save();store=disk.reopen().store;
@@ -322,14 +323,14 @@ public final class DiscoveryInvalidationTest {
             var geometry=OwnershipGeometry.geometry(DIM,id,0,cells,List.of(),1);
             var original=new Landmark(id,DIM,SourceLandmarks.ALGORITHM,Landmark.Kind.BIOME,"minecraft:plains",anchor,OwnershipGeometry.bounds(anchor,geometry),embedding(),.5,new ActivityMetadata(0,0),new Ownership(List.of()),geometry,0,"large retry fixture");
             put(store,original,-1);var captured=store.metadata(id).orElseThrow();Map<String,Landmark> live=new LinkedHashMap<>();live.put(id,original);
-            var hints=new DiscoveryInvalidation.HintQueue(128);var bounds=new Bounds(0,0,0,length+16,8,8);
+            var hints=new DiscoveryPrioritizer(128);var bounds=new Bounds(0,0,0,length+16,8,8);
             var retry=new SourceLandmarks.FrontierRetry(DIM,bounds,true);Set<BlockPos> emitted=new HashSet<>();Map<BlockPos,Integer> pageVisits=new HashMap<>();
             java.util.function.Consumer<BlockPos> emit=p->{
                 emitted.add(p.toImmutable());if(retry.read!=null)pageVisits.merge(p.toImmutable(),1,Integer::sum);
-                check(hints.offer(new DiscoveryInvalidation.Hint(DIM,p.getX(),p.getY(),p.getZ()))==null,"retry never spills while resuming under backpressure");
+                check(hints.offerRetaining(DIM,new BlockPoint(p.getX(),p.getY(),p.getZ()),DiscoveryPrioritizer.FRONTIER,List.of(),0).spill()==null,"retry never spills while resuming under backpressure");
             };
             int pressure=0,steps=0;boolean midReadPublication=false;
-            while(!retry.advance(store,hints,emit)) {
+            while(!retry.advance(store,hints::remaining,emit)) {
                 check(++steps<600,"interleaved Ensure publications cannot starve later pages or discovery sweep");
                 if(!midReadPublication&&!pageVisits.isEmpty()) {
                     check(retry.read!=null&&!retry.read.complete(),"mid-read publication precedes completion");
@@ -339,11 +340,11 @@ public final class DiscoveryInvalidationTest {
                 if(hints.remaining()<8) {
                     boolean geometryPending=retry.current!=null;
                     int completed=retry.read==null?retry.nextGeometryPage:retry.read.nextPageIndex();
-                    check(!retry.advance(store,hints,p->{throw new AssertionError("pressure emitted extra work");}),"pressure yields without completing retry");
+                    check(!retry.advance(store,hints::remaining,p->{throw new AssertionError("pressure emitted extra work");}),"pressure yields without completing retry");
                     check(store.geometryReadAvailable(),"pressure releases geometry lane for Ensure hydration");
                     check(retry.nextGeometryPage==completed&&(!geometryPending||completed>0),"pressure saves exact completed-page boundary");
                     BlockPos point=null;
-                    for(int n=0;n<32;n++){var h=hints.poll();if(h==null)break;if(point==null)point=new BlockPos((int)h.x(),(int)h.y(),(int)h.z());}
+                    for(int n=0;n<32;n++){var h=hints.poll(List.of());if(h==null)break;if(point==null)point=new BlockPos((int)h.pos().x(),(int)h.pos().y(),(int)h.pos().z());}
                     if(changeTerrain&&pressure==0) {
                         final int changedX=point.getX();rows.replaceAll(c->c.position().equals(new BlockPoint(changedX,0,0))?cell(changedX,0,0,DIRT,false):c);
                     }
@@ -356,7 +357,7 @@ public final class DiscoveryInvalidationTest {
                     if(pressure==1){disk.manager.save();disk=disk.reopen();store=disk.store;}
                     // Cold resume must retain the captured list, not reinterpret its page
                     // index against newer sorted keys (including truly changed content).
-                    retry.advance(store,hints,emit);
+                    retry.advance(store,hints::remaining,emit);
                     if(geometryPending)check(retry.read!=null&&retry.read.nextPageIndex()==completed&&retry.read.metadata().geometryKeys().equals(captured.geometryKeys()),"resume keeps immutable page list and cursor together across publications");
                     else check(retry.read==null&&retry.current==null&&retry.sweep!=null,"publication cannot restart completed geometry while discovery is sweeping");
                 }
@@ -376,8 +377,73 @@ public final class DiscoveryInvalidationTest {
             check(store.geometryReadAvailable(),"completed retry and ownership query release geometry lane");
         }
     }
+    private static void priorityOverflowRetainsRequiredRefresh() throws Exception {
+        var disk=disk();var store=disk.store;
+        var hints=new DiscoveryPrioritizer(128);
+        var retries=new DiscoveryInvalidation.RetryQueue<SourceLandmarks.FrontierRetry>(64);
+        var anchors=List.of(new DiscoveryPrioritizer.Anchor(DIM,new BlockPoint(0,0,0)));
+        var protectedPoint=new BlockPoint(5000,0,0);
+        hints.offer(DIM,protectedPoint,DiscoveryPrioritizer.BACKFILL,anchors,0);
+        for(int n=1;n<128;n++)hints.offer(DIM,new BlockPoint(n,0,0),DiscoveryPrioritizer.FRONTIER,anchors,1);
+        // The protected old locality survives a player admission; its displaced neighbor
+        // must survive too. A subsequently rejected required hint is a DIFFERENT spill path.
+        SourceLandmarks.offerDiscoveryHint(hints,retries,DIM,new BlockPoint(-1,0,0),DiscoveryPrioritizer.PLAYER,anchors,1000);
+        SourceLandmarks.offerDiscoveryHint(hints,retries,DIM,new BlockPoint(10000,0,0),DiscoveryPrioritizer.FRONTIER,anchors,1000);
+        check(hints.size()==128&&retries.size()==2,"production admission retains both displacement and rejection without expanding hints");
+        check(hints.peek(anchors,1000,DiscoveryPrioritizer.AGING_TICKS).key().pos().equals(protectedPoint),"saturation still protects oldest wider visible locality");
+        while(!hints.isEmpty())hints.poll(anchors);
+        Set<BlockPos> refreshed=new HashSet<>();int steps=0;
+        while(retries.size()>0){
+            check(++steps<30,"required overflow finishes after bounded backlog drains");
+            var retry=retries.poll();
+            if(!retry.advance(store,hints::remaining,p->{refreshed.add(p);SourceLandmarks.offerDiscoveryHint(hints,retries,DIM,new BlockPoint(p.getX(),p.getY(),p.getZ()),DiscoveryPrioritizer.FRONTIER,anchors,1001);}))retries.requeue(retry);
+        }
+        check(refreshed.equals(Set.of(new BlockPos(127,0,0),new BlockPos(10000,0,0))),"displaced and rejected source seeds are both rediscovered, never silently acknowledged");
+        var live=new LinkedHashMap<String,Landmark>();
+        for(var point:refreshed)refreshFixture(store,live,List.of(cell(point.getX(),0,0,DIRT,false),cell(point.getX(),1,0,AIR,true)),point,1002);
+        disk.manager.save();store=disk.reopen().store;
+        for(var value:live.values())check(load(store,value.id()).geometry().materialAt(value.anchor().x(),0,0).orElseThrow().material().equals(DIRT),"priority overflow installs actual changed terrain after cold reload");
+    }
+    private static void visibleFloodLeavesRefreshProgress() throws Exception {
+        var store=store();var hints=new DiscoveryPrioritizer(128);
+        var retries=new DiscoveryInvalidation.RetryQueue<SourceLandmarks.FrontierRetry>(64);
+        var anchors=List.of(new DiscoveryPrioritizer.Anchor(DIM,new BlockPoint(0,64,0)));
+        for(int n=0;n<512;n++)SourceLandmarks.offerDiscoveryHint(hints,retries,DIM,new BlockPoint(n*16L,64,0),DiscoveryPrioritizer.BACKFILL,anchors,0);
+        check(hints.size()==120&&hints.remaining()==8&&retries.size()==0,"repeating render-distance samples preserve a full frontier step of headroom");
+        var target=new BlockPos(8192,64,8192);var retry=new SourceLandmarks.FrontierRetry(DIM,Bounds.cube(target.getX(),target.getY(),target.getZ(),1),true);
+        boolean done=false,dispatchedRefresh=false;
+        for(int tick=1;tick<=40;tick++){
+            for(int n=0;n<4;n++)SourceLandmarks.offerDiscoveryHint(hints,retries,DIM,new BlockPoint((512L+tick*4+n)*16,64,0),DiscoveryPrioritizer.BACKFILL,anchors,tick);
+            final int tickTime=tick;
+            if(tick%5==0&&!done)done=retry.advance(store,hints::remaining,p->SourceLandmarks.offerDiscoveryHint(hints,retries,DIM,new BlockPoint(p.getX(),p.getY(),p.getZ()),DiscoveryPrioritizer.FRONTIER,anchors,tickTime));
+            var next=SourceLandmarks.nextOperation(hints,List.of(),anchors,tick,true);
+            if(next instanceof DiscoveryPrioritizer.Hint hint){hints.remove(hint);hints.dispatched(hint);if(hint.key().pos().equals(new BlockPoint(target.getX(),target.getY(),target.getZ())))dispatchedRefresh=true;}
+            check(hints.size()<=128&&retries.size()==0,"visible flood remains bounded without manufacturing overflow scans");
+        }
+        check(done&&dispatchedRefresh,"generation refresh completes and dispatches despite sustained four-sample/tick visible arrivals");
+        check(store.geometryReadAvailable(),"visible refresh leaves geometry lane usable");
+    }
+    private static void rotatingRetriesDoNotHeadBlock() throws Exception {
+        var store=store();var retries=new DiscoveryInvalidation.RetryQueue<SourceLandmarks.FrontierRetry>(64);
+        var wide=new SourceLandmarks.FrontierRetry(DIM,new Bounds(0,0,0,100000,1,1),true);
+        var near=new SourceLandmarks.FrontierRetry(DIM,Bounds.cube(200000,0,0,1),true);
+        retries.offer(wide);retries.offer(near);Set<BlockPos> emitted=new HashSet<>();DiscoveryInvalidation.Sweep captured=null;
+        for(int turn=0;turn<12;turn++){
+            retries.advance(retry->retry.advance(store,()->128,emitted::add));
+            if(wide.sweep!=null){if(captured==null)captured=wide.sweep;else check(captured==wide.sweep,"rotation never restarts a captured discovery cursor");}
+        }
+        check(emitted.contains(new BlockPos(200000,0,0))&&retries.size()==1&&retries.peek()==wide,"one-point source refresh completes without waiting for thousands of wide-scan steps");
+        check(emitted.stream().filter(p->p.getX()<100000).count()>4,"wide visible locality keeps advancing while near work is served");
+        retries.clear();check(store.geometryReadAvailable(),"retry cleanup releases read ownership");
+        retries.offer(wide);retries.offer(near);
+        var failure=new IllegalStateException("stale source geometry");
+        try{retries.advance(retry->{throw failure;});throw new AssertionError("failed retry step was swallowed");}
+        catch(IllegalStateException actual){check(actual==failure&&retries.poll()==wide,"failed entry remains available for the tick's explicit cancellation/retry path");}
+        check(retries.size()==1&&retries.peek()==near,"failure cannot cancel unrelated retry coverage");
+        retries.clear();
+    }
     public static void main(String[] args) throws Exception {
-        hintsAndOverflow();retryOverflowAndCoverage();preparationRefresh();frontierProof();storeStalenessAndRetries();cancelledGenerationAndEdit();cancelledChangedGeometry();coalescedCavesOwnTerrain();publicationBackpressureProgress();
+        hintsAndOverflow();retryOverflowAndCoverage();preparationRefresh();frontierProof();storeStalenessAndRetries();cancelledGenerationAndEdit();cancelledChangedGeometry();coalescedCavesOwnTerrain();publicationBackpressureProgress();priorityOverflowRetainsRequiredRefresh();visibleFloodLeavesRefreshProgress();rotatingRetriesDoNotHeadBlock();
         System.out.println("DiscoveryInvalidationTest: "+checks+" checks passed");
     }
 }

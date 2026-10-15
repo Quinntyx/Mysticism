@@ -8,33 +8,6 @@ import java.util.function.Predicate;
 final class DiscoveryInvalidation {
     private DiscoveryInvalidation() {}
     static final String REFRESH_FRONTIER="observed-refresh";
-    record Hint(String dimension,long x,long y,long z) {}
-
-    static final class HintQueue {
-        private final int capacity;
-        private final LinkedHashSet<Hint> hints=new LinkedHashSet<>();
-        HintQueue(int capacity) {
-            if(capacity<1)throw new IllegalArgumentException("hint queue capacity");
-            this.capacity=capacity;
-        }
-        /** Existing work retains its FIFO position. Caller MUST retain the returned spill. */
-        Hint offer(Hint hint) {
-            Objects.requireNonNull(hint);
-            if(hints.contains(hint))return null;
-            Hint spill=null;
-            if(hints.size()==capacity){spill=hints.iterator().next();hints.remove(spill);}
-            hints.add(hint);return spill;
-        }
-        Hint poll() {
-            if(hints.isEmpty())return null;
-            var first=hints.iterator().next();hints.remove(first);return first;
-        }
-        int size(){return hints.size();}
-        int remaining(){return capacity-size();}
-        void removeIf(Predicate<Hint> filter){hints.removeIf(filter);}
-        void clear(){hints.clear();}
-    }
-
     interface Retry {
         String dimension();
         Bounds bounds();
@@ -55,6 +28,16 @@ final class DiscoveryInvalidation {
             for(E existing:retries)if(!existing.started()&&existing.dimension().equals(retry.dimension())&&existing.bounds().intersects(retry.bounds())){existing.extend(retry);return;}
             if(retries.size()>=capacity)for(E existing:retries)if(existing.dimension().equals(retry.dimension())){existing.extend(retry);return;}
             retries.addLast(retry);
+        }
+        /** Rotation is not new work: do not union it back into another started scan or reset
+         * its captured immutable page cursor. The polled slot is still reserved. */
+        void requeue(E retry){retries.addLast(Objects.requireNonNull(retry));}
+        /** One bounded step, then rotate WITHOUT treating cursor progress as new work.
+         * Keep the failed entry at the head so the caller can cancel/retry it explicitly. */
+        void advance(java.util.function.Predicate<E> step){
+            E retry=poll();if(retry==null)return;
+            try{if(!step.test(retry))requeue(retry);}
+            catch(RuntimeException failure){retries.addFirst(retry);throw failure;}
         }
         E peek(){return retries.peekFirst();}
         E poll(){return retries.pollFirst();}
