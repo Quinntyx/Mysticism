@@ -18,9 +18,9 @@ final class SpiritEntryScene {
         if(client.world.getRegistryKey().getValue().toString().equals("mysticism:spirit")) return;
         var main=client.getFramebuffer(); int width=main.textureWidth,height=main.textureHeight;
         if(width<=0 || height<=0)return;
-        if(image==null)image=new SimpleFramebuffer(width,height,false,MinecraftClient.IS_SYSTEM_MAC);
-        else if(image.textureWidth!=width || image.textureHeight!=height) image.resize(width,height,MinecraftClient.IS_SYSTEM_MAC);
         try {
+            if(image==null)image=new SimpleFramebuffer(width,height,false,MinecraftClient.IS_SYSTEM_MAC);
+            else if(image.textureWidth!=width || image.textureHeight!=height) image.resize(width,height,MinecraftClient.IS_SYSTEM_MAC);
             GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER,main.fbo);
             GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER,image.fbo);
             GL30.glBlitFramebuffer(0,0,width,height,0,0,width,height,GL11.GL_COLOR_BUFFER_BIT,GL11.GL_NEAREST);

@@ -4,11 +4,11 @@ uniform sampler2D DepthSampler;
 uniform sampler2D OccupancySampler;
 uniform int HasOccupancy;
 uniform vec3 OccupancyCameraOffset;
-uniform float NearBubble;
+uniform float VisibleRadius;
 uniform mat4 InverseViewProjection;
 uniform vec3 CameraModulo;
 uniform float OpaqueRadius;
-uniform float MinExtinction;
+uniform float HorizonOpticalDepth;
 uniform int FogSteps;
 in vec2 texCoord;
 out vec4 fragColor;
@@ -24,7 +24,8 @@ vec3 sceneOffset(vec2 uv, float depth) {
 }
 
 // Continuous, periodic world-space medium (integer wave numbers prevent wrap discontinuities).
-// A strictly positive extinction floor proves T(64) <= 0.001, even in the thinnest region.
+// Density only modulates the distance ramp; it cannot make the foreground opaque.
+// The exact ramp integral proves T(OpaqueRadius) <= 0.001 in every quality tier.
 float density(vec3 p) {
     vec3 phase = p * (TAU / PERIOD);
     return 1.0 + 0.5 * (0.5 + 0.5 * sin(phase.x * 83.0 + phase.y * 29.0)
@@ -51,18 +52,32 @@ void main() {
     vec3 direction = endpoint / max(distanceToScene, 0.00001);
     // Clear depth is SKY, not empty/no-fog. March it to the shared opaque horizon.
     float endDistance = depth >= 0.9999999 ? OpaqueRadius : min(distanceToScene, OpaqueRadius);
-    float lengthToMarch = max(0.0, endDistance - NearBubble);
+    // Keep useful terrain visible across half the configured render radius, regardless
+    // of source readiness. Do not compress this range to the tiny currently loaded mesh.
+    float lengthToMarch = max(0.0, endDistance - VisibleRadius);
+    float rampSpan = max(OpaqueRadius - VisibleRadius, 0.00001);
+    if (lengthToMarch <= 0.0) {
+        fragColor = vec4(scene.rgb, 1.0);
+        return;
+    }
     int count = clamp(FogSteps, 8, 64);
     float stepLength = lengthToMarch / float(count);
+    float marchedFraction = clamp(lengthToMarch / rampSpan, 0.0, 1.0);
     float transmittance = 1.0;
     vec3 scattering = vec3(0.0);
     for (int i = 0; i < 64; ++i) {
         if (i >= count || transmittance <= 0.001) break;
-        vec3 offset = direction * (NearBubble + (float(i) + 0.5) * stepLength);
+        float segmentStart = VisibleRadius + float(i) * stepLength;
+        vec3 offset = direction * (segmentStart + 0.5 * stepLength);
         vec3 worldSample = CameraModulo + offset;
         float occupied = occupancy(offset);
-        float sigma = MinExtinction * (density(worldSample) + 0.7 * occupied);
-        float segmentTransmittance = exp(-sigma * stepLength);
+        // Integrate the quadratic distance ramp analytically instead of midpoint-
+        // sampling it: changing FogSteps must not weaken the opaque horizon.
+        // Normalized endpoints avoid subtractive float cancellation at wide radii.
+        float a = marchedFraction * float(i) / float(count);
+        float b = marchedFraction * float(i + 1) / float(count);
+        float opticalDepth = HorizonOpticalDepth * (b * b * b - a * a * a);
+        float segmentTransmittance = exp(-opticalDepth * (density(worldSample) + 0.7 * occupied));
         // In-scattering varies throughout the world-space participating medium, not at the endpoint.
         float light = 0.94 + 0.06 * sin(worldSample.y * (TAU * 7.0 / PERIOD));
         scattering += transmittance * (1.0 - segmentTransmittance) * FOG_COLOR * light;

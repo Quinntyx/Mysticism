@@ -68,6 +68,22 @@ suites. Ordinary tests must not call live embedding services, download weights,
 or bootstrap a game. The separate opt-in `embeddedInferenceProbe` task tests
 actual native v2 forward passes; see the embedding runtime contract.
 
+The separate `kuwaharaGpuTest` task executes the packaged shader graph in real
+OpenGL using the existing Minecraft LWJGL dependencies. It requires a display
+(or an already installed `xvfb-run`); it fails instead of silently skipping.
+Run the combined retained checks with an exact preprovisioned GGUF:
+
+```sh
+xvfb-run -a ./gradlew --no-daemon --console=plain --rerun-tasks build kuwaharaGpuTest embeddedInferenceProbe \
+  -PembeddingModelPath=/absolute/path/to/exact-v2.gguf
+```
+
+Only the explicit inference probe may provision weights when
+`-PembeddingProvision=true` is supplied. `buildSelfTest` checks that both probes
+remain independently registered and that normal `build` retains all deterministic
+runtime/packaging suites without depending on either display/weight-dependent probe.
+This does not replace Minecraft gameplay or IntelliJ launch acceptance.
+
 ## Production artifact
 
 `build` runs Loom's `remapJar` and `verifyProductionJar`. The distributable is:

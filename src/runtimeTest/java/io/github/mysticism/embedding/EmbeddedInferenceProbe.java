@@ -20,7 +20,8 @@ public final class EmbeddedInferenceProbe {
             System.out.println("Verifying/provisioning exact v2 GGUF: " + path);
             pinned.resolve();
         }
-        System.setProperty("mysticism.embedding.provider", "embedded");
+        // Exercise the ordinary Minecraft selection, not an explicit local-provider override.
+        System.clearProperty("mysticism.embedding.provider");
         System.setProperty("mysticism.embedding.modelPath", path.toString());
         // Endpoint deliberately unusable; it must have no effect on the default local path.
         System.setProperty("mysticism.embedding.endpoint", "http://127.0.0.1:1/");

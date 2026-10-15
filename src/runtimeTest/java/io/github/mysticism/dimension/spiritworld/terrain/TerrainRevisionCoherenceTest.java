@@ -46,6 +46,20 @@ public final class TerrainRevisionCoherenceTest {
         check(new MeshCollision.Index(gate.committed()).clearRay(rayFrom,rayTo),"committed collision moves with displayed mesh");
         check(gate.commit(newer),"resource reload may rebuild current revision");
         check(!gate.commit(old) && !gate.commit(null),"unrelated resource rebuild cannot change collision");
+        // Resource reload/resize must not let a rebuild of the old frame bypass a newer
+        // pending source/projection revision. Failed rebuilds keep collision on the display.
+        var afterReload=frame(4,true,30);
+        check(gate.accept(afterReload) && gate.shallowFlipPending(),"reload can overlap a pending shallow transition");
+        check(!gate.commit(newer),"rebuilding old display during reload cannot consume newer pending geometry");
+        check(gate.committed()==newer && gate.pending()==afterReload && gate.shallowFlipPending(),
+                "reload failure preserves displayed revision, pending candidate and mode-flip intent");
+        check(gate.commit(afterReload) && !gate.shallowFlipPending(),"successful retry commits geometry and consumes mode flip together");
+        // Equal revision numbers are not enough: a stale upload from a prior entry must
+        // not publish its geometry into a new session with a restarted revision counter.
+        gate.clear();var reentered=frame(4,false,40);
+        check(gate.accept(reentered),"re-entry admits restarted counter");
+        check(!gate.commit(afterReload) && gate.committed()==null,"previous-session upload cannot commit by revision equality");
+        check(gate.commit(reentered) && gate.committed()==reentered,"only current-session upload can establish collision");
         complete.close();check(complete.closes==1,"display owner closes transferred resources on replacement");
         Buffer failing=new Buffer(),after=new Buffer();failing.fail=true;
         try(var build=new TerrainBatchBuild<Buffer>()) {

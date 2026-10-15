@@ -2,6 +2,7 @@ package io.github.mysticism.client.spiritworld;
 
 import com.mojang.blaze3d.systems.RenderSystem;
 import net.minecraft.client.MinecraftClient;
+import com.mojang.blaze3d.platform.TextureUtil;
 import net.minecraft.util.math.Vec3d;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL12;
@@ -29,8 +30,9 @@ final class SpiritMediumTexture {
         pending=copy; center=origin; publishedWorld=MinecraftClient.getInstance().world; revision++;
     }
     static int prepare() {
+        RenderSystem.assertOnRenderThread();
         if (pending==null) return 0;
-        if (texture==0) { texture=GL11.glGenTextures(); uploaded=-1; }
+        if (texture==0) { texture=TextureUtil.generateTextureId(); uploaded=-1; }
         if (uploaded==revision) return texture;
         int previous=GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
         try {
@@ -40,19 +42,20 @@ final class SpiritMediumTexture {
                 int value=Math.round(pending[x+16*(y+16*z)]*255);
                 pixels.put((byte)value).put((byte)0).put((byte)0).put((byte)255);
             }
-            pixels.flip(); GL11.glBindTexture(GL11.GL_TEXTURE_2D,texture);
+            pixels.flip(); RenderSystem.bindTexture(texture);
             GL11.glTexParameteri(GL11.GL_TEXTURE_2D,GL11.GL_TEXTURE_MIN_FILTER,GL11.GL_NEAREST);
             GL11.glTexParameteri(GL11.GL_TEXTURE_2D,GL11.GL_TEXTURE_MAG_FILTER,GL11.GL_NEAREST);
             GL11.glTexParameteri(GL11.GL_TEXTURE_2D,GL11.GL_TEXTURE_WRAP_S,GL12.GL_CLAMP_TO_EDGE);
             GL11.glTexParameteri(GL11.GL_TEXTURE_2D,GL11.GL_TEXTURE_WRAP_T,GL12.GL_CLAMP_TO_EDGE);
             GL11.glTexImage2D(GL11.GL_TEXTURE_2D,0,GL11.GL_RGBA8,64,64,0,GL11.GL_RGBA,GL11.GL_UNSIGNED_BYTE,pixels);
             uploaded=revision;
-        } finally { GL11.glBindTexture(GL11.GL_TEXTURE_2D,previous); }
+        } finally { RenderSystem.bindTexture(previous); }
         return texture;
     }
     static Vec3d offset(Vec3d camera) { return camera.subtract(center); }
     static void resetGpu() {
-        if (texture!=0) GL11.glDeleteTextures(texture);
+        RenderSystem.assertOnRenderThread();
+        if (texture!=0) TextureUtil.releaseTextureId(texture);
         texture=0; uploaded=-1;
     }
     static void retainFor(Object currentWorld) { if(publishedWorld!=currentWorld)clear(); }

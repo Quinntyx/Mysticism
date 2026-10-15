@@ -8,6 +8,7 @@ import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gl.Framebuffer;
 import net.minecraft.client.gl.SimpleFramebuffer;
+import net.minecraft.client.gl.PostEffectProcessor;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
@@ -25,20 +26,28 @@ import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 public final class ShaderManager {
     private static final Logger LOGGER = LoggerFactory.getLogger("Mysticism/SpiritRendering");
     private static final Identifier SPIRIT = Identifier.of("mysticism", "spirit");
+    private static final java.util.List<String> TARGETS = java.util.List.of("fogged", "painted", "saturated");
+    private static final SpiritPostprocessFrame frame = new SpiritPostprocessFrame();
     public static final ManagedShaderEffect KUWAHARA_SHADER = ShaderEffectManager.getInstance().manage(
             Identifier.of("mysticism", "shaders/post/kuwahara.json"), effect -> {
+                frame.invalidate();
                 failed = false;
                 LOGGER.info("Spirit postprocess initialized/reloaded/resized; depth will be rebound this frame");
             });
     private static final Matrix4f inverseViewProjection = new Matrix4f();
     private static SimpleFramebuffer sceneDepth;
+    private static PostEffectProcessor processor;
+    private static Framebuffer processorMain;
     private static ClientWorld sessionWorld;
     private static long enteredAt, transitionAt;
     private static boolean targetActive, meshDepthSeen;
     private static float transitionFrom;
-    private static boolean initialized, failed, frameReady, depthReady, fogHookSeen;
+    private static boolean initialized, failed, fogHookSeen;
     private static boolean missingHookReported;
     private static SpiritRenderSettings.Quality quality = initialQuality();
+    private static SpiritRenderSettings.FogRange fogRange = SpiritRenderSettings.DEFAULT_FOG_RANGE;
+    private static boolean kuwaharaEnabled = Boolean.parseBoolean(
+            System.getProperty("mysticism.spirit.kuwahara", "true"));
     private static String status = "starting";
 
     private ShaderManager() {}
@@ -49,17 +58,20 @@ public final class ShaderManager {
         WorldRenderEvents.START.register(context -> {
             MinecraftClient client = MinecraftClient.getInstance();
             updateSession(client);
-            frameReady = false;
-            depthReady = false;
+            // Refresh once per world frame, including fallback/entry frames. Mesh culling and
+            // volumetrics then use exactly the same range, even after changing the option.
+            fogRange = SpiritRenderSettings.fogRange(client.options.getViewDistance().getValue());
+            // Keep the lifecycle gate: a range change, resize or reload must not carry
+            // a previous frame's depth into this frame (including early-return paths).
+            frame.invalidate();
             meshDepthSeen=false;
             if (sessionWorld == null || !targetActive && effectStrength()<=.001f || failed) return;
+            Framebuffer main = client.getFramebuffer();
+            if (main.textureWidth <= 0 || main.textureHeight <= 0) return;
             try {
-                Framebuffer main = client.getFramebuffer();
-                if (main.textureWidth <= 0 || main.textureHeight <= 0) return;
                 if (!main.useDepthAttachment || main.getDepthAttachment() < 0)
                     throw new IllegalStateException("Main framebuffer has no readable depth attachment");
-                if (KUWAHARA_SHADER.getShaderEffect() == null)
-                    throw new IllegalStateException("Satin could not initialize spirit shader (see preceding Satin diagnostics)");
+                ensureChain(main);
                 ensureDepth(main);
                 // These are the actual world matrices, including projection effects; not postpass ProjMat.
                 inverseViewProjection.set(context.projectionMatrix()).mul(context.positionMatrix());
@@ -73,31 +85,39 @@ public final class ShaderManager {
                         SpiritRenderSettings.wrap(camera.y), SpiritRenderSettings.wrap(camera.z));
                 int medium=SpiritMediumTexture.prepare();
                 KUWAHARA_SHADER.setUniformValue("HasOccupancy",medium==0?0:1);
-                if (medium!=0) KUWAHARA_SHADER.setSamplerUniform("OccupancySampler",medium);
+                // Always bind an existing texture. Satin retains sampler values across reloads;
+                // HasOccupancy=0 must not leave a deleted atlas ID in a recreated program.
+                KUWAHARA_SHADER.setSamplerUniform("OccupancySampler",
+                        medium == 0 ? sceneDepth.getColorAttachment() : medium);
                 var offset=SpiritMediumTexture.offset(camera);
                 KUWAHARA_SHADER.setUniformValue("OccupancyCameraOffset",(float)offset.x,(float)offset.y,(float)offset.z);
-                KUWAHARA_SHADER.setUniformValue("NearBubble",(float)SpiritRenderSettings.NEAR_BUBBLE);
+                KUWAHARA_SHADER.setUniformValue("VisibleRadius", (float) fogRange.visibleRadius());
                 KUWAHARA_SHADER.setUniformValue("EffectStrength",effectStrength());
-                KUWAHARA_SHADER.setUniformValue("OpaqueRadius", (float) SpiritRenderSettings.OPAQUE_RADIUS);
-                KUWAHARA_SHADER.setUniformValue("MinExtinction", (float) SpiritRenderSettings.MIN_EXTINCTION);
+                KUWAHARA_SHADER.setUniformValue("OpaqueRadius", (float) fogRange.opaqueRadius());
+                KUWAHARA_SHADER.setUniformValue("HorizonOpticalDepth", (float) SpiritRenderSettings.HORIZON_OPTICAL_DEPTH);
                 KUWAHARA_SHADER.setUniformValue("FogSteps", quality.fogSteps);
-                KUWAHARA_SHADER.setUniformValue("KernelRadius", quality.kernelRadius);
+                KUWAHARA_SHADER.setUniformValue("KernelRadius", kuwaharaEnabled ? quality.kernelRadius : 0);
+                KUWAHARA_SHADER.setUniformValue("SampleStride", SpiritRenderSettings.painterlyStride(main.textureHeight));
                 KUWAHARA_SHADER.setUniformValue("Saturation", SpiritRenderSettings.saturation(
                         (System.nanoTime() - enteredAt) * 1.0e-9));
-                frameReady = true;
+                frame.prepare(surface(main));
             } catch (RuntimeException exception) {
                 fail("preparing matrices/framebuffer", exception);
+            } finally {
+                // Satin target initialization/resize can bind a secondary FBO before failing.
+                main.beginWrite(true);
             }
         });
         WorldRenderEvents.AFTER_TRANSLUCENT.register(context -> {
-            if (!frameReady || sessionWorld == null) return;
+            if (!frame.ready() || sessionWorld == null) return;
             MinecraftClient client = MinecraftClient.getInstance();
             try {
+                if (!frame.matches(surface(client.getFramebuffer()))) { frame.invalidate(); return; }
                 // Before Fabulous's transparency chain clears main depth. Includes opaque terrain and
                 // our already-flushed glyphs; main depth is NOT the later hand-only depth texture.
                 sceneDepth.copyDepthFrom(client.getFramebuffer());
                 checkGl("copying scene depth");
-                depthReady = true;
+                frame.captureDepth(surface(client.getFramebuffer()));
             } catch (RuntimeException exception) {
                 fail("copying scene depth", exception);
             } finally {
@@ -115,9 +135,9 @@ public final class ShaderManager {
                 try {SpiritEntryScene.capture(MinecraftClient.getInstance());checkGl("capturing source scene");}
                 catch(RuntimeException error) {SpiritEntryScene.clear();fail("source-scene snapshot",error);}
             }
-            if (!frameReady || !depthReady || sessionWorld == null) return;
-            frameReady = false;
-            depthReady = false; // consume the world frame once; never process menus/stale frames
+            MinecraftClient client = MinecraftClient.getInstance();
+            Framebuffer main = client.getFramebuffer();
+            if (!frame.consume(surface(main)) || sessionWorld == null) return;
             if (!fogHookSeen) {
                 status = "fallback: parent must register SpiritBackgroundRendererMixin";
                 if (!missingHookReported) {
@@ -126,8 +146,6 @@ public final class ShaderManager {
                 }
                 return;
             }
-            MinecraftClient client = MinecraftClient.getInstance();
-            Framebuffer main = client.getFramebuffer();
             try {
                 // Fabric END is WorldRenderer.RETURN, BEFORE GameRenderer clears depth for the hand.
                 // Satin's own effect event runs AFTER renderWorld/hand; unsuitable for scene depth.
@@ -192,18 +210,18 @@ public final class ShaderManager {
         if(effectStrength()<=.001f)return;
         // During source-scene fade retain source fog; once fully in spirit there is ONLY
         // participating-medium fog. The transition layer is zero at entry, not an abrupt filter.
-        if (frameReady && !failed && effectStrength()>=.999f) {
+        if (frame.ready() && !failed && effectStrength()>=.999f) {
             RenderSystem.setShaderFogStart(Float.MAX_VALUE / 4);
             RenderSystem.setShaderFogEnd(Float.MAX_VALUE / 2);
-        } else if (!frameReady || failed) {
+        } else if (!frame.ready() || failed) {
             float s=effectStrength();
-            RenderSystem.setShaderFogStart(RenderSystem.getShaderFogStart()*(1-s)+(float)SpiritRenderSettings.HORIZONS.visible()*s);
-            RenderSystem.setShaderFogEnd(RenderSystem.getShaderFogEnd()*(1-s)+(float)SpiritRenderSettings.OPAQUE_RADIUS*s);
+            RenderSystem.setShaderFogStart(RenderSystem.getShaderFogStart()*(1-s)+(float)fogRange.visibleRadius()*s);
+            RenderSystem.setShaderFogEnd(RenderSystem.getShaderFogEnd()*(1-s)+(float)fogRange.opaqueRadius()*s);
         }
     }
 
     public static void applySpiritFogColor() {
-        if (inSpiritWorld() && effectStrength()>.001f && (!frameReady || failed)) {
+        if (inSpiritWorld() && effectStrength()>.001f && (!frame.ready() || failed)) {
             float s=effectStrength(); float[] c=RenderSystem.getShaderFogColor();
             RenderSystem.setShaderFogColor(c[0]+(.75f-c[0])*s,c[1]+(.68f-c[1])*s,c[2]+(.95f-c[2])*s);
         }
@@ -213,7 +231,13 @@ public final class ShaderManager {
         quality = java.util.Objects.requireNonNull(value);
     }
 
+    /** Independent A/B switch: fog and saturation still run when painterly filtering is off. */
+    public static void setKuwaharaEnabled(boolean enabled) { kuwaharaEnabled = enabled; }
+
     public static String status() { return status; }
+
+    /** Current world-frame presentation range, shared by mesh culling and fallback fog. */
+    public static SpiritRenderSettings.FogRange fogRange() { return fogRange; }
 
     private static void updateSession(MinecraftClient client) {
         ClientSpiritCache.syncObserver(client);
@@ -236,19 +260,48 @@ public final class ShaderManager {
         if (!ClientSpiritCache.active() && effectStrength()<=.001f && sceneDepth!=null) release();
     }
 
-    private static void ensureDepth(Framebuffer main) {
-        if (sceneDepth == null) {
-            // One full-size RGBA8+depth FBO; the three Satin targets also allocate color+depth.
-            // No per-frame allocation. Depth snapshot is rebound after every reload/resize.
-            sceneDepth = new SimpleFramebuffer(main.textureWidth, main.textureHeight, true, MinecraftClient.IS_SYSTEM_MAC);
-        } else if (sceneDepth.textureWidth != main.textureWidth || sceneDepth.textureHeight != main.textureHeight) {
-            sceneDepth.resize(main.textureWidth, main.textureHeight, MinecraftClient.IS_SYSTEM_MAC);
+    private static SpiritPostprocessFrame.Surface surface(Framebuffer main) {
+        return new SpiritPostprocessFrame.Surface(main, main.textureWidth, main.textureHeight,
+                main.fbo, main.getColorAttachment(), main.getDepthAttachment());
+    }
+
+    private static void ensureChain(Framebuffer main) {
+        var current = KUWAHARA_SHADER.getShaderEffect();
+        // PostEffectProcessor captures its main target in its constructor. A replacement of
+        // Minecraft's framebuffer cannot be repaired merely by resizing the secondary targets.
+        if (current == processor && processorMain != main) {
+            KUWAHARA_SHADER.release();
+            current = KUWAHARA_SHADER.getShaderEffect();
         }
-        sceneDepth.beginWrite(false);
+        if (current == null)
+            throw new IllegalStateException("Satin could not initialize spirit shader (see preceding Satin diagnostics)");
+        processor = current;
+        processorMain = main;
+        // Satin normally receives window-resize callbacks, but the actual render surface is the
+        // authority (including startup/re-entry and off-screen render-size changes).
+        for (String name : TARGETS) {
+            Framebuffer target = current.getSecondaryTarget(name);
+            if (target == null) throw new IllegalStateException("Missing postprocess target: " + name);
+            if (target.textureWidth != main.textureWidth || target.textureHeight != main.textureHeight) {
+                current.setupDimensions(main.textureWidth, main.textureHeight);
+                frame.invalidate();
+                break;
+            }
+        }
+    }
+
+    private static void ensureDepth(Framebuffer main) {
         try {
+            if (sceneDepth == null) {
+                sceneDepth = new SimpleFramebuffer(main.textureWidth, main.textureHeight, true, MinecraftClient.IS_SYSTEM_MAC);
+            } else if (sceneDepth.textureWidth != main.textureWidth || sceneDepth.textureHeight != main.textureHeight) {
+                sceneDepth.resize(main.textureWidth, main.textureHeight, MinecraftClient.IS_SYSTEM_MAC);
+            }
+            sceneDepth.beginWrite(false);
             sceneDepth.checkFramebufferStatus();
             checkGl("allocating depth snapshot");
         } finally {
+            // Constructors/resize bind their own FBO too. Restore main even on allocation failure.
             main.beginWrite(true);
         }
     }
@@ -272,19 +325,20 @@ public final class ShaderManager {
     private static void fail(String phase, RuntimeException exception) {
         if (!failed) LOGGER.error("Spirit rendering failed while {}; using vanilla linear fog until re-entry/resource reload", phase, exception);
         failed = true;
-        frameReady = false;
+        frame.invalidate();
         status = "fallback: " + phase + " (see log; F3+T to retry)";
     }
 
     private static void release() {
-        frameReady = false;
-        depthReady = false;
+        frame.invalidate();
         SpiritMediumTexture.resetGpu();
         SpiritRenderLayers.clear();
         if (sceneDepth != null) {
             sceneDepth.delete();
             sceneDepth = null;
         }
+        processor = null;
+        processorMain = null;
         KUWAHARA_SHADER.release(); // remains managed: Satin recreates on re-entry/resource reload
     }
 }

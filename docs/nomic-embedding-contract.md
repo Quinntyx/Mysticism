@@ -120,5 +120,6 @@ Real inference is a separate explicit task, not a silently skipped test:
 The probe verifies the SHA256/size, runs actual JNI tokenizer/forward passes,
 checks repeated inference, nonidentical descriptor outputs, all 768 coordinates,
 normalization, async readiness, cache ownership and real token-overflow rejection.
-Its endpoint is intentionally unreachable. It reports observed cosine values,
+The probe clears the provider override to exercise normal embedded selection, and
+its endpoint is intentionally unreachable. It reports observed cosine values,
 not Minecraft-corpus quality, gameplay verification, or cross-platform results.
