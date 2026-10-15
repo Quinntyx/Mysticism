@@ -22,6 +22,8 @@ import java.util.HexFormat;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
+import java.util.concurrent.CancellationException;
+import java.util.function.BooleanSupplier;
 
 /**
  * Offline, read-only loading of the approved native v2 GGUF (weights AND tokenizer).
@@ -90,7 +92,7 @@ public final class NomicV2ModelAssets {
         return open(location, APPROVED);
     }
 
-    private static void requireApprovedProfile() throws AssetException {
+    static void requireApprovedProfile() throws AssetException {
         if (!(EmbeddingSpace.MODEL.equals("nomic-embed-text-v2-moe") || EmbeddingSpace.MODEL.equals("nomic-embed-text-v2-moe:latest"))
                 || !EmbeddingSpace.REVISION.equals(APPROVED_REVISION)
                 || EmbeddingSpace.DIMENSIONS != 768 || EmbeddingSpace.NATIVE_DIMENSIONS != 768
@@ -106,6 +108,11 @@ public final class NomicV2ModelAssets {
     record Pin(String revision, String ggufSha256, long bytes) {}
 
     static OpenedModel open(Location location, Pin pin) throws IOException {
+        return open(location, pin, () -> false);
+    }
+
+    private static OpenedModel open(Location location, Pin pin, BooleanSupplier cancelled) throws IOException {
+        checkCancelled(cancelled);
         Objects.requireNonNull(location, "location");
         Path model = location.path();
         if (location.ollamaCache()) {
@@ -120,7 +127,8 @@ public final class NomicV2ModelAssets {
             // Never trust a manifest's `from` field or a supplied digest as a path.
             model = location.path().resolve("blobs").resolve("sha256-" + pin.ggufSha256());
         }
-        return openGguf(model, pin);
+        checkCancelled(cancelled);
+        return openGguf(model, pin, cancelled);
     }
 
     private static byte[] readManifest(Path path) throws IOException {
@@ -154,7 +162,7 @@ public final class NomicV2ModelAssets {
         }
     }
 
-    private static OpenedModel openGguf(Path path, Pin pin) throws IOException {
+    private static OpenedModel openGguf(Path path, Pin pin, BooleanSupplier cancelled) throws IOException {
         requireRegularFile("native v2 GGUF (including tokenizer)", path);
         Path realPath = path.toRealPath();
         FileChannel channel = FileChannel.open(realPath, StandardOpenOption.READ);
@@ -172,12 +180,13 @@ public final class NomicV2ModelAssets {
             if (h[0] != 'G' || h[1] != 'G' || h[2] != 'U' || h[3] != 'F') {
                 throw new AssetException("Unsupported model format at " + path + "; expected the approved GGUF artifact");
             }
-            String ggufDigest = digest(channel, pin.bytes());
+            String ggufDigest = digest(channel, pin.bytes(), cancelled);
             if (!ggufDigest.equals(pin.ggufSha256())) {
                 throw new AssetException("Native v2 GGUF SHA256 mismatch at " + path + ": expected " + pin.ggufSha256()
                         + ", got " + ggufDigest + "; refusing corrupt, replaced or incompatible weights/tokenizer");
             }
             if (channel.size() != pin.bytes()) throw new AssetException("Native v2 GGUF changed during verification at " + path);
+            checkCancelled(cancelled);
             return new OpenedModel(realPath, channel, pin);
         } catch (Throwable e) {
             try { channel.close(); } catch (Throwable closing) { e.addSuppressed(closing); }
@@ -214,11 +223,16 @@ public final class NomicV2ModelAssets {
         catch (NoSuchAlgorithmException e) { throw new AssertionError(e); }
     }
     private static String digest(byte[] bytes) { return HexFormat.of().formatHex(sha256().digest(bytes)); }
-    private static String digest(FileChannel channel, long expectedBytes) throws IOException {
+    private static void checkCancelled(BooleanSupplier cancelled) {
+        if (cancelled.getAsBoolean() || Thread.currentThread().isInterrupted())
+            throw new CancellationException("Native v2 asset loading cancelled");
+    }
+    private static String digest(FileChannel channel, long expectedBytes, BooleanSupplier cancelled) throws IOException {
         MessageDigest hash = sha256();
         ByteBuffer buffer = ByteBuffer.allocate(256 * 1024);
         long offset = 0;
         while (offset < expectedBytes) {
+            checkCancelled(cancelled);
             buffer.clear();
             buffer.limit((int) Math.min(buffer.capacity(), expectedBytes - offset));
             int count = channel.read(buffer, offset);
@@ -251,20 +265,31 @@ public final class NomicV2ModelAssets {
     }
 
     public static <T extends AutoCloseable> T load(Location location, ModelLoader<T> loader) throws Exception {
+        return load(location, loader, () -> false);
+    }
+
+    public static <T extends AutoCloseable> T load(Location location, ModelLoader<T> loader, BooleanSupplier cancelled) throws Exception {
         requireApprovedProfile();
-        return load(location, APPROVED, loader);
+        return load(location, APPROVED, loader, cancelled);
     }
 
     static <T extends AutoCloseable> T load(Location location, Pin pin, ModelLoader<T> loader) throws Exception {
+        return load(location, pin, loader, () -> false);
+    }
+
+    static <T extends AutoCloseable> T load(Location location, Pin pin, ModelLoader<T> loader, BooleanSupplier cancelled) throws Exception {
         Objects.requireNonNull(loader, "loader");
+        Objects.requireNonNull(cancelled, "cancelled");
         T backend = null;
-        try (OpenedModel model = open(location, pin)) {
+        try (OpenedModel model = open(location, pin, cancelled)) {
+            checkCancelled(cancelled);
             backend = Objects.requireNonNull(loader.load(model), "Model loader returned null, not a loaded backend");
             // Re-open the selected cache AND model: also catches replacements, not just
             // changes to the original open inode. Keep provisioned assets immutable.
-            try (OpenedModel verified = open(location, pin)) {
+            try (OpenedModel verified = open(location, pin, cancelled)) {
                 if (!verified.path().equals(model.path())) throw new AssetException("Native v2 asset path changed during backend loading");
             }
+            checkCancelled(cancelled);
         } catch (Throwable e) {
             if (backend != null) try { backend.close(); } catch (Throwable closing) { e.addSuppressed(closing); }
             throw e;

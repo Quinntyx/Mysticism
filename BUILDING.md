@@ -7,7 +7,7 @@
 - Use an already installed JDK/Gradle. This checkout does not install software or
   download embedding model weights during build. Gradle may resolve ordinary build dependencies.
   Normal Minecraft inference now runs in-process; see [the embedding runtime contract](docs/nomic-embedding-contract.md)
-  for first-use pinned weight provisioning and offline launch options.
+  for supported already-provisioned local/cache assets and offline launch options.
 - Common code is in `src/main`; client-only code is in `src/client`. Keep client
   classes out of common initializers so dedicated servers can load the mod.
 

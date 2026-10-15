@@ -17,7 +17,15 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
         @Override void close();
     }
     interface Loader { Model load(Path path, BooleanSupplier cancelled) throws Exception; }
-    interface Asset extends AutoCloseable { Path resolve() throws Exception; @Override void close(); }
+    interface Asset extends AutoCloseable {
+        Path resolve() throws Exception;
+        default Model load(Loader loader, BooleanSupplier cancelled) throws Exception {
+            Path path = resolve();
+            if (cancelled.getAsBoolean()) throw new CancellationException("Native v2 asset loading cancelled");
+            return loader.load(path, cancelled);
+        }
+        @Override void close();
+    }
     private final Asset asset;
     private final Loader loader;
     private final ReentrantLock work = new ReentrantLock();
@@ -25,25 +33,7 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
     private Model model; // guarded by work, including JNI lifetime
 
     public EmbeddedEmbeddingService() {
-        asset = new Asset() {
-            private PinnedEmbeddingModel pinned;
-            private boolean stopped;
-            public Path resolve() throws Exception {
-                PinnedEmbeddingModel selected;
-                synchronized (this) {
-                    if (stopped) throw new CancellationException("Model provisioning cancelled");
-                    // Even home/cache metadata checks belong on the preparation worker.
-                    if (pinned == null) pinned = PinnedEmbeddingModel.configured();
-                    selected = pinned;
-                }
-                return selected.resolve();
-            }
-            public void close() {
-                PinnedEmbeddingModel selected;
-                synchronized (this) { stopped = true; selected = pinned; }
-                if (selected != null) selected.close();
-            }
-        };
+        asset = new LocalNomicV2ModelAsset();
         loader = LlamaEmbeddingModel::new;
     }
     EmbeddedEmbeddingService(Asset asset, Loader loader) { this.asset = asset; this.loader = loader; }
@@ -54,9 +44,7 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
         try {
             requireOpen();
             if (model != null) return;
-            Path path = asset.resolve();
-            requireOpen();
-            Model candidate = loader.load(path, () -> closed || Thread.currentThread().isInterrupted());
+            Model candidate = asset.load(loader, () -> closed || Thread.currentThread().isInterrupted());
             try {
                 requireOpen();
                 if (candidate.dimensions() != EmbeddingSpace.NATIVE_DIMENSIONS)

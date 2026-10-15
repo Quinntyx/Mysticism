@@ -17,26 +17,35 @@ manifest**, not a different conversion or a moving Hugging Face/Ollama tag:
 - GGUF length: **957,680,480 bytes**
 - Source: `https://registry.ollama.ai/v2/library/nomic-embed-text-v2-moe/blobs/sha256:a5db3381f2e514d3490a3a31fe70eb1a65e95016c85c6c2c23223b810806594f`
 
-Provider construction does no asset IO/native loading. On the embedding worker,
-preparation verifies a configured/cached file, or downloads the pinned blob on
-first use. The download is not inference over HTTP and needs no running service.
-Both length and SHA256 are checked before native loading. Publication is atomic,
-concurrent JVMs share a file lock, incomplete downloads are removed, corrupt
-existing files are **not** replaced, and cancellation/deadlines are enforced.
-Readiness includes an actual model forward pass; an executor/file flag is not
-readiness. Startup does not join preparation. Restart to retry failed readiness.
+Provider construction does no asset IO/native loading. Preparation runs on the
+embedding worker and loads only supported **already-provisioned local assets** via
+[the retained asset verifier](embedded-model-assets.md). Both complete file length
+and SHA256 are checked **before and after** allocating the native context. Cache
+manifests, when selected, are rechecked too. Failure/cancellation closes a returned
+context; readiness still requires an actual model forward pass. Startup does not
+join preparation. Restart/world re-entry is needed to retry failed readiness.
 
-Resolution order:
+Resolution order (explicit choices are authoritative and never fall back):
 
-1. Explicit `mysticism.embedding.modelPath` (exact GGUF; never downloaded/overwritten).
-2. Existing `~/.ollama/models/blobs/sha256-<GGUF SHA256>` (weights only; no Ollama process).
-3. `~/.cache/mysticism/models/sha256-<GGUF SHA256>.gguf` (download if missing, unless disabled).
+1. `mysticism.embedding.modelPath` (exact GGUF).
+2. `mysticism.embedding.ollamaModels`, or environment `OLLAMA_MODELS` (existing
+   Ollama models root; requires the pinned manifest and blob, not a running service).
+3. Default `~/.ollama/models` manifest and blob, when the manifest exists.
+4. Existing `~/.ollama/models/blobs/sha256-<GGUF SHA256>` when no default manifest exists.
+5. Existing `~/.cache/mysticism/models/sha256-<GGUF SHA256>.gguf`.
 
-First use therefore requires internet access **or** a preprovisioned exact file,
-about 958 MB disk space, and sufficient native memory. Build/test never downloads
-model weights. Native runtime selection/CPU support is platform-dependent; no
-fallback model is used on unsupported platforms. JNI extraction uses a private
-temporary directory rather than cleaning a shared system temp root.
+Only absence permits checking a lower-priority **default** cache. Corruption,
+wrong revisions and permission errors are not hidden by falling back. If absent,
+readiness fails with the checked paths and how to provision the exact asset;
+there is no automatic download, server connection, alternate model or dummy output.
+`mysticism.embedding.download` is not a runtime provisioning option here.
+The explicit opt-in inference probe below retains a download option; it is never
+part of a Minecraft launch or ordinary build.
+
+An exact local file requires about 958 MB disk space and sufficient native memory.
+Build/test never downloads model weights. Native runtime selection/CPU support is
+platform-dependent; no fallback model is used on unsupported platforms. JNI
+extraction uses a private temporary directory rather than a shared system temp root.
 
 ## JVM properties (set before mod classes load)
 
@@ -44,7 +53,7 @@ temporary directory rather than cleaning a shared system temp root.
 |---|---|---|
 | `mysticism.embedding.provider` | `embedded` | `ollama` explicitly opts into legacy HTTP deployment; an endpoint alone cannot select it |
 | `mysticism.embedding.modelPath` | resolution above | Offline/preprovisioned exact GGUF |
-| `mysticism.embedding.download` | `true` | Allow first-use pinned blob download; ignored for an explicit modelPath |
+| `mysticism.embedding.ollamaModels` | `OLLAMA_MODELS` or user cache | Existing local cache root; explicit choices require pinned manifest and blob |
 | `mysticism.embedding.nativeThreads` | up to 4, leaving one CPU | 1..32 native CPU threads; inference on one context is serialized |
 | `mysticism.embedding.workers` | `2` | 1..32 async workers |
 | `mysticism.embedding.deadlineMillis` | `30000` | 1..120000 total queue + inference deadline |
@@ -55,10 +64,10 @@ temporary directory rather than cleaning a shared system temp root.
 An offline IntelliJ VM-options example:
 
 ```text
--Dmysticism.embedding.modelPath=/absolute/path/to/the-pinned-v2.gguf -Dmysticism.embedding.download=false
+-Dmysticism.embedding.modelPath=/absolute/path/to/the-pinned-v2.gguf
 ```
 
-No options or server process are needed when automatic provisioning is allowed.
+No options or server process are needed when a supported default cache already contains the approved weights.
 Client/server model and revision must agree, because they determine the vector
 fingerprint. Clients do not execute inference for authoritative server state.
 
@@ -259,13 +268,16 @@ The canonical Java 21 build runs all discovered current runtime suites and packa
 The canonical build discovers **all** current main-based runtime suites and runs
 packaging/verifier suites. Embedded tests cover default selection, lifecycle,
 serialized inference/context release, late-load cancellation, actual token-limit
-contract, full-coordinate retention, pinned provenance, local HTTP/file integrity,
-atomic cache reuse and bundled JNI ABI loading. Fixture vectors exist only inside
+contract, full-coordinate retention, pinned provenance, offline file/cache integrity,
+post-allocation re-verification/cancellation and bundled JNI ABI loading. Separate
+probe-provisioning tests use loopback HTTP fixtures, never live model downloads. Fixture vectors exist only inside
 tests; these checks are not a real model forward pass or a Minecraft launch.
 
 Real inference is a separate explicit task, not a silently skipped test:
 
 ```sh
+# Default supported local/cache assets (fails explicitly when absent):
+./gradlew --no-daemon --console=plain embeddedInferenceProbe
 # Existing exact GGUF (offline):
 ./gradlew --no-daemon --console=plain embeddedInferenceProbe -PembeddingModelPath=/absolute/path/to/exact-v2.gguf
 # Explicitly download the pinned weights into this checkout's ignored build directory:

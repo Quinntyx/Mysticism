@@ -11,14 +11,22 @@ import net.ladenthin.llama.LlamaModel;
 public final class EmbeddedInferenceProbe {
     private static void check(boolean value, String message) { if (!value) throw new AssertionError(message); }
     public static void main(String[] args) throws Exception {
-        if (args.length != 2) throw new IllegalArgumentException("Usage: EmbeddedInferenceProbe <exact-GGUF-path> <provision:true|false>");
+        if (args.length != 2) throw new IllegalArgumentException("Usage: EmbeddedInferenceProbe <exact-GGUF-path-or-empty-for-local-caches> <provision:true|false>");
+        NomicV2ModelAssets.requireApprovedProfile();
         Path base = Path.of("build/embedding-inference-probe").toAbsolutePath(); Files.createDirectories(base);
         System.setProperty("net.ladenthin.llama.tmpdir", Files.createTempDirectory(base, "jni-").toString());
-        Path path = Path.of(args[0]).toAbsolutePath();
-        try (var pinned = new PinnedEmbeddingModel(path, PinnedEmbeddingModel.SOURCE, PinnedEmbeddingModel.SHA256,
-                PinnedEmbeddingModel.BYTES, Boolean.parseBoolean(args[1]), Duration.ofMinutes(10))) {
-            System.out.println("Verifying/provisioning exact v2 GGUF: " + path);
-            pinned.resolve();
+        Path path;
+        if (args[0].isEmpty()) {
+            if (Boolean.parseBoolean(args[1])) throw new IllegalArgumentException("Provisioning requires an explicit probe path");
+            System.out.println("Verifying normal read-only runtime local/cache assets (no download)");
+            try (var asset = new LocalNomicV2ModelAsset()) { path = asset.resolve(); }
+        } else {
+            path = Path.of(args[0]).toAbsolutePath();
+            try (var pinned = new PinnedEmbeddingModel(path, PinnedEmbeddingModel.SOURCE, PinnedEmbeddingModel.SHA256,
+                    PinnedEmbeddingModel.BYTES, Boolean.parseBoolean(args[1]), Duration.ofMinutes(10))) {
+                System.out.println("Verifying/provisioning exact v2 GGUF: " + path);
+                pinned.resolve();
+            }
         }
         System.setProperty("mysticism.embedding.provider", "embedded");
         System.setProperty("mysticism.embedding.modelPath", path.toString());

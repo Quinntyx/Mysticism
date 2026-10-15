@@ -1,4 +1,9 @@
-# Retained embedded-default unit: validation record
+# Imported embedded-default reference: historical validation record
+
+**Historical reference only:** imported from immutable reviewed commit
+`ca2addcb52dc1bd3b46058045911c1e9cd8ba221`; these checks are not a claim about
+this model-loading candidate. Its original runtime provisioning policy is now
+replaced by read-only local/cache loading. See [current model-loading validation](embedded-model-assets.md).
 
 Scope: restore real in-process native v2 inference as the default provider.
 Branch: `feat-runtime-embeddings-embedded-default` (target integration: dev, never main).
