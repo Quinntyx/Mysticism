@@ -8,15 +8,39 @@ import net.minecraft.util.math.Vec3d;
 import java.util.*;
 import java.util.function.Function;
 
-/** Swept AABB against visible affine block-shape parallelepipeds, shared by server and prediction. */
+/** Swept SAT against visible affine mesh cells, shared by server and prediction. Grounding, stepping,
+ * sneaking and support all read the actual distorted mesh; vanilla block shapes/flags never stand in. */
 public final class MeshCollision {
     private MeshCollision() {}
     private static volatile Function<UUID,TerrainMeshFrame> client = id -> null;
     private static final Map<UUID,Index> SERVER = new java.util.concurrent.ConcurrentHashMap<>(), CLIENT = new java.util.concurrent.ConcurrentHashMap<>();
     public static void clientFrames(Function<UUID,TerrainMeshFrame> provider) { client=Objects.requireNonNull(provider); }
-    public static void clear(UUID player) { SERVER.remove(player); CLIENT.remove(player); }
-    public static void clearClient() { CLIENT.clear(); }
+    public static void clear(UUID player) { SERVER.remove(player); CLIENT.remove(player); SERVER_CORRECTIONS.remove(player); CLIENT_CORRECTIONS.remove(player); }
+    public static void clearClient() { CLIENT.clear(); CLIENT_CORRECTIONS.clear(); }
+    /** Movement-response accounting for the integrators: depenetration displacement applied to this
+     *  body since the last drain. Collision corrections are not chosen movement; integration that
+     *  folds them in repeats the correction every tick and jitters/rubber-bands. */
+    public static Vec3d drainCorrection(PlayerEntity p) { return drainCorrection(p.getUuid(), p.getWorld().isClient); }
+    public static Vec3d drainCorrection(UUID player, boolean clientSide) {
+        var drained = (clientSide ? CLIENT_CORRECTIONS : SERVER_CORRECTIONS).put(player, Vec3d.ZERO);
+        return drained == null ? Vec3d.ZERO : drained;
+    }
+    public static void recordCorrection(UUID player, boolean clientSide, Vec3d correction) {
+        if (player == null || correction.equals(Vec3d.ZERO)) return;
+        (clientSide ? CLIENT_CORRECTIONS : SERVER_CORRECTIONS).merge(player, correction, Vec3d::add);
+    }
+    private static final Map<UUID,Vec3d> SERVER_CORRECTIONS=new java.util.concurrent.ConcurrentHashMap<>(), CLIENT_CORRECTIONS=new java.util.concurrent.ConcurrentHashMap<>();
+    private static void recordCorrection(PlayerEntity p,Vec3d correction) { recordCorrection(p.getUuid(),p.getWorld().isClient,correction); }
     public record Hit(double time, Vec3d normal, TerrainMeshFrame.Cell cell) {}
+    /** Player input snapshot shared with entity-free regressions. The vanilla ground flag is an
+     * untrusted carrier/packet claim, NOT evidence of support on this observer's mesh. */
+    record MotionState(Box body,double stepHeight,boolean flying,boolean sneaking,boolean vanillaOnGround) {
+        private static MotionState of(PlayerEntity player) {
+            return new MotionState(player.getBoundingBox(),player.getStepHeight(),player.getAbilities().flying,
+                    player.isSneaking(),player.isOnGround());
+        }
+    }
+    private record Slide(Vec3d movement,boolean landed) {}
     private record Bucket(int x,int y,int z) {}
     private record Shape(TerrainMeshFrame.Cell cell,Box local,Box bounds) {}
     public static final class Index {
@@ -56,7 +80,8 @@ public final class MeshCollision {
         public boolean clearRay(Vec3d from,Vec3d to) {
             return sweep(new Box(from.x-1e-4,from.y-1e-4,from.z-1e-4,from.x+1e-4,from.y+1e-4,from.z+1e-4),to.subtract(from)).isEmpty();
         }
-        private Vec3d depenetrate(Box body) {
+        /** Minimal-penetration escape, displacement bounded to `limit`. Public for runtime regressions. */
+        public Vec3d depenetrate(Box body,double limit) {
             Vec3d moved=Vec3d.ZERO;
             for(int step=0;step<8;step++) {
                 Vec3d correction=null;
@@ -65,22 +90,26 @@ public final class MeshCollision {
                     if(depth!=null && (correction==null || depth.lengthSquared()<correction.lengthSquared()))correction=depth;
                 }
                 if(correction==null)break;
-                if(correction.length()>4)correction=correction.normalize().multiply(4);
-                moved=moved.add(correction);if(moved.length()>4)break;
+                if(correction.length()>limit)correction=correction.normalize().multiply(limit);
+                moved=moved.add(correction);
+                if(moved.length()>limit){moved=moved.normalize().multiply(limit);break;}
             }
             return moved;
         }
-        private Vec3d slide(Box body,Vec3d wanted) {
-            Vec3d moved=Vec3d.ZERO,remaining=wanted;
+        private Slide slide(Box body,Vec3d wanted) {
+            Vec3d moved=Vec3d.ZERO,remaining=wanted;boolean landed=false;
             for(int i=0;i<4 && remaining.lengthSquared()>1e-12;i++) {
                 var hit=sweep(body.offset(moved),remaining);
                 if(hit.isEmpty()){moved=moved.add(remaining);break;}
+                // A clipped vertical delta alone is not a landing: wall sliding and depenetration
+                // can also move the body upward. Keep evidence of an actual up-facing swept contact.
+                if(remaining.y<0 && hit.get().normal.y>.3)landed=true;
                 double t=Math.max(0,hit.get().time-1e-5/Math.max(1e-5,remaining.length()));
                 moved=moved.add(remaining.multiply(t));remaining=remaining.multiply(1-t);
                 double into=remaining.dotProduct(hit.get().normal);
                 if(into<0)remaining=remaining.subtract(hit.get().normal.multiply(into));else break;
             }
-            return moved;
+            return new Slide(moved,landed);
         }
     }
     private static int grid(double x){return (int)Math.floor(x/8);}
@@ -93,77 +122,199 @@ public final class MeshCollision {
         return index;
     }
     public static Vec3d move(PlayerEntity player,Vec3d wanted) {
-        Index i=index(player);
+        Resolution result=moveResolved(index(player),MotionState.of(player),wanted);
+        recordCorrection(player,result.correction());
+        return result.movement();
+    }
+    /** Same movement path used by server/prediction, without requiring a live entity for tests. */
+    static Vec3d move(Index i,MotionState state,Vec3d wanted) {
+        return moveResolved(i,state,wanted).movement();
+    }
+    /** The correction must belong to the SELECTED path, including step-up, not just the direct sweep. */
+    record Resolution(Vec3d movement,Vec3d correction,boolean landed) {}
+    static Resolution moveResolved(Index i,MotionState state,Vec3d wanted) {
         // No fabricated floor. Preparation supplies geometry before entry; packet delay simply has no surfaces yet.
-        if(i==null)return wanted;
-        Box body=player.getBoundingBox();
+        if(i==null)return new Resolution(wanted,Vec3d.ZERO,false);
         if(wanted.length()>256)wanted=wanted.multiply(256/wanted.length());
-        Vec3d result=i.depenetrate(body);
+        Box body=state.body();
+        Resolution direct=resolveMotion(i,body,wanted);
+        Vec3d applied=direct.correction(),result=direct.movement();
+        Box from=body.offset(applied);
+        // Only real mesh support (after depenetration) or a genuine swept landing grants step-up.
+        // A vanilla ground claim or an upward wall slide is never evidence of support.
+        if(!state.flying() && (supported(i,from) || direct.landed())
+                && result.subtract(wanted).horizontalLengthSquared()>1e-8)
+            result=stepUp(i,from,applied,wanted,state.stepHeight(),result);
+        return new Resolution(result,applied,direct.landed());
+    }
+    /** Vanilla-style up/over/down selection starts at the depenetrated body and carries the
+     * applied correction into the selected displacement for exact movement-response accounting. */
+    public static Vec3d stepUp(Index i,Box from,Vec3d applied,Vec3d wanted,double step,Vec3d direct) {
+        if(step<=0)return direct;
+        Vec3d up=i.slide(from,new Vec3d(0,step,0)).movement();
+        Vec3d over=i.slide(from.offset(up),new Vec3d(wanted.x,0,wanted.z)).movement();
+        Vec3d down=i.slide(from.offset(up).offset(over),new Vec3d(0,wanted.y-up.y,0)).movement();
+        Vec3d stepped=applied.add(up).add(over).add(down);
+        return stepped.horizontalLengthSquared()>direct.horizontalLengthSquared()+1e-8?stepped:direct;
+    }
+    /** Pure swept resolution shared by move(): reports depenetration separately from chosen travel. */
+    public static Vec3d resolve(Index i,Box body,Vec3d wanted,Vec3d[] correction) {
+        Resolution result=resolveMotion(i,body,wanted);
+        if(correction!=null && correction.length>0)correction[0]=result.correction();
+        return result.movement();
+    }
+    private static Resolution resolveMotion(Index i,Box body,Vec3d wanted) {
+        Vec3d applied=i.depenetrate(body,4),result=applied;
         // Bound swept traversal for unusually fast flight/teleports rather than tunnelling through a grid overflow.
         int pieces=Math.min(64,Math.max(1,(int)Math.ceil(wanted.length()/4)));
-        Vec3d piece=wanted.multiply(1.0/pieces);
-        for(int p=0;p<pieces;p++)result=result.add(i.slide(body.offset(result),piece));
-        if(!player.getAbilities().flying && (player.isOnGround() || wanted.y<0 && result.y>wanted.y+1e-5)
-                && result.subtract(wanted).horizontalLengthSquared()>1e-8) {
-            double step=player.getStepHeight();
-            if(step>0) {
-                Vec3d up=i.slide(body,new Vec3d(0,step,0));
-                Vec3d over=i.slide(body.offset(up),new Vec3d(wanted.x,0,wanted.z));
-                Vec3d down=i.slide(body.offset(up).offset(over),new Vec3d(0,wanted.y-up.y,0));
-                Vec3d stepped=up.add(over).add(down);
-                if(stepped.horizontalLengthSquared()>result.horizontalLengthSquared()+1e-8)result=stepped;
-            }
+        Vec3d piece=wanted.multiply(1.0/pieces);boolean landed=false;
+        for(int p=0;p<pieces;p++) {
+            Slide slide=i.slide(body.offset(result),piece);
+            result=result.add(slide.movement());landed|=slide.landed();
         }
-        return result;
+        return new Resolution(result,applied,landed);
     }
     /** Vanilla's carrier-air ledge check would prevent all sneaking; use the real mesh below the future footprint. */
     public static Vec3d sneak(PlayerEntity p,Vec3d wanted,MovementType type) {
-        Index i=index(p);
-        if(i==null || p.getAbilities().flying || !p.isSneaking() || !p.isOnGround() || type!=MovementType.SELF && type!=MovementType.PLAYER)return wanted;
-        Box body=p.getBoundingBox();Vec3d down=new Vec3d(0,-Math.max(.6,p.getStepHeight()),0);double x=wanted.x,z=wanted.z;int guard=0;
-        while(x!=0 && !supported(i,body.offset(x,0,0),down) && guard++<128)x=trim(x);
+        return sneak(index(p),MotionState.of(p),wanted,type);
+    }
+    static Vec3d sneak(Index i,MotionState state,Vec3d wanted,MovementType type) {
+        if(i==null || state.flying() || !state.sneaking() || !supported(i,state.body())
+                || type!=MovementType.SELF && type!=MovementType.PLAYER)return wanted;
+        Box body=state.body();Vec3d down=new Vec3d(0,-Math.max(.6,state.stepHeight()),0);double x=wanted.x,z=wanted.z;int guard=0;
+        while(x!=0 && !supportedBySweep(i,body.offset(x,0,0),down) && guard++<128)x=trim(x);
         if(guard>=128)x=0;guard=0;
-        while(z!=0 && !supported(i,body.offset(0,0,z),down) && guard++<128)z=trim(z);
+        while(z!=0 && !supportedBySweep(i,body.offset(0,0,z),down) && guard++<128)z=trim(z);
         if(guard>=128)z=0;guard=0;
-        while(x!=0 && z!=0 && !supported(i,body.offset(x,0,z),down) && guard++<128){x=trim(x);z=trim(z);}
+        while(x!=0 && z!=0 && !supportedBySweep(i,body.offset(x,0,z),down) && guard++<128){x=trim(x);z=trim(z);}
         if(guard>=128){x=0;z=0;}return new Vec3d(x,wanted.y,z);
     }
-    private static boolean supported(Index i,Box body,Vec3d down){return i.sweep(body,down).filter(h->h.normal.y>.3).isPresent();}
+    private static boolean supportedBySweep(Index i,Box body,Vec3d down){return i.sweep(body,down).filter(h->h.normal.y>.3).isPresent();}
     private static double trim(double x){return Math.abs(x)<=.05?0:x-Math.copySign(.05,x);}
+    private static final double GROUND_RISE=.025,GROUND_DROP=.15;
+    /** Source readiness resolves the same footprint as the real mesh grounding probe. */
+    static Box supportFootprint(Box body) {
+        return body.union(body.offset(0,GROUND_RISE,0).stretch(new Vec3d(0,-GROUND_DROP,0)));
+    }
+    /** Actual mesh support contact, shared by the player adapter and entity-free regressions. */
+    public static Optional<Hit> ground(Index index,Box body) {
+        return index.sweep(body.offset(0,GROUND_RISE,0),new Vec3d(0,-GROUND_DROP,0)).filter(h->h.normal.y>.3);
+    }
     public static Optional<Hit> ground(PlayerEntity player) {
         Index i=index(player);
-        return i==null?Optional.empty():i.sweep(player.getBoundingBox().offset(0,.025,0),new Vec3d(0,-.15,0))
-                .filter(h->h.normal.y>.3);
+        return i==null?Optional.empty():ground(i,player.getBoundingBox());
     }
+    /** Mesh-verdict grounded state for movement gates; the vanilla flag is a client claim on the server. */
+    public static boolean supported(Index index,Box body){return ground(index,body).isPresent();}
     public static boolean clearRay(ServerPlayerEntity player,Vec3d from,Vec3d to) {
         Index i=index(player);return i!=null && from.distanceTo(to)<=128 && i.clearRay(from,to);
     }
     /** Actual affine SAT body clearance, including a newly acquired source window. */
     public static boolean bodyClear(TerrainMeshFrame frame,Box body) {
         Box strict=body.expand(-1e-5);
-        for(var cell:frame.cells())if(cell.bounds().intersects(strict))
-            for(Box collision:cell.collision())if(penetration(strict,new Shape(cell,collision,cell.bounds(collision)))!=null)return false;
+        for(var cell:frame.cells())for(Box collision:cell.collision()) {
+            Box bounds=cell.bounds(collision); // A fence/overhang may extend outside the unit cell.
+            if(bounds.intersects(strict) && penetration(strict,new Shape(cell,collision,bounds))!=null)return false;
+        }
         return true;
     }
-    /** Conservative continuous affine-motion guard: the union of endpoint AABBs contains EVERY intermediate
-     * vertex under linear affine interpolation. An ambiguous swept/body overlap is held, never sampled through. */
+    /** Continuous affine-motion guard. Endpoint AABBs are broad phase only: a tilted supporting
+     * floor can overlap the body's AABB while its actual collision stays entirely below the feet.
+     * Each accepted interval has a separating plane between the body and BOTH endpoint solids.
+     * Their convex hull contains every intermediate vertex under linear affine interpolation.
+     * Ambiguous intervals are subdivided, never accepted merely from clear sampled poses. */
     public static boolean transitionClear(TerrainMeshFrame old,TerrainMeshFrame next,Box body) {
+        return transitionClear(old,next,body,Vec3d.ZERO);
+    }
+    /** Same guard, aware of how far the OBSERVER moved since the old frame was accepted. A cell that
+     * translated exactly with the observer (teleport re-anchor, observer-following re-root) keeps the
+     * accepted relative relationship to the body and cannot sweep through it; only true surface motion,
+     * or geometry appearing near the body, is held. */
+    public static boolean transitionClear(TerrainMeshFrame old,TerrainMeshFrame next,Box body,Vec3d observerDelta) {
+        return transitionClear(old,next,body,observerDelta,Set.of());
+    }
+    /** Aligned shallow cells follow the accepted CARRIER, not ordinary walking since frame acceptance.
+     * Other producers (including deep representatives retained in a shallow view) still follow the observer.
+     * Callers supply only keys with the same local producer in both accepted and candidate frames. */
+    static boolean transitionClear(TerrainMeshFrame old,TerrainMeshFrame next,Box body,Vec3d observerDelta,Set<Long> shallowLocalKeys) {
         if(old==null)return true;
+        Vec3d carrierDelta=next.carrierOrigin().subtract(old.carrierOrigin());
         Map<Long,TerrainMeshFrame.Cell> previous=new HashMap<>();for(var c:old.cells())previous.put(c.key(),c);
-        Box local=body.expand(5),strict=body.expand(-1e-5);
+        Box strict=body.expand(-1e-5);
         for(var c:next.cells()) {
             var before=previous.get(c.key());
             if(before!=null && c.min().equals(before.min()) && c.axisX().equals(before.axisX()) && c.axisY().equals(before.axisY())
                     && c.axisZ().equals(before.axisZ()) && c.collision().equals(before.collision()))continue;
-            if(!c.bounds().intersects(local) && (before==null || !before.bounds().intersects(local)))continue;
+            if(before!=null && c.axisX().equals(before.axisX()) && c.axisY().equals(before.axisY())
+                    && c.axisZ().equals(before.axisZ()) && c.collision().equals(before.collision())
+                    && rigidWith(c.min().subtract(before.min()),old.shallow() && next.shallow() && shallowLocalKeys.contains(c.key())
+                            ?carrierDelta:observerDelta))continue;
+            // Do not cull by endpoint locality: a distant-to-distant surface may cross the body.
+            // The swept bounds below are the broad phase for true affine surface motion.
             if(before==null) {for(Box b:c.collision())if(penetration(strict,new Shape(c,b,c.bounds(b)))!=null)return false;continue;}
             if(c.collision().isEmpty())continue;
             for(Box collision:c.collision()) {
                 Box swept=c.bounds(collision).union(before.bounds(collision));
-                if(swept.intersects(strict))return false;
+                if(!swept.intersects(strict))continue;
+                Shape from=new Shape(before,collision,before.bounds(collision)),to=new Shape(c,collision,c.bounds(collision));
+                if(penetration(strict,from)!=null || penetration(strict,to)!=null)return false;
+                if(!affineSweepClear(strict,AffineSolid.of(from),AffineSolid.of(to),0,new int[]{MAX_AFFINE_INTERVALS}))return false;
             }
         }
         return true;
+    }
+    /** A local collision box expressed as a center and three world-space half edges. */
+    private record AffineSolid(Vec3d center,Vec3d x,Vec3d y,Vec3d z) {
+        static AffineSolid of(Shape shape) {
+            var c=shape.cell;var b=shape.local;
+            return new AffineSolid(c.point((b.minX+b.maxX)/2,(b.minY+b.maxY)/2,(b.minZ+b.maxZ)/2),
+                    c.axisX().multiply(b.getLengthX()/2),c.axisY().multiply(b.getLengthY()/2),c.axisZ().multiply(b.getLengthZ()/2));
+        }
+        AffineSolid midpoint(AffineSolid other) {
+            return new AffineSolid(center.add(other.center).multiply(.5),x.add(other.x).multiply(.5),
+                    y.add(other.y).multiply(.5),z.add(other.z).multiply(.5));
+        }
+        double radius(Vec3d axis) {
+            return Math.abs(x.dotProduct(axis))+Math.abs(y.dotProduct(axis))+Math.abs(z.dotProduct(axis));
+        }
+    }
+    private static final int MAX_AFFINE_INTERVALS=256,MAX_AFFINE_DEPTH=16;
+    private static final double SWEEP_CLEARANCE=1e-7;
+    private static final Vec3d[] WORLD_AXES={new Vec3d(1,0,0),new Vec3d(0,1,0),new Vec3d(0,0,1)};
+    private static boolean affineSweepClear(Box body,AffineSolid from,AffineSolid to,int depth,int[] budget) {
+        // Bound both recursion depth and total work per shape. Unproven motion still fails closed.
+        if(--budget[0]<0)return false;
+        for(Vec3d axis:WORLD_AXES)if(separatesSweep(body,from,to,axis))return true;
+        if(sweepAxesSeparate(body,from,to,from) || sweepAxesSeparate(body,from,to,to))return true;
+        if(depth>=MAX_AFFINE_DEPTH)return false;
+        AffineSolid middle=from.midpoint(to);
+        return affineSweepClear(body,from,middle,depth+1,budget) && affineSweepClear(body,middle,to,depth+1,budget);
+    }
+    private static boolean sweepAxesSeparate(Box body,AffineSolid from,AffineSolid to,AffineSolid axes) {
+        if(separatesSweep(body,from,to,axes.y.crossProduct(axes.z))
+                || separatesSweep(body,from,to,axes.z.crossProduct(axes.x))
+                || separatesSweep(body,from,to,axes.x.crossProduct(axes.y)))return true;
+        for(Vec3d world:WORLD_AXES)
+            if(separatesSweep(body,from,to,world.crossProduct(axes.x))
+                    || separatesSweep(body,from,to,world.crossProduct(axes.y))
+                    || separatesSweep(body,from,to,world.crossProduct(axes.z)))return true;
+        return false;
+    }
+    private static boolean separatesSweep(Box body,AffineSolid from,AffineSolid to,Vec3d raw) {
+        double length=raw.length();if(length<1e-9)return false;
+        Vec3d axis=raw.multiply(1/length),center=body.getCenter();
+        double radius=body.getLengthX()/2*Math.abs(axis.x)+body.getLengthY()/2*Math.abs(axis.y)+body.getLengthZ()/2*Math.abs(axis.z);
+        double a=from.center.subtract(center).dotProduct(axis),b=to.center.subtract(center).dotProduct(axis);
+        double ar=from.radius(axis),br=to.radius(axis);
+        // The SAME side/plane must separate both endpoints. Positive clearance avoids numerical
+        // acceptance of an ambiguous grazing interval; strict body shrink is the contact tolerance.
+        return a-ar>radius+SWEEP_CLEARANCE && b-br>radius+SWEEP_CLEARANCE
+                || a+ar< -radius-SWEEP_CLEARANCE && b+br< -radius-SWEEP_CLEARANCE;
+    }
+    /** Exact rigid translation (floating-point tolerant): the cell moved with the observer, not across it. */
+    private static boolean rigidWith(Vec3d motion,Vec3d observerDelta) {
+        return Math.abs(motion.x-observerDelta.x)<1e-6 && Math.abs(motion.y-observerDelta.y)<1e-6
+                && Math.abs(motion.z-observerDelta.z)<1e-6;
     }
     private static Vec3d penetration(Box body,Shape shape) {
         var c=shape.cell;Box b=shape.local;

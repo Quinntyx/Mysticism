@@ -1,6 +1,7 @@
 package io.github.mysticism.landmark;
 
 import io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService;
+import io.github.mysticism.landmark.extract.DiscoveryPrioritizer;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.util.math.BlockPos;
@@ -86,9 +87,34 @@ public final class LoadedSourceBackfillTest {
         check(references(SpiritTerrainService.class,"discoverLoaded"),"spirit entry invokes source backfill discovery");
         check(references(SpiritTerrainService.class,"backfillLoadedSource"),"spirit entry uses the defensive helper");
         check(references(SourceLandmarks.class,"LoadedSourceBackfill"),"source discovery uses the bounded backfill plan");
-        check(references(SourceLandmarks.class,"offerBackfill"),"loaded-source seeds use reserved admission");
         var session=Arrays.stream(SourceLandmarks.class.getDeclaredClasses()).filter(c->c.getSimpleName().equals("Session")).findFirst().orElseThrow();
-        check(references(session,"SourceDiscoveryHints")&&references(session,"poll"),"session drains the tested queue into extraction");
+        check(references(session,"offerDiscoveryHint"),"entry hints use the lossless production admission path");
+        check(references(session,"DiscoveryPrioritizer")&&references(session,"nextOperation"),"entry and visible sweep share fair extraction scheduling");
+        check(references(SourceLandmarks.class,"FrontierRetry"),"entry retains refresh scans for loaded chunks");
+    }
+
+    private static void saturatedEntryRetainsRequiredSeeds() {
+        var hints=new DiscoveryPrioritizer(16);
+        var retries=new DiscoveryInvalidation.RetryQueue<SourceLandmarks.FrontierRetry>(4);
+        var seeds=new ArrayList<BlockPoint>();
+        // Same required FRONTIER admission used by discoverLoaded, not the droppable repeating
+        // visible BACKFILL tier. Much larger than both budgets to exercise lossless overflow.
+        for(int z=-8;z<=8;z++)for(int x=-8;x<=8;x++) {
+            var point=new BlockPoint(x*16L+8,65,z*16L+8);seeds.add(point);
+            SourceLandmarks.offerDiscoveryHint(hints,retries,"minecraft:overworld",point,
+                    DiscoveryPrioritizer.FRONTIER,List.of(),10);
+        }
+        check(hints.size()==16,"entry cannot grow the bounded extraction queue");
+        check(retries.size()>0&&retries.size()<=4,"entry overload retains a bounded conservative sweep");
+        var admitted=new HashSet<BlockPoint>();DiscoveryPrioritizer.Key key;
+        while((key=hints.poll(List.of()))!=null)admitted.add(key.pos());
+        var areas=new ArrayList<Bounds>();SourceLandmarks.FrontierRetry retry;
+        while((retry=retries.poll())!=null) {
+            check(retry.discover,"overflow must discover new terrain, not just refresh existing catalog");
+            areas.add(retry.bounds());
+        }
+        for(var seed:seeds)check(admitted.contains(seed)||areas.stream().anyMatch(b->b.contains(seed.x(),seed.y(),seed.z())),
+                "every required entry seed is either scheduled or retained for real source observation");
     }
 
     private static boolean references(Class<?> owner,String constant) {
@@ -109,6 +135,7 @@ public final class LoadedSourceBackfillTest {
         capAndCompleteness();
         rejectedArguments();
         compiledWiring();
+        saturatedEntryRetainsRequiredSeeds();
         System.out.println("LoadedSourceBackfillTest: "+checks+" checks passed");
     }
 }

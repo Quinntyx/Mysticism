@@ -10,8 +10,10 @@
     "ActivitySpawnMixin",
     "SpiritMeshSneakMixin",
     "SpiritMeshCollisionMixin",
+    "SpiritTeleportCorrectionMixin",
     "SpiritNativeMobMixin",
     "SpiritFlightToggleMixin",
+    "SpiritTeleportBaselineMixin",
     "DroppedItemSemanticMixin",
     "SourceEntityLookupAccessor",
     "SourceChunkHolderAccessor"

@@ -3,7 +3,9 @@ package io.github.mysticism.dimension.spiritworld.terrain;
 import io.github.mysticism.activity.SpiritActivityService;
 import io.github.mysticism.component.MysticismEntityComponents;
 import io.github.mysticism.navigation.SpiritNavigationService;
+import io.github.mysticism.navigation.MovementProvenance;
 import io.github.mysticism.landmark.*;
+import io.github.mysticism.landmark.extract.LandmarkExtractionService;
 import io.github.mysticism.landmark.extract.LandmarkProfiles;
 import io.github.mysticism.vector.*;
 import net.fabricmc.fabric.api.event.lifecycle.v1.*;
@@ -33,6 +35,17 @@ public final class SpiritTerrainService {
         @Override public Vec384f embedding(){return embedding.clone();}
     }
     public record SourcePosition(String dimension,Vec3d position,String landmarkId) {}
+    /** Relocate only an explicitly marked requestTeleport window, at any distance. Ordinary
+     * accumulated movement must advance source space just as it advances semantic navigation.
+     * Terrain retains its own baseline because the evolver's teleport hook resets its baseline
+     * before the next tick. A no-displacement correction does not need a new mesh publication. */
+    static Vec3d relocation(Vec3d now,Vec3d last,boolean teleported) {
+        if(!teleported || last==null)return null;
+        Vec3d jump=now.subtract(last);return jump.lengthSquared()>0?jump:null;
+    }
+    /** Shallow source mapping: source = window origin + (body - carrier). Relocating the carrier with
+     * the body preserves it, so a teleport neither drifts nor travels through source space. */
+    static Vec3d shallowSource(Vec3d origin,Vec3d body,Vec3d carrier){return origin.add(body.subtract(carrier));}
     private static final Map<MinecraftServer,Context> SERVERS=new IdentityHashMap<>();
     private static final java.util.concurrent.atomic.AtomicLong WINDOW_IDS=new java.util.concurrent.atomic.AtomicLong();
     private static BiConsumer<ServerPlayerEntity,TerrainMeshFrame> transport=(p,f)->{};
@@ -48,11 +61,17 @@ public final class SpiritTerrainService {
             @Override public boolean ready(ServerPlayerEntity p,String dimension,String id,Vec3d point){return landingReady(p,dimension,id,point);}
         });
         onSourceAnchor(SpiritNavigationService::anchorSource);
+        // Newly committed landmarks are announced to every live session here, so freshly generated
+        // terrain becomes a selectable, preparable navigation target without a catalog sweep delay.
+        LandmarkExtractionService.COMMITTED_TOPOLOGY.register((server,previous,replacement)->{
+            Context c=server==null?null:SERVERS.get(server);if(c==null||replacement==null)return;
+            for(String id:replacement)c.published(id);
+        });
         ServerTickEvents.END_SERVER_TICK.register(SpiritTerrainService::tick);
         ServerEntityWorldChangeEvents.AFTER_PLAYER_CHANGE_WORLD.register((p,from,to)->{
             if(from.getRegistryKey().equals(WORLD) && !to.getRegistryKey().equals(WORLD))cancelEnter(p);
             else if(to.getRegistryKey().equals(WORLD)) {
-                Session s=session(p);if(s!=null){s.carrier=p.getPos();s.entered=true;publish(p,s,true);}
+                Session s=session(p);if(s!=null){s.carrier=p.getPos();s.lastBody=p.getPos();s.entered=true;publish(p,s,true);}
             }
         });
         ServerPlayConnectionEvents.JOIN.register((handler,sender,server)->{if(handler.player.getWorld().getRegistryKey().equals(WORLD))restore(handler.player);});
@@ -80,6 +99,7 @@ public final class SpiritTerrainService {
             w.nodes=compact(player.getServer(),w,player.getPos());
             Session s=new Session(w,player.getPos());s.created=c.tick;c.sessions.put(player.getUuid(),s);
             BuiltMesh initial=buildMesh(player,s,0,basis(player));s.frame=initial.frame();s.frameProducers=initial.producers(); // actual local mesh exists BEFORE dimension teleport
+            s.frameAnchor=player.getPos();s.lastBody=player.getPos();
             discoverOwner(player,s);requestSource(player,s,player.getPos(),32);
             backfillLoadedSource(player,w.dimension,player.getPos());
             return true;
@@ -120,6 +140,7 @@ public final class SpiritTerrainService {
         } catch(RuntimeException failure){cancelEnter(player);player.sendMessage(Text.literal("Spirit mesh restore deferred: "+failure.getMessage()),false);return false;}
     }
     public static void cancelEnter(ServerPlayerEntity player) {
+        MovementProvenance.drainTerrainTeleport(player.getUuid());
         Context c=SERVERS.get(player.getServer());if(c==null)return;
         Session s=c.sessions.remove(player.getUuid());if(s!=null)s.cancel();MeshCollision.clear(player.getUuid());
     }
@@ -153,7 +174,7 @@ public final class SpiritTerrainService {
     }
     public static Optional<SourcePosition> sourcePosition(ServerPlayerEntity p) {
         Session s=session(p);if(s==null || !s.shallow)return Optional.empty();
-        Vec3d at=s.local.origin.add(p.getPos().subtract(s.carrier));
+        Vec3d at=shallowSource(s.local.origin,p.getPos(),s.carrier);
         if(!s.local.tiles.containsKey(BlockPos.ofFloored(at)))return Optional.empty();
         Optional<String> actual=exactOwner(p,s,s.local,at);
         if(actual.isEmpty()) {
@@ -211,6 +232,60 @@ public final class SpiritTerrainService {
     private record WalkCandidate(Window field,WalkSupport support) {}
     /** Current visible contact only; no target attraction, q replacement or remembered-entry rebinding. */
     public static Optional<WalkSupport> currentSupport(ServerPlayerEntity p) {return walkCandidate(p).map(WalkCandidate::support);}
+    /** Semantic re-anchor that places the live contact feet at the observer: q − grid·(feet−origin)/SCALE.
+     * The coordinate of the current contact becomes exactly q, so acquisition's projected 1 mm
+     * residual is exactly zero and the guarded alignment pivots about the player instead of a
+     * drift-shifted point. */
+    public static Vec384f supportPivotSemantic(Vec384f q,Basis384f grid,Vec3d feet,Vec3d windowOrigin) {
+        Vec3d offset=feet.subtract(windowOrigin);
+        return q.clone().sub(grid.i.clone().mul((float)(offset.x/SCALE)))
+                .sub(grid.j.clone().mul((float)(offset.y/SCALE)))
+                .sub(grid.k.clone().mul((float)(offset.z/SCALE)));
+    }
+    /** Exact inverse of the deep placement at the observer: the source point currently rendered at
+     * the player. Solves [axis_i]·(feet−origin) = player − root for the producing window's affine
+     * frame; null when the grid is invisible under this observer (no contact to pivot on). */
+    public static Vec3d supportContactFeet(Vec384f windowSemantic,Vec384f q,Basis384f windowGrid,Basis384f observer,Vec3d windowOrigin) {
+        Vec384f delta=windowSemantic.clone().sub(q);
+        Vec3d translation=new Vec3d(delta.dot(observer.i)*SCALE,delta.dot(observer.j)*SCALE,delta.dot(observer.k)*SCALE);
+        Vec3d c0=axis(windowGrid.i,observer),c1=axis(windowGrid.j,observer),c2=axis(windowGrid.k,observer);
+        double det=c0.dotProduct(c1.crossProduct(c2));
+        if(Math.abs(det)<1e-9)return null;
+        Vec3d rhs=translation.multiply(-1);
+        return windowOrigin.add(c1.crossProduct(c2).dotProduct(rhs)/det,
+                c2.crossProduct(c0).dotProduct(rhs)/det,c0.crossProduct(c1).dotProduct(rhs)/det);
+    }
+    /** Deep placement helpers shared with append/origin and exercised by runtime regressions. */
+    public static Vec3d frameRoot(Vec3d playerPos,Vec384f windowSemantic,Vec384f q,Basis384f observer) {
+        Vec384f delta=windowSemantic.clone().sub(q);
+        return playerPos.add(delta.dot(observer.i)*SCALE,delta.dot(observer.j)*SCALE,delta.dot(observer.k)*SCALE);
+    }
+    public static Vec3d frameAxis(Vec384f sourceAxis,Basis384f observer) {return axis(sourceAxis,observer);}
+    public static Vec3d frameCellMin(Vec3d playerPos,Vec384f windowSemantic,Vec384f q,Basis384f observer,Basis384f windowGrid,Vec3d windowOrigin,Vec3d source) {
+        Vec3d offset=source.subtract(windowOrigin);
+        return frameRoot(playerPos,windowSemantic,q,observer)
+                .add(frameAxis(windowGrid.i,observer).multiply(offset.x))
+                .add(frameAxis(windowGrid.j,observer).multiply(offset.y))
+                .add(frameAxis(windowGrid.k,observer).multiply(offset.z));
+    }
+    /** Placement-neutral re-anchor of the walk support's producing window onto the player's live
+     * contact. Deep flight accumulates semantic drift OUTSIDE the source grid span (movement is
+     * lifted through the rotating personal basis). Left in place, that drift re-projects under
+     * every blended basis and TRANSLATES the whole visible scene during the guarded alignment,
+     * sweeping the supporting floor through the body so canAlign refuses every step and every
+     * walk request expires unrepeated. Re-anchoring is placement-neutral at the current basis
+     * (the scene does not move now) and makes the alignment a pure rotation about the contact. */
+    public static boolean anchorSupportPivot(ServerPlayerEntity p) {
+        Session s=session(p);if(s==null || s.shallow)return false;
+        var candidate=walkCandidate(p);if(candidate.isEmpty())return false;
+        Window w=candidate.get().field();
+        if(w==s.target)return false; // Captured-destination proof/landing semantics stay immutable during an approach.
+        var q=q(p);
+        Vec3d feet=supportContactFeet(w.semantic,q,w.sourceBasis,basis(p),w.origin);
+        if(feet==null)return false; // Grid invisible under this observer; no contact pivot to re-anchor onto.
+        w.semantic=supportPivotSemantic(q,w.sourceBasis,feet,w.origin);
+        return true;
+    }
     private static Optional<WalkCandidate> walkCandidate(ServerPlayerEntity p) {
         Session s=session(p);
         if(s==null || s.shallow || !MysticismEntityComponents.SPIRIT_NAVIGATION.get(p).semanticReady())return Optional.empty();
@@ -270,7 +345,6 @@ public final class SpiritTerrainService {
         if(new Vec3d(error.dot(b.i)*SCALE,error.dot(b.j)*SCALE,error.dot(b.k)*SCALE).lengthSquared()>1e-6)return false;
         ServerWorld world=world(p.getServer(),probe.dimension);
         if(world!=null)captureLoaded(world,probe,current.sourcePosition(),200,false);
-        if(!clearCachedBody(probe,current.sourcePosition()) || !hasCachedFloor(probe,current.sourcePosition()))return false;
         Window next=new Window(current.sourceDimension(),current.sourcePosition(),q(p),source,current.landmarkId());
         next.owner=LandmarkStore.get(p.getServer()).metadata(next.id).orElse(null);if(next.owner==null)return false;
         next.owners=field.owners;next.geometryNodes=field.geometryNodes.isEmpty()?field.nodes:field.geometryNodes;
@@ -279,12 +353,13 @@ public final class SpiritTerrainService {
         preview.regions.putAll(s.regions);preview.target=s.target;preview.closestId=s.closestId;
         if(!s.local.id.isEmpty() && !s.local.id.equals(next.id))preview.regions.putIfAbsent(s.local.id,s.local);
         BuiltMesh built=buildMesh(p,preview,s.revision+1,b);TerrainMeshFrame frame=built.frame();
-        if(!MeshCollision.bodyClear(frame,p.getBoundingBox()) || !MeshCollision.transitionClear(s.frame,frame,p.getBoundingBox()))return false;
+        Vec3d observerDelta=s.frame==null?Vec3d.ZERO:p.getPos().subtract(s.frameAnchor);
+        if(!walkAcquisitionClear(probe.tiles,current.sourcePosition(),s.frame,frame,p.getBoundingBox(),observerDelta))return false;
         // All validation precedes publication. No q/basis/position/velocity/attunement mutation.
         Window previous=s.local;Vec3d previousCarrier=s.carrier;
         boolean previousShallow=s.shallow,previousAcquired=s.acquiredView,previousAnchor=s.anchorDelivered;
         Map<String,Window> previousRegions=new LinkedHashMap<>(s.regions);
-        s.local=next;s.carrier=p.getPos();s.shallow=true;s.acquiredView=true;s.anchorDelivered=true;
+        s.local=next;s.carrier=p.getPos();s.shallow=true;s.acquiredView=true;s.anchorDelivered=true;s.coverageReady=null;
         s.regions.clear();s.regions.putAll(preview.regions);
         try {acceptFrame(p,s,built);}
         catch(RuntimeException failure) {
@@ -292,6 +367,7 @@ public final class SpiritTerrainService {
             s.regions.clear();s.regions.putAll(previousRegions);
             status(p,s,"Walking acquisition held: mesh publication failed.");return false;
         }
+        s.lastBody=p.getPos(); // The newly committed source mapping is anchored at this body pose.
         s.ingesting=null;s.sourceRequested=null;s.discovery.cancel();
         if(s.sourceFuture!=null)s.sourceFuture.cancel(false);
         if(previous.ownershipFuture!=null)previous.ownershipFuture.cancel(false);
@@ -376,8 +452,9 @@ public final class SpiritTerrainService {
         if(ground.isEmpty() || !ground.get().cell().landmarkId().equals(target.id) || origin(p,s,target).distanceTo(p.getPos())>.001)return false;
         // At subpixel/physics epsilon alignment only. Physical carrier is unchanged; source origin is the exact captured pose.
         Window previous=s.local;Vec3d previousCarrier=s.carrier;
-        s.local=target;s.carrier=p.getPos();s.shallow=true;target.owner=metadata.get();
+        s.local=target;s.carrier=p.getPos();s.shallow=true;target.owner=metadata.get();s.coverageReady=null;
         if(!publish(p,s,true)){s.local=previous;s.carrier=previousCarrier;s.shallow=false;return false;}
+        s.lastBody=p.getPos(); // Do not relocate an already re-anchored mapping again next tick.
         if(s.sourceFuture!=null)s.sourceFuture.cancel(false);s.sourceFuture=null;s.ingesting=null;s.sourceRequested=null;
         s.discovery.cancel();
         p.setVelocity(Vec3d.ZERO);p.fallDistance=0;return true;
@@ -393,17 +470,62 @@ public final class SpiritTerrainService {
         return true;
     }
     private static Box body(Vec3d at){return new Box(at.x-.3,at.y,at.z-.3,at.x+.3,at.y+1.8,at.z+.3);}
-    private static boolean clearCachedBody(Window w,Vec3d at) {
-        Box body=body(at);
-        for(BlockPos pos:BlockPos.iterate(MathHelper.floor(body.minX),MathHelper.floor(body.minY),MathHelper.floor(body.minZ),MathHelper.floor(body.maxX),MathHelper.floor(body.maxY),MathHelper.floor(body.maxZ))) {
-            var tile=w.tiles.get(pos);if(tile==null)return false;
-            for(Box b:tile.collision())if(b.offset(pos).intersects(body))return false;
-        }
+    private static boolean clearCachedBody(Window w,Vec3d at) {return clearCachedBody(w.tiles,at);}
+    private static boolean clearCachedBody(Map<BlockPos,SourceMeshBuilder.Tile> tiles,Vec3d at) {
+        Box body=body(at);if(!known(tiles,body))return false;
+        for(var source:collisionSources(tiles,body))
+            for(Box b:source.getValue().collision())if(b.offset(source.getKey()).intersects(body))return false;
         return true;
     }
-    private static boolean hasCachedFloor(Window w,Vec3d at) {
-        BlockPos pos=BlockPos.ofFloored(at.add(0,-.05,0));var tile=w.tiles.get(pos);if(tile==null)return false;
-        return tile.collision().stream().anyMatch(b->contact(b.offset(pos),body(at),at.y));
+    /** Query producing origins, not just origins inside the probe. Fences/walls rise above their
+     * source voxel; other valid mesh shapes can overhang any side. Invert the shared mesh-local
+     * envelope for a bounded candidate search, then retain only actual shapes overlapping the probe.
+     * Missing unrelated neighbor tiles are not evidence of support or a reason to reject known air
+     * in the direct footprint. A missing supporting producer simply supplies no collision. */
+    private static List<Map.Entry<BlockPos,SourceMeshBuilder.Tile>> collisionSources(
+            Map<BlockPos,SourceMeshBuilder.Tile> tiles,Box probe) {
+        Box query=probe.expand(1e-5);
+        double min=TerrainMeshFrame.MIN_LOCAL_SHAPE,max=TerrainMeshFrame.MAX_LOCAL_SHAPE;
+        var sources=new ArrayList<Map.Entry<BlockPos,SourceMeshBuilder.Tile>>();
+        for(BlockPos pos:BlockPos.iterate(MathHelper.floor(query.minX-max),MathHelper.floor(query.minY-max),MathHelper.floor(query.minZ-max),
+                MathHelper.floor(query.maxX-min),MathHelper.floor(query.maxY-min),MathHelper.floor(query.maxZ-min))) {
+            var tile=tiles.get(pos);if(tile==null)continue;
+            for(Box shape:tile.collision())if(shape.offset(pos).intersects(query)) {
+                sources.add(Map.entry(pos.toImmutable(),tile));break;
+            }
+        }
+        return sources;
+    }
+    private static boolean hasCachedFloor(Window w,Vec3d at) {return hasCachedFloor(w.tiles,at);}
+    private static boolean hasCachedFloor(Map<BlockPos,SourceMeshBuilder.Tile> tiles,Vec3d at) {
+        Box body=body(at);List<TerrainMeshFrame.Cell> cells=new ArrayList<>();
+        List<TerrainMeshFrame.Material> materials=new ArrayList<>();
+        // Alignment preserves the inverse-mapped FEET, not a snapped source-block position. On a
+        // tilted support those feet can be > .05 above its face, or over an adjacent air voxel.
+        // Resolve the whole actual grounding footprint, including known air, then sweep the REAL
+        // source collision shapes with the same rise/drop/normal test as projected mesh grounding.
+        // Known samples and collision producers are different sets: a 1.5-high fence at y=0 can
+        // support feet at y=1.5 although its producing voxel is outside the swept footprint at y>=1.
+        Box footprint=MeshCollision.supportFootprint(body);if(!known(tiles,footprint))return false;
+        for(var source:collisionSources(tiles,footprint)) {
+            BlockPos pos=source.getKey();var tile=source.getValue();
+            if(!materials.contains(tile.material()))materials.add(tile.material());
+            Vec3d min=new Vec3d(pos.getX(),pos.getY(),pos.getZ());
+            cells.add(new TerrainMeshFrame.Cell(cells.size(),materials.indexOf(tile.material()),"",min,min,
+                    new Vec3d(1,1,1),new Vec3d(1,0,0),new Vec3d(0,1,0),new Vec3d(0,0,1),
+                    tile.color(),tile.light(),1,tile.collision()));
+        }
+        var source=new TerrainMeshFrame(0,true,"",at,at,materials,cells);
+        return MeshCollision.ground(new MeshCollision.Index(source),body).isPresent();
+    }
+    /** Final geometry proof shared by current-support acquisition and entity-free regressions.
+     * This runs before publishing the shallow session; ownership/readiness/basis gates precede it.
+     * Neither clearance nor acquisition is allowed to snap feet or fabricate source collision. */
+    static boolean walkAcquisitionClear(Map<BlockPos,SourceMeshBuilder.Tile> tiles,Vec3d sourceFeet,
+            TerrainMeshFrame previous,TerrainMeshFrame walking,Box body,Vec3d observerDelta) {
+        return clearCachedBody(tiles,sourceFeet) && hasCachedFloor(tiles,sourceFeet)
+                && MeshCollision.bodyClear(walking,body)
+                && MeshCollision.transitionClear(previous,walking,body,observerDelta);
     }
     // Kept for the existing tiny production-shape smoke fixture, not an overlay lookup.
     static boolean contact(VoxelShape shape,BlockPos pos,Box body,double feet){return shape.getBoundingBoxes().stream().anyMatch(b->contact(b.offset(pos),body,feet));}
@@ -569,14 +691,31 @@ public final class SpiritTerrainService {
         if(tile!=null){w.liveTiles.add(position.toImmutable());if(!tile.equals(w.tiles.put(position.toImmutable(),tile)))w.dirty=true;}
     }
     private static void tick(MinecraftServer server) {
-        Context c=SERVERS.get(server);if(c==null)return;c.tick++;
+        Context c=SERVERS.get(server);if(c!=null)c.tick++;
         var players=server.getPlayerManager().getPlayerList();
         for(var p:players) {
+            // Drain even without a terrain session: a source-world teleport must not relocate a
+            // future spirit session. The evolver has its own copy; callback order is irrelevant.
+            boolean teleported=MovementProvenance.drainTerrainTeleport(p.getUuid());
+            if(c==null)continue;
             Session s=c.sessions.get(p.getUuid());if(s==null)continue;
             if(!p.getWorld().getRegistryKey().equals(WORLD)){if(c.tick-s.created>100)cancelEnter(p);continue;}
             try {
+                Vec3d now=p.getPos();
+                if(s.lastBody!=null) {
+                    Vec3d jump=relocation(now,s.lastBody,teleported);
+                    if(jump!=null) {
+                        // Vanilla/external teleports relocate the observer; they never travel through source
+                        // space. Move the aligned view's carrier with the body so the loaded source region
+                        // re-roots around the relocated body with matching collision instead of draining the
+                        // mapping into an ungeneratable region below the fall.
+                        s.carrier=s.carrier.add(jump);
+                        if(s.shallow)publish(p,s,true);
+                    }
+                }
+                s.lastBody=now;
                 if(s.shallow) {
-                    Vec3d source=s.local.origin.add(p.getPos().subtract(s.carrier));
+                    Vec3d source=shallowSource(s.local.origin,p.getPos(),s.carrier);
                     ServerWorld sourceWorld=world(server,s.local.dimension);
                     if(sourceWorld!=null)captureLoaded(sourceWorld,s.local,source,64,false);
                     if(s.sourceRequested==null || s.sourceRequested.distanceTo(source)>4)requestSource(p,s,source,16);
@@ -595,26 +734,112 @@ public final class SpiritTerrainService {
                 c.animate(p,s);if(c.tick%2==0)publish(p,s,false);
             } catch(RuntimeException failure){status(p,s,"Mesh deferred: "+failure.getMessage());}
         }
+        if(c==null)return;
         // A single repository geometry cursor is advanced globally. A failed region never retries ahead of others forever.
         c.advanceNear();c.advanceGeometry();
         if(!players.isEmpty())for(int n=0;n<Math.min(2,players.size());n++) {
             ServerPlayerEntity p=players.get(Math.floorMod(c.playerCursor++,players.size()));Session s=c.sessions.get(p.getUuid());
             if(s!=null && p.getWorld().getRegistryKey().equals(WORLD))try{c.maintain(p,s);c.scan(p,s);}catch(RuntimeException failure){status(p,s,"Selection deferred: "+failure.getMessage());}
         }
+        // Coverage describes the ACCEPTED frame after ingestion, compaction and all publication attempts,
+        // including maintenance below the player loop. A cached candidate is not collision readiness.
+        for(var p:players) {
+            Session s=c.sessions.get(p.getUuid());
+            if(s!=null && s.shallow && p.getWorld().getRegistryKey().equals(WORLD))reportCoverage(p,s);
+        }
     }
     private static void status(ServerPlayerEntity p,Session s,String message){if(!Objects.equals(message,s.status)){s.status=message;p.sendMessage(Text.literal(message),true);}}
+    /** Truthful shallow coverage readiness: the displayed terrain is usable only when the source cells
+     * under and around the body are actually known. Unknown cells load from the live source or the
+     * generated region stream; nothing is fabricated while they resolve. */
+    public record Coverage(boolean ready,boolean bodyKnown,boolean supportKnown,boolean collisionKnown,boolean streaming) {}
+    private static Iterable<BlockPos> samples(Box b) {
+        return BlockPos.iterate(MathHelper.floor(b.minX),MathHelper.floor(b.minY),MathHelper.floor(b.minZ),
+                MathHelper.floor(b.maxX),MathHelper.floor(b.maxY),MathHelper.floor(b.maxZ));
+    }
+    private static boolean known(Map<BlockPos,SourceMeshBuilder.Tile> tiles,Box footprint) {
+        for(BlockPos pos:samples(footprint))if(!tiles.containsKey(pos))return false;
+        return true;
+    }
+    static boolean bodyKnown(Map<BlockPos,SourceMeshBuilder.Tile> tiles,Vec3d at) {return known(tiles,body(at));}
+    /** Air is resolved without a mesh cell; non-air must survive budgets/stitching in the accepted local
+     * frame with its source-identical transform and shape. A held candidate or stale carrier cannot pass.
+     * Near nodes are unit cells; uniform octree cubes may also cover multiple resolved source samples. */
+    static Coverage coverage(Map<BlockPos,SourceMeshBuilder.Tile> tiles,Vec3d at,boolean streaming,
+            TerrainMeshFrame accepted,String dimension,Vec3d sourceOrigin,Vec3d carrier,Set<Long> localKeys) {
+        Box footprint=MeshCollision.supportFootprint(body(at));
+        boolean bodyKnown=bodyKnown(tiles,at),supportKnown=known(tiles,footprint);
+        boolean matching=bodyKnown && supportKnown && accepted!=null && accepted.shallow()
+                && accepted.sourceDimension().equals(dimension) && accepted.sourceOrigin().equals(sourceOrigin)
+                && accepted.carrierOrigin().equals(carrier);
+        if(matching) {
+            List<TerrainMeshFrame.Cell> local=new ArrayList<>();
+            for(var cell:accepted.cells())if(localKeys.contains(cell.key()))local.add(cell);
+            for(BlockPos pos:samples(footprint)) {
+                var tile=tiles.get(pos);TerrainMeshFrame.Cell covering=null;
+                for(var cell:local)if(containsSource(cell,pos)) {
+                    if(covering!=null){matching=false;break;} // overlapping local samples are not a proven match
+                    covering=cell;
+                }
+                if(!matching || (tile.air()?covering!=null:covering==null
+                        || !matchesTile(accepted,covering,tile,sourceOrigin,carrier))) {matching=false;break;}
+            }
+        }
+        return new Coverage(bodyKnown && supportKnown && matching,bodyKnown,supportKnown,matching,streaming);
+    }
+    private static boolean containsSource(TerrainMeshFrame.Cell cell,BlockPos pos) {
+        Vec3d min=cell.sourceMin(),size=cell.size();
+        return pos.getX()>=min.x && pos.getX()<min.x+size.x && pos.getY()>=min.y && pos.getY()<min.y+size.y
+                && pos.getZ()>=min.z && pos.getZ()<min.z+size.z;
+    }
+    private static boolean matchesTile(TerrainMeshFrame frame,TerrainMeshFrame.Cell cell,SourceMeshBuilder.Tile tile,
+            Vec3d sourceOrigin,Vec3d carrier) {
+        Vec3d size=cell.size();
+        if(cell.opacity()!=1 || !frame.materials().get(cell.material()).equals(tile.material())
+                || cell.min().squaredDistanceTo(carrier.add(cell.sourceMin().subtract(sourceOrigin)))>1e-12
+                || !cell.axisX().equals(new Vec3d(size.x,0,0)) || !cell.axisY().equals(new Vec3d(0,size.y,0))
+                || !cell.axisZ().equals(new Vec3d(0,0,size.z)))return false;
+        return size.equals(new Vec3d(1,1,1))?cell.collision().equals(tile.collision())
+                :tile.cube() && cell.collision().equals(List.of(SourceMeshBuilder.UNIT));
+    }
+    private static Set<Long> localKeys(Session s) {
+        Set<Long> keys=new HashSet<>();s.frameProducers.forEach((key,w)->{if(w==s.local)keys.add(key);});return keys;
+    }
+    /** Current shallow coverage readiness, or null outside a shallow spirit session. */
+    public static Coverage coverage(ServerPlayerEntity p) {
+        Session s=session(p);
+        if(s==null || !s.shallow || !p.getWorld().getRegistryKey().equals(WORLD))return null;
+        Vec3d at=shallowSource(s.local.origin,p.getPos(),s.carrier);
+        return coverage(s.local.tiles,at,s.ingesting!=null || s.sourceFuture!=null && !s.sourceFuture.isDone(),
+                s.frame,s.local.dimension,s.local.origin,s.carrier,localKeys(s));
+    }
+    static String coverageMessage(Coverage coverage) {
+        return coverage.ready()?"Spirit terrain ready: displayed terrain has matching collision at your location."
+                :!coverage.bodyKnown() || !coverage.supportKnown()
+                        ?"Spirit terrain loading: body/support source cells are still unknown."
+                        :"Spirit terrain loading: resolved source cells await matching local collision publication.";
+    }
+    private static void reportCoverage(ServerPlayerEntity p,Session s) {
+        Coverage coverage=coverage(p);String message=coverageMessage(coverage);
+        // Do not spam a ready entry, but announce initial loading and changes in WHY it is loading too.
+        boolean announce=s.coverageReady==null?!coverage.ready():!message.equals(s.coverageStatus);
+        s.coverageReady=coverage.ready();s.coverageStatus=message;
+        if(announce)status(p,s,message);
+    }
     private static Vec3d origin(ServerPlayerEntity p,Session s,Window w) {
         if(w==s.local && s.shallow)return s.carrier;
-        Vec384f delta=w.semantic.clone().sub(q(p));Basis384f b=basis(p);
-        return p.getPos().add(delta.dot(b.i)*SCALE,delta.dot(b.j)*SCALE,delta.dot(b.k)*SCALE);
+        return frameRoot(p.getPos(),w.semantic,q(p),basis(p));
     }
     public static boolean canAlign(ServerPlayerEntity p,Basis384f proposed) {
-        Session s=session(p);return s!=null && MeshCollision.transitionClear(s.frame,build(p,s,s.revision+1,proposed),p.getBoundingBox());
+        Session s=session(p);if(s==null)return false;
+        Vec3d observerDelta=s.frame==null?Vec3d.ZERO:p.getPos().subtract(s.frameAnchor);
+        return transitionClear(s,buildMesh(p,s,s.revision+1,proposed),p.getBoundingBox(),observerDelta);
     }
-    private static TerrainMeshFrame build(ServerPlayerEntity p,Session s,long revision) {return build(p,s,revision,basis(p));}
     private record BuiltMesh(TerrainMeshFrame frame,Map<Long,Window> producers) {}
-    private static TerrainMeshFrame build(ServerPlayerEntity p,Session s,long revision,Basis384f observer) {
-        return buildMesh(p,s,revision,observer).frame();
+    private static boolean transitionClear(Session s,BuiltMesh built,Box body,Vec3d observerDelta) {
+        Set<Long> aligned=localKeys(s);
+        aligned.removeIf(key->built.producers().get(key)!=s.local);
+        return MeshCollision.transitionClear(s.frame,built.frame(),body,observerDelta,aligned);
     }
     private static BuiltMesh buildMesh(ServerPlayerEntity p,Session s,long revision,Basis384f observer) {
         Map<Long,Window> producers=new HashMap<>();
@@ -641,8 +866,8 @@ public final class SpiritTerrainService {
         if(w.compactedOwnership!=epoch)w.nodes=compact(p.getServer(),w,w.origin);
     }
     private static void append(ServerPlayerEntity p,Session s,Window w,List<TerrainMeshFrame.Material> materials,Map<TerrainMeshFrame.Material,Integer> palette,List<TerrainMeshFrame.Cell> cells,Set<Long> keys,Map<Long,Window> producers,int limit,Basis384f current) {
-        boolean aligned=w==s.local && s.shallow;Vec3d root;
-        if(aligned)root=s.carrier;else {Vec384f delta=w.semantic.clone().sub(q(p));root=p.getPos().add(delta.dot(current.i)*SCALE,delta.dot(current.j)*SCALE,delta.dot(current.k)*SCALE);}
+        boolean aligned=w==s.local && s.shallow;
+        Vec3d root=aligned?s.carrier:frameRoot(p.getPos(),w.semantic,q(p),current);
         Vec3d ax=aligned?new Vec3d(1,0,0):axis(w.sourceBasis.i,current),ay=aligned?new Vec3d(0,1,0):axis(w.sourceBasis.j,current),az=aligned?new Vec3d(0,0,1):axis(w.sourceBasis.k,current);
         int count=0;
         for(var node:w.nodes) {
@@ -672,7 +897,10 @@ public final class SpiritTerrainService {
                 && s.frame.materials().equals(frame.materials()) && s.frame.cells().equals(frame.cells())) {
             s.frameProducers=built.producers();confirmTargetFade(s);return true;
         }
-        if(!MeshCollision.transitionClear(s.frame,frame,p.getBoundingBox())) {
+        // Shallow local cells use accepted carrier displacement; intervening ordinary walking must not
+        // contaminate that delta. Other representatives still use observer displacement for deep re-rooting.
+        Vec3d observerDelta=s.frame==null?Vec3d.ZERO:p.getPos().subtract(s.frameAnchor);
+        if(!transitionClear(s,built,p.getBoundingBox(),observerDelta)) {
             status(p,s,"Terrain transition held: moving surface intersects your body; move clear to continue.");return false;
         }
         acceptFrame(p,s,built);confirmTargetFade(s);return true;
@@ -680,9 +908,10 @@ public final class SpiritTerrainService {
     /** All runtime frame replacements commit provenance together and roll both back on transport failure. */
     private static void acceptFrame(ServerPlayerEntity p,Session s,BuiltMesh built) {
         TerrainMeshFrame previous=s.frame;Map<Long,Window> previousProducers=s.frameProducers;long previousRevision=s.revision;
-        s.frame=built.frame();s.frameProducers=built.producers();s.revision=s.frame.revision();
+        Vec3d previousAnchor=s.frameAnchor;
+        s.frame=built.frame();s.frameProducers=built.producers();s.revision=s.frame.revision();s.frameAnchor=p.getPos();
         try {if(p.getWorld().getRegistryKey().equals(WORLD))transport.accept(p,s.frame);}
-        catch(RuntimeException failure){s.frame=previous;s.frameProducers=previousProducers;s.revision=previousRevision;throw failure;}
+        catch(RuntimeException failure){s.frame=previous;s.frameProducers=previousProducers;s.revision=previousRevision;s.frameAnchor=previousAnchor;throw failure;}
     }
     private static void confirmTargetFade(Session s) {
         Window target=s.target;if(target==null || target==s.local)return;
@@ -703,13 +932,15 @@ public final class SpiritTerrainService {
         Window(String dimension,Vec3d origin,Vec384f semantic,Basis384f basis,String id){this.dimension=dimension;this.origin=origin;this.semantic=semantic.clone();captured=semantic.clone();supportEmbedding=semantic.clone();sourceBasis=basis.clone();this.id=id;}
     }
     private static final class Session {
-        Window local,target,walkProbe;Vec3d carrier,sourceRequested;boolean shallow=true,entered,anchorDelivered,acquiredView;long revision,created,walkField,walkNextProbe;
+        Window local,target,walkProbe;Vec3d carrier,sourceRequested,lastBody,frameAnchor;Boolean coverageReady;boolean shallow=true,entered,anchorDelivered,acquiredView;long revision,created,walkField,walkNextProbe;
         final SourceDiscoveryAttempt discovery=new SourceDiscoveryAttempt();
         TerrainMeshFrame frame;Map<Long,Window> frameProducers=Map.of();CompletableFuture<?> sourceFuture,targetFuture,targetOwnerFuture,walkFuture;Iterator<SourceLandmarks.Cell> ingesting;
         final Map<String,Window> regions=new LinkedHashMap<>();final MeshRepresentatives selection=new MeshRepresentatives();
         final Map<String,Window> prepared=new LinkedHashMap<>();
-        String scanCursor,status,closestId="";int dimensionCursor,regionCursor;boolean scanning;Set<String> selected=Set.of();
-        Session(Window local,Vec3d carrier){this.local=local;this.carrier=carrier;}
+        String scanCursor,status,coverageStatus,closestId="";int dimensionCursor,regionCursor;boolean scanning;Set<String> selected=Set.of();
+        Session(Window local,Vec3d carrier){this.local=local;this.carrier=carrier;this.lastBody=carrier;}
+        /** Immediately published landmarks stay selected until the next full sweep re-derives the set. */
+        void unionSelected(String id){var union=new HashSet<>(selected);if(union.add(id))selected=Set.copyOf(union);}
         void cancel(){discovery.cancel();if(sourceFuture!=null)sourceFuture.cancel(false);if(targetFuture!=null)targetFuture.cancel(false);if(targetOwnerFuture!=null)targetOwnerFuture.cancel(false);if(walkFuture!=null)walkFuture.cancel(false);cancelWindow(local);if(target!=null)cancelWindow(target);for(var w:regions.values())cancelWindow(w);for(var w:prepared.values())cancelWindow(w);regions.clear();prepared.clear();}
     }
     private static void cancelWindow(Window w){if(w.ownershipFuture!=null)w.ownershipFuture.cancel(false);if(w.nearFuture!=null)w.nearFuture.cancel(false);w.stream=null;w.nearCells=null;w.nearSamples=null;}
@@ -721,10 +952,43 @@ public final class SpiritTerrainService {
         boolean proving;final Map<BlockPos,BlockPalette.State> proofSamples=new HashMap<>();
         final ArrayDeque<Map.Entry<Session,LandmarkMetadata>> pending=new ArrayDeque<>();
         Context(MinecraftServer server){this.server=server;store=LandmarkStore.get(server);}
+        /** A newly committed landmark becomes available to selection immediately: offered to each
+         * live deep session's reservoir, unioned into its selected set and queued for preparation
+         * without waiting for the next full catalog sweep. Consumers still re-verify the CURRENT
+         * radius/selection before any geometry, opacity or landing permission is spent. */
+        void published(String id) {
+            LandmarkMetadata m=store.metadata(id).orElse(null);if(m==null)return;
+            Vec384f vector=SpiritActivityService.effectiveEmbedding(server,m).vector();
+            double importance=SpiritActivityService.importance(server,m);
+            for(var entry:sessions.entrySet()) {
+                Session s=entry.getValue();ServerPlayerEntity p=player(s);
+                if(p==null || !p.getWorld().getRegistryKey().equals(WORLD))continue;
+                boolean known=id.equals(s.local.id) || s.target!=null&&id.equals(s.target.id)
+                        || s.regions.containsKey(id) || s.prepared.containsKey(id);
+                if(vector.squareDistance(q(p))>=MeshRepresentatives.RADIUS*MeshRepresentatives.RADIUS)continue;
+                if(!known) {
+                    // Retarget BEFORE the publication offer: the commit listener runs before this
+                    // tick's scan, so the reservoir still gates against the PREVIOUS observer frame.
+                    // Without retargeting, a landmark inside the player's CURRENT radius but outside
+                    // that previous radius is rejected here, the sweep later completes without it,
+                    // completion overwrites selected and cancels its preparation, and availability
+                    // is delayed until another full sweep.
+                    if(s.scanning){s.selection.retarget(q(p),basis(p));s.selection.offer(m,vector,importance);}
+                    if(pending.size()<32 && pending.stream().noneMatch(e->e.getKey()==s && e.getValue().id().equals(id)))pending.add(Map.entry(s,m));
+                }
+                // A grown landmark's existing window must not fade out while it is current and in radius.
+                s.unionSelected(id);
+            }
+        }
         void scan(ServerPlayerEntity p,Session s) {
             List<ServerWorld> worlds=new ArrayList<>();for(var world:server.getWorlds())if(!world.getRegistryKey().equals(WORLD))worlds.add(world);
             if(worlds.isEmpty())return;
-            if(!s.scanning){s.selection.begin(q(p),basis(p));s.scanning=true;s.dimensionCursor=0;s.scanCursor=null;}
+            Vec384f now=q(p);
+            // A sweep whose origin q drifted out of the selection radius can no longer offer the
+            // current locality (including landmarks published mid-sweep); restart from a fresh cursor.
+            if(s.scanning && s.selection.sweepStale(now))s.scanning=false;
+            if(!s.scanning){s.selection.begin(now,basis(p));s.scanning=true;s.dimensionCursor=0;s.scanCursor=null;}
+            s.selection.retarget(now,basis(p));
             ServerWorld world=worlds.get(Math.min(s.dimensionCursor,worlds.size()-1));
             Bounds all=new Bounds(-30000000,world.getBottomY(),-30000000,30000000,world.getTopY(),30000000);
             var batch=store.sourceRangePage(world.getRegistryKey().getValue().toString(),all,s.scanCursor,8,8);s.scanCursor=batch.nextId();

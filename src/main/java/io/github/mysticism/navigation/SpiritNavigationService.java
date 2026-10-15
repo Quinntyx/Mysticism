@@ -48,6 +48,7 @@ public final class SpiritNavigationService {
         Vec384f targetSnapshot, supportTargetSnapshot;
         Basis384f supportFrom, supportGrid;
         long supportWindow;
+        SupportAlignment alignment = new SupportAlignment();
         String supportId = "", supportDimension = "";
         Basis384f blendFrom, blendTo, landingFrom;
         CompletableFuture<?> capture;
@@ -208,7 +209,10 @@ public final class SpiritNavigationService {
         }
         nav.anchored(SpiritNavigation.AnchorOrigin.SOURCE);
         s.lastTransition = "Exact source ownership discovered; semantic travel is now ready. Movement mode unchanged.";
-        MysticismEntityComponents.LATENT_ATTUNEMENT.sync(p); MysticismEntityComponents.LATENT_POS.sync(p); sync(p);
+        // Correction ordering: nav (and its motionEpoch) must sync BEFORE the q it re-anchors, so the
+        // client pose-sync guard sees the changed epoch when the delayed/reordered q sync arrives.
+        sync(p);
+        MysticismEntityComponents.LATENT_ATTUNEMENT.sync(p); MysticismEntityComponents.LATENT_POS.sync(p);
     }
     private static boolean live(ServerPlayerEntity p, Session s) {
         Map<UUID, Session> sessions = SERVERS.get(p.getServer());
@@ -259,6 +263,7 @@ public final class SpiritNavigationService {
         if (s.supportPending) return; // repeated packets cannot reset budgets or duplicate requests
         endApproach(p, s); s.blendFrom = null; s.blendTo = null;
         s.supportPending = true; s.supportTick = 0; s.supportFrom = null;
+        s.alignment = new SupportAlignment();
         s.supportId = ""; s.supportDimension = "";
         s.supportTargetSnapshot = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target();
         state(p).setSupportApproach(true); sync(p);
@@ -268,11 +273,14 @@ public final class SpiritNavigationService {
         if (s.supportPending) SpiritTerrainService.cancelCurrentSupport(p);
         s.supportPending = false; s.supportTargetSnapshot = null; s.supportFrom = null; s.supportGrid = null;
         s.supportId = ""; s.supportDimension = ""; s.supportTick = 0; s.supportAlignTick = 0;
+        s.alignment = new SupportAlignment();
         if (state(p).supportApproach()) { state(p).setSupportApproach(false); sync(p); }
     }
 
-    /** Called once by the evolver. True permits ordinary deep movement integration. */
-    public static boolean update(ServerPlayerEntity p, Vec3d delta) {
+    /** Called once by the evolver. `state` drives per-tick state machines; ONLY `semantic` may advance q/basis.
+     *  Collision corrections and teleports keep state physical but pause semantic advance instead of
+     *  being re-integrated as movement every tick. Never snaps q/pose/basis. */
+    public static boolean update(ServerPlayerEntity p, Vec3d state, Vec3d semantic) {
         if (!spirit(p)) { if (state(p).active() || state(p).hasSavedAbilities()) deactivate(p); return false; }
         var nav = state(p); Session s = session(p); restoreAnchor(p, s);
         if (nav.hasShallowTarget() && !s.prefetched) {
@@ -291,7 +299,7 @@ public final class SpiritNavigationService {
                     // Temporary exact-proof invalidation is not walking off a visible floor.
                     s.unsupported = 0; s.jumping = false; flight(p, false);
                     if (nav.semanticReady()) TraversalSteering.advance(p.getComponent(MysticismEntityComponents.LATENT_POS).get(),
-                            p.getComponent(MysticismEntityComponents.LATENT_BASIS).get(), delta.x, delta.y, delta.z);
+                            p.getComponent(MysticismEntityComponents.LATENT_BASIS).get(), semantic.x, semantic.y, semantic.z);
                     return false;
                 }
                 enterDeep(p, "Current shallow source mapping unavailable"); return nav.deep() && nav.semanticReady();
@@ -318,7 +326,7 @@ public final class SpiritNavigationService {
                 s.unsupported = 0; s.jumping = false;
             }
             else {
-                if (s.unsupported == 0) s.jumping = delta.y > .01;
+                if (s.unsupported == 0) s.jumping = state.y > .01;
                 if (++s.unsupported > 14 || !s.jumping) {
                     enterDeep(p, s.jumping ? "Jump grace expired without supporting terrain" : "Left supporting terrain");
                     return nav.deep() && nav.semanticReady();
@@ -326,15 +334,15 @@ public final class SpiritNavigationService {
             } // Ascending takeoff gets ordinary jump grace; walking over an edge gets immediate freeflight.
             flight(p, false);
             if (state(p).semanticReady() && !anchoredNow) TraversalSteering.advance(p.getComponent(MysticismEntityComponents.LATENT_POS).get(),
-                    p.getComponent(MysticismEntityComponents.LATENT_BASIS).get(), delta.x, delta.y, delta.z);
+                    p.getComponent(MysticismEntityComponents.LATENT_BASIS).get(), semantic.x, semantic.y, semantic.z);
             if (p.getServer().getTicks() % 4 == 0) sync(p);
             return false;
         }
         flight(p, true);
-        if (s.supportPending) { attemptSupport(p, s, delta); return false; }
+        if (s.supportPending) { attemptSupport(p, s, semantic); return false; }
         if (!state(p).semanticReady()) return false;
         if (s.blendTo != null) {
-            if (delta.lengthSquared() > 1e-5) { s.blendFrom = null; s.blendTo = null; }
+            if (state.lengthSquared() > 1e-5) { s.blendFrom = null; s.blendTo = null; }
             else {
                 float fraction = ++s.blendTick / 20f;
                 p.getComponent(MysticismEntityComponents.LATENT_BASIS).set(TraversalSteering.blend(s.blendFrom, s.blendTo, fraction));
@@ -342,9 +350,11 @@ public final class SpiritNavigationService {
                 return false;
             }
         }
-        if (attemptLanding(p, s, delta)) return false; // Approach advanced q once, without ordinary basis steering.
+        if (attemptLanding(p, s, semantic)) return false; // Approach advanced q once, without ordinary basis steering.
         return nav.deep();
     }
+    /** Legacy single-delta entry: the measured movement is both state and semantic movement. */
+    public static boolean update(ServerPlayerEntity p, Vec3d delta) { return update(p, delta, delta); }
     private static void restoreAnchor(ServerPlayerEntity p, Session s) {
         if (s.checkedRestore) return; s.checkedRestore = true;
         endSupportApproach(p, s);
@@ -375,8 +385,8 @@ public final class SpiritNavigationService {
     private static void attemptSupport(ServerPlayerEntity p, Session s, Vec3d delta) {
         var nav = state(p); var component = p.getComponent(MysticismEntityComponents.LATENT_BASIS);
         var q = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
-        if (state(p).semanticReady() && Double.isFinite(delta.x) && Double.isFinite(delta.y) && Double.isFinite(delta.z)
-                && delta.lengthSquared() <= 16)
+        if (nav.semanticReady() && Double.isFinite(delta.x) && Double.isFinite(delta.y) && Double.isFinite(delta.z)
+                && delta.lengthSquared() <= MovementIntegration.REPOSITION_LIMIT * MovementIntegration.REPOSITION_LIMIT)
             TraversalSteering.advance(q, component.get(), delta.x, delta.y, delta.z);
         if (++s.supportTick > SUPPORT_REQUEST_TICKS) {
             endSupportApproach(p, s);
@@ -391,7 +401,13 @@ public final class SpiritNavigationService {
         }
         var found = SpiritTerrainService.currentSupport(p);
         if (found.isEmpty()) return; // Terrain starts/reuses bounded exact source-cell proof, never a join.
-        var support = found.get(); Basis384f destination = support.sourceBasis();
+        var support = found.get();
+        // Keep the guarded alignment pivot at the player's live contact. Deep flight accumulates
+        // semantic drift outside the source grid span; without this placement-neutral re-anchor the
+        // drift translates the whole visible scene while the basis blends, sweeping the supporting
+        // floor through the body so canAlign refuses every step and every walk request expires.
+        SpiritTerrainService.anchorSupportPivot(p);
+        Basis384f destination = support.sourceBasis();
         if (s.supportFrom == null) {
             s.supportFrom = component.get().clone(); s.supportGrid = destination.clone(); s.supportAlignTick = 0;
             s.supportWindow = support.windowIdentity(); s.supportId = support.landmarkId(); s.supportDimension = support.sourceDimension();
@@ -403,33 +419,60 @@ public final class SpiritNavigationService {
         }
         Basis384f before = component.get();
         boolean aligned = basisError(before, destination) < 1e-8f;
-        Basis384f proposed = aligned ? before : TraversalSteering.blend(s.supportFrom, destination, (s.supportAlignTick + 1) / 40f);
+        Basis384f proposed = before;
+        float fraction = 1f;
+        if (!aligned) {
+            fraction = s.alignment.nextFraction();
+            proposed = TraversalSteering.blend(s.supportFrom, destination, fraction);
+            if (basisError(proposed, s.supportFrom) < 1e-12f) {
+                // Singular/antipodal blend cannot leave the captured basis; a finer step cannot help.
+                endSupportApproach(p, s);
+                notice(p, s, "Source-grid alignment is singular from this basis; remaining deep. Move, then request walking again.", true);
+                return;
+            }
+        }
         if (before.i.squareDistance(proposed.i) > .01f || before.j.squareDistance(proposed.j) > .01f
                 || before.k.squareDistance(proposed.k) > .01f) {
-            endSupportApproach(p, s);
-            notice(p, s, "Source-grid alignment would be discontinuous; remaining deep on current geometry.", true);
+            // The blend path's angular speed peaks mid-rotation; retry a finer guarded step instead of
+            // cancelling, so large but continuous rotations still reach the source grid. Truly
+            // singular blends never leave supportFrom and are rejected above.
+            if (!aligned) s.alignment.refuse();
             return;
         }
         // q already represents ACTUAL movement in the previous frame. Validate the joint current-q /
         // proposed-basis scene before application. No attraction to sourceCoordinate or user target.
-        if (!SpiritTerrainService.canAlign(p, proposed)) return;
-        if (!aligned) { component.set(proposed); ++s.supportAlignTick; }
+        if (!SpiritTerrainService.canAlign(p, proposed)) {
+            // Retry a finer guarded step next tick instead of repeating the identical refused
+            // proposal until the request deadline; accepted work stays within 40 full-step equivalents.
+            if (!aligned) s.alignment.refuse();
+            return;
+        }
+        if (!aligned) { component.set(proposed); s.alignment.accept(fraction); ++s.supportAlignTick; }
         if (basisError(component.get(), destination) >= 1e-8f) return;
         // This real terrain operation rechecks current contact, window identity, ownership revision,
         // source body/floor clearance and whole-frame continuity, and never sets q/basis/body position.
         if (!SpiritTerrainService.acquireCurrentSupport(p, support)) return;
-        var mapped = SpiritTerrainService.sourcePosition(p);
-        if (mapped.isEmpty() || !mapped.get().landmarkId().equals(support.landmarkId())
-                || !mapped.get().dimension().equals(support.sourceDimension())) {
+        if (!commitSupportMapping(nav, support, SpiritTerrainService.sourcePosition(p))) {
             SpiritTerrainService.setShallow(p, false); endSupportApproach(p, s);
             notice(p, s, "Terrain acquisition did not retain its validated source mapping; remaining deep.", true);
             return;
         }
-        var at = mapped.get(); nav.shallow(at.dimension(), at.landmarkId(), at.position());
         s.confirmedOwned = true; s.unsupported = 0; s.jumping = false; endSupportApproach(p, s);
         SpiritBasisEvolver.resetMotion(p); flight(p, false);
-        MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p); sync(p);
+        // Correction ordering: nav (and its motionEpoch) must sync BEFORE the shallow pose it commits.
+        sync(p);
+        MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p);
         notice(p, s, "Shallow: walking on the current source-owned landmark. Captured attunement retained.", true);
+    }
+    /** Final state transition AFTER terrain acquisition succeeds. Kept entity-free so regressions
+     * can drive the real source/mesh proof through this mapping check and walking mutation without
+     * bootstrapping a server. This does not grant permission to bypass terrain's acquisition gates. */
+    public static boolean commitSupportMapping(SpiritNavigation nav, SpiritTerrainService.WalkSupport support,
+            Optional<SpiritTerrainService.SourcePosition> mapped) {
+        if (mapped.isEmpty() || !mapped.get().landmarkId().equals(support.landmarkId())
+                || !mapped.get().dimension().equals(support.sourceDimension())) return false;
+        var at = mapped.get(); nav.shallow(at.dimension(), at.landmarkId(), at.position());
+        return true;
     }
     private static float basisError(Basis384f a, Basis384f b) {
         return a.i.squareDistance(b.i) + a.j.squareDistance(b.j) + a.k.squareDistance(b.k);
@@ -504,7 +547,9 @@ public final class SpiritNavigationService {
                 var at = source.get(); nav.shallow(at.dimension(), at.landmarkId(), at.position()); s.unsupported = 0;
                 s.confirmedOwned = true; s.lastTransition = "Captured destination acquired on validated source-owned support; now shallow.";
                 endApproach(p, s); SpiritBasisEvolver.resetMotion(p); flight(p, false);
-                MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p); sync(p);
+                // Correction ordering: nav (and its motionEpoch) must sync BEFORE the landing pose it commits.
+                sync(p);
+                MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p);
             }
         } else { endApproach(p, s); notice(p, s, "Captured destination changed or blocked. Remaining deep nearby.", false); }
         return true;
