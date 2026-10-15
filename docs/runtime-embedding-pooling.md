@@ -1,121 +1,125 @@
-# Retained unit: native v2 embedded output
+# Retained unit: native v2 pooling and normalization
 
-Scope: `feat-runtime-embeddings-embedded-output`, for integration into **dev**, not
-main. Only embedding inference/output and its necessary embedded-runtime/build
-prerequisite changed. Per-player projection, source-coordinate octrees, terrain
-rendering and collision are untouched.
+Scope: `feat-runtime-embeddings-embedded-pooling`, targeting **dev**, never main.
+Per-player deep/shallow projection, source-coordinate octree ownership/growth,
+custom terrain rendering/collision and persistence policy are untouched.
 
-## Existing work preserved and reused
+## Preserved work and dependency integration
 
-The retained session `01a11c85-79a9-7371-aff7-1ab013faf731` failed at the provider
-while inspecting an HTTP-only baseline (`bfbce90`); it left no edits or commits.
-Rather than recreate the pinned runtime, this branch preserves the baseline and
-cherry-picks the existing embedded prerequisite
-`bf1a6714d8d4d2dd407bdf8beb941d94432f25d5` as `da2a675`, and existing output math
-`82f59acf87f35d65820e33f7901854a7ba795862` as `c1a603d`. The sole conflict was the
-contract documentation: retain the current embedded-default contract, not the
-historical HTTP-only/256-dimensional instructions.
+The retained session `01a11c85-7cd5-73f6-b358-a79aee9865d3` produced commit
+`82f59ac`: native v2 masked pooling and stable output normalization. That commit
+is preserved. The earlier HTTP-only integration blocker was rechecked and is
+**no longer current**: reviewed embedded-default commit `ca2addc` was integrated
+as `64454dd`, and reviewed embedded-output commit `9814794` as `6b6297b`. This
+reuses the pinned runtime and connects its actual sentence output to the retained
+adapter, instead of creating a second provider or requiring an external server.
+Uncommitted composition/probe work was preserved across the interrupted session.
 
-## Runtime behavior
+## Runtime math
 
-- `EmbeddingHelper` defaults to the pinned in-process CPU/JNI provider. No HTTP
-  inference or external server is needed; Ollama remains an explicit opt-in.
-- The approved v2 GGUF includes weights **and tokenizer**. Its manifest, length
-  and SHA256 are verified before native loading; no v1 asset/remapping or fallback
-  vectors are accepted. See [deployment contract](nomic-embedding-contract.md).
-- The identical `search_document: ` input reaches tokenization and inference.
-  Count actual token IDs including special tokens, not a character heuristic.
-  Require 1..512 tokens, rejecting overflow before executing JNI: never truncate.
-  Reject malformed token-response IDs and unpaired UTF-16, rather than silently
-  replacing text during native encoding.
-- `LlamaEmbeddingModel` configures MEAN pooling, a full 512-token context/batch,
-  one sequence and CPU execution. Its single **already pooled** native sentence
-  output is passed to `NativeEmbeddingOutput.fromTensor([1,768], null)`. It is not
-  pooled again, reinterpreted as CLS, layer-normalized using v1 math or resized.
-- The adapter also supports raw `[1,tokens,768]` states with an exact binary
-  attention mask: compensated-double masked mean, then L2. Padding cannot dilute
-  or poison the output; invalid shapes/masks, nonfinite attended states, zero and
-  cancelling means fail. This raw-tensor API is not the llama.cpp path.
-- Normalize with maximum-magnitude scaling in double precision before converting
-  to float. Retain all **768** coordinates, including the native tail. Reject
-  null, reduced/legacy/wrong-size, nonfinite and zero sentence outputs.
-- The async engine applies the same stable normalization as a provider guard and
-  caches only successful, current-profile, independently owned vectors. No
-  malformed output becomes a cached value, successful readiness or placeholder.
-  The declared schema/fingerprint/semantic-space contract remains unchanged.
+- `LlamaEmbeddingModel` requests MEAN pooling, one sequence and a full 512-token
+  context/batch on CPU. Its already-pooled sentence output enters
+  `NativeEmbeddingOutput.fromTensor(values, [1,768], null)`: no second pooling,
+  CLS selection, v1 layer normalization, resizing or Matryoshka truncation.
+- The adapter also accepts raw `[1,tokens,768]` hidden states with an exact binary
+  tokenizer attention mask. Compensated-double masked mean precedes L2. Padding
+  cannot dilute or poison the result; prompt/special tokens follow the mask.
+  This raw-tensor interface is not the llama.cpp sentence-output path.
+- Stable L2 divides by maximum magnitude before squaring in double precision.
+  Conversion to float occurs after normalization. Null/wrong-size/nonfinite/zero
+  vectors, malformed/batched tensors, invalid masks and zero/cancelling means
+  fail explicitly. All **768** coordinates survive, with independently owned
+  output storage. The async cache applies the same normalizer.
+- `DescriptorVectors.compose`, used by source landmark composition, normalizes
+  each contributor using that same native normalizer. It scales finite positive
+  weights by their maximum instead of adding a potentially overflowing total.
+  The common mean divisor cancels in L2. Neumaier-compensated double sums survive
+  cancellation of large opposite contributors without first casting to float.
+  Exact zero still fails; a finite nonzero residual is not rejected by an
+  arbitrary `1e-12` threshold. Zero-weight observations do not contribute.
+- The GGUF's own tokenizer sees the identical `search_document: ` input used by
+  inference, including special tokens. Actual overflow is rejected, not silently
+  truncated. Pinned model/tokenizer identity and fresh schema-2 native profile
+  remain required. No substitute model, placeholder vector or v1 migration exists.
 
-The normalizer is output math, not proof of model identity or semantic quality.
-That proof requires pinned asset verification and an actual model forward pass.
+See [deployment contract](nomic-embedding-contract.md) for the exact model asset
+and server-free default. Output math does not authenticate model identity or
+establish semantic quality.
 
-## Checks actually performed in this worktree
+## Checks actually performed in this checkout
 
-Installed Gradle 8.13 / Java 21, canonical command (no exclusions/init overrides):
+Installed Gradle 8.13 / Java 21, canonical command, no exclusions/init overrides:
 
 ```text
 /home/zlare/.gradle/wrapper/dists/gradle-8.13-bin/5xuhj0ry160q40clulazy9h7d/gradle-8.13/bin/gradle --no-daemon --console=plain build --rerun-tasks
 ```
 
-**PASS**, exit 0: 15 actionable tasks executed. Common/client/test compilation,
-all **9 discovered** main-based runtime suites, metadata/descriptor/packaging and
-runner fixtures, remapped production jar and `verifyProductionJar` passed.
+**PASS**, exit 0: all 15 actionable tasks executed. Common/client/runtime-test
+compilation, all **10 discovered** runtime suites, metadata/descriptor/packaging
+and runner fixtures, remapped production jar and `verifyProductionJar` passed.
+The Gradle framework `test` action is intentionally disabled; `check` runs the
+main-based `runtimeSelfTest` runner, which actually discovered the new suite.
 
 | Discovered suite | Actual result |
 |---|---|
 | AsyncEmbeddingCallbackIsolationTest | 28 checks |
 | AsyncEmbeddingEngineSafetyTest | 184 checks |
-| EmbeddedEmbeddingSelfTest | 54 fixture/lifecycle checks |
+| EmbeddedEmbeddingSelfTest | 54 fixture checks |
 | EmbeddedNativeOutputTest | 3139 provider/output fixture checks |
-| EmbeddedNativeRuntimeSelfTest | Real Linux x86_64 JNI load/ABI `b10682-5ea1b124e`; **not inference** |
+| EmbeddedNativeRuntimeSelfTest | Real JNI load/ABI `b10682-5ea1b124e`; **not inference** |
 | EmbeddingPersistenceTest | 90 assertions |
 | EmbeddingPipelineTest | 135 assertions |
+| LandmarkEmbeddingPoolingTest | 808 numeric composition checks |
 | NativeEmbeddingOutputTest | 107 synthetic tensor checks |
 | PinnedEmbeddingModelSelfTest | 25 loopback/integrity checks; no weights |
 
-The new provider-output test checks every coordinate against an independent
-reference at subnormal, small, ordinary and near-maximum scales; task/tokenizer
-input equality, actual-limit validation, malformed Unicode/token responses,
-cache rejection/recovery, ownership and native landmark composition. Before the
-repair the canonical build **failed** in this discovered test because a
-zero-token result was allowed to execute inference. After repair it passes.
-Fixture outputs exist only in tests, never as production fallback vectors.
+Before the composition repair, the canonical build failed in the newly discovered
+`LandmarkEmbeddingPoolingTest`: `Positive finite total weight required` for
+individually finite weights whose sum overflowed. After repair it passes. New
+coverage also checks common-weight scaling (subnormal through near-maximum),
+tiny residuals, same-coordinate compensated cancellation, all 768 coordinates
+against an independent randomized reference, repeatability, native tail retention,
+exact-zero rejection and ownership. Text labels are canonical block/biome and
+multilingual cave descriptors; these **numeric fixtures are not tokenization or
+real landmark semantic inference**.
 
-Nonfatal warnings: 98 existing API-Guardian/mixin client warnings, Gradle
- deprecations, Jackson annotation version semver warning, duplicate SLF4J providers
- on the test classpath. Persistence corrupt-input fixtures deliberately log
- rejected-state exceptions. None is proof of Minecraft gameplay validation.
+The expanded opt-in real-weight probe covers canonical block, biome, region and
+multilingual cave text; independent all-coordinate L2 comparison; and repeated
+inference after other texts/lengths to expose stale native state. Those assertions
+are compiled, but did not execute because asset resolution failed first.
 
-## Real inference verification: blocked
+Nonfatal build warnings: 98 existing API-Guardian/mixin client warnings,
+Jackson annotation version semver warning, duplicate SLF4J providers and Gradle
+deprecations. Persistence corruption fixtures deliberately log rejected inputs.
+
+## Fresh inference recheck: blocked by missing approved weights
 
 ```text
 /path/to/the/same/gradle --no-daemon --console=plain embeddedInferenceProbe -PembeddingProvision=false
 ```
 
-Actual result: **exit 1**, `FileNotFoundException: Pinned Nomic v2 GGUF missing`
-at `build/embedding-inference-probe/nomic-v2.gguf`. No approved v2 weights were
-found in the inspected caches/workspace. No software or model weights were
-installed/downloaded; cached v1 assets were not used. Thus **no actual model
-forward pass or semantic-quality/gameplay/IntelliJ-launch verification ran**.
-The opt-in probe is retained for an exact preprovisioned file, and checks repeated
-inference, full native vectors, distinct descriptors, mutable cache isolation,
-real tokenizer overflow rejection and default local selection without an HTTP
-service. Run with `-PembeddingModelPath=/absolute/path/to/exact.gguf`.
+**Exit 1**, `FileNotFoundException: Pinned Nomic v2 GGUF missing` at
+`build/embedding-inference-probe/nomic-v2.gguf`. Rechecked the exact Mysticism
+cache and Ollama blob paths: absent. The inspected Hugging Face cache contains
+v1.5/nomic-bert, not the approved v2 asset. No model/software installation,
+configuration changes, substitute assets or external inference service were used.
+Network/authentication recovery alone cannot supply a missing preprovisioned file.
 
-The required GGUF is **957,680,480 bytes**, SHA256
+Required GGUF: **957,680,480 bytes**, SHA256
 `a5db3381f2e514d3490a3a31fe70eb1a65e95016c85c6c2c23223b810806594f`.
-First normal launch must have the exact cached/provisioned file or allow its
-pinned download; readiness can fail on network/disk/native-memory/deadline limits.
-No external inference server is a substitute or prerequisite. Cross-platform
-native execution and actual model output remain unverified here.
+To verify when available, pass `-PembeddingModelPath=/absolute/path/to/exact.gguf`
+to the probe, or deliberately authorize its pinned download. Normal runtime
+supports first-use pinned provisioning; this validation did not enable it.
+**No actual model forward pass, semantic-quality, Minecraft gameplay or IntelliJ
+launch verification is claimed.** Cross-platform native execution is unverified.
 
 ## Retained command handles
 
-Original tmux session `$11`, origin `%1951`; all long commands use `tmux-jobs`.
+All long commands use `tmux-jobs`, original session `$11`, origin `%2309`.
 
-- Red regression build: pane `%1960`, run `8500cb6c4fa94875ad71b03fcfc623f2`, exit 1.
-- Green forced canonical build: pane `%1960`, run `23c1065d83a045d1a4517041bbbfd869`, exit 0.
-- No-download inference probe: pane `%2000`, run `aeae3a58a3ee4401a86ff245ec4805e3`, exit 1 (missing weights).
+- Red canonical regression: pane `%2328`, run `dda68f89bcba47f88c343d6fc8d69a36`, exit 1 (historical output captured before pane loss).
+- Recovered forced canonical build: pane `%3125`, run `364c4582f91d4b99bb5a272a17a04c0e`, exit 0.
+- Recovered no-download inference probe: pane `%3131`, run `1998aba45b034ec0bba0213c2b3c67a9`, exit 1 (missing exact v2 weights).
 
-See the final report for exact candidate HEAD and the final committed-tree build
-handle. The [prerequisite validation record](runtime-embedded-validation.md) is
-historical evidence from its original branch, not additional checks performed on
-this candidate.
+Earlier interrupted panes disappeared; their completion was not invented. Current
+handles retain the rechecked results above. See final report for candidate HEAD.

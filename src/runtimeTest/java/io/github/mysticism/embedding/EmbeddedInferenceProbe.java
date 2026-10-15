@@ -26,13 +26,43 @@ public final class EmbeddedInferenceProbe {
         System.setProperty("mysticism.embedding.endpoint", "http://127.0.0.1:1/");
         try (var model = new LlamaEmbeddingModel(path, () -> false)) {
             check(model.dimensions() == 768, "Wrong native model dimension");
-            String shortInput = "search_document: oak log";
-            check(model.tokens(shortInput) > 0 && model.tokens(shortInput) < 512, "Real GGUF tokenizer unavailable");
             check(model.tokens("search_document: " + "oak ".repeat(600)) > 512, "Tokenizer cannot detect overflow");
-            Vec384f a = EmbeddedEmbeddingService.decodeEmbedding(model.embed(shortInput));
-            Vec384f b = EmbeddedEmbeddingService.decodeEmbedding(model.embed(shortInput));
-            check(a.dot(b) > .99999f, "Repeated native inference unstable");
-            check(a.data()[767] != 0, "Native tail missing");
+            // Production canonical text and multilingual cave text, at differing actual lengths.
+            // The single-sequence native MEAN output is already pooled, not a hidden-state batch.
+            List<String> corpus = List.of(
+                    CanonicalDescriptors.block("minecraft:oak_log", List.of("minecraft:logs", "minecraft:burnable")),
+                    CanonicalDescriptors.biome("minecraft:dripstone_caves", List.of("minecraft:is_overworld")),
+                    CanonicalDescriptors.region("minecraft:the_nether", "minecraft:basalt_deltas", List.of()),
+                    "cave minecraft:lush_caves. moss clay water glow berries. cueva 洞窟 Höhle 🌳");
+            var firstPass = new ArrayList<Vec384f>();
+            for (String descriptor : corpus) {
+                String input = "search_document: " + descriptor;
+                int tokens = model.tokens(input);
+                check(tokens > 0 && tokens <= 512, "Real landmark tokenizer length out of bounds: " + tokens);
+                float[] sentence = model.embed(input);
+                check(sentence != null && sentence.length == 768, "Native sentence output shape changed");
+                double squared = 0;
+                for (float value : sentence) {
+                    check(Float.isFinite(value), "Nonfinite real native output");
+                    squared += (double) value * value;
+                }
+                check(squared > 0, "Zero real native output");
+                double length = Math.sqrt(squared);
+                Vec384f decoded = EmbeddedEmbeddingService.decodeEmbedding(sentence);
+                float[] coordinates = decoded.data();
+                for (int i = 0; i < 768; i++)
+                    check(Math.abs(coordinates[i] - sentence[i] / length) < 1e-7,
+                            "Real native coordinate differs from independent L2 reference: " + i);
+                check(coordinates[767] != 0, "Native tail missing");
+                firstPass.add(decoded);
+            }
+            // Revisit after different-length/text requests to expose stale pooling/context state.
+            for (int i = corpus.size() - 1; i >= 0; i--) {
+                Vec384f repeated = EmbeddedEmbeddingService.decodeEmbedding(model.embed("search_document: " + corpus.get(i)));
+                check(firstPass.get(i).dot(repeated) > .99999f, "Repeated real landmark inference unstable");
+            }
+            System.out.println("Real landmark tokenizer/pooled-output checks passed for " + corpus.size() +
+                    " texts (all 768 coordinates compared; no semantic-quality claim)");
         }
         try (var provider = EmbeddingProviders.create();
              var engine = new AsyncEmbeddingEngine(provider, 2, 16, 32, Duration.ofSeconds(30), Duration.ofMinutes(3))) {
