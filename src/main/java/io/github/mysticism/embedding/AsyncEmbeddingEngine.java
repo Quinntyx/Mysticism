@@ -94,7 +94,7 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
         }
         for (var subscriber : subscribers) publish(subscriber, null, error);
         if (error != null) {
-            workers.shutdownNow();
+            workers.shutdownNow(); timer.shutdown();
             // Failure/timeout must cancel preparation and release an eventual native context.
             // Provider cleanup cannot stall the deadline or subscriber delivery threads.
             CompletableFuture.runAsync(this::closeProvider);
@@ -169,7 +169,7 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
     }
     private void finish(String key, Request request, Vec384f value, Throwable error) {
         List<Request> invalidated = List.of();
-        boolean deliver;
+        boolean deliver, modelFailed = false;
         synchronized (this) {
             deliver = pending.get(key) == request;
             if (deliver) {
@@ -179,7 +179,8 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
             }
             // A late definitive model error still revokes readiness after its request
             // deadline. Late successes cannot repopulate caches or redeliver subscribers.
-            if (!closed && error instanceof EmbeddingModelException) {
+            if (!closed && ready && error instanceof EmbeddingModelException) {
+                modelFailed = true;
                 // A successful startup probe cannot authorize a missing/changed model forever.
                 // Fail the generation atomically; no cached result or queued old-model success
                 // can make a fresh discovery look ready. Current persisted anchors are separate.
@@ -196,6 +197,12 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
         }
         if (deliver) for (var subscriber : request.subscribers) publish(subscriber, error == null ? value.clone() : null, error);
         for (var work : invalidated) for (var subscriber : work.subscribers) publish(subscriber, null, error);
+        if (modelFailed) {
+            workers.shutdownNow(); timer.shutdown();
+            // Revoke the native generation, not merely its status. As with failed startup,
+            // cleanup cannot wait on JNI or run on a Minecraft/deadline delivery thread.
+            CompletableFuture.runAsync(this::closeProvider);
+        }
     }
     public synchronized int cacheSize() { return cache.size(); }
     public synchronized int inflightSize() { return pending.size(); }

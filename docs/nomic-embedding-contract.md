@@ -88,9 +88,20 @@ compatible semantics. No v1 migration or first-256 reduction is performed.
 cache results and compositions are independently owned. `EmbeddingHelper` keeps
 its existing asynchronous API: `initializeServer`, `readiness`, `getEmbedding`,
 `composeDescriptors`, `isReady`, `getInitializationStatus`, `shutdown`, `profile`.
-Requests before readiness fail, and failures stay explicit. The bounded async
-engine preserves callback isolation, copied caching, deduplication, and request
-deadlines. JNI calls and context release cannot race; shutdown cancels pending
+Requests before readiness fail, and failures stay explicit. Discovery admission
+uses the live `INITIALIZING` / `READY` / `FAILED` / `STOPPED` state, not a past
+startup promise or a populated item index. A readiness probe must execute valid
+native inference. Subsequent native execution/linkage, malformed tokenizer or
+invalid-vector errors revoke readiness and invalidate the whole generation's
+cache and queued/active work; the original cause reaches discovery/navigation.
+Even a definitive error delivered after its request deadline revokes readiness.
+The failed provider is disposed off the game/deadline threads. Descriptor errors
+(including valid token counts >512) reject only that request. Restart the server
+lifecycle to retry a terminal model failure; there is no silent fallback/retry.
+Current-profile published source anchors and physical source/ownership reads do
+not require new inference. See [readiness integration validation](embedding-readiness-handoff.md).
+The bounded async engine preserves callback isolation, copied caching,
+deduplication, and request deadlines. JNI calls and context release cannot race; shutdown cancels pending
 work without waiting on a native call and releases any eventual context on its
 owner worker. Independent player projection, source-coordinate octree ownership,
 collision/rendering and persistence policy are not changed by this provider.

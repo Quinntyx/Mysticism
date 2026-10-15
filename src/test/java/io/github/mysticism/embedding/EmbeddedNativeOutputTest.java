@@ -20,7 +20,7 @@ public final class EmbeddedNativeOutputTest {
     private static void rejects(Checked operation) throws Exception {
         checks++;
         try { operation.run(); }
-        catch (IllegalArgumentException expected) { return; }
+        catch (IllegalArgumentException | EmbeddingModelException expected) { return; }
         throw new AssertionError("Expected explicit invalid inference rejection");
     }
     private static final class Model implements EmbeddedEmbeddingService.Model {
@@ -91,24 +91,31 @@ public final class EmbeddedNativeOutputTest {
             rejects(() -> LlamaEmbeddingModel.decodeTokenCount(response));
     }
     private static void noInvalidPublication() throws Exception {
-        Model model = new Model();
-        try (var provider = provider(model);
-             var engine = new AsyncEmbeddingEngine(provider, 1, 8, 8, Duration.ofSeconds(2))) {
-            engine.readiness().get(2, TimeUnit.SECONDS);
-            float[] nan = coordinates(1); nan[767] = Float.NaN;
-            float[] infinite = coordinates(1); infinite[767] = Float.POSITIVE_INFINITY;
-            for (float[] invalid : new float[][]{new float[256], new float[384], new float[767],
-                    new float[769], new float[768], nan, infinite, null}) {
+        float[] nan = coordinates(1); nan[767] = Float.NaN;
+        float[] infinite = coordinates(1); infinite[767] = Float.POSITIVE_INFINITY;
+        // An invalid native output now revokes the model generation. Exercise every bad
+        // tensor on its own fresh generation; never rely on malformed-model recovery.
+        for (float[] invalid : new float[][]{new float[256], new float[384], new float[767],
+                new float[769], new float[768], nan, infinite, null}) {
+            Model model = new Model();
+            try (var provider = provider(model);
+                 var engine = new AsyncEmbeddingEngine(provider, 1, 8, 8, Duration.ofSeconds(2))) {
+                engine.readiness().get(2, TimeUnit.SECONDS);
                 model.output = invalid;
                 try {
                     engine.embed("same descriptor").get(2, TimeUnit.SECONDS);
                     throw new AssertionError("Invalid native output published/cached");
                 } catch (ExecutionException expected) {
-                    check(expected.getCause() instanceof IllegalArgumentException, "Wrong failure: " + expected.getCause());
+                    check(expected.getCause() instanceof EmbeddingModelException, "Wrong failure: " + expected.getCause());
                 }
+                check(engine.state().unavailable(), "Malformed native output must revoke readiness");
                 check(engine.cacheSize() == 0 && engine.inflightSize() == 0, "Invalid output left a cache/pending entry");
             }
-            model.output = coordinates(1);
+        }
+        Model model = new Model();
+        try (var provider = provider(model);
+             var engine = new AsyncEmbeddingEngine(provider, 1, 8, 8, Duration.ofSeconds(2))) {
+            engine.readiness().get(2, TimeUnit.SECONDS);
             Vec384f vector = engine.embed("same descriptor").get(2, TimeUnit.SECONDS);
             check(vector.data().length == 768 && vector.data()[767] != 0, "Recovery truncated native tail");
             check(engine.cacheSize() == 1, "Successful inference not cached");
@@ -121,7 +128,7 @@ public final class EmbeddedNativeOutputTest {
         try (var provider = provider(zero);
              var engine = new AsyncEmbeddingEngine(provider, 1, 8, 8, Duration.ofSeconds(2))) {
             try { engine.readiness().get(2, TimeUnit.SECONDS); throw new AssertionError("Zero readiness output accepted"); }
-            catch (ExecutionException expected) { check(expected.getCause() instanceof IllegalArgumentException, "Wrong readiness error"); }
+            catch (ExecutionException expected) { check(expected.getCause() instanceof EmbeddingModelException, "Wrong readiness error"); }
             check(!engine.isReady() && engine.cacheSize() == 0, "Failed native readiness exposed success/placeholder");
         }
     }

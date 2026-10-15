@@ -73,7 +73,7 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
         work.lockInterruptibly();
         try {
             requireOpen();
-            if (model == null) throw new IllegalStateException("Embedded inference not prepared");
+            if (model == null) throw new EmbeddingModelException("Embedded inference not prepared");
             Vec384f vector = infer(model, descriptor);
             requireOpen();
             return vector;
@@ -83,10 +83,24 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
         validateDescriptor(descriptor);
         String input = "search_document: " + descriptor;
         // Use the actual GGUF tokenizer (including special tokens), never a character heuristic.
-        int tokens = model.tokens(input);
-        if (tokens < 1 || tokens > NativeEmbeddingOutput.MAX_TOKENS)
+        int tokens;
+        try { tokens = model.tokens(input); }
+        catch (RuntimeException | LinkageError failure) {
+            throw modelFailure("tokenization", failure);
+        }
+        if (tokens < 1) throw new EmbeddingModelException("Embedded native v2 tokenizer returned no tokens");
+        // A valid tokenizer reporting input overflow is a descriptor error, not model loss.
+        if (tokens > NativeEmbeddingOutput.MAX_TOKENS)
             throw new IllegalArgumentException("Nomic v2 input must have 1..512 tokens; truncation is forbidden");
-        return decodeEmbedding(model.embed(input));
+        try { return decodeEmbedding(model.embed(input)); }
+        catch (RuntimeException | LinkageError failure) {
+            throw modelFailure("inference/output validation", failure);
+        }
+    }
+    private static EmbeddingModelException modelFailure(String operation, Throwable failure) {
+        if (failure instanceof EmbeddingModelException modelFailure) return modelFailure;
+        return new EmbeddingModelException("Embedded native v2 " + operation + " failed: "
+                + EmbeddingReadiness.describe(failure), failure);
     }
     private static void validateDescriptor(String descriptor) {
         if (descriptor == null || descriptor.isBlank() || descriptor.length() > 8192)
