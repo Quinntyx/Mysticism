@@ -20,7 +20,7 @@ import net.minecraft.util.math.*;
 import net.minecraft.util.shape.VoxelShape;
 import net.minecraft.world.World;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.*;
 import java.util.function.BiConsumer;
 
 /** Observer-local custom geometry. No placed blocks, global saved anchors or synthetic floors. */
@@ -114,7 +114,7 @@ public final class SpiritTerrainService {
         Context c=SERVERS.get(player.getServer());if(c==null)return;
         Session s=c.sessions.remove(player.getUuid());if(s!=null)s.cancel();MeshCollision.clear(player.getUuid());
     }
-    private static void close(MinecraftServer server){Context c=SERVERS.remove(server);if(c!=null){if(c.read!=null)c.read.cancel();c.sessions.forEach((id,s)->{s.cancel();MeshCollision.clear(id);});}}
+    private static void close(MinecraftServer server){Context c=SERVERS.remove(server);if(c!=null){if(c.read!=null)c.read.cancel();c.sessions.forEach((id,s)->{s.cancel();MeshCollision.clear(id);});c.discoveryWorker.shutdownNow();}}
     private static Session session(ServerPlayerEntity p){Context c=SERVERS.get(p.getServer());return c==null?null:c.sessions.get(p.getUuid());}
     private static Vec384f q(ServerPlayerEntity p){return p.getComponent(MysticismEntityComponents.LATENT_POS).get().clone();}
     private static Basis384f basis(ServerPlayerEntity p){return p.getComponent(MysticismEntityComponents.LATENT_BASIS).get().clone();}
@@ -485,12 +485,15 @@ public final class SpiritTerrainService {
         s.viewHorizon=SourceDiscovery.meshHorizon(view);
         if(w.discoveryCenter==null || view!=w.discoveryView || w.discoveryCenter.squaredDistanceTo(source)>256 || c.tick-w.discoveryPlanned>=40) {
             w.discoveryPlanned=c.tick;w.discoveryCenter=source;w.discoveryView=view;
-            for(var expired:w.discovery.replan(source,view)) {
+            var expiredTiles=w.discovery.replan(source,view);
+            for(var expired:expiredTiles) {
                 w.discovered.remove(expired);
                 var pending=w.discoveryPending.remove(expired);
-                if(pending!=null)pending.cancel(false); // remove before cancellation can deliver a callback
+                w.discoveryMeshes.cancel(expired);
+                if(pending!=null)pending.cancel(false);
             }
-            refreshDiscovered(w,c.tick);
+            w.discoveryMeshes.refresh(source,!expiredTiles.isEmpty());
+            w.discoveredNodes=w.discoveryMeshes.nodes();w.dirty=true;
         }
         if(c.tick%2==0)issueDiscovery(p,s,w);
     }
@@ -510,22 +513,10 @@ public final class SpiritTerrainService {
             try {future=SourceLandmarks.discoveryRegion(p.getServer(),w.dimension,tile,SourceDiscovery.TILE*SourceDiscovery.TILE*SourceDiscovery.TILE);}
             catch(RuntimeException rejected){return;} // bounded queues are busy; the tile stays queued for the next attempt
             w.discoveryPending.put(tile,future);w.discovery.pending(tile);
-            future.whenComplete((region,error)->p.getServer().execute(()->{
-                if(!w.discoveryPending.remove(tile,future))return;
-                if(!live(p,s) || !c.retained(s,w)){w.discovery.cancel(tile);return;}
-                if(error!=null || region==null){w.discovery.failed(tile,c.tick);return;}
-                Vec3d center=new Vec3d(tile.minX()+SourceDiscovery.TILE/2.0,tile.minY()+SourceDiscovery.TILE/2.0,tile.minZ()+SourceDiscovery.TILE/2.0);
-                w.discovered.put(tile,SourceDiscovery.nodes(region.cells(),center));
-                w.discovery.completed(tile,region.complete(),c.tick);
-                refreshDiscovered(w,c.tick);w.dirty=true; // near-field supersede and mesh horizon pick this up on the normal compaction/publish cadence
-            }));
+            // Completed regions retain their admission slot until incremental materialization and
+            // detached compaction publish. No completion callback runs a whole-tile mesh rebuild.
+            // Context.advanceDiscovery polls this same identity-guarded map without waiting.
         }
-    }
-    /** Retained discovered tiles become one sorted far-field node list under the node budget. */
-    private static void refreshDiscovered(Window w,long tick) {
-        Vec3d center=w.discoveryCenter==null?w.origin:w.discoveryCenter;
-        w.discoveredNodes=SourceDiscovery.retain(w.discovered,w.discovery,center,SourceDiscovery.MAX_NODES,tick);
-        w.dirty=true;
     }
     private static double nodeDistance(SourceMeshBuilder.Node n,Vec3d center) {
         return SourceMeshBuilder.distanceSquared(SourceMeshBuilder.nodeBox(n),center);
@@ -587,7 +578,7 @@ public final class SpiritTerrainService {
             } catch(RuntimeException failure){status(p,s,"Mesh deferred: "+failure.getMessage());}
         }
         // A single repository geometry cursor is advanced globally. A failed region never retries ahead of others forever.
-        c.advanceNear();c.advanceGeometry();
+        c.advanceDiscovery();c.advanceNear();c.advanceGeometry();
         if(!players.isEmpty())for(int n=0;n<Math.min(2,players.size());n++) {
             ServerPlayerEntity p=players.get(Math.floorMod(c.playerCursor++,players.size()));Session s=c.sessions.get(p.getUuid());
             if(s!=null && p.getWorld().getRegistryKey().equals(WORLD))try{c.maintain(p,s);c.scan(p,s);}catch(RuntimeException failure){status(p,s,"Selection deferred: "+failure.getMessage());}
@@ -700,6 +691,7 @@ public final class SpiritTerrainService {
         final SourceDiscovery.Scheduler discovery=new SourceDiscovery.Scheduler();
         final Map<Bounds,CompletableFuture<SourceLandmarks.Region>> discoveryPending=new LinkedHashMap<>();
         final Map<Bounds,List<SourceMeshBuilder.Node>> discovered=new LinkedHashMap<>();
+        final DiscoveryMeshPipeline discoveryMeshes=new DiscoveryMeshPipeline(discovery,discoveryPending,discovered);
         List<SourceMeshBuilder.Node> discoveredNodes=List.of();Vec3d discoveryCenter;long discoveryPlanned;int discoveryView;
         Window(String dimension,Vec3d origin,Vec384f semantic,Basis384f basis,String id){this.dimension=dimension;this.origin=origin;this.semantic=semantic.clone();captured=semantic.clone();supportEmbedding=semantic.clone();sourceBasis=basis.clone();this.id=id;}
     }
@@ -719,13 +711,30 @@ public final class SpiritTerrainService {
         // before invoking callbacks, and iterate a snapshot rather than the mutable values view.
         var pending=List.copyOf(w.discoveryPending.values());
         w.discoveryPending.clear();
+        w.discoveryMeshes.cancelAll();
         pending.forEach(f->f.cancel(false));
         w.discovered.clear();w.discoveredNodes=List.of();w.stream=null;w.nearCells=null;w.nearSamples=null;
     }
     private static final class Context {
         final MinecraftServer server;final LandmarkStore store;final Map<UUID,Session> sessions=new HashMap<>();
         long tick;int playerCursor;LandmarkStore.GeometryRead read;Session readingSession;Window readingWindow;
-        int geometryCursor,nearCursor;
+        int geometryCursor,nearCursor,discoveryCursor;
+        final ExecutorService discoveryWorker=new ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(2),Thread.ofPlatform().daemon().name("mysticism-discovery-mesh").factory(),new ThreadPoolExecutor.AbortPolicy());
+        /** One shared per-server materialization/time budget. Worker results only swap immutable
+         * node lists here; their compaction and full retention sorts never run on the server. */
+        void advanceDiscovery(){
+            var active=new ArrayList<Window>();
+            for(Session s:sessions.values())for(Window w:windows(s))if(w.discoveryMeshes.hasWork())active.add(w);
+            if(active.isEmpty())return;
+            int start=Math.floorMod(discoveryCursor++,active.size());var budget=new DiscoveryMeshPipeline.Budget();
+            for(int i=0;i<active.size();i++){
+                Window w=active.get((start+i)%active.size());
+                if(w.discoveryMeshes.advance(budget,discoveryWorker,tick)){
+                    w.discoveredNodes=w.discoveryMeshes.nodes();w.dirty=true;
+                }
+            }
+        }
 
         boolean proving;final Map<BlockPos,BlockPalette.State> proofSamples=new HashMap<>();
         final ArrayDeque<Map.Entry<Session,LandmarkMetadata>> pending=new ArrayDeque<>();

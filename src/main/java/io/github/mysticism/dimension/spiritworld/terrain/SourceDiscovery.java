@@ -233,17 +233,26 @@ public final class SourceDiscovery {
      * evicted data must never remain marked covered. A cooldown prevents stationary budget thrash. */
     static List<SourceMeshBuilder.Node> retain(Map<Bounds,List<SourceMeshBuilder.Node>> discovered,Scheduler scheduler,
                                               Vec3d center,int budget,long tick) {
+        Retention result=retention(discovered,center,budget);
+        for(var tile:result.evicted()){discovered.remove(tile);scheduler.evicted(tile,tick);}
+        return result.nodes();
+    }
+
+    /** Detached result: worker code never mutates the live tile map or coverage scheduler. */
+    record Retention(Map<Bounds,List<SourceMeshBuilder.Node>> tiles,List<SourceMeshBuilder.Node> nodes,List<Bounds> evicted) {}
+    static Retention retention(Map<Bounds,List<SourceMeshBuilder.Node>> discovered,Vec3d center,int budget) {
         var tiles=new ArrayList<>(discovered.entrySet());
         tiles.sort(Comparator.comparingDouble((Map.Entry<Bounds,List<SourceMeshBuilder.Node>> e)->e.getKey().distanceSquared(new io.github.mysticism.landmark.Point3(center.x,center.y,center.z)))
                 .thenComparingLong(e->e.getKey().minX()).thenComparingLong(e->e.getKey().minY()).thenComparingLong(e->e.getKey().minZ()));
         List<SourceMeshBuilder.Node> merged=new ArrayList<>();int total=0;
+        Map<Bounds,List<SourceMeshBuilder.Node>> kept=new LinkedHashMap<>();var evicted=new ArrayList<Bounds>();
         for(var e:tiles) {
-            if(total+e.getValue().size()>budget){discovered.remove(e.getKey());scheduler.evicted(e.getKey(),tick);continue;}
-            total+=e.getValue().size();merged.addAll(e.getValue());
+            if(total+e.getValue().size()>budget){evicted.add(e.getKey());continue;}
+            total+=e.getValue().size();kept.put(e.getKey(),e.getValue());merged.addAll(e.getValue());
         }
         merged.sort(Comparator.comparingDouble((SourceMeshBuilder.Node n)->SourceMeshBuilder.distanceSquared(SourceMeshBuilder.nodeBox(n),center))
                 .thenComparingLong(n->n.position().asLong()));
-        return List.copyOf(merged);
+        return new Retention(Map.copyOf(kept),List.copyOf(merged),List.copyOf(evicted));
     }
 
     /** Deterministic per-window discovery schedule: pending queue, coverage, retries. Server-thread only. */

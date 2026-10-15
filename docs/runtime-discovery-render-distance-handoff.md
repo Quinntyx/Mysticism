@@ -129,6 +129,72 @@ jar verified. Retained build handle: origin `%2587`, pane `%2593`, run
 warnings remain nonfatal. This is bare-JVM teardown coverage, not a live
 world-change/server-stop play test or native v2 inference verification.
 
+## Completion-path review repair (retained merge follow-up)
+
+The review correctly identified that the earlier bounded reader ended in an
+unbounded **server-thread** completion handler. A whole 32³ region still went
+through registry/block-state resolution, shape extraction, octree compaction,
+prism coalescing and sorting there; retention then rebuilt/sorted up to 65,536
+nodes. Scheduler-only latency tests did not cover that workload.
+
+Production `issueDiscovery` now only registers the real region future and keeps
+its admission slot through mesh publication. `Context.advanceDiscovery` polls
+those same per-window identities; completion never invokes mesh construction.
+The shared per-server budget is at most 256 examined cells and a one-millisecond
+materialization deadline per tick, with at most 64 cells per window turn. Air and
+duplicate samples count too. The starting window rotates so one player's horizon
+cannot consume every tick. Registry resolution and collision-shape extraction stay
+on the owning server thread, under that incremental budget. This is cooperative:
+a single modded shape callback cannot be preempted mid-call.
+
+A dedicated single-thread daemon with a two-task queue performs detached
+`farNodes` compaction/coalescing and `retention` merging/sorting. It receives only
+completed materialized maps, immutable tile geometry and source-coordinate
+metadata, never world/registry access or the live coverage scheduler. There are at
+most two submissions per server tick and one pending result per window. Rejection
+retains progress for a later tick; there is no synchronous fallback or waiting.
+The two source-read admission slots now also bound completed-but-unmaterialized
+regions. Retention decisions return as immutable nodes, tile references and
+explicit evictions; only the owner applies coverage/retry changes. No 65,536-node
+retention rebuild or sort runs in the completion/poll path.
+
+Window teardown/expiry invalidates request identities and worker results before
+cancellation; late work cannot restore expired data or replace a fresh same-tile
+request. Replans invalidate detached retention snapshots, while retaining completed
+tile compaction so registry work is not repeated. Unchanged stationary replans do
+not continuously invalidate a delayed result. Materialization failures preserve
+prior valid terrain and request real retry rather than granting false coverage.
+
+`DiscoveryMeshCompletionSelfTest` drives the **actual private Context/Window
+completion path**, not a second scheduler. It feeds all 32,768 observed source
+cells and two existing 32,768-node tiles, then runs real detached compaction and
+98,304 -> 65,536-node retention on separate worker threads. A bare-JVM adapter
+substitutes only registry/shape resolution with immutable material geometry and
+asserts its owner-thread affinity. The test checks per-window and shared eight-
+player budgets, elapsed-time stopping, budgeted air scans, held/saturated worker
+progress, no inline fallback/publication, material/extent preservation, real
+coverage eviction/retry, partial observations, stale-replan caching, stationary
+replans, materialization failure and actual window teardown with fresh same-tile
+replacement. This does not measure Minecraft movement time or real registry cost.
+
+Final validation: cached Gradle 8.13 / Java 21
+`--offline --no-daemon --console=plain --rerun-tasks build` passed in 2m 5s;
+all 14 actionable tasks executed. The runner discovered and passed all **14**
+main-based runtime classes, including the new completion-path test (36,124 checks
+on this run; count includes per-tick assertions). Packaging/metadata/descriptor/
+runner tests and `verifyProductionJar` passed. The retained build handle is session
+`$11`, original pane `%2904`, build pane `%2928`, run
+`b3b53fce0916427780635157ae0de40b`, exit 0. Existing annotation/deprecation and
+intentional invalid-persistence fixture warnings remain. `git diff --check` passed.
+The earlier full build also passed, before the stationary-replan guard was added.
+No software was installed, no external embedding endpoint was used, and no live
+Minecraft/GPU/multiplayer or native-v2 model inference was verified.
+No projection, ownership/growth or embedding policy is changed by this repair.
+Near-field refinement, frame candidate selection, mesh/collision stitching and
+transport remain their existing server-thread paths; this fix does not claim a
+hard deadline for the whole terrain tick or prove real-world FPS. Source views
+remain progressive and the extra materialization budget can delay full coverage.
+
 ## Limits / unverified
 
 Discovery and mesh budgets are intentional: large views generate progressively,
