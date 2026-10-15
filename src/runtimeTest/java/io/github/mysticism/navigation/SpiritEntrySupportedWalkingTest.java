@@ -18,15 +18,13 @@ public final class SpiritEntrySupportedWalkingTest {
     /** Simulates update()'s shallow support bookkeeping: support confirmation resets the counter. */
     private static final class Stance {
         int unsupported, entrySupportTicks;
-        boolean everSupported, confirmedOwned;
 
         SpiritNavigationService.StanceStep tick(boolean standing, boolean jumping, boolean ownershipPending) {
-            var step = SpiritNavigationService.entryStance(unsupported, entrySupportTicks, everSupported, confirmedOwned,
-                    standing, jumping, ownershipPending);
+            var step = SpiritNavigationService.entryStance(unsupported, entrySupportTicks, standing, jumping, ownershipPending);
             unsupported = step.unsupportedTicks(); entrySupportTicks = step.entrySupportTicks();
             return step;
         }
-        void confirmSupport() { everSupported = true; confirmedOwned = true; unsupported = 0; }
+        void confirmSupport() { unsupported = 0; entrySupportTicks = 0; }
     }
 
     private static void freshStandingEntryHoldsWalkingWhileOwnershipPublishes() {
@@ -61,12 +59,19 @@ public final class SpiritEntrySupportedWalkingTest {
                 "A confirmed stance that loses support must freefall immediately");
     }
 
-    private static void confirmedOwnershipIsNeverReheld() {
-        // Ownership already confirmed for this session; support vanished while standing (e.g. an
-        // ownership revision flip). Re-holding would mask a real region change.
-        check(SpiritNavigationService.entryStance(0, 0, false, true, true, false, true).stance()
-                == SpiritNavigationService.Stance.FREE_FALL,
-                "Confirmed-then-lost stance must not re-enter the walking hold");
+    private static void confirmedGroundRevalidationIsBounded() {
+        var stance = new Stance();
+        stance.confirmSupport();
+        for (int tick = 0; tick < SpiritNavigationService.ENTRY_SUPPORT_GRACE_TICKS; tick++)
+            check(stance.tick(true, false, true).stance() == SpiritNavigationService.Stance.HOLD_ENTRY_SUPPORT,
+                    "exact local pending floor must preserve previously acquired walking");
+        check(stance.tick(true, false, true).stance() == SpiritNavigationService.Stance.FREE_FALL,
+                "stuck ownership revalidation cannot hold walking indefinitely");
+        stance.confirmSupport();
+        check(stance.tick(true, false, true).stance() == SpiritNavigationService.Stance.HOLD_ENTRY_SUPPORT,
+                "actual support recovery grants a fresh bounded revalidation episode");
+        check(stance.tick(true, false, false).stance() == SpiritNavigationService.Stance.FREE_FALL,
+                "settled-unowned/changed-producer ground cannot retain a confirmed binding");
     }
 
     private static void airborneEntryKeepsTheJumpGraceAndEdgeRules() {
@@ -78,21 +83,18 @@ public final class SpiritEntrySupportedWalkingTest {
         check(jump.tick(false, true, true).stance() == SpiritNavigationService.Stance.FREE_FALL,
                 "Jump grace must expire into freeflight after 14 ticks");
         // The first ascending tick may still overlap the ground probe, but must not hold entry support.
-        check(SpiritNavigationService.entryStance(0, 0, false, false, true, true, true).stance()
+        check(SpiritNavigationService.entryStance(0, 0, true, true, true).stance()
                 == SpiritNavigationService.Stance.WALK,
                 "An ascending jump with residual ground contact must use jump grace, not entry hold");
         // Walking over an edge at entry: immediate freeflight, no hold.
-        check(SpiritNavigationService.entryStance(0, 0, false, false, false, false, true).stance()
+        check(SpiritNavigationService.entryStance(0, 0, false, false, true).stance()
                 == SpiritNavigationService.Stance.FREE_FALL,
                 "An unsupported edge walk-off must freefall immediately");
         // Standing on genuinely unowned ground (ownership resolved, nothing pending): no hold.
-        check(SpiritNavigationService.entryStance(0, 0, false, false, true, false, false).stance()
+        check(SpiritNavigationService.entryStance(0, 0, true, false, false).stance()
                 == SpiritNavigationService.Stance.FREE_FALL,
                 "Resolved-unowned ground must not hold walking");
-        // Established bindings do not matter here: the hold keys on session-confirmed state only.
-        check(SpiritNavigationService.entryStance(0, 0, true, false, true, false, true).stance()
-                == SpiritNavigationService.Stance.FREE_FALL,
-                "A session that already had support must not re-enter the hold");
+
     }
 
     private static void entryWaitDoesNotSpendJumpGraceOrResetEntryBudget() {
@@ -126,7 +128,7 @@ public final class SpiritEntrySupportedWalkingTest {
         int afterUpdate = source.indexOf("private static void restoreAnchor(ServerPlayerEntity p, Session s) {");
         check(update >= 0 && afterUpdate > update, "update() body must precede restoreAnchor");
         String updateBody = source.substring(update, afterUpdate);
-        check(updateBody.contains("SpiritTerrainService.entrySupportPending(p)"),
+        check(updateBody.contains("SpiritTerrainService.groundPending(p)"),
                 "Shallow stance must consult both source discovery and octree ownership publication");
         check(updateBody.contains("MeshCollision.ground(p).isPresent()"),
                 "Standing detection must use actual visible/collidable mesh contact, not low delta or stale vanilla flags");
@@ -135,8 +137,8 @@ public final class SpiritEntrySupportedWalkingTest {
         check(updateBody.contains("if (standing && delta.y <= .01) s.jumping = false")
                         && updateBody.contains("s.entrySupportTicks = stance.entrySupportTicks()"),
                 "Physical recontact must reset jumping while preserving the separate entry lifetime");
-        check(updateBody.contains("s.everSupported = true"),
-                "Confirmed support must permanently end the entry hold for the session");
+        check(updateBody.contains("s.entrySupportTicks = 0"),
+                "Actual confirmed support must reset the bounded revalidation episode");
         check(updateBody.contains("Stance.HOLD_ENTRY_SUPPORT") && updateBody.contains("flight(p, false)"),
                 "The walking hold must keep flight off");
         check(updateBody.contains("Stance.WALK"), "Ordinary jump-grace walking must remain a stance outcome");
@@ -156,7 +158,7 @@ public final class SpiritEntrySupportedWalkingTest {
     public static void main(String[] args) {
         freshStandingEntryHoldsWalkingWhileOwnershipPublishes();
         ownershipResolutionEndsTheHoldAndRestoresOrdinaryRules();
-        confirmedOwnershipIsNeverReheld();
+        confirmedGroundRevalidationIsBounded();
         airborneEntryKeepsTheJumpGraceAndEdgeRules();
         entryWaitDoesNotSpendJumpGraceOrResetEntryBudget();
         try {

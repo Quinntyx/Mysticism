@@ -58,9 +58,9 @@ public final class EmbeddingService implements EmbeddingProvider {
         return vector;
     }
     private Vec384f infer(String descriptor) throws Exception {
-        if(descriptor==null || descriptor.isBlank() || descriptor.length()>8192)throw new IllegalArgumentException("Descriptor must be nonempty and at most 8192 characters");
+        String input=NomicV2Tokenizer.prepareDocument(descriptor);
         JsonObject body=new JsonObject();body.addProperty("model",EmbeddingSpace.MODEL);
-        body.addProperty("input","search_document: "+descriptor);
+        body.addProperty("input",input);
         body.addProperty("truncate",false); // 512-token overflow must be explicit, not silently changed semantics
         JsonObject response=request("api/embed",body.toString());
         if(!response.has("model") || !canonicalModel(response.get("model").getAsString()).equals(canonicalModel(EmbeddingSpace.MODEL)))

@@ -52,16 +52,14 @@ public final class SupportedWalkingIntegrationTest {
             check(grounded(collision, feet), "source-identical entry mesh must support exact source feet");
             int unsupported = 0, entrySupportTicks = 0;
             for (int tick = 0; tick < 30; tick++) {
-                var step = SpiritNavigationService.entryStance(unsupported, entrySupportTicks, false, false,
-                        grounded(collision, feet), false, true);
+                var step = SpiritNavigationService.entryStance(unsupported, entrySupportTicks, grounded(collision, feet), false, true);
                 check(step.stance() == SpiritNavigationService.Stance.HOLD_ENTRY_SUPPORT,
                         "real unowned source floor must keep walking while ownership publishes");
                 unsupported = step.unsupportedTicks(); entrySupportTicks = step.entrySupportTicks();
             }
             // The accepted collision frame is unchanged when ownership confirms: no pose/basis snap needed.
             check(grounded(collision, feet), "publishing ownership must not require a replacement floor");
-            var lost = SpiritNavigationService.entryStance(0, 0, true, true,
-                    grounded(collision, feet.add(2, 0, 0)), false, true);
+            var lost = SpiritNavigationService.entryStance(0, 0, grounded(collision, feet.add(2, 0, 0)), false, true);
             check(lost.stance() == SpiritNavigationService.Stance.FREE_FALL,
                     "walking off a once-confirmed source floor must not regain entry grace");
         }
@@ -72,12 +70,11 @@ public final class SupportedWalkingIntegrationTest {
         for (Vec3d feet : List.of(new Vec3d(.5, 2, .5), new Vec3d(2, 1, .5))) {
             boolean contact = grounded(collision, feet);
             check(!contact, "hovering/off-edge pose must have no actual mesh support");
-            check(SpiritNavigationService.entryStance(0, 0, false, false, contact, false, true).stance()
+            check(SpiritNavigationService.entryStance(0, 0, contact, false, true).stance()
                     == SpiritNavigationService.Stance.FREE_FALL,
                     "zero delta or stale vanilla onGround cannot authorize walking on air");
         }
-        check(SpiritNavigationService.entryStance(0, 0, false, false,
-                grounded(collision, new Vec3d(.5, 1.05, .5)), true, true).stance()
+        check(SpiritNavigationService.entryStance(0, 0, grounded(collision, new Vec3d(.5, 1.05, .5)), true, true).stance()
                 == SpiritNavigationService.Stance.WALK, "ascending residual ground contact keeps ordinary jump grace");
     }
 
@@ -101,19 +98,21 @@ public final class SupportedWalkingIntegrationTest {
         String terrain = Files.readString(root.resolve("src/main/java/io/github/mysticism/dimension/spiritworld/terrain/SpiritTerrainService.java"));
         String expiry = method(nav, "private static void expireSupport(", "public static boolean update(");
         check(!expiry.contains("cancelCurrentSupport"), "expiry must retain already-started terrain proof for retry");
-        check(expiry.contains("s.supportPending = false") && expiry.contains("s.walkIntent = null")
+        check(expiry.contains("s.alignment.reset()") && expiry.contains("s.walkIntent = null")
                         && expiry.contains("setSupportApproach(false)"),
                 "expiry must clear navigation and client prediction, not stick in pending flight");
+        check(expiry.contains("flight(p, true, true)"), "expiry must explicitly acknowledge usable client flight");
         String cancel = method(nav, "private static void endSupportApproach(", "private static void expireSupport(");
         check(cancel.contains("SpiritTerrainService.cancelCurrentSupport(p);")
-                        && !cancel.contains("if (s.supportPending)"),
+                        && !cancel.contains("if (s.alignment.pending())"),
                 "explicit cancellation must release even a proof retained AFTER expiry");
         String clear = method(nav, "private static void clear(", "private static void sync(");
         check(clear.contains("SpiritTerrainService.cancelCurrentSupport(p);")
                         && !clear.contains("removed.supportPending"),
                 "disconnect/respawn cleanup must release retained proof without a live intent");
         String request = method(nav, "public static void onFlightToggle(", "private static void endSupportApproach(");
-        check(request.indexOf("if (s.supportPending) return") < request.indexOf("new WalkIntent()"),
+        check(request.indexOf("if (!s.alignment.begin()) return") >= 0
+                        && request.indexOf("if (!s.alignment.begin()) return") < request.indexOf("new WalkIntent()"),
                 "duplicate flight-off packets must not reset request budgets");
         check(!request.contains("cancelCurrentSupport"), "a retry must reuse retained proof, not restart it");
         String attempt = method(nav, "private static void attemptSupport(", "private static float basisError(");
@@ -121,9 +120,11 @@ public final class SupportedWalkingIntegrationTest {
                 "invalid retargets must cancel even while late source discovery is pending");
         String discovery = method(attempt, "if (!s.semanticReady)", "var found = SpiritTerrainService.currentSupport(p)");
         check(!discovery.contains("SpiritTerrainService.currentSupport(p)"), "no source queries before a real semantic anchor");
-        check(attempt.contains("found.isEmpty() && SpiritTerrainService.currentSupportProofPending(p)"),
+        check(attempt.contains("boolean proofPending = SpiritTerrainService.currentSupportProofPending(p)")
+                        && attempt.contains("s.walkIntent.tick(true, found.isPresent(), proofPending)")
+                        && attempt.contains("destination), proofPending)"),
                 "actual source-proof latency must participate in the intent's lifetime");
-        check(attempt.contains("acquireCurrentSupport(p, support)") && attempt.contains("s.everSupported = true"),
+        check(attempt.contains("acquireCurrentSupport(p, support)") && attempt.contains("s.confirmedOwned = true"),
                 "successful walk retry must use real guarded acquisition and end fresh-entry grace");
         String pending = method(terrain, "public static boolean currentSupportProofPending(", "private static Optional<WalkCandidate> walkCandidate(");
         check(pending.contains("MeshCollision.ground(p)") && pending.contains("windowFor(s,hit.get().cell())")

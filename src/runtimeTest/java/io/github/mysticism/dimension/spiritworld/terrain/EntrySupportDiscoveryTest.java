@@ -18,6 +18,7 @@ import net.minecraft.world.PersistentStateManager;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -91,35 +92,34 @@ public final class EntrySupportDiscoveryTest {
     private static void emptySnapshotBeforeDiscoveryKeepsBoundedWalking() throws Exception {
         var ownership = completedEmptyOwnership();
         var discovery = new CompletableFuture<Optional<LandmarkMetadata>>();
+        var lifecycle = new InitialSourceDiscovery();
+        var server = new ArrayDeque<Runnable>();
+        lifecycle.await(() -> discovery, server::addLast, (result, error) -> {});
         boolean standing = meshContact();
         check(standing, "unowned entry frame must have real visible/collidable floor contact");
         // Reproduces the production ordering: source ownership queue finished, while the separate
         // ensureSourceLocation operation still waits on extraction/model/publication work.
-        check(SpiritTerrainService.entrySupportPending(ownership.pending(), discovery),
+        check(lifecycle.groundPending(ownership.pending()),
                 "current EMPTY ownership must not hide an unfinished source-discovery future");
         int unsupported = 0, waited = 0;
         for (int tick = 0; tick < SpiritNavigationService.ENTRY_SUPPORT_GRACE_TICKS; tick++) {
-            var step = SpiritNavigationService.entryStance(unsupported, waited, false, false, standing, false,
-                    SpiritTerrainService.entrySupportPending(ownership.pending(), discovery));
+            var step = SpiritNavigationService.entryStance(unsupported, waited, standing, false, lifecycle.groundPending(ownership.pending()));
             check(step.stance() == SpiritNavigationService.Stance.HOLD_ENTRY_SUPPORT,
                     "empty ownership before discovery must keep flight off at tick " + tick);
             unsupported = step.unsupportedTicks(); waited = step.entrySupportTicks();
         }
-        var expired = SpiritNavigationService.entryStance(unsupported, waited, false, false, standing, false,
-                SpiritTerrainService.entrySupportPending(ownership.pending(), discovery));
+        var expired = SpiritNavigationService.entryStance(unsupported, waited, standing, false, lifecycle.groundPending(ownership.pending()));
         check(expired.stance() == SpiritNavigationService.Stance.FREE_FALL,
                 "never-completing discovery still expires at the entry grace, not permanent walking");
-        check(SpiritNavigationService.entryStance(0, 0, false, false, false, false,
-                SpiritTerrainService.entrySupportPending(ownership.pending(), discovery)).stance()
+        check(SpiritNavigationService.entryStance(0, 0, false, false, lifecycle.groundPending(ownership.pending())).stance()
                 == SpiritNavigationService.Stance.FREE_FALL, "pending discovery never authorizes walking on air");
-        check(SpiritNavigationService.entryStance(0, 0, true, true, standing, false,
-                SpiritTerrainService.entrySupportPending(ownership.pending(), discovery)).stance()
-                == SpiritNavigationService.Stance.FREE_FALL, "confirmed-then-lost ownership cannot regain entry grace");
+
         discovery.complete(Optional.empty());
-        check(!SpiritTerrainService.entrySupportPending(ownership.pending(), discovery),
+        check(lifecycle.groundPending(ownership.pending()), "completed worker still holds until server application");
+        server.removeFirst().run();
+        check(!lifecycle.groundPending(ownership.pending()),
                 "completed-empty discovery with settled empty ownership must stop the hold");
-        check(SpiritNavigationService.entryStance(0, 20, false, false, standing, false,
-                SpiritTerrainService.entrySupportPending(ownership.pending(), discovery)).stance()
+        check(SpiritNavigationService.entryStance(0, 20, standing, false, lifecycle.groundPending(ownership.pending())).stance()
                 == SpiritNavigationService.Stance.FREE_FALL, "terminal unowned source is not supported walking");
     }
 
@@ -128,12 +128,16 @@ public final class EntrySupportDiscoveryTest {
         failed.completeExceptionally(new IllegalStateException("source unavailable"));
         var cancelled = new CompletableFuture<Optional<LandmarkMetadata>>();
         cancelled.cancel(false);
-        for (CompletableFuture<?> terminal : List.of(failed, cancelled, CompletableFuture.completedFuture(Optional.empty()))) {
-            check(!SpiritTerrainService.entrySupportPending(false, terminal), "settled failure/cancellation/empty discovery is not pending");
-            check(SpiritTerrainService.entrySupportPending(true, terminal), "ownership refresh has its independent bounded wait");
+        for (var terminal : List.of(failed, cancelled, CompletableFuture.completedFuture(Optional.<LandmarkMetadata>empty()))) {
+            var lifecycle = new InitialSourceDiscovery();
+            var server = new ArrayDeque<Runnable>();
+            lifecycle.await(() -> terminal, server::addLast, (result, error) -> {});
+            check(lifecycle.groundPending(false), "terminal worker still waits for server application");
+            server.removeFirst().run();
+            check(!lifecycle.groundPending(false), "settled failure/cancellation/empty discovery is not pending");
+            check(lifecycle.groundPending(true), "ownership refresh has its independent bounded wait");
         }
-        check(!SpiritTerrainService.entrySupportPending(false, null), "no started discovery must not fabricate a wait");
-        check(SpiritTerrainService.entrySupportPending(true, null), "missing ownership still participates without discovery");
+        check(!new InitialSourceDiscovery().groundPending(false), "no started discovery cannot fabricate a wait");
     }
 
     private static void productionAdapterUsesTheDiscoveryFuture() throws Exception {
@@ -142,17 +146,14 @@ public final class EntrySupportDiscoveryTest {
         while (root != null && !Files.exists(root.resolve(terrainPath))) root = root.getParent();
         check(root != null, "could not locate production source root");
         String terrain = Files.readString(root.resolve(terrainPath));
-        int start = terrain.indexOf("public static boolean entrySupportPending(ServerPlayerEntity p)");
-        int end = terrain.indexOf("static boolean entrySupportPending(boolean", start);
-        check(start >= 0 && end > start, "player adapter must exist before the detached state query");
-        String adapter = terrain.substring(start, end);
-        check(adapter.contains("entrySupportPending(ownershipPending(p),s.ownerFuture)"),
-                "production must combine live ownership with the actual session discovery future");
-        check(terrain.contains("s.ownerFuture=SourceLandmarks.ensureSourceLocation("),
-                "the wait must track source discovery, not mesh IO or a made-up pending flag");
+        check(terrain.contains("w.discovery.groundPending(ownershipPendingAt(p,w,source))")
+                        && terrain.contains("s.ownerFuture=expected.discovery.await("),
+                "production must combine exact floor ownership with server-applied discovery lifecycle");
+        check(terrain.contains("if(w!=s.local") && terrain.contains("windowFor(s,cell)"),
+                "pending ground must require the accepted local producer, never an unrelated representative");
         String nav = Files.readString(root.resolve("src/main/java/io/github/mysticism/navigation/SpiritNavigationService.java"));
-        check(nav.contains("s.jumping, SpiritTerrainService.entrySupportPending(p)"),
-                "production shallow stance must use the combined discovery/ownership state");
+        check(nav.contains("s.jumping, SpiritTerrainService.groundPending(p)"),
+                "production shallow stance must use exact-ground discovery/ownership state");
     }
 
     public static void main(String[] args) throws Exception {
