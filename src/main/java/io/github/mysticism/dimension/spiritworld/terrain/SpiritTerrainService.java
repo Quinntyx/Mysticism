@@ -507,7 +507,7 @@ public final class SpiritTerrainService {
         while(w.discoveryPending.size()<SourceDiscovery.MAX_INFLIGHT) {
             Bounds tile=w.discovery.next(c.tick);if(tile==null)return;
             CompletableFuture<SourceLandmarks.Region> future;
-            try {future=SourceLandmarks.region(p.getServer(),w.dimension,tile,SourceDiscovery.TILE*SourceDiscovery.TILE*SourceDiscovery.TILE);}
+            try {future=SourceLandmarks.discoveryRegion(p.getServer(),w.dimension,tile,SourceDiscovery.TILE*SourceDiscovery.TILE*SourceDiscovery.TILE);}
             catch(RuntimeException rejected){return;} // bounded queues are busy; the tile stays queued for the next attempt
             w.discoveryPending.put(tile,future);w.discovery.pending(tile);
             future.whenComplete((region,error)->p.getServer().execute(()->{

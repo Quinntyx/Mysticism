@@ -74,8 +74,8 @@ public final class SourceOwnership {
                 return;
             }
             if(!candidates.isEmpty()){
-                if(!store.geometryReadAvailable())return;
-                var candidate=candidates.removeFirst();owner=candidate.id();read=store.beginGeometryRead(owner,bounds);return;
+                if(!store.ownershipReadAvailable())return;
+                var candidate=candidates.removeFirst();owner=candidate.id();read=store.beginOwnershipRead(owner,bounds);return;
             }
             if(!end){var batch=store.sourceRangePage(dimension,bounds,cursor,4,4);cursor=batch.nextId();end=batch.end();candidates.addAll(batch.landmarks());return;}
             done=true;future.complete(new Region(this));

@@ -15,12 +15,28 @@ import java.util.concurrent.*;
  * vanilla's async read-only NBT scanner (including pending saves), NEVER getChunk/create/tickets.
  * Detached NBT palettes are decoded on our bounded worker, with no world/registry access there. */
 final class GeneratedSourceReader {
-    final String dimension; final Bounds bounds; final ServerWorld world;
+    final String dimension; final Bounds bounds; final int seaLevel;
     final SourceLandmarks.Cell[] cells; final List<ChunkPos> chunks=new ArrayList<>();
     final Executor executor; int chunkIndex,cellIndex,lastSampled; boolean cancelled;
     CompletableFuture<List<SourceLandmarks.Cell>> disk;List<SourceLandmarks.Cell> diskRows;int diskCursor;
+    LimitedCollector collector;CompletableFuture<?> scan;
+    /** Chunk presence + read-only NBT scan; the world-backed adapter in production, a fake in regressions. */
+    interface ChunkIo {
+        WorldChunk live(ChunkPos pos);
+        /** Drives the collector over the saved chunk NBT; must not block the caller. */
+        CompletableFuture<?> scan(ChunkPos pos,LimitedCollector collector);
+    }
     GeneratedSourceReader(ServerWorld world,Bounds bounds,Executor executor) {
-        this.world=world;this.dimension=world.getRegistryKey().getValue().toString();this.bounds=bounds;this.executor=executor;
+        this(world.getRegistryKey().getValue().toString(),bounds,executor,world.getBottomY(),world.getHeight(),world.getSeaLevel(),new ChunkIo(){
+            @Override public WorldChunk live(ChunkPos pos){return world.getChunkManager().getWorldChunk(pos.x,pos.z);}
+            @Override public CompletableFuture<?> scan(ChunkPos pos,LimitedCollector collector){return world.getChunkManager().getChunkIoWorker().scanChunk(pos,collector);}
+        });
+    }
+    /** Detached metadata + IO seam: production captures sea level on the owner thread,
+     * so Ensure completion never depends on a nullable world retained by a test adapter. */
+    GeneratedSourceReader(String dimension,Bounds bounds,Executor executor,int bottom,int height,int seaLevel,ChunkIo io) {
+        this.io=io;this.bottom=bottom;this.height=height;this.seaLevel=seaLevel;
+        this.dimension=dimension;this.bounds=bounds;this.executor=executor;
         long volume=Math.multiplyExact(Math.multiplyExact(bounds.maxX()-bounds.minX(),bounds.maxY()-bounds.minY()),bounds.maxZ()-bounds.minZ());
         if(volume>32768)throw new IllegalArgumentException("source region volume");
         cells=new SourceLandmarks.Cell[(int)volume];
@@ -28,6 +44,10 @@ final class GeneratedSourceReader {
             for(int z=Math.floorDiv((int)bounds.minZ(),16);z<=Math.floorDiv((int)bounds.maxZ()-1,16);z++)chunks.add(new ChunkPos(x,z));
         if(chunks.size()>16)throw new IllegalArgumentException("source chunk IO budget");
     }
+    private final ChunkIo io;private final int bottom,height;
+    /** Advancing to the next chunk clears ALL per-chunk decode state: a new chunk must never
+     * decode the previous chunk's NBT (or reuse a completed scan of a different/ungenerated chunk). */
+    private void completeChunk(){disk=null;diskRows=null;diskCursor=0;collector=null;scan=null;chunkIndex++;cellIndex=0;}
     boolean advance(int budget) {
         lastSampled=0;if(cancelled)throw new CancellationException();
         if(chunkIndex==chunks.size())return true;
@@ -36,38 +56,38 @@ final class GeneratedSourceReader {
             if(!disk.isDone())return false;if(diskRows==null)diskRows=disk.getNow(List.of());
             int end=Math.min(diskRows.size(),diskCursor+budget);
             while(diskCursor<end){lastSampled++;var cell=diskRows.get(diskCursor++);cells[index(bounds,cell.position())]=cell;}
-            if(diskCursor==diskRows.size()){disk=null;diskRows=null;diskCursor=0;chunkIndex++;cellIndex=0;}
+            if(diskCursor==diskRows.size()){completeChunk();}
             return chunkIndex==chunks.size();
         }
-        WorldChunk live=world.getChunkManager().getWorldChunk(cp.x,cp.z);
+        WorldChunk live=io.live(cp);
         if(live==null) {
-            // Capture world-specific immutable dimensions on server thread BEFORE the callback.
-            int bottom=world.getBottomY(),height=world.getHeight();Bounds region=bounds;
-            var scanner=new LimitedCollector();
-            disk=world.getChunkManager().getChunkIoWorker().scanChunk(cp,scanner)
-                .thenApplyAsync(v->Arrays.stream(decode(scanner.getRoot(),cp,region,bottom,height)).filter(Objects::nonNull).toList(),executor);
+            Bounds region=bounds;
+            if(scan==null){collector=new LimitedCollector();scan=io.scan(cp,collector);}
+            // Decode attachment tolerates a saturated worker: retry next tick, never cancel the observation.
+            if(disk==null){try{disk=scan.thenApplyAsync(v->Arrays.stream(decode(collector.getRoot(),cp,region,bottom,height)).filter(Objects::nonNull).toList(),executor);}catch(RejectedExecutionException busy){return false;}}
             return false;
         }
         Bounds slice=new Bounds(Math.max(bounds.minX(),cp.getStartX()),bounds.minY(),Math.max(bounds.minZ(),cp.getStartZ()),Math.min(bounds.maxX(),cp.getStartX()+16L),bounds.maxY(),Math.min(bounds.maxZ(),cp.getStartZ()+16L));
         int volume=(int)((slice.maxX()-slice.minX())*(slice.maxY()-slice.minY())*(slice.maxZ()-slice.minZ()));int sampled=0;long deadline=System.nanoTime()+1_500_000L;
         while(cellIndex<volume && sampled<budget && (sampled==0||System.nanoTime()<deadline)) {
             BlockPoint p=point(slice,cellIndex++);int i=index(bounds,p);sampled++;lastSampled++;
-            if(p.y()<world.getBottomY() || p.y()>=world.getTopY())continue;
+            if(p.y()<bottom || p.y()>=bottom+height)continue;
             BlockPos pos=new BlockPos((int)p.x(),(int)p.y(),(int)p.z());var state=live.getBlockState(pos);
             Map<String,String> properties=new TreeMap<>();state.getEntries().forEach((key,value)->properties.put(key.getName(),name(key,value)));
             String biome=live.getBiomeForNoiseGen(pos.getX()>>2,pos.getY()>>2,pos.getZ()>>2).getKey().map(k->k.getValue().toString()).orElse(null);
             if(biome!=null)cells[i]=new SourceLandmarks.Cell(p,new BlockPalette.State(Registries.BLOCK.getId(state.getBlock()).toString(),properties),biome,
                 p.y()>live.sampleHeightmap(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,pos.getX()&15,pos.getZ()&15));
         }
-        if(cellIndex==volume){chunkIndex++;cellIndex=0;}
+        if(cellIndex==volume){completeChunk();}
         return chunkIndex==chunks.size();
     }
-    CompletableFuture<SourceLandmarks.Region> resultAsync(){var copy=cells.clone();return CompletableFuture.supplyAsync(()->new SourceLandmarks.Region(dimension,bounds,Arrays.stream(copy).filter(Objects::nonNull).toList(),Arrays.stream(copy).allMatch(Objects::nonNull)),executor);}
+    /** Null only on a saturated worker; the caller retries next tick. */
+    CompletableFuture<SourceLandmarks.Region> resultAsync(){var copy=cells.clone();try{return CompletableFuture.supplyAsync(()->new SourceLandmarks.Region(dimension,bounds,Arrays.stream(copy).filter(Objects::nonNull).toList(),Arrays.stream(copy).allMatch(Objects::nonNull)),executor);}catch(RejectedExecutionException busy){return null;}}
     private static int index(Bounds b,BlockPoint p){return (int)((p.x()-b.minX())+(b.maxX()-b.minX())*((p.z()-b.minZ())+(b.maxZ()-b.minZ())*(p.y()-b.minY())));}
     void cancel(){cancelled=true;if(disk!=null)disk.cancel(false);}
     @SuppressWarnings({"rawtypes","unchecked"}) private static String name(Property p,Comparable value){return p.name(value);}
     static BlockPoint point(Bounds b,int i){long dx=b.maxX()-b.minX(),dz=b.maxZ()-b.minZ();return new BlockPoint(b.minX()+i%dx,b.minY()+i/(dx*dz),b.minZ()+(i/dx)%dz);}
-    private static final class LimitedCollector extends SelectiveNbtCollector {
+    static final class LimitedCollector extends SelectiveNbtCollector {
         private long words,characters,nodes;
         LimitedCollector(){super(new NbtScanQuery(NbtString.TYPE,"Status"),new NbtScanQuery(NbtList.TYPE,"sections"),new NbtScanQuery(NbtCompound.TYPE,"Heightmaps"));}
         @Override public NbtScanner.Result visitListMeta(NbtType<?> type,int length){if(length>4096||(nodes+=length)>65536)throw new IllegalArgumentException("chunk NBT list budget");return super.visitListMeta(type,length);}
