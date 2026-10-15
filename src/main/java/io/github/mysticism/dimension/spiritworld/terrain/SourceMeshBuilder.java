@@ -109,52 +109,73 @@ final class SourceMeshBuilder {
                 .thenComparingLong(n->n.position.asLong()).thenComparingInt(Node::side));
         return result;
     }
-    /** Compose in absolute source space. Samples (including AIR) replace only their exact cells;
-     * an empty/missing sample is UNKNOWN, not permission to erase the bounding envelope.
-     * Reapply the completed ownership mask to BOTH persisted and live geometry on every rebuild. */
+    /** Compose in absolute source space. AIR/solid observations replace only their exact cells;
+     * unknown samples keep persisted geometry. Reapply current ownership to both live and persisted
+     * leaves, including after negative-mask eviction and octree root growth. */
     static List<Node> compose(List<Node> base,Map<BlockPos,Tile> samples,Map<BlockPos,String> owners,
                               Bounds ownershipRange,Vec3d center) {
-        List<Node> near=compact(samples,center,owners);
-        List<Node> result=replaceNear(base,near,samples.keySet(),center);
+        return compose(base,samples,owners,ownershipRange,new NegativeCoverage(),center);
+    }
+    static List<Node> compose(List<Node> base,Map<BlockPos,Tile> samples,Map<BlockPos,String> owners,
+                              Bounds ownershipRange,NegativeCoverage negative,Vec3d center) {
+        List<Node> result=replaceNear(base,compact(samples,center,owners),samples.keySet(),negative,center);
         return ownershipRange==null?result:splitOwnership(result,owners,ownershipRange,center);
     }
+    /** Replace only PROVEN sampled source cells; every unsampled cell keeps its persisted geometry.
+     *  Unlike a bounding-box cut, gaps between disjoint sampled patches (and never-sampled areas inside
+     *  the overall extent) retain their base nodes instead of being shattered and erased. */
     static List<Node> replaceNear(List<Node> base,List<Node> near,Set<BlockPos> sampled,Vec3d center) {
+        Map<Long,Integer> buckets=new HashMap<>();
+        for(BlockPos p:sampled)buckets.merge(bucket(p),1,Integer::sum);
+        return replaceNear(base,near,sampled,buckets,center);
+    }
+    /** Packed negative coverage is indexed by bucket, never expanded into millions of positions. */
+    static List<Node> replaceNear(List<Node> base,List<Node> near,Set<BlockPos> sampled,NegativeCoverage negative,Vec3d center) {
+        Map<Long,Integer> buckets=negative.bucketCounts();
+        for(BlockPos p:sampled)if(!negative.contains(p))buckets.merge(bucket(p),1,Integer::sum);
+        return replaceNear(base,near,negative.covering(sampled),buckets,center);
+    }
+    private static List<Node> replaceNear(List<Node> base,List<Node> near,Set<BlockPos> sampled,Map<Long,Integer> buckets,Vec3d center) {
+        return replaceObserved(base,near,sampled::contains,p->buckets.getOrDefault(bucket(p),0),center);
+    }
+    /** Query masks only beneath the bounded incoming nodes, not a horizon-sized bucket map copy. */
+    static List<Node> replaceObserved(List<Node> base,List<Node> near,java.util.function.Predicate<BlockPos> sampled,
+            java.util.function.ToIntFunction<BlockPos> bucketCount,Vec3d center) {
         List<Node> result=new ArrayList<>(near);
-        Bounds envelope=null;
-        for(BlockPos cell:sampled) {
-            Bounds unit=Bounds.cube(cell.getX(),cell.getY(),cell.getZ(),1);
-            envelope=envelope==null?unit:envelope.union(unit);
-        }
-        for(Node node:base) {
-            BlockPos p=node.position();int side=node.side();
-            Bounds box=Bounds.cube(p.getX(),p.getY(),p.getZ(),side);
-            // The envelope is ONLY a broad-phase rejection, never an exact replacement mask.
-            if(envelope==null || !box.intersects(envelope)){result.add(node);continue;}
-            List<BlockPos> inside=new ArrayList<>();
-            if((long)side*side*side<=sampled.size()) {
-                for(BlockPos cell:BlockPos.iterate(p,p.add(side-1,side-1,side-1)))
-                    if(sampled.contains(cell))inside.add(cell.toImmutable());
-            } else for(BlockPos cell:sampled)
-                if(box.contains(cell.getX(),cell.getY(),cell.getZ()))inside.add(cell);
-            outsideSamples(node,inside,result);
-        }
+        for(Node node:base)replace(node,sampled,bucketCount,result);
         result.sort(Comparator.comparingDouble((Node n)->distanceSquared(nodeBox(n),center))
-                .thenComparingLong(n->n.position().asLong()).thenComparingInt(Node::side));
-        return List.copyOf(result);
+                .thenComparingLong(n->n.position().asLong()).thenComparingInt(Node::side));return List.copyOf(result);
     }
-    private static void outsideSamples(Node node,List<BlockPos> sampled,List<Node> result) {
-        BlockPos p=node.position();int side=node.side();
-        if(sampled.isEmpty()){result.add(node);return;}
-        if(sampled.size()==(long)side*side*side)return;
-        int half=side/2;
-        List<List<BlockPos>> children=new ArrayList<>(8);
-        for(int child=0;child<8;child++)children.add(new ArrayList<>());
-        for(BlockPos cell:sampled)children.get((cell.getX()>=p.getX()+half?1:0)
-                |(cell.getY()>=p.getY()+half?2:0)|(cell.getZ()>=p.getZ()+half?4:0)).add(cell);
-        for(int child=0;child<8;child++)outsideSamples(new Node(p.add((child&1)==0?0:half,
-                (child&2)==0?0:half,(child&4)==0?0:half),half,node.tile(),node.ownerId()),children.get(child),result);
-    }
+    /** Sample-volume buckets accelerate exact replacement; persisted octree roots can be unaligned. */
     private static Box nodeBox(Node n){BlockPos p=n.position();return new Box(p.getX(),p.getY(),p.getZ(),(double)p.getX()+n.side(),(double)p.getY()+n.side(),(double)p.getZ()+n.side());}
+    static long bucket(BlockPos p) {
+        return ((long)(p.getX()>>4)&0x3FFFFFL)<<42 | ((long)(p.getZ()>>4)&0x3FFFFFL)<<20 | ((long)(p.getY()>>4)&0xFFFFFL);
+    }
+    private static void replace(Node n,java.util.function.Predicate<BlockPos> sampled,
+            java.util.function.ToIntFunction<BlockPos> bucketCount,List<Node> result) {
+        BlockPos p=n.position();int side=n.side();long cells=(long)side*side*side;
+        long sampledVolume=0;
+        for(int bx=p.getX()>>4;bx<=(p.getX()+side-1)>>4;bx++)
+            for(int by=p.getY()>>4;by<=(p.getY()+side-1)>>4;by++)
+                for(int bz=p.getZ()>>4;bz<=(p.getZ()+side-1)>>4;bz++)
+                    sampledVolume+=bucketCount.applyAsInt(new BlockPos(bx<<4,by<<4,bz<<4));
+        if(sampledVolume<=0){result.add(n);return;}
+        if(side==16 && (p.getX()&15)==0 && (p.getY()&15)==0 && (p.getZ()&15)==0 && sampledVolume>=cells)return;
+        if(side>16) {
+            int half=side/2;
+            for(int child=0;child<8;child++)replace(new Node(p.add((child&1)==0?0:half,(child&2)==0?0:half,(child&4)==0?0:half),half,n.tile(),n.ownerId()),sampled,bucketCount,result);
+            return;
+        }
+        boolean any=false,all=true;
+        for(BlockPos cell:BlockPos.iterate(p,p.add(side-1,side-1,side-1))) {
+            if(sampled.test(cell))any=true;else{all=false;if(any)break;}
+        }
+        if(!any){result.add(n);return;} // partial bucket without samples under this node: survives
+        if(all)return;
+        if(side==1)return; // sampled unit leaf: the exact near tile covers it
+        int half=side/2;
+        for(int child=0;child<8;child++)replace(new Node(p.add((child&1)==0?0:half,(child&2)==0?0:half,(child&4)==0?0:half),half,n.tile(),n.ownerId()),sampled,bucketCount,result);
+    }
     /** Refine a persisted coarse leaf only inside the bounded exact-mask window, preserving far geometry. */
     static List<Node> splitOwnership(List<Node> source,Map<BlockPos,String> owners,Bounds range,Vec3d center) {
         List<Node> result=new ArrayList<>();for(Node node:source)splitOwner(node,owners,range,center,result);
@@ -187,6 +208,11 @@ final class SourceMeshBuilder {
     }
     private static long mix(long h) {
         h^=h>>>30;h*=0xbf58476d1ce4e5b9L;h^=h>>>27;h*=0x94d049bb133111ebL;return h^(h>>>31);
+    }
+    static long hashDouble(long h,double value) {
+        long bits=Double.doubleToLongBits(value);
+        for(int shift=0;shift<64;shift+=8)h=(h^((bits>>>shift)&255))*0x100000001b3L;
+        return h;
     }
     static double distanceSquared(Box b,Vec3d p) {
         double x=Math.max(Math.max(b.minX-p.x,0),p.x-b.maxX),y=Math.max(Math.max(b.minY-p.y,0),p.y-b.maxY),z=Math.max(Math.max(b.minZ-p.z,0),p.z-b.maxZ);

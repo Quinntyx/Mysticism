@@ -10,18 +10,23 @@ public final class SpiritGlyphFrame {
     private final Vec384f q;
     private final Basis384f basis;
     private final Vec3d head;
-    public SpiritGlyphFrame(Vec384f q, Basis384f basis, Vec3d head) {
+    private final Vec3d continuity;
+    public SpiritGlyphFrame(Vec384f q, Basis384f basis, Vec3d head) { this(q, basis, head, Vec3d.ZERO); }
+    public SpiritGlyphFrame(Vec384f q, Basis384f basis, Vec3d head, Vec3d continuity) {
         EmbeddingSpace.requireCurrent(q);
         this.q=q.clone(); this.basis=basis.clone(); this.head=head;
+        this.continuity=continuity==null?Vec3d.ZERO:continuity;
     }
     public static SpiritGlyphFrame current(float tickDelta) {
         var player=MinecraftClient.getInstance().player;
         if (player==null || !ClientSpiritCache.observerReady()) return null;
-        return new SpiritGlyphFrame(ClientSpiritCache.playerLatentPos,ClientSpiritCache.playerLatentBasis,
-                player.getLerpedPos(tickDelta).add(0,player.getStandingEyeHeight(),0));
+        return new SpiritGlyphFrame(ClientSpiritCache.interpolatedPos(tickDelta),
+                ClientSpiritCache.interpolatedBasis(tickDelta),
+                player.getLerpedPos(tickDelta).add(0,player.getStandingEyeHeight(),0),
+                ClientSpiritCache.interpolatedOffset(tickDelta));
     }
     public Vec3d project(Vec384f semanticPosition) {
-        return Projection384f.projectToWorld(semanticPosition,q,basis,head,(float)SCALE);
+        return Projection384f.projectToWorld(semanticPosition,q,basis,head.add(continuity),(float)SCALE);
     }
     public Vec3d head() { return head; }
     public Vec384f position() { return q.clone(); }

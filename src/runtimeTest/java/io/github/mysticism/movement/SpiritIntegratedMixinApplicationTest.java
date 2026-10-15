@@ -41,14 +41,15 @@ public final class SpiritIntegratedMixinApplicationTest {
             }
             check(process.exitValue() == 0, "Integrated mixin application failed: " + side);
         }
-        System.out.println("SpiritIntegratedMixinApplicationTest: real travel/accessor and both entry hooks applied");
+        System.out.println("SpiritIntegratedMixinApplicationTest: combined collision/walk/flight/travel/accessor and both entry hooks applied");
     }
 
     static InputStream config() {
         boolean client = Boolean.getBoolean("mysticism.test.integratedClient");
         String resource = client ? "mysticism.client.mixins.json" : "mysticism.mixins.json";
         List<String> retained = client ? List.of("SpiritEntryWorldMixin", "SpiritEntryLoadingMixin")
-                : List.of("SpiritFlightPredictionMixin", "SpiritTravelMixin", "EntityFlagAccess");
+                : List.of("SpiritFlightPredictionMixin", "SpiritMeshMovementMixin", "SpiritFlightToggleMixin",
+                        "SpiritMeshCollisionMixin", "SpiritMeshSneakMixin", "SpiritTravelMixin", "EntityFlagAccess");
         try (var stream = SpiritIntegratedMixinApplicationTest.class.getClassLoader().getResourceAsStream(resource)) {
             check(stream != null, "Missing production config " + resource);
             var json = JsonParser.parseReader(new InputStreamReader(stream, StandardCharsets.UTF_8)).getAsJsonObject();
@@ -133,6 +134,19 @@ public final class SpiritIntegratedMixinApplicationTest {
                             "Vanilla packet collision call must be present before application");
                     check(calls(method(after, "onPlayerMove"), after.name, "isPlayerNotCollidingWithBlocks") == 0,
                             "Flight reconciliation must survive the combined common config");
+                    var packet = method(after, "onPlayerMove");
+                    for (String suffix : List.of("$flightPredictionTolerance", "$meshMoveValidation",
+                            "$spiritShortCircuit", "$beforeMove", "$acceptedMove")) {
+                        var hook = after.methods.stream().filter(m -> m.name.endsWith(suffix)).findFirst().orElseThrow();
+                        check(calls(packet, after.name, hook.name) > 0, "Combined movement path lost " + suffix);
+                        new Analyzer<>(new BasicVerifier()).analyze(after.name, hook);
+                    }
+                    var meshVerdict = after.methods.stream().filter(m -> m.name.endsWith("$meshVerdict")).findFirst().orElseThrow();
+                    check(calls(method(after,"isPlayerNotCollidingWithBlocks"), after.name, meshVerdict.name) == 1,
+                            "Walking fallback must call the installed shared mesh verdict");
+                    check(calls(meshVerdict, PREFIX + "dimension/spiritworld/terrain/MeshCollision", "movementRejected") == 1,
+                            "Walking verdict must use actual production collision validation");
+                    new Analyzer<>(new BasicVerifier()).analyze(after.name, packet);
                 } else {
                     String entry = target.endsWith("MinecraftClient") ? "joinWorld" : "startWorldLoading";
                     String vanilla = target.endsWith("MinecraftClient") ? "reset" : "setScreen";

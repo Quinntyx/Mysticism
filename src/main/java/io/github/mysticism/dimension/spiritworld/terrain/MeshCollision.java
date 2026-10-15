@@ -56,6 +56,7 @@ public final class MeshCollision {
         public boolean clearRay(Vec3d from,Vec3d to) {
             return sweep(new Box(from.x-1e-4,from.y-1e-4,from.z-1e-4,from.x+1e-4,from.y+1e-4,from.z+1e-4),to.subtract(from)).isEmpty();
         }
+        Vec3d depenetrate(Box body) { return depenetrate(body,4); }
         /** Minimal-penetration escape, displacement bounded to `limit` per move. Public for runtime regressions. */
         public Vec3d depenetrate(Box body,double limit) {
             Vec3d moved=Vec3d.ZERO;
@@ -72,7 +73,7 @@ public final class MeshCollision {
             }
             return moved;
         }
-        private Vec3d slide(Box body,Vec3d wanted) {
+        Vec3d slide(Box body,Vec3d wanted) {
             Vec3d moved=Vec3d.ZERO,remaining=wanted;
             for(int i=0;i<4 && remaining.lengthSquared()>1e-12;i++) {
                 var hit=sweep(body.offset(moved),remaining);
@@ -103,6 +104,10 @@ public final class MeshCollision {
         // No fabricated floor. Preparation supplies geometry before entry; packet delay simply has no surfaces yet.
         if(i==null)return wanted;
         return predicted(i,player.getBoundingBox(),wanted,player.getAbilities().flying,player.isOnGround(),player.getStepHeight());
+    }
+    /** Deterministic replay of the same movement core used by live entities on both sides. */
+    public static Vec3d simulate(TerrainMeshFrame frame,Box body,Vec3d wanted,boolean flying,boolean onGround,double stepHeight) {
+        return predicted(new Index(frame),body,wanted,flying,onGround,stepHeight);
     }
     /** Movement core shared by live server/prediction and runtime regressions. Flying bodies are
      *  pushed by rotating observer-local geometry between frame publications; depenetration eases
@@ -162,9 +167,36 @@ public final class MeshCollision {
     /** Actual affine SAT body clearance, including a newly acquired source window. */
     public static boolean bodyClear(TerrainMeshFrame frame,Box body) {
         Box strict=body.expand(-1e-5);
-        for(var cell:frame.cells())if(cell.bounds().intersects(strict))
-            for(Box collision:cell.collision())if(penetration(strict,new Shape(cell,collision,cell.bounds(collision)))!=null)return false;
+        for(var cell:frame.cells()) {
+            // Faded cells have no collision anywhere (broadphase rule); the verdict must match movement.
+            if(cell.opacity()<=0)continue;
+            if(cell.bounds().intersects(strict))
+                for(Box collision:cell.collision())if(penetration(strict,new Shape(cell,collision,cell.bounds(collision)))!=null)return false;
+        }
         return true;
+    }
+    /** Bound for a claimed destination's shallow overlap that the client's own next collision tick resolves. */
+    static final double PENETRATION_TOLERANCE=1.0/16;
+    /** Server movement verdict for a claimed destination, in the vanilla isPlayerNotCollidingWithBlocks
+     * polarity: TRUE rejects the claim and teleports the player back to the server pose, FALSE accepts it.
+     * The spirit dimension is a void world, where vanilla ALWAYS teleports whenever straight-line server
+     * re-simulation of a claim disagrees by more than 0.25 blocks; re-simulation of swept mesh walking
+     * (slopes, steps above step height, late input, frame latency) routinely diverges that far, so every
+     * such correction rubber-bands the player. This verdict instead accepts every collision-clear endpoint
+     * — client and server resolve the same shared sweep math — still rejects genuinely penetrating claims
+     * (server authority retained), tolerates only sub-tick overlap the client settles next tick, and
+     * accepts recovery claims from an already-overlapping body instead of teleport-oscillating inside
+     * moving geometry. */
+    public static boolean movementRejected(TerrainMeshFrame frame,Box previous,Box destination) {
+        if(frame==null)return false;
+        if(bodyClear(frame,destination))return false;
+        if(!bodyClear(frame,previous))return false;
+        return new Index(frame).depenetrate(destination).length()>PENETRATION_TOLERANCE;
+    }
+    /** Server-session frame lookup plus the shared verdict. */
+    public static boolean movementRejected(PlayerEntity player,Box previous,Box destination) {
+        Index i=index(player);
+        return i!=null && movementRejected(i.frame,previous,destination);
     }
     /** Conservative continuous affine-motion guard: the union of endpoint AABBs contains EVERY intermediate
      * vertex under linear affine interpolation. An ambiguous swept/body overlap is held, never sampled through. */

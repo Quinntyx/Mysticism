@@ -1,5 +1,6 @@
 package io.github.mysticism.client.spiritworld;
 
+import io.github.mysticism.activity.TraversalSteering;
 import io.github.mysticism.component.MysticismEntityComponents;
 import io.github.mysticism.dimension.spiritworld.SpiritGlyphSelection;
 import io.github.mysticism.net.*;
@@ -14,6 +15,19 @@ public final class ClientSpiritCache {
     public static final HashSet<String> VISIBLE = new HashSet<>();
     public static Basis384f target = new Basis384f(), playerLatentBasis = new Basis384f();
     public static Vec384f playerLatentPos = Vec384f.ZERO(), playerLatentAttunement = Vec384f.ZERO();
+    /** Rendered-scene continuity cap: revisions beyond this are deliberate re-anchoring, not prediction divergence. */
+    public static final double MAX_CONTINUITY_SHIFT = 32;
+    // Last authoritative mirror. The render frame above also carries client prediction between syncs.
+    private static Vec384f mirrorPos; private static Basis384f mirrorBasis;
+    // Shader/session callbacks may run before the predictor or between rendered frames. Stage
+    // their latest snapshot; only the predictor publishes it with the CURRENT tick's movement.
+    private static Vec384f refreshedPos; private static Basis384f refreshedBasis;
+    private static long mirrorEpoch = Long.MIN_VALUE, lastMotionEpoch = Long.MIN_VALUE;
+    // Previous render frame for per-tick interpolation, and the world-space continuity offset that
+    // keeps semantic geometry visually fixed across authoritative frame revisions while moving.
+    private static Vec384f previousLatentPos; private static Basis384f previousLatentBasis;
+    private static Vec3d continuityOffset = Vec3d.ZERO, previousContinuityOffset = Vec3d.ZERO;
+    private static boolean frameHistory;
     private static Object connection, world, player;
     private static String dimension, sourceDimension = "";
     private static UUID playerId, serverNonce;
@@ -35,6 +49,11 @@ public final class ClientSpiritCache {
         active=deep=observerReady=false; sourceDimension=""; sourcePosition=Vec3d.ZERO;
         playerLatentPos=Vec384f.ZERO(); playerLatentBasis=new Basis384f(); target=new Basis384f();
         playerLatentAttunement=Vec384f.ZERO();
+        mirrorPos=null; mirrorBasis=null; refreshedPos=null; refreshedBasis=null;
+        mirrorEpoch=lastMotionEpoch=Long.MIN_VALUE;
+        previousLatentPos=null; previousLatentBasis=null;
+        continuityOffset=Vec3d.ZERO; previousContinuityOffset=Vec3d.ZERO;
+        frameHistory=false;
     }
     public static boolean accept(SpiritFramePayload payload) {
         var s=payload.session();
@@ -71,10 +90,42 @@ public final class ClientSpiritCache {
         scene=value; sceneSequence=value.sequence(); return true;
     }
     public static Optional<SpiritScenePayload> scene() { return io.github.mysticism.client.net.SpiritSceneClient.snapshot(); }
-    public static void updateNavigation(boolean enabled, boolean isDeep, String source, Vec3d position) {
-        active=enabled; deep=isDeep; sourceDimension=Objects.requireNonNull(source); sourcePosition=Objects.requireNonNull(position);
+    public static void updateNavigation(boolean enabled, boolean isDeep, String source, Vec3d position, long motionEpoch) {
+        active=enabled; deep=isDeep; lastMotionEpoch=motionEpoch;
+        sourceDimension=Objects.requireNonNull(source); sourcePosition=Objects.requireNonNull(position);
     }
-    public static void updateObserver(Vec384f position, Basis384f basis) {
+    /** Roll render-frame history so renderers can interpolate this tick's advance sub-tick. */
+    public static void beginTick() {
+        previousLatentPos=playerLatentPos.clone(); previousLatentBasis=playerLatentBasis.clone();
+        previousContinuityOffset=continuityOffset; frameHistory=observerReady;
+    }
+    /**
+     * Shader/session refresh is read-only with respect to the render frame and its history.
+     * Revisions (including stationary touch corrections) publish on the next predictor tick,
+     * never with a stale movement classification from an earlier tick or render callback.
+     */
+    public static void refreshObserver(Vec384f position, Basis384f basis) {
+        refreshedPos=position.clone(); refreshedBasis=basis.clone();
+    }
+    /** Roll history once, then publish the latest refreshed observer using CURRENT movement. */
+    public static void beginTick(Vec3d movement) {
+        beginTick();
+        if (refreshedPos != null) {
+            Vec384f position=refreshedPos; Basis384f basis=refreshedBasis;
+            refreshedPos=null; refreshedBasis=null;
+            updateObserver(position, basis, movement);
+        }
+    }
+    /** Direct stationary publication; moving callers must supply their current displacement. */
+    public static void updateObserver(Vec384f position, Basis384f basis) { updateObserver(position, basis, Vec3d.ZERO); }
+    /**
+     * Mirror one authoritative observer frame. A frame revision that arrives while the observer is
+     * moving and navigation state is unchanged is prediction divergence, not semantic travel: the
+     * rendered scene is kept continuous by shifting the projection anchor, instead of snapping every
+     * projected glyph/peer when the sync replaces the predicted frame (movement jitter/rubber banding).
+     * Stationary revisions and navigation-state transitions remain visible snaps on purpose.
+     */
+    public static void updateObserver(Vec384f position, Basis384f basis, Vec3d movement) {
         EmbeddingSpace.requireCurrent(position); EmbeddingSpace.requireCurrent(basis.i);
         EmbeddingSpace.requireCurrent(basis.j); EmbeddingSpace.requireCurrent(basis.k);
         if (position.length()<1e-6 || Math.abs(basis.i.dot(basis.i)-1)>.02
@@ -82,8 +133,47 @@ public final class ClientSpiritCache {
                 || Math.abs(basis.i.dot(basis.j))>.02 || Math.abs(basis.i.dot(basis.k))>.02 || Math.abs(basis.j.dot(basis.k))>.02) {
             observerReady=false; return; // initial/default CCA must not manufacture projection
         }
-        playerLatentPos=position.clone(); playerLatentBasis=basis.clone(); observerReady=true;
+        Vec3d currentMovement = movement == null ? Vec3d.ZERO : movement;
+        boolean mirrorChanged = mirrorPos == null || mirrorPos.squareDistance(position) > 0 || basisShift(mirrorBasis, basis) > 0;
+        if (!mirrorChanged) return; // per-frame mirror refresh; the predicted render frame stands
+        // Preserve the coherent pre-revision render state (position, basis AND offset as last
+        // rendered) before any compensation, so every tickDelta interpolates between what was on
+        // screen and the compensated revision — not a half-applied mix of both.
+        previousLatentPos=playerLatentPos.clone(); previousLatentBasis=playerLatentBasis.clone();
+        previousContinuityOffset=continuityOffset; frameHistory=observerReady;
+        if (observerReady && lastMotionEpoch == mirrorEpoch && currentMovement.lengthSquared() > 1e-12) {
+            Vec3d shift = semanticShift(position, playerLatentPos, playerLatentBasis);
+            if (shift.lengthSquared() <= MAX_CONTINUITY_SHIFT * MAX_CONTINUITY_SHIFT)
+                continuityOffset = continuityOffset.add(shift);
+        }
+        playerLatentPos=position.clone(); playerLatentBasis=basis.clone();
+        mirrorPos=position.clone(); mirrorBasis=basis.clone(); mirrorEpoch=lastMotionEpoch;
+        observerReady=true;
     }
+    private static double basisShift(Basis384f a, Basis384f b) {
+        return a.i.squareDistance(b.i)+a.j.squareDistance(b.j)+a.k.squareDistance(b.k);
+    }
+    /** World-space displacement this frame revision alone gives the semantic neighborhood of the observer. */
+    private static Vec3d semanticShift(Vec384f next, Vec384f from, Basis384f basis) {
+        Vec384f delta = next.clone().sub(from);
+        return new Vec3d(TraversalSteering.BLOCKS_PER_SEMANTIC_UNIT*delta.dot(basis.i),
+                TraversalSteering.BLOCKS_PER_SEMANTIC_UNIT*delta.dot(basis.j),
+                TraversalSteering.BLOCKS_PER_SEMANTIC_UNIT*delta.dot(basis.k));
+    }
+    /** Tick-interpolated render frame; keeps projected geometry continuous within a movement tick. */
+    public static Vec384f interpolatedPos(float tickDelta) {
+        if (!frameHistory || previousLatentPos == null) return playerLatentPos.clone();
+        return previousLatentPos.clone().converge(playerLatentPos, clampUnit(tickDelta));
+    }
+    public static Basis384f interpolatedBasis(float tickDelta) {
+        if (!frameHistory || previousLatentBasis == null) return playerLatentBasis.clone();
+        return TraversalSteering.blend(previousLatentBasis, playerLatentBasis, clampUnit(tickDelta));
+    }
+    public static Vec3d interpolatedOffset(float tickDelta) {
+        if (!frameHistory) return continuityOffset;
+        return previousContinuityOffset.lerp(continuityOffset, clampUnit(tickDelta));
+    }
+    private static float clampUnit(float value) { return Math.max(0, Math.min(1, value)); }
     /** Read the actual synced navigation/observer components, never infer mode from dimension alone. */
     public static void syncObserver(MinecraftClient client) {
         observe(client.getNetworkHandler(),client.world,client.player,
@@ -96,8 +186,8 @@ public final class ClientSpiritCache {
             for(var glyph:current) { VISIBLE.add(glyph.id()); VEC.put(glyph.id(),glyph.embedding()); }
         }
         var nav=MysticismEntityComponents.SPIRIT_NAVIGATION.get(client.player);
-        updateNavigation(nav.active(),nav.deep(),nav.sourceDimension(),nav.sourcePosition());
-        updateObserver(MysticismEntityComponents.LATENT_POS.get(client.player).get(),
+        updateNavigation(nav.active(),nav.deep(),nav.sourceDimension(),nav.sourcePosition(),nav.motionEpoch());
+        refreshObserver(MysticismEntityComponents.LATENT_POS.get(client.player).get(),
                 MysticismEntityComponents.LATENT_BASIS.get(client.player).get());
     }
     public static boolean active() { return active; }

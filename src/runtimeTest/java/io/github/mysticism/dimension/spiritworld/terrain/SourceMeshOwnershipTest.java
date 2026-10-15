@@ -16,8 +16,34 @@ public final class SourceMeshOwnershipTest {
     private static final Vec3d FAR=new Vec3d(100,100,100);
     private static int checks;
     private static void check(boolean value,String message){checks++;if(!value)throw new AssertionError(message);}
+    /** Integration regression for the retained AIR mask + current ownership merge. Octree roots
+     * may grow from arbitrary source minima; a globally aligned full AIR bucket is not proof
+     * that an unaligned persisted cube is empty. */
+    private static void retainedAirAndOwnershipComposeAfterGrowth() {
+        Vec3d focus=new Vec3d(16,16,16);NegativeCoverage negative=new NegativeCoverage();
+        for(BlockPos p:BlockPos.iterate(0,0,0,15,15,15))negative.add(p);
+        List<SourceMeshBuilder.Node> base=List.of(new SourceMeshBuilder.Node(new BlockPos(1,1,1),16,STONE,"old-owner"));
+        BlockPos owned=new BlockPos(16,16,16),air=new BlockPos(16,15,16),solid=new BlockPos(0,16,0);
+        Bounds range=new Bounds(0,0,0,17,17,17);
+        var actual=SourceMeshBuilder.compose(base,Map.of(air,AIR,solid,STONE),Map.of(owned,"new-owner",solid,"live-owner"),range,negative,focus);
+        var mask=expand(actual);
+        for(BlockPos p:BlockPos.iterate(1,1,1,16,16,16)) {
+            boolean expected=!negative.contains(p) && !p.equals(air);
+            check(mask.containsKey(p)==expected,"Unaligned grown root lost unknown geometry or restored AIR at "+p);
+        }
+        for(var n:actual)for(BlockPos p:BlockPos.iterate(n.position(),n.position().add(n.side()-1,n.side()-1,n.side()-1)))
+            check(n.ownerId().equals(p.equals(owned)?"new-owner":p.equals(solid)?"live-owner":""),"Composed ownership is not exact at "+p);
+        check(mask.containsKey(solid),"Live geometry outside persisted root was lost");
+        // Ownership rebuilds reuse the same retained negative mask, even once sampled tiles are evicted.
+        var rebuilt=SourceMeshBuilder.compose(base,Map.of(),Map.of(owned,"grown-owner"),range,negative,focus);
+        var rebuiltMask=expand(rebuilt);
+        check(rebuiltMask.containsKey(owned) && rebuiltMask.get(owned).ownerId().equals("grown-owner"),"Ownership revision orphaned surviving collision");
+        check(!rebuiltMask.containsKey(new BlockPos(15,15,15)),"Retained AIR resurrected on ownership rebuild");
+    }
+
     public static void main(String[] args) {
         sourceKeys();sourcePriority();sparseSamples();ownershipRebuild();grownSource();projectedCollision();randomizedMembership();
+        retainedAirAndOwnershipComposeAfterGrowth();
         System.out.println("SourceMeshOwnershipTest passed: "+checks+" checks");
     }
     private static List<SourceMeshBuilder.Node> base(BlockPos p,int side,String owner) {
