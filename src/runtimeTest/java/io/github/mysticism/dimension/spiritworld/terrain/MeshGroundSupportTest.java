@@ -193,6 +193,33 @@ public final class MeshGroundSupportTest {
         close(falling.minY+landed.y,1.4,2e-5,"swept landing step finishes on the obstacle top");
     }
 
+    /** Integration of the retained parents: floor escape, mesh-only support and step selection
+     * must share one resolution, otherwise prediction subtracts a correction that was not applied. */
+    private static void overlappingStepAccountsForSelectedCorrection() {
+        var i=index(wideFloor(),lowObstacle());
+        Box body=new Box(0,.9,0,.6,2.7,.6);
+        Vec3d wanted=new Vec3d(1,0,0);
+        var resolved=MeshCollision.moveResolved(i,state(body,false,false,false),wanted);
+        close(resolved.correction().y,.1,2e-5,"floor depenetration is reported separately");
+        close(resolved.correction().horizontalLengthSquared(),0,1e-12,"escape has no chosen horizontal travel");
+        close(resolved.movement().x,1,1e-6,"mesh support after escape grants full step travel without a vanilla flag");
+        close(body.minY+resolved.movement().y,1.4,2e-5,"selected path rests on the actual ledge");
+        check(MeshCollision.supported(i,body.offset(resolved.movement())),"selected step retains real mesh support");
+        check(MeshCollision.bodyClear(i.frame,body.offset(resolved.movement())),"selected displacement clears floor and ledge");
+        Vec3d chosen=io.github.mysticism.navigation.MovementIntegration.clientSemantic(
+                resolved.movement(),resolved.correction(),false);
+        close(chosen.x,1,1e-6,"client integrates the full chosen horizontal step");
+        close(chosen.y,.4,3e-5,"client integrates only the chosen ledge rise, not floor escape");
+        check(io.github.mysticism.navigation.MovementIntegration.server(
+                resolved.movement(),resolved.correction(),false).requiresReconciliation(),
+                "server explicitly reconciles the disputed overlap window");
+        sameMovement(resolved.movement(),MeshCollision.move(i,state(body,true,false,false),wanted),
+                "even overlapping step selection ignores the vanilla ground claim");
+        var atRest=MeshCollision.moveResolved(i,state(body.offset(resolved.movement()),false,false,false),Vec3d.ZERO);
+        close(atRest.correction().lengthSquared(),0,1e-12,"the next resting window does not repeat the escape");
+        sameMovement(atRest.movement(),Vec3d.ZERO,"resting on the selected mesh pose does not jitter");
+    }
+
     private static void upwardWallSlideIsNotALanding() {
         // This leaning side's normal has y ~= .196: horizontal collision deflects motion upward,
         // but it is NOT an up-facing ground contact. The former result.y>wanted.y test allowed a step.
@@ -202,7 +229,10 @@ public final class MeshGroundSupportTest {
         check(!MeshCollision.supported(i,body),"leaning-wall fixture has no mesh support");
         var hit=i.sweep(body,wanted).orElseThrow();
         check(hit.normal().y>0 && hit.normal().y<=.3,"leaning-wall contact is upward but not ground");
-        Vec3d moved=MeshCollision.move(i,state(body,true,false,false),wanted);
+        var resolved=MeshCollision.moveResolved(i,state(body,true,false,false),wanted);
+        check(!resolved.landed(),"merged resolver retains the up-facing-contact requirement for a landing");
+        close(resolved.correction().lengthSquared(),0,1e-12,"wall slide is not a depenetration correction");
+        Vec3d moved=resolved.movement();
         check(moved.y>wanted.y+1e-5,"wall slide really clips the downward delta (old landing shortcut discriminator)");
         check(moved.x<.5,"upward wall sliding does not authorize an unsupported step");
     }
@@ -253,6 +283,7 @@ public final class MeshGroundSupportTest {
         blockShapedStandInsWouldDiffer();
         unsupportedStepIgnoresTrueVanillaFlag();
         supportedStepAndSweptLandingStillWork();
+        overlappingStepAccountsForSelectedCorrection();
         upwardWallSlideIsNotALanding();
         unsupportedSneakIgnoresTrueVanillaFlag();
         supportedSneakStillProtectsMeshLedges();

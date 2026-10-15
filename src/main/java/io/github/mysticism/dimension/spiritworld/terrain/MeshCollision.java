@@ -15,8 +15,22 @@ public final class MeshCollision {
     private static volatile Function<UUID,TerrainMeshFrame> client = id -> null;
     private static final Map<UUID,Index> SERVER = new java.util.concurrent.ConcurrentHashMap<>(), CLIENT = new java.util.concurrent.ConcurrentHashMap<>();
     public static void clientFrames(Function<UUID,TerrainMeshFrame> provider) { client=Objects.requireNonNull(provider); }
-    public static void clear(UUID player) { SERVER.remove(player); CLIENT.remove(player); }
-    public static void clearClient() { CLIENT.clear(); }
+    public static void clear(UUID player) { SERVER.remove(player); CLIENT.remove(player); SERVER_CORRECTIONS.remove(player); CLIENT_CORRECTIONS.remove(player); }
+    public static void clearClient() { CLIENT.clear(); CLIENT_CORRECTIONS.clear(); }
+    /** Movement-response accounting for the integrators: depenetration displacement applied to this
+     *  body since the last drain. Collision corrections are not chosen movement; integration that
+     *  folds them in repeats the correction every tick and jitters/rubber-bands. */
+    public static Vec3d drainCorrection(PlayerEntity p) { return drainCorrection(p.getUuid(), p.getWorld().isClient); }
+    public static Vec3d drainCorrection(UUID player, boolean clientSide) {
+        var drained = (clientSide ? CLIENT_CORRECTIONS : SERVER_CORRECTIONS).put(player, Vec3d.ZERO);
+        return drained == null ? Vec3d.ZERO : drained;
+    }
+    public static void recordCorrection(UUID player, boolean clientSide, Vec3d correction) {
+        if (player == null || correction.equals(Vec3d.ZERO)) return;
+        (clientSide ? CLIENT_CORRECTIONS : SERVER_CORRECTIONS).merge(player, correction, Vec3d::add);
+    }
+    private static final Map<UUID,Vec3d> SERVER_CORRECTIONS=new java.util.concurrent.ConcurrentHashMap<>(), CLIENT_CORRECTIONS=new java.util.concurrent.ConcurrentHashMap<>();
+    private static void recordCorrection(PlayerEntity p,Vec3d correction) { recordCorrection(p.getUuid(),p.getWorld().isClient,correction); }
     public record Hit(double time, Vec3d normal, TerrainMeshFrame.Cell cell) {}
     /** Player input snapshot shared with entity-free regressions. The vanilla ground flag is an
      * untrusted carrier/packet claim, NOT evidence of support on this observer's mesh. */
@@ -108,15 +122,49 @@ public final class MeshCollision {
         return index;
     }
     public static Vec3d move(PlayerEntity player,Vec3d wanted) {
-        return move(index(player),MotionState.of(player),wanted);
+        Resolution result=moveResolved(index(player),MotionState.of(player),wanted);
+        recordCorrection(player,result.correction());
+        return result.movement();
     }
     /** Same movement path used by server/prediction, without requiring a live entity for tests. */
     static Vec3d move(Index i,MotionState state,Vec3d wanted) {
+        return moveResolved(i,state,wanted).movement();
+    }
+    /** The correction must belong to the SELECTED path, including step-up, not just the direct sweep. */
+    record Resolution(Vec3d movement,Vec3d correction,boolean landed) {}
+    static Resolution moveResolved(Index i,MotionState state,Vec3d wanted) {
         // No fabricated floor. Preparation supplies geometry before entry; packet delay simply has no surfaces yet.
-        if(i==null)return wanted;
-        Box body=state.body();
+        if(i==null)return new Resolution(wanted,Vec3d.ZERO,false);
         if(wanted.length()>256)wanted=wanted.multiply(256/wanted.length());
-        Vec3d result=i.depenetrate(body,4);
+        Box body=state.body();
+        Resolution direct=resolveMotion(i,body,wanted);
+        Vec3d applied=direct.correction(),result=direct.movement();
+        Box from=body.offset(applied);
+        // Only real mesh support (after depenetration) or a genuine swept landing grants step-up.
+        // A vanilla ground claim or an upward wall slide is never evidence of support.
+        if(!state.flying() && (supported(i,from) || direct.landed())
+                && result.subtract(wanted).horizontalLengthSquared()>1e-8)
+            result=stepUp(i,from,applied,wanted,state.stepHeight(),result);
+        return new Resolution(result,applied,direct.landed());
+    }
+    /** Vanilla-style up/over/down selection starts at the depenetrated body and carries the
+     * applied correction into the selected displacement for exact movement-response accounting. */
+    public static Vec3d stepUp(Index i,Box from,Vec3d applied,Vec3d wanted,double step,Vec3d direct) {
+        if(step<=0)return direct;
+        Vec3d up=i.slide(from,new Vec3d(0,step,0)).movement();
+        Vec3d over=i.slide(from.offset(up),new Vec3d(wanted.x,0,wanted.z)).movement();
+        Vec3d down=i.slide(from.offset(up).offset(over),new Vec3d(0,wanted.y-up.y,0)).movement();
+        Vec3d stepped=applied.add(up).add(over).add(down);
+        return stepped.horizontalLengthSquared()>direct.horizontalLengthSquared()+1e-8?stepped:direct;
+    }
+    /** Pure swept resolution shared by move(): reports depenetration separately from chosen travel. */
+    public static Vec3d resolve(Index i,Box body,Vec3d wanted,Vec3d[] correction) {
+        Resolution result=resolveMotion(i,body,wanted);
+        if(correction!=null && correction.length>0)correction[0]=result.correction();
+        return result.movement();
+    }
+    private static Resolution resolveMotion(Index i,Box body,Vec3d wanted) {
+        Vec3d applied=i.depenetrate(body,4),result=applied;
         // Bound swept traversal for unusually fast flight/teleports rather than tunnelling through a grid overflow.
         int pieces=Math.min(64,Math.max(1,(int)Math.ceil(wanted.length()/4)));
         Vec3d piece=wanted.multiply(1.0/pieces);boolean landed=false;
@@ -124,20 +172,7 @@ public final class MeshCollision {
             Slide slide=i.slide(body.offset(result),piece);
             result=result.add(slide.movement());landed|=slide.landed();
         }
-        // Only this mesh's support probe or a genuine swept landing grants step-up. In particular,
-        // a true vanillaOnGround claim must not let an airborne player climb a nearby low obstacle.
-        if(!state.flying() && (supported(i,body) || landed)
-                && result.subtract(wanted).horizontalLengthSquared()>1e-8) {
-            double step=state.stepHeight();
-            if(step>0) {
-                Vec3d up=i.slide(body,new Vec3d(0,step,0)).movement();
-                Vec3d over=i.slide(body.offset(up),new Vec3d(wanted.x,0,wanted.z)).movement();
-                Vec3d down=i.slide(body.offset(up).offset(over),new Vec3d(0,wanted.y-up.y,0)).movement();
-                Vec3d stepped=up.add(over).add(down);
-                if(stepped.horizontalLengthSquared()>result.horizontalLengthSquared()+1e-8)result=stepped;
-            }
-        }
-        return result;
+        return new Resolution(result,applied,landed);
     }
     /** Vanilla's carrier-air ledge check would prevent all sneaking; use the real mesh below the future footprint. */
     public static Vec3d sneak(PlayerEntity p,Vec3d wanted,MovementType type) {
