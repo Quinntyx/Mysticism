@@ -323,7 +323,6 @@ public final class SpiritTerrainService {
         if(new Vec3d(error.dot(b.i)*SCALE,error.dot(b.j)*SCALE,error.dot(b.k)*SCALE).lengthSquared()>1e-6)return false;
         ServerWorld world=world(p.getServer(),probe.dimension);
         if(world!=null)captureLoaded(world,probe,current.sourcePosition(),200,false);
-        if(!clearCachedBody(probe,current.sourcePosition()) || !hasCachedFloor(probe,current.sourcePosition()))return false;
         Window next=new Window(current.sourceDimension(),current.sourcePosition(),q(p),source,current.landmarkId());
         next.owner=LandmarkStore.get(p.getServer()).metadata(next.id).orElse(null);if(next.owner==null)return false;
         next.owners=field.owners;next.geometryNodes=field.geometryNodes.isEmpty()?field.nodes:field.geometryNodes;
@@ -333,7 +332,7 @@ public final class SpiritTerrainService {
         if(!s.local.id.isEmpty() && !s.local.id.equals(next.id))preview.regions.putIfAbsent(s.local.id,s.local);
         BuiltMesh built=buildMesh(p,preview,s.revision+1,b);TerrainMeshFrame frame=built.frame();
         Vec3d observerDelta=s.frame==null?Vec3d.ZERO:p.getPos().subtract(s.frameAnchor);
-        if(!MeshCollision.bodyClear(frame,p.getBoundingBox()) || !MeshCollision.transitionClear(s.frame,frame,p.getBoundingBox(),observerDelta))return false;
+        if(!walkAcquisitionClear(probe.tiles,current.sourcePosition(),s.frame,frame,p.getBoundingBox(),observerDelta))return false;
         // All validation precedes publication. No q/basis/position/velocity/attunement mutation.
         Window previous=s.local;Vec3d previousCarrier=s.carrier;
         boolean previousShallow=s.shallow,previousAcquired=s.acquiredView,previousAnchor=s.anchorDelivered;
@@ -447,17 +446,43 @@ public final class SpiritTerrainService {
         return true;
     }
     private static Box body(Vec3d at){return new Box(at.x-.3,at.y,at.z-.3,at.x+.3,at.y+1.8,at.z+.3);}
-    private static boolean clearCachedBody(Window w,Vec3d at) {
+    private static boolean clearCachedBody(Window w,Vec3d at) {return clearCachedBody(w.tiles,at);}
+    private static boolean clearCachedBody(Map<BlockPos,SourceMeshBuilder.Tile> tiles,Vec3d at) {
         Box body=body(at);
-        for(BlockPos pos:BlockPos.iterate(MathHelper.floor(body.minX),MathHelper.floor(body.minY),MathHelper.floor(body.minZ),MathHelper.floor(body.maxX),MathHelper.floor(body.maxY),MathHelper.floor(body.maxZ))) {
-            var tile=w.tiles.get(pos);if(tile==null)return false;
+        for(BlockPos pos:samples(body)) {
+            var tile=tiles.get(pos);if(tile==null)return false;
             for(Box b:tile.collision())if(b.offset(pos).intersects(body))return false;
         }
         return true;
     }
-    private static boolean hasCachedFloor(Window w,Vec3d at) {
-        BlockPos pos=BlockPos.ofFloored(at.add(0,-.05,0));var tile=w.tiles.get(pos);if(tile==null)return false;
-        return tile.collision().stream().anyMatch(b->contact(b.offset(pos),body(at),at.y));
+    private static boolean hasCachedFloor(Window w,Vec3d at) {return hasCachedFloor(w.tiles,at);}
+    private static boolean hasCachedFloor(Map<BlockPos,SourceMeshBuilder.Tile> tiles,Vec3d at) {
+        Box body=body(at);List<TerrainMeshFrame.Cell> cells=new ArrayList<>();
+        List<TerrainMeshFrame.Material> materials=new ArrayList<>();
+        // Alignment preserves the inverse-mapped FEET, not a snapped source-block position. On a
+        // tilted support those feet can be > .05 above its face, or over an adjacent air voxel.
+        // Resolve the whole actual grounding footprint, including known air, then sweep the REAL
+        // source collision shapes with the same rise/drop/normal test as projected mesh grounding.
+        for(BlockPos pos:samples(MeshCollision.supportFootprint(body))) {
+            var tile=tiles.get(pos);if(tile==null)return false;
+            if(tile.collision().isEmpty())continue;
+            if(!materials.contains(tile.material()))materials.add(tile.material());
+            Vec3d min=new Vec3d(pos.getX(),pos.getY(),pos.getZ());
+            cells.add(new TerrainMeshFrame.Cell(cells.size(),materials.indexOf(tile.material()),"",min,min,
+                    new Vec3d(1,1,1),new Vec3d(1,0,0),new Vec3d(0,1,0),new Vec3d(0,0,1),
+                    tile.color(),tile.light(),1,tile.collision()));
+        }
+        var source=new TerrainMeshFrame(0,true,"",at,at,materials,cells);
+        return MeshCollision.ground(new MeshCollision.Index(source),body).isPresent();
+    }
+    /** Final geometry proof shared by current-support acquisition and entity-free regressions.
+     * This runs before publishing the shallow session; ownership/readiness/basis gates precede it.
+     * Neither clearance nor acquisition is allowed to snap feet or fabricate source collision. */
+    static boolean walkAcquisitionClear(Map<BlockPos,SourceMeshBuilder.Tile> tiles,Vec3d sourceFeet,
+            TerrainMeshFrame previous,TerrainMeshFrame walking,Box body,Vec3d observerDelta) {
+        return clearCachedBody(tiles,sourceFeet) && hasCachedFloor(tiles,sourceFeet)
+                && MeshCollision.bodyClear(walking,body)
+                && MeshCollision.transitionClear(previous,walking,body,observerDelta);
     }
     // Kept for the existing tiny production-shape smoke fixture, not an overlay lookup.
     static boolean contact(VoxelShape shape,BlockPos pos,Box body,double feet){return shape.getBoundingBoxes().stream().anyMatch(b->contact(b.offset(pos),body,feet));}

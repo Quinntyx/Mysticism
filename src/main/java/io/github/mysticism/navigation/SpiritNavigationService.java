@@ -396,18 +396,25 @@ public final class SpiritNavigationService {
         // This real terrain operation rechecks current contact, window identity, ownership revision,
         // source body/floor clearance and whole-frame continuity, and never sets q/basis/body position.
         if (!SpiritTerrainService.acquireCurrentSupport(p, support)) return;
-        var mapped = SpiritTerrainService.sourcePosition(p);
-        if (mapped.isEmpty() || !mapped.get().landmarkId().equals(support.landmarkId())
-                || !mapped.get().dimension().equals(support.sourceDimension())) {
+        if (!commitSupportMapping(nav, support, SpiritTerrainService.sourcePosition(p))) {
             SpiritTerrainService.setShallow(p, false); endSupportApproach(p, s);
             p.sendMessage(Text.literal("Terrain acquisition did not retain its validated source mapping; remaining deep."), true);
             return;
         }
-        var at = mapped.get(); nav.shallow(at.dimension(), at.landmarkId(), at.position());
         s.confirmedOwned = true; s.unsupported = 0; s.jumping = false; endSupportApproach(p, s);
         SpiritBasisEvolver.resetMotion(p); flight(p, false);
         MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p); sync(p);
         p.sendMessage(Text.literal("Shallow: walking on the current source-owned landmark. Captured attunement retained."), true);
+    }
+    /** Final state transition AFTER terrain acquisition succeeds. Kept entity-free so regressions
+     * can drive the real source/mesh proof through this mapping check and walking mutation without
+     * bootstrapping a server. This does not grant permission to bypass terrain's acquisition gates. */
+    public static boolean commitSupportMapping(SpiritNavigation nav, SpiritTerrainService.WalkSupport support,
+            Optional<SpiritTerrainService.SourcePosition> mapped) {
+        if (mapped.isEmpty() || !mapped.get().landmarkId().equals(support.landmarkId())
+                || !mapped.get().dimension().equals(support.sourceDimension())) return false;
+        var at = mapped.get(); nav.shallow(at.dimension(), at.landmarkId(), at.position());
+        return true;
     }
     private static float basisError(Basis384f a, Basis384f b) {
         return a.i.squareDistance(b.i) + a.j.squareDistance(b.j) + a.k.squareDistance(b.k);
