@@ -3,6 +3,7 @@ package io.github.mysticism.dimension.spiritworld.terrain;
 import io.github.mysticism.activity.SpiritActivityService;
 import io.github.mysticism.component.MysticismEntityComponents;
 import io.github.mysticism.navigation.SpiritNavigationService;
+import io.github.mysticism.navigation.MovementProvenance;
 import io.github.mysticism.landmark.*;
 import io.github.mysticism.landmark.extract.LandmarkExtractionService;
 import io.github.mysticism.landmark.extract.LandmarkProfiles;
@@ -34,12 +35,13 @@ public final class SpiritTerrainService {
         @Override public Vec384f embedding(){return embedding.clone();}
     }
     public record SourcePosition(String dimension,Vec3d position,String landmarkId) {}
-    /** Per-tick body displacement above this is a teleport/relocation, never source or semantic travel
-     * (same threshold as the evolver's semantic-travel clamp). */
-    static final double RELOCATE_SQUARED=16;
-    /** The >4 blocks/tick jump between two observed body positions, or null for ordinary movement. */
-    static Vec3d relocation(Vec3d now,Vec3d last) {
-        Vec3d jump=now.subtract(last);return jump.lengthSquared()>RELOCATE_SQUARED?jump:null;
+    /** Relocate only an explicitly marked requestTeleport window, at any distance. Ordinary
+     * accumulated movement must advance source space just as it advances semantic navigation.
+     * Terrain retains its own baseline because the evolver's teleport hook resets its baseline
+     * before the next tick. A no-displacement correction does not need a new mesh publication. */
+    static Vec3d relocation(Vec3d now,Vec3d last,boolean teleported) {
+        if(!teleported || last==null)return null;
+        Vec3d jump=now.subtract(last);return jump.lengthSquared()>0?jump:null;
     }
     /** Shallow source mapping: source = window origin + (body - carrier). Relocating the carrier with
      * the body preserves it, so a teleport neither drifts nor travels through source space. */
@@ -69,7 +71,7 @@ public final class SpiritTerrainService {
         ServerEntityWorldChangeEvents.AFTER_PLAYER_CHANGE_WORLD.register((p,from,to)->{
             if(from.getRegistryKey().equals(WORLD) && !to.getRegistryKey().equals(WORLD))cancelEnter(p);
             else if(to.getRegistryKey().equals(WORLD)) {
-                Session s=session(p);if(s!=null){s.carrier=p.getPos();s.entered=true;publish(p,s,true);}
+                Session s=session(p);if(s!=null){s.carrier=p.getPos();s.lastBody=p.getPos();s.entered=true;publish(p,s,true);}
             }
         });
         ServerPlayConnectionEvents.JOIN.register((handler,sender,server)->{if(handler.player.getWorld().getRegistryKey().equals(WORLD))restore(handler.player);});
@@ -129,6 +131,7 @@ public final class SpiritTerrainService {
         } catch(RuntimeException failure){cancelEnter(player);player.sendMessage(Text.literal("Spirit mesh restore deferred: "+failure.getMessage()),false);return false;}
     }
     public static void cancelEnter(ServerPlayerEntity player) {
+        MovementProvenance.drainTerrainTeleport(player.getUuid());
         Context c=SERVERS.get(player.getServer());if(c==null)return;
         Session s=c.sessions.remove(player.getUuid());if(s!=null)s.cancel();MeshCollision.clear(player.getUuid());
     }
@@ -345,6 +348,7 @@ public final class SpiritTerrainService {
             s.regions.clear();s.regions.putAll(previousRegions);
             status(p,s,"Walking acquisition held: mesh publication failed.");return false;
         }
+        s.lastBody=p.getPos(); // The newly committed source mapping is anchored at this body pose.
         s.ingesting=null;s.sourceRequested=null;
         if(s.sourceFuture!=null)s.sourceFuture.cancel(false);if(s.ownerFuture!=null)s.ownerFuture.cancel(false);
         if(previous.ownershipFuture!=null)previous.ownershipFuture.cancel(false);
@@ -431,6 +435,7 @@ public final class SpiritTerrainService {
         Window previous=s.local;Vec3d previousCarrier=s.carrier;
         s.local=target;s.carrier=p.getPos();s.shallow=true;target.owner=metadata.get();s.coverageReady=null;
         if(!publish(p,s,true)){s.local=previous;s.carrier=previousCarrier;s.shallow=false;return false;}
+        s.lastBody=p.getPos(); // Do not relocate an already re-anchored mapping again next tick.
         if(s.sourceFuture!=null)s.sourceFuture.cancel(false);s.sourceFuture=null;s.ingesting=null;s.sourceRequested=null;
         if(s.ownerFuture!=null)s.ownerFuture.cancel(false);
         p.setVelocity(Vec3d.ZERO);p.fallDistance=0;return true;
@@ -609,15 +614,19 @@ public final class SpiritTerrainService {
         if(tile!=null){w.liveTiles.add(position.toImmutable());if(!tile.equals(w.tiles.put(position.toImmutable(),tile)))w.dirty=true;}
     }
     private static void tick(MinecraftServer server) {
-        Context c=SERVERS.get(server);if(c==null)return;c.tick++;
+        Context c=SERVERS.get(server);if(c!=null)c.tick++;
         var players=server.getPlayerManager().getPlayerList();
         for(var p:players) {
+            // Drain even without a terrain session: a source-world teleport must not relocate a
+            // future spirit session. The evolver has its own copy; callback order is irrelevant.
+            boolean teleported=MovementProvenance.drainTerrainTeleport(p.getUuid());
+            if(c==null)continue;
             Session s=c.sessions.get(p.getUuid());if(s==null)continue;
             if(!p.getWorld().getRegistryKey().equals(WORLD)){if(c.tick-s.created>100)cancelEnter(p);continue;}
             try {
                 Vec3d now=p.getPos();
                 if(s.lastBody!=null) {
-                    Vec3d jump=relocation(now,s.lastBody);
+                    Vec3d jump=relocation(now,s.lastBody,teleported);
                     if(jump!=null) {
                         // Vanilla/external teleports relocate the observer; they never travel through source
                         // space. Move the aligned view's carrier with the body so the loaded source region
@@ -648,6 +657,7 @@ public final class SpiritTerrainService {
                 c.animate(p,s);if(c.tick%2==0)publish(p,s,false);
             } catch(RuntimeException failure){status(p,s,"Mesh deferred: "+failure.getMessage());}
         }
+        if(c==null)return;
         // A single repository geometry cursor is advanced globally. A failed region never retries ahead of others forever.
         c.advanceNear();c.advanceGeometry();
         if(!players.isEmpty())for(int n=0;n<Math.min(2,players.size());n++) {
@@ -849,7 +859,7 @@ public final class SpiritTerrainService {
         final Map<String,Window> regions=new LinkedHashMap<>();final MeshRepresentatives selection=new MeshRepresentatives();
         final Map<String,Window> prepared=new LinkedHashMap<>();
         String scanCursor,status,coverageStatus,closestId="";int dimensionCursor,regionCursor;boolean scanning;Set<String> selected=Set.of();
-        Session(Window local,Vec3d carrier){this.local=local;this.carrier=carrier;}
+        Session(Window local,Vec3d carrier){this.local=local;this.carrier=carrier;this.lastBody=carrier;}
         /** Immediately published landmarks stay selected until the next full sweep re-derives the set. */
         void unionSelected(String id){var union=new HashSet<>(selected);if(union.add(id))selected=Set.copyOf(union);}
         void cancel(){if(ownerFuture!=null)ownerFuture.cancel(false);if(sourceFuture!=null)sourceFuture.cancel(false);if(targetFuture!=null)targetFuture.cancel(false);if(targetOwnerFuture!=null)targetOwnerFuture.cancel(false);if(walkFuture!=null)walkFuture.cancel(false);cancelWindow(local);if(target!=null)cancelWindow(target);for(var w:regions.values())cancelWindow(w);for(var w:prepared.values())cancelWindow(w);regions.clear();prepared.clear();}

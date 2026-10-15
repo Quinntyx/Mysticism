@@ -110,3 +110,52 @@ No embedding runtime/profile was replaced, no old vectors migrated/truncated,
 no dummy vectors added and no server dependency newly introduced by this merge.
 Other separately owned rendering/entry/fog/model units require their own
 integration and gameplay/inference validation.
+
+## Scoped review follow-up: explicit teleport provenance
+
+Retained base: `66e95a56baa3a1865ababd0ecbc2d9c8c6c87943`; initial worktree
+was clean. The P2 review exposed a surviving cross-parent mismatch: terrain
+classified any movement above four blocks as relocation while semantic movement
+accepted ordinary accumulated windows through eight blocks. Short teleports had
+the opposite mismatch, advancing source mapping despite semantic suppression.
+
+- Removed the terrain distance heuristic. Only explicit `requestTeleport`
+  provenance relocates the carrier, including sub-block/vertical corrections.
+  A zero-displacement correction does not force an unnecessary frame publication.
+- `MovementProvenance` now offers independent once-per-window terrain and semantic
+  copies of the same marker, so either consumer can run first without stealing
+  evidence. Terrain drains markers even without an active session; cancellation
+  and lifecycle clear discard the terrain copy. No stale source-world marker is
+  allowed to relocate a future session.
+- Terrain keeps its body baseline independently of the evolver's teleport baseline
+  reset. New sessions, world entry and successful mapping acquisitions initialize
+  that baseline at the committed carrier pose, avoiding double relocation of an
+  already re-anchored view.
+- `TeleportMeshCoverageTest` now runs **304 checks**. Paired source/navigation
+  regressions cover ordinary six/eight-block bursts, short horizontal/vertical
+  teleports, zero-displacement corrections, either drain order, repeated markers,
+  independent players and the following ordinary movement window. They exercise
+  real shallow steering, production compaction, mesh transition acceptance,
+  actual ground collision and stale-versus-accepted readiness, not status strings.
+  Tests retain the existing affine support, collision and readiness cases.
+
+The new explicit-provenance regression was first run with the old heuristic
+still present: `runtimeSelfTest` correctly failed on a 0.3-block teleport.
+Retained red run: session `$11`, origin `%2973`, pane `%2974`, token
+`a50ca492fd544828ab08172adb3c5c04`. An intermediate full build then exposed an
+incomplete test fixture (ordinary vertical travel required known air at y=130);
+the fixture was extended rather than relaxing collision-readiness checks.
+
+Final verification reran the canonical command above with `--rerun-tasks`:
+**BUILD SUCCESSFUL**, exit 0, 32s, all 14 actionable tasks executed. All **25
+main-based suites** were discovered and passed, including the expanded teleport
+suite, unchanged movement/discovery/embedding regressions, packaging and runner
+fixtures, remapping and production jar verification. Session `$11`, original
+origin `%2973`, retained pane `%2975`, window `@1794`, final run token
+`51a071f6e6324e9c9191b3ca1ca2344a`. Existing nonfatal compile warnings and caught
+malformed-persistence fixture errors remain. `git diff --check` also passed.
+
+This follow-up does not change embeddings or projection/ownership policy. It is
+still offline, entity-free validation: no live Minecraft/mixin execution, model
+inference or IntelliJ launch was performed. The limits and separately owned
+full-request work described above remain outstanding.

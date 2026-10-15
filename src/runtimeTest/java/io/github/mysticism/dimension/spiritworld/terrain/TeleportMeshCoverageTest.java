@@ -1,5 +1,11 @@
 package io.github.mysticism.dimension.spiritworld.terrain;
 
+import io.github.mysticism.activity.TraversalSteering;
+import io.github.mysticism.navigation.MovementIntegration;
+import io.github.mysticism.navigation.MovementProvenance;
+import io.github.mysticism.vector.Basis384f;
+import io.github.mysticism.vector.Vec384f;
+import java.util.UUID;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
@@ -37,13 +43,80 @@ public final class TeleportMeshCoverageTest {
     private static final Vec3d FEET=new Vec3d(.5,128,.5);
     private static Box body(Vec3d feet){return new Box(feet.x-.3,feet.y,feet.z-.3,feet.x+.3,feet.y+1.8,feet.z+.3);}
 
-    private static void relocationThreshold() {
-        check(SpiritTerrainService.relocation(new Vec3d(.3,0,0),Vec3d.ZERO)==null,"ordinary walking pace is not a relocation");
-        check(SpiritTerrainService.relocation(new Vec3d(0,-3.92,0),Vec3d.ZERO)==null,"terminal fall velocity is not a relocation");
-        check(SpiritTerrainService.relocation(new Vec3d(4,0,0),Vec3d.ZERO)==null,"exactly four blocks is ordinary movement");
-        Vec3d jump=SpiritTerrainService.relocation(new Vec3d(100,0,0),Vec3d.ZERO);
-        check(jump!=null && jump.equals(new Vec3d(100,0,0)),"a /tp-sized per-tick jump is a relocation carrying its delta");
-        check(SpiritTerrainService.relocation(new Vec3d(0,-40,0),Vec3d.ZERO)!=null,"vertical teleports relocate too");
+    private static void relocationProvenance() {
+        for(Vec3d delta:List.of(new Vec3d(.3,0,0),new Vec3d(0,-3.92,0),new Vec3d(4,0,0),
+                new Vec3d(6,0,0),new Vec3d(8,0,0),new Vec3d(100,0,0))) {
+            check(SpiritTerrainService.relocation(delta,Vec3d.ZERO,false)==null,
+                    "distance alone never invents a teleport: "+delta);
+            check(delta.equals(SpiritTerrainService.relocation(delta,Vec3d.ZERO,true)),
+                    "explicit teleport retains its full displacement at any size: "+delta);
+        }
+        check(new Vec3d(0,-.25,0).equals(SpiritTerrainService.relocation(new Vec3d(0,-.25,0),Vec3d.ZERO,true)),
+                "sub-block vertical teleports relocate too");
+    }
+
+    /** Exercise both real provenance consumers together with classification, shallow steering,
+     * compaction, collision and accepted-frame readiness. A six-block burst used to freeze source
+     * travel while q advanced six; a short /tp used to move source while q correctly stayed still. */
+    private static void movementWindowConsistency() {
+        UUID player=UUID.randomUUID(),other=UUID.randomUUID();
+        Map<BlockPos,SourceMeshBuilder.Tile> tiles=new HashMap<>();
+        for(int x=-1;x<=9;x++)for(int z=-1;z<=1;z++)for(int y=127;y<=130;y++)
+            tiles.put(new BlockPos(x,y,z),tile(y==127?STONE:AIR,y!=127));
+        // The actual callback order must not matter: terrain and evolver drain independent copies.
+        for(boolean terrainFirst:new boolean[]{false,true})for(boolean teleported:new boolean[]{false,true})
+            for(Vec3d delta:List.of(new Vec3d(6,0,0),new Vec3d(8,0,0),new Vec3d(.25,0,0),
+                    new Vec3d(0,.5,0),Vec3d.ZERO)) {
+                try {
+                    if(teleported){MovementProvenance.markServerTeleport(player);MovementProvenance.markServerTeleport(player);}
+                    boolean terrainTeleport=false;
+                    if(terrainFirst)terrainTeleport=MovementProvenance.drainTerrainTeleport(player);
+                    boolean semanticTeleport=MovementProvenance.drainServerTeleport(player);
+                    if(!terrainFirst)terrainTeleport=MovementProvenance.drainTerrainTeleport(player);
+                    check(terrainTeleport==teleported && semanticTeleport==teleported,"both consumers see the same explicit teleport");
+                    check(!MovementProvenance.drainTerrainTeleport(player) && !MovementProvenance.drainServerTeleport(player),
+                            "each window consumes provenance exactly once");
+                    check(!MovementProvenance.drainTerrainTeleport(other) && !MovementProvenance.drainServerTeleport(other),
+                            "one player's relocation never changes another observer");
+                    Vec3d now=FEET.add(delta),carrier=Vec3d.ZERO;
+                    Vec3d jump=SpiritTerrainService.relocation(now,FEET,terrainTeleport);
+                    if(jump!=null)carrier=carrier.add(jump);
+                    Vec3d source=SpiritTerrainService.shallowSource(Vec3d.ZERO,now,carrier);
+                    // requestTeleport's baseline hook may already have erased the semantic measured
+                    // delta. Terrain must still preserve source mapping using its own previous body.
+                    var sample=MovementIntegration.server(teleported?Vec3d.ZERO:delta,Vec3d.ZERO,semanticTeleport);
+                    Vec3d expected=teleported?Vec3d.ZERO:delta;
+                    check(sample.semanticDelta().squaredDistanceTo(expected)<1e-20,"semantic window uses the expected chosen travel");
+                    check(source.subtract(FEET).squaredDistanceTo(expected)<1e-20,
+                            "source and semantic travel agree, including six-block bursts and sub-block teleports");
+                    Vec384f q=Vec384f.ZERO();Basis384f basis=new Basis384f();
+                    var semantic=sample.semanticDelta();TraversalSteering.advance(q,basis,semantic.x,semantic.y,semantic.z);
+                    Vec3d sourceDelta=source.subtract(FEET);
+                    check(Math.abs(q.dot(basis.i)*96-sourceDelta.x)<1e-6
+                                    && Math.abs(q.dot(basis.j)*96-sourceDelta.y)<1e-6
+                                    && Math.abs(q.dot(basis.k)*96-sourceDelta.z)<1e-6,
+                            "actual shallow navigation advance agrees with the terrain's mapped source delta");
+                    var old=sampled(tiles,Vec3d.ZERO);var next=sampled(tiles,carrier);
+                    check(MeshCollision.transitionClear(old,next,body(now),delta,keys(old)),
+                            "provenance-consistent mapping publishes the matching collision frame");
+                    check(coverage(tiles,source,false,next,carrier).ready(),
+                            "accepted source mapping is truthfully collision-ready: delta="+delta+", teleport="+teleported);
+                    if(teleported || delta.y==0)check(MeshCollision.ground(new MeshCollision.Index(next),body(now)).isPresent(),
+                            "ordinary horizontal bursts and all explicit teleports retain usable ground collision");
+                    if(teleported && delta.lengthSquared()>0)check(!coverage(tiles,source,false,old,carrier).ready(),
+                            "stale pre-teleport collision cannot claim readiness even for a short teleport");
+                    // Neither teleport's second copy may leak into the next ordinary movement window.
+                    Vec3d walk=new Vec3d(.125,0,0),after=now.add(walk);
+                    Vec3d nextJump=SpiritTerrainService.relocation(after,now,MovementProvenance.drainTerrainTeleport(player));
+                    check(nextJump==null,"following ordinary movement does not repeat the carrier relocation");
+                    var resumed=MovementIntegration.server(walk,Vec3d.ZERO,MovementProvenance.drainServerTeleport(player));
+                    check(SpiritTerrainService.shallowSource(Vec3d.ZERO,after,carrier).subtract(source)
+                            .squaredDistanceTo(resumed.semanticDelta())<1e-20,"next ordinary source and semantic windows resume together");
+                } finally { MovementProvenance.clear(player);MovementProvenance.clear(other); }
+            }
+        MovementProvenance.markServerTeleport(player);MovementProvenance.clear(player);
+        check(!MovementProvenance.drainTerrainTeleport(player) && !MovementProvenance.drainServerTeleport(player),
+                "lifecycle clear retires both consumers' teleport evidence");
     }
 
     private static void carrierContinuity() {
@@ -313,7 +386,8 @@ public final class TeleportMeshCoverageTest {
     }
 
     public static void main(String[] args) {
-        relocationThreshold();
+        relocationProvenance();
+        movementWindowConsistency();
         carrierContinuity();
         coverageReadiness();
         probeFootprintAndShapeReadiness();
