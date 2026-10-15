@@ -43,7 +43,7 @@ this document describes the combined candidate, not all eleven runtime fixes.
 
 ## Verification
 
-Requested final canonical full build (installed Gradle 8.13 / Java 21; no task
+Final canonical full build (installed Gradle 8.13 / Java 21; no task
 exclusions, classpath overrides, extra software, live embedding service or game
 bootstrap):
 
@@ -51,23 +51,41 @@ bootstrap):
 /home/zlare/.gradle/wrapper/dists/gradle-8.13-bin/5xuhj0ry160q40clulazy9h7d/gradle-8.13/bin/gradle --no-daemon --console=plain --continue --rerun-tasks build runtimeSelfTest buildSelfTest verifyProductionJar
 ```
 
-**Final verification is blocked.** The required `tmux-jobs` helper, using the
-original `%2685` origin, repeatedly refused to launch with `Job workspace busy;
-retry later`. No direct-shell workaround was used. An earlier execution of the
-same canonical command succeeded (exit 0, 15 tasks executed, 1m6s), retained in
-pane `%2705`, run `38d4c467cfd54905bf17cc4a50ed2c31`. It discovered all eleven
-runtime suites, passed the packaging/runner fixtures, and verified the production
-jar. That run reported WalkingModePolicyTest 2,557 checks, WalkIntentLifetimeTest
-9,457 checks, tokenizer 8,455 checks, and 766 official grapheme cases.
+**Final verification passed on 2026-10-15**, including the final slow-proof /
+alignment-stall refinement and its regression in source commit
+`c15b243e9ef6106859acd0cdc27d1b07c0d6baff`. The required helper recovered after
+the earlier workspace-busy blocker; no direct-shell workaround was used. The
+resumed connection's original origin was `%3064`, session `$11`. Retained build
+pane `%3065`, run `d680821514c74767a2704c037ff16ff4`: exit 0, 3m43s,
+15 actionable tasks executed (`--rerun-tasks`). Subsequent changes only update
+this handoff document.
 
-The subsequent slow-proof/alignment-stall composition refinement and its new
-regression were **not compiled or executed** by that earlier run. Do not treat
-the stale jar or earlier green build as verification of the final candidate.
+All eleven runtime suites were discovered and passed:
+
+| Suite | Checks |
+| --- | ---: |
+| EntrySupportDiscoveryTest | 124 |
+| InitialSourceDiscoveryTest | 129 |
+| AsyncEmbeddingCallbackIsolationTest | 28 |
+| AsyncEmbeddingEngineSafetyTest | 184 |
+| EmbeddingPersistenceTest | 90 |
+| EmbeddingPipelineTest | 135 |
+| NomicV2TokenizerTest | 8,455 (+766 official grapheme cases) |
+| SpiritEntrySupportedWalkingTest | 555 |
+| SupportedWalkingIntegrationTest | 93 |
+| WalkIntentLifetimeTest | 9,457 |
+| WalkingModePolicyTest | 14,062 |
+
+Packaging/runner fixtures, decoded metadata, descriptor rejection regressions,
+and `verifyProductionJar` passed for `build/libs/mysticism-1.0-SNAPSHOT.jar`.
+Malformed persistence fixtures intentionally emit rejection warnings/exceptions;
+their assertions passed. Compilation still reports existing API Guardian,
+mixin-target and deprecated API warnings; Gradle reports deprecated features.
 
 Runtime checks are main-based tests under `src/runtimeTest`, discovered by
 `runtimeSelfTest`; Gradle's framework `test` action is intentionally skipped.
-The full build must discover eleven runtime suites, run packaging/runner
-fixtures and verify the remapped production artifact. Checks include actual SAT
+The full build discovered eleven runtime suites, ran packaging/runner
+fixtures and verified the remapped production artifact. Checks include actual SAT
 mesh contact and accepted-cell inverse primitives, plus source-contract checks
 of production wiring. They do not instantiate a Minecraft player/server.
 Tokenizer fixtures include 2,058 exact HF reference cases and all 766 official
