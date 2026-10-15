@@ -1,5 +1,8 @@
 # Retained unit: native v2 pooling and normalization
 
+This parent handoff is historical. See [merged integration validation](runtime-embedding-integration.md)
+for current candidate results, including the combined pooling/readiness regression.
+
 Scope: `feat-runtime-embeddings-embedded-pooling`, targeting **dev**, never main.
 Per-player deep/shallow projection, source-coordinate octree ownership/growth,
 custom terrain rendering/collision and persistence policy are untouched.
