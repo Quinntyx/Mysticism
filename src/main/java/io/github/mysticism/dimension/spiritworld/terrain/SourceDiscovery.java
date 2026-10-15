@@ -13,8 +13,9 @@ import java.util.*;
  * <p>Entry and shallow movement keep their immediate bounded near-field requests; this planner
  * schedules the remaining source observation across the whole render/view distance instead of a
  * fixed tiny neighborhood. One aligned side-32 tile is the largest single bounded
- * {@link SourceLandmarks#region} volume (32^3 = 32768 cells), so coverage is a center-out schedule
- * of tiles, each a real generated-source read, rather than one oversized query.</p>
+ * {@link SourceLandmarks#region} volume (32^3 = 32768 cells). A short multi-bearing horizon
+ * bootstrap precedes dense center-out fill, each tile a real generated-source read rather than
+ * one oversized query or a fabricated coarse terrain sample.</p>
  *
  * <p>Pure geometry/scheduling only: no world access, registry work or threading. The caller
  * (SpiritTerrainService) owns issue rate, ingestion and window lifecycle.</p> */
@@ -93,6 +94,26 @@ public final class SourceDiscovery {
         // No truncation: the full render-distance box is scheduled. The tile queue is cheap; the
         // bounded issue rate and node budget are what keep discovery progressive and bounded.
         return List.copyOf(tiles);
+    }
+
+    /** Bootstrap real observations across the visible horizon before filling the dense center-out
+     * volume. Near reads already protect the walking patch. Two source Y layers and eight bearings
+     * at successively halved distances expose actual source silhouettes, never generated proxies.
+     * Every tile still occurs exactly once; replans skip covered/pending seeds normally. */
+    static List<Bounds> discoveryOrder(Vec3d center,int viewChunks) {
+        List<Bounds> dense=plan(center,viewChunks);
+        if(viewChunks<=2)return dense;
+        Set<Bounds> available=new HashSet<>(dense);var order=new LinkedHashSet<Bounds>();
+        order.addAll(dense.subList(0,Math.min(4,dense.size())));
+        for(int distance=horizontalRadius(viewChunks);distance>=TILE;distance/=2) {
+            double edge=distance-.5,diagonal=distance/Math.sqrt(2);
+            double[][] bearings={{edge,0},{-edge,0},{0,edge},{0,-edge},
+                    {diagonal,diagonal},{-diagonal,diagonal},{diagonal,-diagonal},{-diagonal,-diagonal}};
+            // Quantize actual world positions, not signed tile deltas: floor(-d) is
+            // asymmetric at the origin and otherwise misses the negative diagonals.
+            for(int y:new int[]{0,-1})for(var bearing:bearings){Bounds b=tile(center.add(bearing[0],0,bearing[1]),0,y,0);if(available.contains(b))order.add(b);}
+        }
+        order.addAll(dense);return List.copyOf(order);
     }
 
     /** True when every cell of the tile lies outside the retained discovery extent. */
@@ -291,7 +312,7 @@ public final class SourceDiscovery {
             covered.removeAll(expired);retryAt.keySet().removeAll(expired);
             budgetEvicted.removeAll(expired);inFlight.removeAll(expired);
             queue.clear();
-            for (Bounds tile : plan(center, viewChunks)) if (!covered.contains(tile) && !inFlight.contains(tile)) queue.add(tile);
+            for (Bounds tile : discoveryOrder(center, viewChunks)) if (!covered.contains(tile) && !inFlight.contains(tile)) queue.add(tile);
             return expired;
         }
 

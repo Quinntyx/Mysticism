@@ -68,6 +68,27 @@ public final class GeneratedSourceReaderMultiChunkTest {
             "both chunks contribute exactly their half: "+materialsByHalf);
         check(region.cells().stream().noneMatch(c->c.position().x()>=16&&c.position().x()<32),"the ungenerated middle chunk contributes nothing");
         check(region.cells().stream().allMatch(SourceLandmarks.Cell::sky),"missing heightmap proof conservatively marks every decoded cell as sky-exposed");
+        var tasks=new ArrayDeque<Runnable>();boolean[] reject={true};
+        var fast=new GeneratedSourceReader("minecraft:overworld",bounds,task->{
+            if(reject[0])throw new java.util.concurrent.RejectedExecutionException("held worker saturated");tasks.add(task);
+        },-64,384,63,savedChunks(roots));
+        // State left by partial live sampling before this chunk unloads. The saved
+        // snapshot must replace that same source position, never append an overlap.
+        fast.cells[0]=new SourceLandmarks.Cell(new BlockPoint(0,0,0),new BlockPalette.State("minecraft:dirt",Map.of()),"minecraft:plains",true);
+        fast.cellIndex=1;
+        for(int i=0;i<4;i++)check(!fast.advanceDiscovery(),"saturated fast decoder retains pending scans, never falls back to inline decoding");
+        check(tasks.isEmpty(),"no accepted worker tasks under saturation");reject[0]=false;
+        int turns=0;boolean done=false;
+        while(turns++<10&&!(done=fast.advanceDiscovery())){check(fast.lastSampled==0,"saved horizon rows never copy voxel-by-voxel on owner ticks");while(!tasks.isEmpty())tasks.removeFirst().run();}
+        check(done&&turns<=5,"three chunks including an ungenerated hole decode in a handful of bounded turns");
+        var result=fast.resultAsync();while(!tasks.isEmpty())tasks.removeFirst().run();var accelerated=result.join();
+        check(!accelerated.complete()&&new HashSet<>(accelerated.cells()).equals(new HashSet<>(region.cells())),"accelerated path preserves exact material/biome/sky/unknown semantics across each chunk");
+        check(accelerated.cells().size()==1024&&accelerated.cells().stream().map(SourceLandmarks.Cell::position).distinct().count()==1024,"partial live-to-saved transition preserves exact coverage without duplicates or stale material");
+        var shared=accelerated.cells().stream().filter(c->c.position().x()<16).findFirst().orElseThrow().material();
+        check(accelerated.cells().stream().filter(c->c.position().x()<16).allMatch(c->c.material()==shared),"one actual palette descriptor shared by all cells of a saved section (no per-voxel map allocations)");
+        var hold=new GeneratedSourceReader("minecraft:overworld",bounds,tasks::add,-64,384,63,savedChunks(roots));
+        hold.advanceDiscovery();hold.advanceDiscovery();hold.cancel();while(!tasks.isEmpty())tasks.removeFirst().run();
+        try{hold.advanceDiscovery();throw new AssertionError("cancelled fast reader resumed");}catch(java.util.concurrent.CancellationException expected){checks++;}
         System.out.println("GeneratedSourceReaderMultiChunkTest: "+checks+" checks passed");
     }
 }

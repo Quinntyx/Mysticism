@@ -211,7 +211,7 @@ public final class SourceLandmarks {
         void pause(){if(resume==null)resume=SpiritActivityService.pauseLandmarkMutations(s.server);}
         void cancel(Throwable failure){done=true;if(reader!=null)reader.cancel();if(geometryRead!=null)geometryRead.cancel();if(work!=null)work.cancel(false);if(mutation!=null&&!mutation.complete())mutation.cancel();if(history!=null)history.cancel();future.completeExceptionally(failure);}
         void release(){if(resume!=null){resume.run();resume=null;}}
-        boolean observe(){if(snapshot!=null)return snapshot.isDone();if(reader==null){ServerWorld world=s.world(dimension);if(world==null)throw new IllegalStateException("source world unavailable");reader=new GeneratedSourceReader(world,bounds,s.worker);}s.status="Source read";boolean complete=reader.advance(512);s.lastCells=reader.lastSampled;if(complete){var next=reader.resultAsync();if(next==null)return false; // saturated worker; retry completion next tick
+        boolean observe(){if(snapshot!=null)return snapshot.isDone();if(reader==null){ServerWorld world=s.world(dimension);if(world==null)throw new IllegalStateException("source world unavailable");reader=new GeneratedSourceReader(world,bounds,s.worker);}s.status="Source read";boolean complete=this instanceof DiscoveryRead?reader.advanceDiscovery():reader.advance(512);s.lastCells=reader.lastSampled;if(complete){var next=reader.resultAsync();if(next==null)return false; // saturated worker; retry completion next tick
             snapshot=next;work=snapshot;}return false;}
     }
     private static final class Read extends Operation<Region> {

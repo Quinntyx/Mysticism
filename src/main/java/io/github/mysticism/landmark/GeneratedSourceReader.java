@@ -20,6 +20,42 @@ final class GeneratedSourceReader {
     final Executor executor; int chunkIndex,cellIndex,lastSampled; boolean cancelled;
     CompletableFuture<List<SourceLandmarks.Cell>> disk;List<SourceLandmarks.Cell> diskRows;int diskCursor;
     LimitedCollector collector;CompletableFuture<?> scan;
+    private final Map<net.minecraft.block.BlockState,BlockPalette.State> livePalette=new HashMap<>();
+    private final List<FastDisk> fastDisk=new ArrayList<>();
+    private final List<List<SourceLandmarks.Cell>> fastRows=new ArrayList<>();
+    private static final class FastDisk {
+        final ChunkPos pos;final LimitedCollector collector;final CompletableFuture<?> scan;
+        CompletableFuture<List<SourceLandmarks.Cell>> decoded;
+        FastDisk(ChunkPos pos,LimitedCollector collector,CompletableFuture<?> scan){this.pos=pos;this.collector=collector;this.scan=scan;}
+    }
+    /** Discovery may examine a full tile per turn, still under the live sampler's 1.5ms deadline.
+     * Saved chunks decode concurrently (at most four outstanding); their immutable rows are not
+     * copied voxel-by-voxel on the server. Ordinary urgent reads keep their existing small slices. */
+    boolean advanceDiscovery() {
+        lastSampled=0;if(cancelled)throw new CancellationException();
+        for(var it=fastDisk.iterator();it.hasNext();) {
+            var pending=it.next();
+            if(pending.decoded==null && pending.scan.isDone()) {
+                pending.scan.getNow(null); // propagate real IO failure, never invent generated air
+                try {pending.decoded=CompletableFuture.supplyAsync(()->Arrays.stream(decode(pending.collector.getRoot(),pending.pos,bounds,bottom,height)).filter(Objects::nonNull).toList(),executor);}
+                catch(RejectedExecutionException busy){continue;}
+            }
+            if(pending.decoded!=null && pending.decoded.isDone()){fastRows.add(pending.decoded.getNow(List.of()));it.remove();}
+        }
+        long deadline=System.nanoTime()+1_500_000L;int sampled=0;
+        while(chunkIndex<chunks.size() && fastDisk.size()<4 && System.nanoTime()<deadline) {
+            ChunkPos cp=chunks.get(chunkIndex);
+            if(io.live(cp)==null) {
+                var collector=new LimitedCollector();fastDisk.add(new FastDisk(cp,collector,io.scan(cp,collector)));chunkIndex++;cellIndex=0;
+            } else {
+                // advance itself has a deadline too; never allow one allowance per live chunk.
+                advance(32768-sampled,deadline);sampled+=lastSampled;
+                if(sampled>=32768)break;
+            }
+        }
+        lastSampled=sampled;
+        return chunkIndex==chunks.size() && fastDisk.isEmpty();
+    }
     /** Chunk presence + read-only NBT scan; the world-backed adapter in production, a fake in regressions. */
     interface ChunkIo {
         WorldChunk live(ChunkPos pos);
@@ -48,7 +84,8 @@ final class GeneratedSourceReader {
     /** Advancing to the next chunk clears ALL per-chunk decode state: a new chunk must never
      * decode the previous chunk's NBT (or reuse a completed scan of a different/ungenerated chunk). */
     private void completeChunk(){disk=null;diskRows=null;diskCursor=0;collector=null;scan=null;chunkIndex++;cellIndex=0;}
-    boolean advance(int budget) {
+    boolean advance(int budget) {return advance(budget,System.nanoTime()+1_500_000L);}
+    private boolean advance(int budget,long deadline) {
         lastSampled=0;if(cancelled)throw new CancellationException();
         if(chunkIndex==chunks.size())return true;
         ChunkPos cp=chunks.get(chunkIndex);
@@ -68,23 +105,35 @@ final class GeneratedSourceReader {
             return false;
         }
         Bounds slice=new Bounds(Math.max(bounds.minX(),cp.getStartX()),bounds.minY(),Math.max(bounds.minZ(),cp.getStartZ()),Math.min(bounds.maxX(),cp.getStartX()+16L),bounds.maxY(),Math.min(bounds.maxZ(),cp.getStartZ()+16L));
-        int volume=(int)((slice.maxX()-slice.minX())*(slice.maxY()-slice.minY())*(slice.maxZ()-slice.minZ()));int sampled=0;long deadline=System.nanoTime()+1_500_000L;
+        int volume=(int)((slice.maxX()-slice.minX())*(slice.maxY()-slice.minY())*(slice.maxZ()-slice.minZ()));int sampled=0;
         while(cellIndex<volume && sampled<budget && (sampled==0||System.nanoTime()<deadline)) {
             BlockPoint p=point(slice,cellIndex++);int i=index(bounds,p);sampled++;lastSampled++;
             if(p.y()<bottom || p.y()>=bottom+height)continue;
             BlockPos pos=new BlockPos((int)p.x(),(int)p.y(),(int)p.z());var state=live.getBlockState(pos);
-            Map<String,String> properties=new TreeMap<>();state.getEntries().forEach((key,value)->properties.put(key.getName(),name(key,value)));
+            BlockPalette.State material=livePalette.computeIfAbsent(state,value->{
+                Map<String,String> properties=new TreeMap<>();value.getEntries().forEach((key,entry)->properties.put(key.getName(),name(key,entry)));
+                return new BlockPalette.State(Registries.BLOCK.getId(value.getBlock()).toString(),properties);
+            });
             String biome=live.getBiomeForNoiseGen(pos.getX()>>2,pos.getY()>>2,pos.getZ()>>2).getKey().map(k->k.getValue().toString()).orElse(null);
-            if(biome!=null)cells[i]=new SourceLandmarks.Cell(p,new BlockPalette.State(Registries.BLOCK.getId(state.getBlock()).toString(),properties),biome,
+            if(biome!=null)cells[i]=new SourceLandmarks.Cell(p,material,biome,
                 p.y()>live.sampleHeightmap(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,pos.getX()&15,pos.getZ()&15));
         }
         if(cellIndex==volume){completeChunk();}
         return chunkIndex==chunks.size();
     }
     /** Null only on a saturated worker; the caller retries next tick. */
-    CompletableFuture<SourceLandmarks.Region> resultAsync(){var copy=cells.clone();try{return CompletableFuture.supplyAsync(()->new SourceLandmarks.Region(dimension,bounds,Arrays.stream(copy).filter(Objects::nonNull).toList(),Arrays.stream(copy).allMatch(Objects::nonNull)),executor);}catch(RejectedExecutionException busy){return null;}}
+    CompletableFuture<SourceLandmarks.Region> resultAsync(){
+        var copy=cells.clone();var rows=List.copyOf(fastRows);
+        try{return CompletableFuture.supplyAsync(()->{
+            // A live chunk may unload after partial sampling. Saved rows then replace
+            // those positions, rather than duplicating cells or preserving stale material.
+            for(var batch:rows)for(var cell:batch)copy[index(bounds,cell.position())]=cell;
+            var result=Arrays.stream(copy).filter(Objects::nonNull).toList();
+            return new SourceLandmarks.Region(dimension,bounds,result,result.size()==copy.length);
+        },executor);}catch(RejectedExecutionException busy){return null;}
+    }
     private static int index(Bounds b,BlockPoint p){return (int)((p.x()-b.minX())+(b.maxX()-b.minX())*((p.z()-b.minZ())+(b.maxZ()-b.minZ())*(p.y()-b.minY())));}
-    void cancel(){cancelled=true;if(disk!=null)disk.cancel(false);}
+    void cancel(){cancelled=true;if(disk!=null)disk.cancel(false);for(var pending:fastDisk){pending.scan.cancel(false);if(pending.decoded!=null)pending.decoded.cancel(false);}fastDisk.clear();fastRows.clear();}
     @SuppressWarnings({"rawtypes","unchecked"}) private static String name(Property p,Comparable value){return p.name(value);}
     static BlockPoint point(Bounds b,int i){long dx=b.maxX()-b.minX(),dz=b.maxZ()-b.minZ();return new BlockPoint(b.minX()+i%dx,b.minY()+i/(dx*dz),b.minZ()+(i/dx)%dz);}
     static final class LimitedCollector extends SelectiveNbtCollector {
@@ -100,22 +149,33 @@ final class GeneratedSourceReader {
         if(!(root instanceof NbtCompound n) || !Set.of("full","minecraft:full").contains(n.getString("Status")))return result;
         NbtList sections=n.getList("sections",NbtElement.COMPOUND_TYPE);if(sections.size()>64)throw new IllegalArgumentException("chunk section budget");
         Map<Integer,NbtCompound> byY=new HashMap<>();for(int i=0;i<sections.size();i++){var section=sections.getCompound(i);byY.put((int)section.getByte("Y"),section);}
+        // Decode each immutable section palette once, not a State/TreeMap per source voxel.
+        // This is detached worker work, but reducing its allocation rate prevents wide views
+        // from flooding the heap/GC and stalling movement despite bounded tick callbacks.
+        record Section(NbtList palette,NbtList biomes,long[] blocks,long[] biomeData,BlockPalette.State[] states) {}
+        Map<Integer,Section> decoded=new HashMap<>();
+        byY.forEach((y,section)->{
+            var bs=section.getCompound("block_states");var biomes=section.getCompound("biomes");
+            var palette=bs.getList("palette",NbtElement.COMPOUND_TYPE);var names=biomes.getList("palette",NbtElement.STRING_TYPE);
+            if(!palette.isEmpty()&&!names.isEmpty())decoded.put(y,new Section(palette,names,bs.getLongArray("data"),biomes.getLongArray("data"),new BlockPalette.State[palette.size()]));
+        });
         long[] heights=n.getCompound("Heightmaps").getLongArray("MOTION_BLOCKING_NO_LEAVES");
         for(int i=0;i<volume;i++) {
             BlockPoint p=point(bounds,i);if(Math.floorDiv(p.x(),16)!=cp.x || Math.floorDiv(p.z(),16)!=cp.z || p.y()<bottom || p.y()>=bottom+height)continue;
-            NbtCompound section=byY.get(Math.floorDiv((int)p.y(),16));if(section==null)continue; // absent section/biome is UNKNOWN, never invented air
-            NbtCompound bs=section.getCompound("block_states"),biomes=section.getCompound("biomes");
-            NbtList palette=bs.getList("palette",NbtElement.COMPOUND_TYPE),bio=biomes.getList("palette",NbtElement.STRING_TYPE);
-            if(palette.isEmpty() || bio.isEmpty())continue;
+            Section section=decoded.get(Math.floorDiv((int)p.y(),16));if(section==null)continue; // absent section/biome is UNKNOWN, never invented air
             int x=(int)p.x()&15,y=(int)p.y()&15,z=(int)p.z()&15;
-            int index=packed(bs.getLongArray("data"),palette.size(),4,y*256+z*16+x);
-            int biomeIndex=packed(biomes.getLongArray("data"),bio.size(),1,(y>>2)*16+(z>>2)*4+(x>>2));
-            if(index<0 || index>=palette.size() || biomeIndex<0 || biomeIndex>=bio.size())continue;
-            NbtCompound state=palette.getCompound(index);Map<String,String> props=new TreeMap<>();NbtCompound properties=state.getCompound("Properties");
-            if(properties.getSize()>64)throw new IllegalArgumentException("state property budget");for(String key:properties.getKeys())props.put(key,properties.getString(key));
+            int index=packed(section.blocks,section.palette.size(),4,y*256+z*16+x);
+            int biomeIndex=packed(section.biomeData,section.biomes.size(),1,(y>>2)*16+(z>>2)*4+(x>>2));
+            if(index<0 || index>=section.palette.size() || biomeIndex<0 || biomeIndex>=section.biomes.size())continue;
+            BlockPalette.State material=section.states[index];
+            if(material==null){
+                NbtCompound state=section.palette.getCompound(index);Map<String,String> props=new TreeMap<>();NbtCompound properties=state.getCompound("Properties");
+                if(properties.getSize()>64)throw new IllegalArgumentException("state property budget");for(String key:properties.getKeys())props.put(key,properties.getString(key));
+                section.states[index]=material=new BlockPalette.State(state.getString("Name"),props);
+            }
             int h=packedBits(heights,32-Integer.numberOfLeadingZeros(height),z*16+x);
             boolean sky=h<0 || p.y()>bottom+h-1; // missing height proof conservatively forbids a closed cave
-            result[i]=new SourceLandmarks.Cell(p,new BlockPalette.State(state.getString("Name"),props),bio.getString(biomeIndex),sky);
+            result[i]=new SourceLandmarks.Cell(p,material,section.biomes.getString(biomeIndex),sky);
         }
         return result;
     }

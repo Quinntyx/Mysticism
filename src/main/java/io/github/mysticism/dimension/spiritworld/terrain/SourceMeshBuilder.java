@@ -36,6 +36,11 @@ final class SourceMeshBuilder {
         int light=(world.getLightLevel(LightType.BLOCK,position)<<4)|(world.getLightLevel(LightType.SKY,position)<<20);
         return tile(state,world,position,color,light);
     }
+    static DiscoveryMeshPipeline.Resolved storedDiscovery(BlockPalette.State material,BlockPos position) {
+        BlockState state=resolve(new TerrainMeshFrame.Material(material.blockId(),material.properties()));
+        return new DiscoveryMeshPipeline.Resolved(tile(state,EmptyBlockView.INSTANCE,position,0xffffff,0xf000f0),
+                !state.getBlock().hasDynamicBounds());
+    }
     static Tile stored(BlockPalette.State material,BlockPos position) {
         return tile(resolve(new TerrainMeshFrame.Material(material.blockId(),material.properties())),EmptyBlockView.INSTANCE,position,0xffffff,0xf000f0);
     }

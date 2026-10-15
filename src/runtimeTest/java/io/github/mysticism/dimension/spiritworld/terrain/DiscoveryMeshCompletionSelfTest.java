@@ -63,7 +63,7 @@ public final class DiscoveryMeshCompletionSelfTest {
     private static final class Fixture {
         final Object window;final Map<Bounds,CompletableFuture<SourceLandmarks.Region>> requests;
         final Map<Bounds,List<SourceMeshBuilder.Node>> retained;final SourceDiscovery.Scheduler scheduler;final DiscoveryMeshPipeline pipeline;
-        int materialized;boolean fail;final Thread owner=Thread.currentThread();
+        int materialized;boolean fail,reusable;final Thread owner=Thread.currentThread();
         @SuppressWarnings("unchecked") Fixture(Object window) throws Exception {
             this.window=window;
             requests=(Map<Bounds,CompletableFuture<SourceLandmarks.Region>>)field(WINDOW,"discoveryPending").get(window);
@@ -72,7 +72,7 @@ public final class DiscoveryMeshCompletionSelfTest {
             pipeline=new DiscoveryMeshPipeline(DIM,scheduler,requests,retained,(cell,at)->{
                 check(Thread.currentThread()==owner,"registry/collision-shape materialization stays on the server thread");materialized++;
                 if(fail)throw new IllegalArgumentException("bad material fixture");
-                return cell.material().blockId().equals("minecraft:stone")?STONE:DIRT;
+                return new DiscoveryMeshPipeline.Resolved(cell.material().blockId().equals("minecraft:stone")?STONE:DIRT,reusable);
             });
             field(WINDOW,"discoveryMeshes").set(window,pipeline);pipeline.refresh(Vec3d.ZERO,false);
         }
@@ -98,6 +98,10 @@ public final class DiscoveryMeshCompletionSelfTest {
         return List.copyOf(nodes);
     }
     private static DiscoveryMeshPipeline.Budget unlimited(){return new DiscoveryMeshPipeline.Budget(256,1,()->0);}
+    private static void index(Harness h,Fixture f,long tick) throws Exception {
+        int before=f.materialized;f.pipeline.advance(unlimited(),h.worker,tick);h.worker.runOne();
+        check(f.materialized==before,"detached indexing never evaluates registry/shape callbacks");
+    }
 
     private static void fullTileThroughProductionContext() throws Exception {
         var h=new Harness();var f=h.window();Bounds tile=Bounds.cube(0,0,0,32),near=Bounds.cube(64,0,0,32),far=Bounds.cube(256,0,0,32);
@@ -123,12 +127,13 @@ public final class DiscoveryMeshCompletionSelfTest {
         check(f.nodes().size()==65536&&f.retained.get(tile).size()==32768,"checkerboard materials survive detached compaction without filling or dropping cells");
         check(f.scheduler.next(h.tick)==null,"completed tile is covered and evicted tile has cooldown");
         check(f.scheduler.next(h.tick+SourceDiscovery.RETRY_ERROR_TICKS).equals(far),"worker eviction is applied to real scheduler coverage for rediscovery");
-        check(h.worker.ran>=2,"both prior-data retention and full-tile compaction used detached work");
+        check(h.worker.ran>=2,"both observation indexing and full-tile compaction used detached work");
     }
 
     private static void sharedBudgetAndHeldWorker() throws Exception {
         var h=new Harness();var fs=new ArrayList<Fixture>();
         for(int i=0;i<8;i++){var f=h.window();fs.add(f);f.source(Bounds.cube(0,0,0,32),cells(Bounds.cube(0,0,0,32),256),true);}
+        for(var f:fs)index(h,f,0);
         for(int tick=0;tick<40;tick++){
             int before=fs.stream().mapToInt(f->f.materialized).sum();h.step();int used=fs.stream().mapToInt(f->f.materialized).sum()-before;
             check(used<=DiscoveryMeshPipeline.CELLS_PER_TICK,"actual Context shares one global materialization allowance across eight players");
@@ -143,7 +148,7 @@ public final class DiscoveryMeshCompletionSelfTest {
 
     private static void revisionsCancellationAndFailure() throws Exception {
         var h=new Harness();var f=h.window();Bounds tile=Bounds.cube(0,0,0,32);var source=f.source(tile,cells(tile,8),false);
-        h.worker.reject=true;
+        index(h,f,0);h.worker.reject=true;
         f.pipeline.advance(unlimited(),h.worker,0);
         check(f.materialized==8&&f.requests.get(tile)==source&&f.retained.isEmpty(),"worker rejection preserves completed cells/request identity without inline fallback");
         h.worker.reject=false;f.pipeline.advance(unlimited(),h.worker,1);h.worker.runOne();
@@ -157,26 +162,27 @@ public final class DiscoveryMeshCompletionSelfTest {
         Bounds queued;while((queued=f.scheduler.next(3))!=null){check(!queued.equals(tile),"partial observation respects its retry cooldown");f.scheduler.pending(queued);}
         check(tile.equals(f.scheduler.next(3+SourceDiscovery.RETRY_INCOMPLETE_TICKS)),"partial observation is retried rather than granting permanent coverage");
 
-        var old=f.source(tile,cells(tile,8),true);f.pipeline.advance(unlimited(),h.worker,4);
+        var old=f.source(tile,cells(tile,8),true);index(h,f,4);f.pipeline.advance(unlimited(),h.worker,4);
         invoke(CANCEL,null,f.window); // actual window cleanup, while compaction is queued
         var replacement=f.source(tile,cells(tile,1),true);
         h.worker.runOne();f.pipeline.advance(unlimited(),h.worker,5);
         check(f.requests.get(tile)==replacement&&old.isDone()&&f.retained.isEmpty(),"late cancelled work cannot displace fresh same-tile request or restore retired data");
         h.worker.runOne();f.pipeline.advance(unlimited(),h.worker,6);
+        h.worker.runOne();f.pipeline.advance(unlimited(),h.worker,6);
         check(f.requests.isEmpty()&&f.retained.get(tile).size()==1,"fresh request still publishes after window cancellation");
         f.fail=true;f.source(Bounds.cube(32,0,0,32),cells(Bounds.cube(32,0,0,32),8),true);
-        f.pipeline.advance(unlimited(),h.worker,7);
+        index(h,f,7);f.pipeline.advance(unlimited(),h.worker,7);
         check(f.requests.isEmpty()&&f.retained.size()==1,"registry failure cannot publish a partial tile or drop prior valid terrain");
     }
     private static void deadlineAndAirBudget() throws Exception {
         var h=new Harness();var f=h.window();Bounds tile=Bounds.cube(0,0,0,32);f.source(tile,cells(tile,20),true);
-        long[] clock={0};var budget=new DiscoveryMeshPipeline.Budget(256,3,()->clock[0]++);
+        index(h,f,0);long[] clock={0};var budget=new DiscoveryMeshPipeline.Budget(256,3,()->clock[0]++);
         f.pipeline.advance(budget,h.worker,0);
         check(f.materialized==2&&budget.remaining()==254,"elapsed budget stops materialization before the cell-count cap");
         invoke(CANCEL,null,f.window);var air=new BlockPalette.State("minecraft:air",Map.of());
         var cells=new ArrayList<SourceLandmarks.Cell>();for(int i=0;i<1000;i++)cells.add(new SourceLandmarks.Cell(new BlockPoint(i%32,i/1024,(i/32)%32),air,"minecraft:plains",true));
-        f.source(tile,cells,true);budget=unlimited();f.pipeline.advance(budget,h.worker,1);
-        check(budget.remaining()==256-DiscoveryMeshPipeline.CELLS_PER_WINDOW,"air scanning is budgeted too, not an unbounded zero-shape loop");
+        f.source(tile,cells,true);index(h,f,1);budget=unlimited();f.pipeline.advance(budget,h.worker,1);
+        check(budget.remaining()==256,"air scans stay on bounded detached jobs, consuming zero owner-thread shape budget");
         check(f.materialized==2,"air never invokes the registry/collision adapter");
     }
     private static void dimensionScopedCompletion() throws Exception {
@@ -206,8 +212,28 @@ public final class DiscoveryMeshCompletionSelfTest {
         var production=(DiscoveryMeshPipeline)field(WINDOW,"discoveryMeshes").get(w);
         check(field(DiscoveryMeshPipeline.class,"dimension").get(production).equals("minecraft:the_end"),"window binds discovery pipeline to its immutable source namespace");
     }
+    private static void paletteThroughputAndHeldIndex() throws Exception {
+        var h=new Harness();var f=h.window();f.reusable=true;Bounds tile=Bounds.cube(0,0,0,32);
+        f.source(tile,cells(tile,32768),true);h.worker.reject=true;
+        for(int i=0;i<20;i++)h.step();
+        check(f.materialized==0&&f.retained.isEmpty()&&f.requests.size()==1,"index saturation never scans/materializes/publishes inline or loses the slot");
+        h.worker.reject=false;h.step();
+        for(int i=0;i<20;i++)h.step();
+        check(f.materialized==0&&f.retained.isEmpty(),"a held index cannot block owner ticks or invoke registry work");
+        int turns=0;
+        while(!f.requests.isEmpty()&&turns++<12){h.worker.runOne();h.step();}
+        check(f.requests.isEmpty()&&turns<=6,"full-size static tile publishes within six worker turns, not 512 voxel ticks");
+        check(f.materialized==2&&f.retained.get(tile).size()==32768,"two static palette evaluations preserve ALL checkerboard cells/materials, no truncation or invented coarse cubes");
+        check(f.retained.get(tile).stream().allMatch(n->n.tile().equals(((n.position().getX()+n.position().getY()+n.position().getZ())&1)==0?STONE:DIRT)),"palette expansion associates exact source positions with actual material");
+
+        // Cancellation during indexing must invalidate its result just like cancellation during compaction.
+        f.source(tile,cells(tile,32768),true);f.pipeline.advance(unlimited(),h.worker,0);
+        invoke(CANCEL,null,f.window);f.source(tile,cells(tile,1),true);
+        for(int i=0;i<8;i++){h.worker.runOne();f.pipeline.advance(unlimited(),h.worker,i);}
+        check(f.requests.isEmpty()&&f.retained.get(tile).size()==1,"late index cannot restore retired 32768-cell data over fresh same-tile request");
+    }
     public static void main(String[] args) throws Exception {
-        fullTileThroughProductionContext();sharedBudgetAndHeldWorker();revisionsCancellationAndFailure();deadlineAndAirBudget();dimensionScopedCompletion();
+        paletteThroughputAndHeldIndex();fullTileThroughProductionContext();sharedBudgetAndHeldWorker();revisionsCancellationAndFailure();deadlineAndAirBudget();dimensionScopedCompletion();
         System.out.println("DiscoveryMeshCompletionSelfTest: "+checks+" checks passed");
     }
 }
