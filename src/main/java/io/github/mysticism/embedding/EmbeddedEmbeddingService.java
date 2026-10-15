@@ -13,6 +13,7 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
     interface Model extends AutoCloseable {
         int dimensions();
         int tokens(String input);
+        /** One mean-pooled native sentence vector, not CLS/token rows or a reduced vector. */
         float[] embed(String input);
         @Override void close();
     }
@@ -60,7 +61,7 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
         work.lockInterruptibly();
         try {
             requireOpen();
-            if (model == null) throw new IllegalStateException("Embedded inference not prepared");
+            if (model == null) throw new EmbeddingModelException("Embedded inference not prepared");
             Vec384f vector = infer(model, descriptor);
             requireOpen();
             return vector;
@@ -70,19 +71,42 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
         validateDescriptor(descriptor);
         String input = "search_document: " + descriptor;
         // Use the actual GGUF tokenizer (including special tokens), never a character heuristic.
-        if (model.tokens(input) > 512) throw new IllegalArgumentException("Nomic v2 input exceeds 512 tokens; truncation is forbidden");
-        return decodeEmbedding(model.embed(input));
+        int tokens;
+        try { tokens = model.tokens(input); }
+        catch (RuntimeException | LinkageError failure) {
+            throw modelFailure("tokenization", failure);
+        }
+        if (tokens < 1) throw new EmbeddingModelException("Embedded native v2 tokenizer returned no tokens");
+        // A valid tokenizer reporting input overflow is a descriptor error, not model loss.
+        if (tokens > NativeEmbeddingOutput.MAX_TOKENS)
+            throw new IllegalArgumentException("Nomic v2 input must have 1..512 tokens; truncation is forbidden");
+        try { return decodeEmbedding(model.embed(input)); }
+        catch (RuntimeException | LinkageError failure) {
+            throw modelFailure("inference/output validation", failure);
+        }
+    }
+    private static EmbeddingModelException modelFailure(String operation, Throwable failure) {
+        if (failure instanceof EmbeddingModelException modelFailure) return modelFailure;
+        return new EmbeddingModelException("Embedded native v2 " + operation + " failed: "
+                + EmbeddingReadiness.describe(failure), failure);
     }
     private static void validateDescriptor(String descriptor) {
         if (descriptor == null || descriptor.isBlank() || descriptor.length() > 8192)
             throw new IllegalArgumentException("Descriptor must be nonempty and at most 8192 characters");
+        for (int i = 0; i < descriptor.length(); i++) {
+            char value = descriptor.charAt(i);
+            if (Character.isHighSurrogate(value)) {
+                if (++i == descriptor.length() || !Character.isLowSurrogate(descriptor.charAt(i)))
+                    throw new IllegalArgumentException("Descriptor contains unpaired UTF-16 surrogate");
+            } else if (Character.isLowSurrogate(value)) {
+                throw new IllegalArgumentException("Descriptor contains unpaired UTF-16 surrogate");
+            }
+        }
     }
     static Vec384f decodeEmbedding(float[] values) {
-        if (values == null || values.length != EmbeddingSpace.NATIVE_DIMENSIONS)
-            throw new IllegalArgumentException("Expected all 768 native Nomic v2 coordinates");
-        Vec384f vector = new Vec384f(values); // validates finiteness and takes a copy
-        if (vector.length() == 0) throw new IllegalArgumentException("Zero embedding");
-        return new Vec384f(vector.norm());
+        // llama.cpp performs MEAN pooling. Treat its result as a sentence tensor: never
+        // pool again, select CLS, resize, layer-normalize (v1), or cast before stable L2.
+        return NativeEmbeddingOutput.fromTensor(values, new long[]{1, EmbeddingSpace.NATIVE_DIMENSIONS}, null);
     }
     private void requireOpen() {
         if (closed || Thread.currentThread().isInterrupted()) throw new CancellationException("Embedded inference closed/cancelled");

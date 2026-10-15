@@ -1,5 +1,8 @@
 # Building Mysticism
 
+Current retained source/native-v2 integration checks and real-inference blockers:
+[merge-0063 validation](docs/runtime-source-embedding-integration.md).
+
 ## Toolchain
 
 - Minecraft **1.21.1**, Yarn **1.21.1+build.1**, Java **21**.
