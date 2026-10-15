@@ -448,12 +448,29 @@ public final class SpiritTerrainService {
     private static Box body(Vec3d at){return new Box(at.x-.3,at.y,at.z-.3,at.x+.3,at.y+1.8,at.z+.3);}
     private static boolean clearCachedBody(Window w,Vec3d at) {return clearCachedBody(w.tiles,at);}
     private static boolean clearCachedBody(Map<BlockPos,SourceMeshBuilder.Tile> tiles,Vec3d at) {
-        Box body=body(at);
-        for(BlockPos pos:samples(body)) {
-            var tile=tiles.get(pos);if(tile==null)return false;
-            for(Box b:tile.collision())if(b.offset(pos).intersects(body))return false;
-        }
+        Box body=body(at);if(!known(tiles,body))return false;
+        for(var source:collisionSources(tiles,body))
+            for(Box b:source.getValue().collision())if(b.offset(source.getKey()).intersects(body))return false;
         return true;
+    }
+    /** Query producing origins, not just origins inside the probe. Fences/walls rise above their
+     * source voxel; other valid mesh shapes can overhang any side. Invert the shared mesh-local
+     * envelope for a bounded candidate search, then retain only actual shapes overlapping the probe.
+     * Missing unrelated neighbor tiles are not evidence of support or a reason to reject known air
+     * in the direct footprint. A missing supporting producer simply supplies no collision. */
+    private static List<Map.Entry<BlockPos,SourceMeshBuilder.Tile>> collisionSources(
+            Map<BlockPos,SourceMeshBuilder.Tile> tiles,Box probe) {
+        Box query=probe.expand(1e-5);
+        double min=TerrainMeshFrame.MIN_LOCAL_SHAPE,max=TerrainMeshFrame.MAX_LOCAL_SHAPE;
+        var sources=new ArrayList<Map.Entry<BlockPos,SourceMeshBuilder.Tile>>();
+        for(BlockPos pos:BlockPos.iterate(MathHelper.floor(query.minX-max),MathHelper.floor(query.minY-max),MathHelper.floor(query.minZ-max),
+                MathHelper.floor(query.maxX-min),MathHelper.floor(query.maxY-min),MathHelper.floor(query.maxZ-min))) {
+            var tile=tiles.get(pos);if(tile==null)continue;
+            for(Box shape:tile.collision())if(shape.offset(pos).intersects(query)) {
+                sources.add(Map.entry(pos.toImmutable(),tile));break;
+            }
+        }
+        return sources;
     }
     private static boolean hasCachedFloor(Window w,Vec3d at) {return hasCachedFloor(w.tiles,at);}
     private static boolean hasCachedFloor(Map<BlockPos,SourceMeshBuilder.Tile> tiles,Vec3d at) {
@@ -463,9 +480,11 @@ public final class SpiritTerrainService {
         // tilted support those feet can be > .05 above its face, or over an adjacent air voxel.
         // Resolve the whole actual grounding footprint, including known air, then sweep the REAL
         // source collision shapes with the same rise/drop/normal test as projected mesh grounding.
-        for(BlockPos pos:samples(MeshCollision.supportFootprint(body))) {
-            var tile=tiles.get(pos);if(tile==null)return false;
-            if(tile.collision().isEmpty())continue;
+        // Known samples and collision producers are different sets: a 1.5-high fence at y=0 can
+        // support feet at y=1.5 although its producing voxel is outside the swept footprint at y>=1.
+        Box footprint=MeshCollision.supportFootprint(body);if(!known(tiles,footprint))return false;
+        for(var source:collisionSources(tiles,footprint)) {
+            BlockPos pos=source.getKey();var tile=source.getValue();
             if(!materials.contains(tile.material()))materials.add(tile.material());
             Vec3d min=new Vec3d(pos.getX(),pos.getY(),pos.getZ());
             cells.add(new TerrainMeshFrame.Cell(cells.size(),materials.indexOf(tile.material()),"",min,min,

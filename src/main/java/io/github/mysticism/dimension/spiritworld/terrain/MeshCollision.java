@@ -177,8 +177,10 @@ public final class MeshCollision {
     /** Actual affine SAT body clearance, including a newly acquired source window. */
     public static boolean bodyClear(TerrainMeshFrame frame,Box body) {
         Box strict=body.expand(-1e-5);
-        for(var cell:frame.cells())if(cell.bounds().intersects(strict))
-            for(Box collision:cell.collision())if(penetration(strict,new Shape(cell,collision,cell.bounds(collision)))!=null)return false;
+        for(var cell:frame.cells())for(Box collision:cell.collision()) {
+            Box bounds=cell.bounds(collision); // A fence/overhang may extend outside the unit cell.
+            if(bounds.intersects(strict) && penetration(strict,new Shape(cell,collision,bounds))!=null)return false;
+        }
         return true;
     }
     /** Continuous affine-motion guard. Endpoint AABBs are broad phase only: a tilted supporting

@@ -44,8 +44,12 @@ public final class WalkAcquisitionProofTest {
                         SpiritTerrainService.frameAxis(grid.k,observer),-1,0,1,shape)));
     }
     private static TerrainMeshFrame walking(Vec3d player,Vec3d feet,List<Box> shape){
+        return walking(player,feet,BlockPos.ORIGIN,shape);
+    }
+    private static TerrainMeshFrame walking(Vec3d player,Vec3d feet,BlockPos producer,List<Box> shape){
+        Vec3d source=new Vec3d(producer.getX(),producer.getY(),producer.getZ());
         return new TerrainMeshFrame(2,true,DIMENSION,feet,player,List.of(STONE),List.of(
-                new TerrainMeshFrame.Cell(1,0,LANDMARK,Vec3d.ZERO,player.subtract(feet),new Vec3d(1,1,1),
+                new TerrainMeshFrame.Cell(1,0,LANDMARK,source,player.subtract(feet).add(source),new Vec3d(1,1,1),
                         new Vec3d(1,0,0),new Vec3d(0,1,0),new Vec3d(0,0,1),-1,0,1,shape)));
     }
     private static boolean proof(Map<BlockPos,SourceMeshBuilder.Tile> tiles,Vec3d feet,TerrainMeshFrame previous,
@@ -121,6 +125,45 @@ public final class WalkAcquisitionProofTest {
             check(proof(tiles,at,frame,frame,player)==grounded,"source proof uses the same actual grounding reach, not a separate contact tolerance");
         }
     }
+    /** Fence/wall support extends above its producing voxel. Its origin is outside the grounding
+     * footprint even while its actual top face supports the body; the old origin-only proof misses
+     * it. Also cover horizontal positive/negative local overhangs allowed by the mesh contract. */
+    private static void neighboringProducerBecomesWalking(){
+        Vec3d player=new Vec3d(8123,70,-431.5);
+        for(int originX:new int[]{0,-1,-2,2})for(double gap:new double[]{0,.0624}){
+            BlockPos producer=new BlockPos(originX,0,0);Vec3d feet=new Vec3d(.5,1.5+gap,.5);
+            List<Box> shape=List.of(new Box(.375-originX,0,.375,.625-originX,1.5,.625));
+            var tiles=known(feet);
+            check(!tiles.containsKey(producer),"1.5-high shape producer lies outside the direct grounding footprint");
+            tiles.put(producer,tile(shape));var frame=walking(player,feet,producer,shape);
+            var previous=new TerrainMeshFrame(1,false,DIMENSION,feet,player,frame.materials(),frame.cells());
+            check(MeshCollision.ground(new MeshCollision.Index(previous),body(player)).isPresent(),"displayed deep-frame tall shape supplies real mesh ground contact");
+            check(MeshCollision.bodyClear(frame,body(player)),"standing above tall shape does not penetrate it");
+            boolean acquired=proof(tiles,feet,previous,frame,player);
+            check(acquired,"neighboring cached shape producer permits acquisition instead of expiring the walk request");
+            var nav=new SpiritNavigation();nav.enterDeep();nav.setSemanticReady(true);nav.setSupportApproach(true);
+            nav.target(DIMENSION,"captured-destination",new Vec3d(17.5,80,-30.5),new Basis384f());long epoch=nav.motionEpoch();
+            var support=new SpiritTerrainService.WalkSupport(LANDMARK,DIMENSION,feet,new Basis384f(),Vec384f.ZERO(),new Vec3d(0,1,0),1,1);
+            check(acquired && SpiritNavigationService.commitSupportMapping(nav,support,
+                    Optional.of(new SpiritTerrainService.SourcePosition(DIMENSION,feet,LANDMARK))),"tall support acquisition reaches production walking-state commit");
+            check(nav.active() && !nav.deep() && !nav.supportApproach() && nav.motionEpoch()>epoch,"tall support leaves flight/request state and invalidates prediction");
+            check(nav.sourcePosition().equals(feet) && nav.landmarkId().equals(LANDMARK)
+                    && nav.targetLandmarkId().equals("captured-destination"),"tall support keeps exact feet, owner and captured destination");
+            tiles.remove(producer);
+            check(!proof(tiles,feet,previous,frame,player),"known air without a cached supporting producer cannot acquire walking");
+            tiles.put(producer,tile(shape));tiles.remove(new BlockPos(0,1,0));
+            check(!proof(tiles,feet,previous,frame,player),"neighbor support does not hide unknown direct footprint samples");
+        }
+        Vec3d feet=new Vec3d(.5,1.49,.5);var shape=List.of(new Box(.375,0,.375,.625,1.5,.625));
+        var tiles=known(feet);tiles.put(BlockPos.ORIGIN,tile(shape));var penetrating=walking(player,feet,shape);
+        check(!MeshCollision.bodyClear(penetrating,body(player)),"actual over-height mesh bounds detect penetration outside the producer's unit box");
+        check(!proof(tiles,feet,penetrating,penetrating,player),"over-height source body obstruction cannot be accepted as walking support");
+        // Keep the displayed frame clear to independently exercise source body clearance for a
+        // neighboring tall collider, rather than passing only because the projected mesh vetoed it.
+        var clear=walking(player,feet,List.of(new Box(0,0,0,1,1,1)));
+        check(MeshCollision.bodyClear(clear,body(player)),"independent source-obstruction fixture has a clear projected frame");
+        check(!proof(tiles,feet,clear,clear,player),"neighbor-origin source collision still vetoes acquisition with a clear projected frame");
+    }
     private static void changedMappingStaysDeep(){
         Vec3d feet=new Vec3d(.5,1.0624,.5);var nav=new SpiritNavigation();nav.enterDeep();nav.setSupportApproach(true);
         var support=new SpiritTerrainService.WalkSupport(LANDMARK,DIMENSION,feet,new Basis384f(),Vec384f.ZERO(),new Vec3d(0,1,0),1,1);
@@ -130,7 +173,7 @@ public final class WalkAcquisitionProofTest {
         check(nav.deep() && nav.supportApproach(),"failed mapping validation does not falsely publish walking state");
     }
     public static void main(String[] args){
-        alignedSupportBecomesWalking();footprintAndShapeEvidence();changedMappingStaysDeep();
+        alignedSupportBecomesWalking();footprintAndShapeEvidence();neighboringProducerBecomesWalking();changedMappingStaysDeep();
         System.out.println("Walk acquisition proof self-tests passed: source footprint through walking state ("+checks+" checks)");
     }
 }
