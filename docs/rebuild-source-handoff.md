@@ -15,6 +15,8 @@ public static CompletableFuture<Optional<LandmarkMetadata>> refine(
     MinecraftServer server, String dimension, BlockPos position);
 public static CompletableFuture<Region> region(
     MinecraftServer server, String dimension, Bounds sourceBounds, int maxCells);
+public static CompletableFuture<Region> discoveryRegion(
+    MinecraftServer server, String dimension, Bounds sourceBounds, int maxCells);
 public static CompletableFuture<Optional<BlockPos>> safeAir(
     MinecraftServer server, String dimension, BlockPos position, int radius);
 public static CompletableFuture<Boolean> transfer(
@@ -53,7 +55,7 @@ boolean isCurrent(MinecraftServer server);
 
 Call on server thread after normal source init. Result is an immutable map of exact native source blocks to canonical source IDs. Both observed AIR and SOLID octree leaves count; UNKNOWN/unowned blocks have **no entry**. AABBs only select candidate/page IO, never assign ownership. Full requested volume must fit `maxCells <=32768`; no partial/truncated success. Conflict between different source masks fails rather than guessing. No source-world access, chunk loads, inference, or readiness dependency. Completed maps are detached immutable snapshots; `isCurrent(server)` checks same store instance and a runtime source-topology stamp. Creation, growth, transfer, merge, split, delete or reset invalidates old maps; activity-only CAS does not. This adds no saved schema/migration.
 
-One ownership request advances/server tick alongside extraction: <=4 metadata records **or** <=1 geometry page with <=512 reconstructed leaves **or** <=256 octree node visits/128 staged leaves **or** <=256 block-map insertions. Queue <=8 including the active request; at most one retained page and 128 staged leaf ranges. Cancellation is polled on tick; dimension unload/server stop cancel queued/active reads and release the shared repository geometry cursor. A concurrent source publication fails the request as stale; consumer re-requests. Cold NBT IO remains synchronous and page-bounded, not a hard wall-clock guarantee. Entire catalogue traversal is resumable; a large catalogue or shared reader contention can delay completion.
+One ownership request advances/server tick alongside extraction: <=4 metadata records **or** <=1 geometry page with <=512 reconstructed leaves **or** <=256 octree node visits/128 staged leaves **or** <=256 block-map insertions. Queue <=8 including the active request; at most one retained page and 128 staged leaf ranges. Cancellation is polled on tick; dimension unload/server stop cancel queued/active reads and release the ownership cursor. Ownership proofs have one dedicated store cursor alongside (not instead of) the exclusive discovery cursor; see the ownership latency repair below. A concurrent source publication fails the request as stale; consumer re-requests. Cold NBT IO remains synchronous and page-bounded, not a hard wall-clock guarantee. Entire catalogue traversal is resumable; a large catalogue or queued ownership requests can still delay completion.
 
 **Terrain consumption required (not edited in SOURCE worktree):** request this mask for the exact local/target sliding source bounds in parallel with `region(...)`, retaining/cancelling the future with the Window/session. Check `mask.isCurrent(server)` and matching dimension/bounds before publishing labels or granting support/exit. Label each unit source sample from `mask.ownerAt(pos)`, never from `Window.id`; absent means empty/unowned, not retained-owner permission. Compaction must not merge different owner IDs or owned with unowned voxels: split nonuniform ownership down to unit cells. `sourcePosition` must verify actual mapped foot/body sample ownership against the resolved retained ID; support must use the actual floor-contact cell's map owner, and exit must fail while ownership is absent/stale/outside the queried region. Replace the AABB-only authority check at SpiritTerrainService.sourcePosition (terrain 87510e0 lines 136–141). Do not retune/re-anchor from a changed owner. Current authoritative map is usable only within its requested bounds; refresh after walking outside or topology invalidation.
 
@@ -65,10 +67,181 @@ No tests/build run for this bounded hook, per parent instruction. Terrain wiring
 
 ## Bounds / honest remaining limits
 
-One active source operation/server, request queue 64, hint queue 128, frontier-retry queue 64, worker queue 4. Live reads <=512 cells and stop after ~1.5ms between cell samples; this is **not** a hard whole-tick deadline for metadata/NBT page IO/publication. Region volume <=32768 and <=16 chunk IO adapters; local overlap operation <=64 parents, <=512 hydrated pages/parent, expanded topology <=131072 cells. These are per-operation limits, not a global catalog cap. Oversized operations fail visibly through futures/status rather than fabricate coverage.
+One advancing source operation/server; separate read/requested/background lanes (64 pending reads/requested ops each), hint queue 128, frontier-retry queue 64, worker queue 16. A suspended resource owner is counted in its discovery lane's pending budget. Live reads <=512 cells and stop after ~1.5ms between cell samples; this is **not** a hard whole-tick deadline for metadata/NBT page IO/publication. Region volume <=32768 and <=16 chunk IO adapters; local overlap operation <=64 parents, <=512 hydrated pages/parent, expanded topology <=131072 cells. These are per-operation limits, not a global catalog cap. Oversized operations fail visibly through futures/status rather than fabricate coverage.
 
-Live gameplay, new save/reload cycles, actual Nomic inference, multiplayer entry, projected meshes/collision and terrain coupling were **not exercised** in this worktree. Parent performs integrated validation. Source and semantic catalog paging are resumable linear traversal, not spatial/high-dimensional acceleration indexes; large catalogs may take many ticks and cold metadata page reads still happen on the owner thread. A single operation waiting for descriptor inference can also delay later queued source reads. Old immutable generated blob files are not garbage-collected. Raw SourceSelector intentionally does not choose representatives itself. Natural neighboring cave union currently requires semantic convergence too; temporarily separate provisional owners can remain. The worker's individual-feature expansion/page caps can stop growth of very large caves. Source edits revise occupancy/material but do not repartition one historical cave ID into new air-component IDs after a new wall splits its air. Safe-air support recognizes a conservative floor whitelist and may reject otherwise valid modded/slab floors. Stored coarse far material detail requires successful near refinement before full fidelity. Nearby chest sampling covers at most two loaded chests and 16 slots/chest per sample. A full-air observation with no real item fallback must await a working descriptor model.
+Live gameplay, new save/reload cycles, actual Nomic inference, multiplayer entry, projected meshes/collision and terrain coupling were **not exercised** in this worktree. Parent performs integrated validation. Source and semantic catalog paging are resumable linear traversal, not spatial/high-dimensional acceleration indexes; large catalogs may take many ticks and cold metadata page reads still happen on the owner thread. Descriptor inference does not exclusively occupy the pipeline: movement reads can interrupt waiting discovery (see the async-discovery scheduling correction below). Read backlog, worker saturation and pending generated-chunk IO can still delay read completion. Old immutable generated blob files are not garbage-collected. Raw SourceSelector intentionally does not choose representatives itself. Natural neighboring cave union currently requires semantic convergence too; temporarily separate provisional owners can remain. The worker's individual-feature expansion/page caps can stop growth of very large caves. Source edits revise occupancy/material but do not repartition one historical cave ID into new air-component IDs after a new wall splits its air. Safe-air support recognizes a conservative floor whitelist and may reject otherwise valid modded/slab floors. Stored coarse far material detail requires successful near refinement before full fidelity. Nearby chest sampling covers at most two loaded chests and 16 slots/chest per sample. A full-air observation with no real item fallback must await a working descriptor model.
 
-## Validation actually run
+## Async-discovery Ensure observation repair
+
+The production `GeneratedSourceReader` constructor now captures the source world's
+sea level on the owner thread alongside dimension/height metadata. `Ensure` consumes
+that detached value, rather than dereferencing the null `world` left by constructor
+delegation. No Overworld/default sea-level fallback is used; mountain classification
+keeps the source dimension's actual elevation threshold. The observation clock still
+uses the Overworld tick, and topology preparation remains on the bounded worker.
+
+`SourceEnsureObservationTest` drives the real `Ensure.advance`/`observe` path through
+NBT decoding, pending snapshot completion and actual asynchronous topology preparation.
+Its detached IO/metadata fixture needs no game bootstrap, persistence or model service;
+only the private session holder is allocated without constructors. It verifies yielding
+while the worker is pending, the sampling budget, source sea level/dimension, and real
+mountain ownership geometry (default/Overworld sea levels give a different result).
+
+Cached Gradle 8.13 `--offline --no-daemon --console=plain build` passed in visible tmux:
+build/packaging tests, all seven discovered runtime regression classes (14 Ensure
+checks), common/client compilation, remapping and production-jar verification.
+Contributing async-discovery commits remain ancestors. No gameplay/GPU/multiplayer or
+actual native-model launch was exercised; cold metadata/page IO still has the bounded
+but not hard-wall-clock tick limitations described above. This repair does not certify
+all eleven runtime symptoms or change their independently owned subsystems.
+
+## Async-discovery scheduling correction: movement reads during resource ownership
+
+Discovery can retain the single store geometry cursor, staged mutation or activity
+mutation pause across ticks. Those resources are not needed by `region(...)` movement
+reads. `SourceSchedule` now reserves a suspended resource owner outside the ordinary
+lanes: reads may interrupt it, but no other discovery (even a requested op ahead of a
+background owner) may take its discovery turn. Five read operations grant the owner
+one bounded advance; quota expiry no longer lets discovery run to completion before
+yielding again. An already running read is not interrupted. Resource completion is
+not gated on model readiness. Source edits/unload/shutdown also cancel the suspended
+owner and release its cursor/mutation/pause through the existing operation lifecycle.
+
+The per-tick geometry/publication budgets remain one page and 512 reconstructed
+leaves. No new concurrency or store schema, projection, terrain/collision, source
+ownership or embedding policy is introduced. At that scheduling revision the
+independent ownership-map request lane still shared the store cursor; the fix
+removed discovery-stage blocking of movement `Read` operations, not every kind of
+shared-cursor contention. The ownership latency repair below addresses that remainder.
+
+`SourceDiscoveryReadLatencyTest` drives the actual Session scheduling step, real
+Ensure operations, real 100-page LandmarkStore geometry/publication and actual
+GeneratedSourceReader movement reads with detached generated NBT. During both
+geometry reading and background publication, three queued walk/near-terrain/target
+reads completed in nine simulated ticks instead of waiting for 100+ discovery ticks.
+Under sustained reads, every read took at most four simulated ticks; all 100 geometry
+pages / 102 publication advances completed, without admitting competing discovery or
+exposing a partial catalog. Real session invalidation cancels suspended geometry and
+publication and releases resources exactly once. These are scheduler tick counts,
+not a guarantee on disk IO, workers or live-game movement latency.
+
+Cached Gradle 8.13 `--no-daemon --console=plain build` passed, including all **eight**
+discovered main-based runtime classes, packaging fixtures and production-jar
+verification. The latency regression passed 12,762 checks, scheduler regression 179,
+Ensure observation regression 14 and multi-chunk reader regression 1,036. Retained
+build pane `%2146`, run `cff3248e153140298b2aca9481d424ee` (exit 0). The initial build
+failed only on the new fixture's hard-coded legacy vector dimension; the fixture
+now follows the current native vector size without altering production vectors.
+No gameplay, GPU, multiplayer launch or real native-model inference was performed.
+
+## Async-discovery ownership latency repair
+
+The real ownership proof used by terrain support/walk acquisition no longer waits for
+an entire discovery geometry read. `SourceOwnership.Request` uses one dedicated
+package-private `LandmarkStore` cursor slot, independent of the exclusive public
+geometry cursor. Both are server-thread confined over immutable page versions and
+share the existing eight-page/65,536-leaf decoded LRU. No competing discovery or
+second ownership decoder is admitted. Completion/cancellation releases only the
+matching cursor instance, including repeated cancellation of a superseded cursor.
+A suspended partial decoder is discarded if the other cursor completes and caches
+that same immutable page, so it cannot be reused against the next page key.
+
+The existing ownership queue, source revision checks and per-tick budgets are
+unchanged: one request phase, at most four metadata records or one geometry page/
+512 decoded leaves or 256 octree node visits/128 staged leaves or 256 known voxel
+insertions. AIR and SOLID grant exact native source-coordinate ownership; UNKNOWN
+and AABB-only overlap do not. Concurrent source publication still fails the proof
+and requires a fresh request. No source-world generation, inference, save-schema
+migration, projection or mesh/collision policy was changed.
+
+`SourceDiscoveryReadLatencyTest` now drives a real ownership Request before the
+actual Session scheduling step, matching tick ordering, during a real 100-page
+Ensure read with sustained generated-terrain reads. Before this repair, the proof
+was still pending at tick 200. With both requested and background discovery, it
+finishes in 105 simulated ticks while discovery still holds its cursor (six pages
+completed); sustained movement reads still take at most four ticks and competing
+discovery never starts. The fixture also checks exact far-page ownership and the
+unowned neighbor, rather than merely future completion or status messages.
+
+`SourceOwnershipCursorTest` covers interleaved partial decoders in both directions,
+cache adoption followed by a different cold page, AIR/SOLID/UNKNOWN and clipped
+masks, bounded decode/expansion/cache work, source-revision invalidation,
+request cancellation, independent cursor release, superseded-cursor cancellation
+and off-thread rejection. These use real store NBT and real Request paths but do
+not launch Minecraft, flush a new save/reload cycle, or run an embedding model.
+
+Validation: cached Gradle 8.13 `--offline --no-daemon --console=plain --rerun-tasks
+build` passed, all 14 tasks executed, with all **nine** discovered runtime classes,
+build/packaging fixtures, common/client compilation, remapping and production-jar
+verification. The discovery latency regression passed 13,390 checks and the new
+ownership cursor regression 542; retained pane `%2579`, run
+`1d205d8996fc49af807afb03ffed9633`, exit 0. Client compilation still emits existing
+API Guardian/mixin warnings; malformed embedding persistence fixtures intentionally
+log rejection errors. Neither is a failed task. `git diff --check` also passed.
+
+Cold metadata/compressed-NBT IO and worker latency remain non-wall-clock-bounded.
+Large catalogues, many-page intersecting features and queued ownership requests
+can still exceed a walk deadline; this removes discovery cursor contention, not
+all possible latency. Live gameplay, GPU rendering, multiplayer and actual native
+v2 model inference have not been verified by this scoped repair.
+
+## Retained render-distance / async-discovery integration
+
+The retained merge keeps the render-distance parent's per-player source window/tile
+planner and the async parent's detached generated-NBT reader, worker backpressure,
+resource-owner scheduling and independent ownership-proof cursor. `region(...)`
+remains movement-critical. `discoveryRegion(...)` is the same real generated-only
+observation API in a separately bounded background lane; terrain's render-distance
+tile path now uses it. A pending 32³ horizon read yields between <=512-cell advances
+rather than running ahead of an entire walk/support request. Both paths retain the
+same source coordinates, UNKNOWN semantics and cancellation lifecycle.
+
+Hints are admitted before lane selection, not only after the pipeline goes idle.
+At most one hint Ensure is materialized at once (remaining hints stay cheap bounded
+seeds); this prevents delayed IO/model work from filling memory with snapshots.
+After five movement read selections, admissible requested/background lanes alternate
+discovery turns. Parkable background work round-robins, so a delayed tile/descriptor
+cannot hide the rest of the horizon. Resource owners still reserve discovery turns
+exclusively and release their own cursor/mutation/activity pause; movement reads and
+the independently budgeted exact ownership proof keep progressing. View-distance
+reads do not require embeddings; landmark construction still requires real compatible
+descriptors or the existing compatible item-index fallback.
+
+`SourceLaneFairnessSelfTest` now tests the production `SourceSchedule`, not an unused
+lookalike picker. It covers continuous reads plus requested/background traffic,
+readiness, parkable IO rotation and exclusive resource ownership. New real Session
+regressions in `SourceDiscoveryReadLatencyTest` drive a pending detached tile decode
+alongside movement sampling, bounded hint materialization/admission during continuous
+reads, background queue backpressure, source-edit cancellation and late completion.
+The render-distance coverage/frame/cancellation and generated-NBT/ownership suites
+remain discovered by the canonical build. No projection, terrain owner/support,
+custom collision or embedding-profile policy was changed by this merge resolution.
+
+Final validation: cached Gradle 8.13 on Java 21 ran
+`--offline --no-daemon --console=plain --rerun-tasks build` successfully (14 tasks
+executed). `runtimeSelfTest` discovered and ran all **13** main-based classes;
+`buildSelfTest` and `verifyProductionJar` passed. New/retained discovery coverage:
+296336 planner checks, 7982 frame checks, 21 cancellation checks, 1036 generated-reader
+checks, 14558 real Session latency/lifecycle checks, 81 production-lane fairness checks,
+179 scheduler checks, 542 ownership checks and 14 detached observation-metadata checks.
+The latency fixture measured nine ticks for its initial three-read batch and four
+ticks maximum under sustained sampling; these are scheduler advances, not wall-clock
+Minecraft latency. The final run corrected a test-fixture expectation: source edits
+also cancel an active overlapping movement sample, then a fresh read succeeds.
+
+Retained tmux build handle: session `$11`, original pane `%2667`, build pane `%2702`,
+run `2b2080c87aed4921bdc5828ebeabf554` (exit 0). The verified artifact is
+`build/libs/mysticism-1.0-SNAPSHOT.jar`. Existing annotation/deprecation warnings and
+intentional invalid-profile fixture warnings remain. No dependencies were installed.
+`git diff --check` and staged diff checks passed; the merge conflict is resolved.
+
+Progressive coverage is not an instantaneous whole-view snapshot. The far-node/mesh
+budgets and planner's +/-64-block vertical band remain; tall views are not full-height
+world discovery. Metadata/compressed page IO, registry mesh conversion and packet/frame
+work still have bounded counts rather than hard wall-clock deadlines; no live FPS or
+movement-stall measurements have been taken. Minecraft/GPU/multiplayer launch and
+actual native-v2 model inference have not been verified by this scope.
+
+## Validation actually run (historical concurrent rebuild)
 
 No new tests added and no Gradle run during concurrent rebuild (parent instruction). Scoped Java21 `javac --release 21 -proc:none` compilation of all SOURCE-owned landmark/activity classes against cached mapped Fabric/Yarn 1.21.1 classpath plus the read-only NAV LatentAttunement source. Interactive tmux pane `%463`, script `/tmp/mysticism-source-rebuild-check.sh`; output displayed, not redirected. `git diff --check`. This is compile validation, **not** evidence that live runtime behaviors above have passed.

@@ -30,12 +30,17 @@ regenerate wrapper tooling using installed Gradle without fetching a distributio
 ```
 
 Long-running commands in the assigned development environment use the
-`tmux-jobs` skill at `/home/zlare/.config/pi/profiles/main/skills/tmux-jobs/SKILL.md`.
-Preserve the original `TMUX` connection and `TMUX_PANE`; pass the original pane
-with `--origin`, the absolute checkout with `run --cwd`, and the executable's
-argument vector after `--`. Monitor with bounded `wait --seconds` calls and
-capture the retained pane using its matching run token. Do not use `send-keys`,
-completion-channel waits or output redirection. Leave completed job panes intact.
+`tmux-jobs` skill helper in the original tmux session/pane, with explicit argv:
+
+```sh
+JOBS=/home/zlare/.config/pi/profiles/main/skills/tmux-jobs/bin/tmux-jobs
+"$JOBS" --origin "$TMUX_PANE" run --cwd "$PWD" --label canonical-build -- \
+  /usr/bin/env JAVA_HOME=/usr/lib/jvm/java-21-openjdk "$GRADLE" \
+  --no-daemon --console=plain --rerun-tasks build
+# Preserve returned pane/run; monitor bounded intervals and inspect retained output:
+"$JOBS" --origin "$TMUX_PANE" wait --pane <pane> --run <run> --seconds 10
+"$JOBS" --origin "$TMUX_PANE" capture --pane <pane> --run <run> --lines 200
+```
 
 ## Tests: no additional framework dependencies
 
@@ -55,19 +60,22 @@ javac --release 21 -d build/build-selftest scripts/selftest/*.java
 java -ea -cp build/build-selftest io.github.mysticism.build.PackagingSelfTest
 ```
 
-**Current runtime integration contract:** place Java checks in `src/runtimeTest/java`,
+**Runtime regression contract:** place current Java checks in `src/runtimeTest/java`
+(or retained embedding checks in `src/test/java/io/github/mysticism/embedding`),
 with class names ending in `Test` (including `SelfTest`) and a
 `public static void main(String[] args)` method. `runtimeSelfTest` discovers
-compiled top-level classes, executes them in sorted fully qualified name order,
-and propagates exceptions/`AssertionError` as a failed Gradle task. The existing
-`src/test/java/io/github/mysticism/embedding` regressions also participate; other
-historical `src/test` prototypes are not current suites. Assertions are explicitly
-enabled and checked. Do not add JUnit dependencies. Runtime compilation/execution
-includes common and client outputs plus their existing dependencies. `check`
-and `build` run `runtimeSelfTest` and `buildSelfTest`; the framework-based Gradle
-`test` action is disabled and is not a verification command by itself. An empty
-suite is reported explicitly, not presented as tested functionality. Tests must
-not call live embedding services, download weights, or bootstrap a game.
+compiled top-level classes in sorted name order and propagates failures.
+Assertions are explicitly enabled and checked. No JUnit dependency is used.
+Compilation/runtime includes common/client outputs and their dependencies.
+`check` and `build` run `runtimeSelfTest` and `buildSelfTest`; the framework `test`
+action is deliberately disabled. Historical shared-frame prototype suites outside
+these source roots are not claimed as executed. Runtime resources are in
+`src/runtimeTest/resources`. Suite counts are reported by each build, not hard-coded here.
+Ordinary tests do not contact services, fetch weights or bootstrap a game.
+The JNI ABI suite loads the packaged native runtime but does not claim model
+inference. Explicit real-weight verification is separate: `embeddedInferenceProbe`.
+With the exact asset already provisioned, this task uses the default offline
+provider, not HTTP. See [native contract](docs/nomic-embedding-contract.md).
 
 ## Production artifact
 
@@ -90,41 +98,29 @@ Fabric API and Fabric Loader are installed separately by the modpack/runtime.
 The artifact verifier checks entrypoint and mixin resources, localization at
 `assets/mysticism/lang/en_us.json`, expanded version, MIT license packaging,
 Java 21 bytecode and intermediary Minecraft class references. No icon is declared
-until an actual icon is supplied. Finder metadata and DJL/PyTorch/tokenizer
-runtimes must not enter the production artifact. Artifact checks are static;
-they do not substitute for a dedicated-server/client launch, GUI-scale/reload
-checks, or an embedding-service integration test.
+until an actual icon is supplied. Finder metadata, model weights and unrelated
+DJL/PyTorch/tokenizer runtimes must not enter the artifact. The verifier requires
+the native provider classes, pinned llama JNI resources and Java dependencies,
+and rejects nested duplicate logging. Artifact checks remain static: they do not
+substitute for a Minecraft/client launch, GL validation or a real forward pass.
 
-## Current retained integration validation
+## Current retained integration
 
-On `feat-runtime-sol-merge-0060`, the canonical cached Gradle command
-`--no-daemon --console=plain --continue build --rerun-tasks` passed with both Java
-source sets, all **21 discovered runtime suites**, build/packaging fixtures, Loom
-remapping and `verifyProductionJar`. Coverage includes supported entry/recovery,
-repeated sub-block packet acceptance, descent/arrival, local reconciliation and
-latest-destination/correction arbitration. The actual continuous mesh transition
-regression passed **5,917 checks** using the integrated production alignment
-object, including touching tilted/slab surfaces, publication cadence, unsafe
-crossings and sheared transitions. Native-v2 preprocessing passed 8,455 checks
-plus 766 official Unicode grapheme cases. These are deterministic JVM and
-bytecode-wiring checks, not a live Fabric launch or model inference.
+Default inference is now in-process native Nomic v2 (full 768), with verified
+local assets and no external-server prerequisite. The interrupted merge-0066 combines the
+supported-walking/arrival/preprocessing history from merge-0060 with the source
+discovery/dimension/shallow/native/transition history from merge-0065. Parent
+verification records remain historical evidence, not proof for this candidate.
+Current reconciliation and validation are recorded in
+[merge-0066](docs/runtime-sol-merge-0066.md).
 
-See `docs/runtime-sol-merge-0060.md` for conflict decisions, exact checks and the
-retained build handle; `docs/rebuild-navigation-handoff.md` retains parent history.
-The HTTP inference backend remains unchanged: a model-correct local tokenizer
-alone does **not** complete the full no-external-server embedding requirement.
+## Historical portability-branch evidence (superseded, not current blockers)
 
-## Historical build-portability integration status (not the current branch)
+The records below predate source integration/native restoration. Their DJL
+compile failures and diagnostic artifacts describe only that historical branch.
+Current compilation has no DJL shim or excluded build task.
 
-This build intentionally has no DJL dependencies or local/native model runtime.
-The original source still imports DJL in `EmbeddingService`, `EmbeddingCommand`,
-`KnnIndex`, `SimpleKnnIndex` and `ItemEmbeddingIndexState`. Until the separately
-owned JDK HTTP embedding migration removes those imports, full compilation is
-expected to fail. Do not restore local-model dependencies to disguise that source
-integration requirement. Any additional compilation errors must be fixed by the
-agent owning the affected source, then rerun `build` and `verifyProductionJar`.
-
-### Checks actually performed on the build-portability branch
+### Checks actually performed on the old build-portability branch
 
 - Cached Gradle and the generated wrapper both report **8.13**, running Java **21**.
   Wrapper generation used the installed binary; no Gradle distribution was fetched.

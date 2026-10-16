@@ -25,6 +25,9 @@ public final class ApproachSupportSweepTest {
         fadedTerrainIsNeverSupport();
         approachDiscoveryKeepsTheAcquisitionNormalContract();
         contactAndApproachShareTheSameSweep();
+        arrivalHandsOffToGroundedCrouch();
+        distantMotionStillHitsPublishedMesh();
+        stationaryRayUsesActualOccupancy();
         System.out.println("approach support sweep checks: " + checks);
     }
 
@@ -87,6 +90,59 @@ public final class ApproachSupportSweepTest {
                 "retained contact API and approach API share the exact same query at contact reach");
         for (double invalid : new double[] {0, -1, Double.NaN, Double.POSITIVE_INFINITY})
             check(MeshCollision.ground(body, index, invalid).isEmpty(), "invalid discovery depth cannot grant support or make an unbounded sweep");
+    }
+
+    /** Merge regression: the approach query, ordinary ground query and crouch kernel must
+     * agree after descending onto the newly published frame. No server acquisition is mocked. */
+    private static void arrivalHandsOffToGroundedCrouch() {
+        var published = frame(cell(1, new Vec3d(0, FLOOR_CELL_MIN_Y, 0), 1f));
+        var server = new MeshCollision.Index(published);
+        var prediction = new MeshCollision.Index(published);
+        Box authoritative = descendingBody(140), predicted = authoritative;
+        check(MeshCollision.ground(authoritative, server, 24).isPresent(), "published approach floor is discoverable");
+        check(server.ground(authoritative).isEmpty(), "approach is not premature grounded authority");
+        Vec3d descent = new Vec3d(0, -20, 0);
+        Vec3d accepted = server.move(authoritative, descent, true, .6);
+        Vec3d guessed = prediction.move(predicted, descent, true, .6);
+        check(accepted.equals(guessed), "server and prediction accept the same deep descent");
+        authoritative = authoritative.offset(accepted); predicted = predicted.offset(guessed);
+        check(server.ground(authoritative).isPresent(), "actual arrival has ordinary support");
+        check(MeshCollision.ground(authoritative, server, CONTACT_REACH).equals(server.ground(authoritative)),
+                "approach/contact adapter retains grounded-kernel support");
+        for (int tick = 0; tick < 100; tick++) {
+            Vec3d requested = new Vec3d(.1, -.08, 0);
+            Vec3d safe = server.sneak(authoritative, requested, .6);
+            Vec3d clientSafe = prediction.sneak(predicted, requested, .6);
+            Vec3d movement = server.move(authoritative, safe, false, .6);
+            Vec3d clientMovement = prediction.move(predicted, clientSafe, false, .6);
+            check(safe.equals(clientSafe) && movement.equals(clientMovement), "walking handoff prediction diverged at " + tick);
+            authoritative = authoritative.offset(movement); predicted = predicted.offset(clientMovement);
+            check(server.ground(authoritative).isPresent(), "arrival crouch lost mesh support at " + tick);
+            check(Math.abs(authoritative.minY - FLOOR_TOP) < 2e-5, "arrival crouch changed resting height");
+        }
+    }
+
+    private static void distantMotionStillHitsPublishedMesh() {
+        var index = new MeshCollision.Index(frame(cell(1, new Vec3d(100, 100, 100), 1f)));
+        Box actor = new Box(.2, .2, .2, .8, .8, .8);
+        Vec3d wanted = new Vec3d(200, 200, 200);
+        var hit = index.sweep(actor, wanted).orElseThrow();
+        check(hit.time() > 0 && hit.time() < .5, "oversized discovery-distance sweep cannot skip a published cell");
+        // A direct crossing cannot slide around this cell. The diagonal request above
+        // can legitimately clear its edge in later substeps, so its final position is
+        // not a tunneling oracle; the exact sweep still has to report that first hit.
+        Box crossing = new Box(.2, 100.2, 100.2, .8, 100.8, 100.8);
+        Vec3d moved = index.move(crossing, new Vec3d(200, 0, 0), true, .6);
+        check(crossing.maxX + moved.x <= 100 && crossing.maxX + moved.x > 99.99,
+                "long direct movement must stop at the displayed mesh face");
+        check(!index.clearRay(new Vec3d(0,0,0), new Vec3d(200,200,200)), "segmented long ray must hit published cell");
+    }
+
+    private static void stationaryRayUsesActualOccupancy() {
+        var index = new MeshCollision.Index(frame(cell(1, new Vec3d(0, FLOOR_CELL_MIN_Y, 0), 1f)));
+        Vec3d air = new Vec3d(.5, 140, .5), solid = new Vec3d(.5, FLOOR_CELL_MIN_Y + .5, .5);
+        check(index.clearRay(air, air), "zero-length ray in empty air is clear");
+        check(!index.clearRay(solid, solid), "zero-length ray in visible collision is blocked");
     }
 
     private static void approachDiscoveryKeepsTheAcquisitionNormalContract() {

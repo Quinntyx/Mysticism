@@ -146,8 +146,8 @@ public final class EntrySupportDiscoveryTest {
         while (root != null && !Files.exists(root.resolve(terrainPath))) root = root.getParent();
         check(root != null, "could not locate production source root");
         String terrain = Files.readString(root.resolve(terrainPath));
-        check(terrain.contains("w.discovery.groundPending(ownershipPendingAt(p,w,source))")
-                        && terrain.contains("s.ownerFuture=expected.discovery.await("),
+        check(terrain.contains("w.initialDiscovery.groundPending(ownershipPendingAt(p,w,source))")
+                        && terrain.contains("s.ownerFuture=expected.initialDiscovery.await("),
                 "production must combine exact floor ownership with server-applied discovery lifecycle");
         check(terrain.contains("if(w!=s.local") && terrain.contains("windowFor(s,cell)"),
                 "pending ground must require the accepted local producer, never an unrelated representative");

@@ -5,6 +5,7 @@ public final class SpiritNetworking {
     private static boolean initialized;private SpiritNetworking(){}
     public static void init(){
         if(initialized)return;initialized=true;
+        PayloadTypeRegistry.playS2C().register(SpiritTransitionPayload.ID,SpiritTransitionPayload.CODEC);
         PayloadTypeRegistry.playS2C().register(SpiritScenePayload.ID,SpiritScenePayload.CODEC);
         PayloadTypeRegistry.playS2C().register(SpiritDeltaPayload.ID,SpiritDeltaPayload.CODEC);
         PayloadTypeRegistry.playS2C().register(SpiritTerrainPayload.ID,SpiritTerrainPayload.CODEC);

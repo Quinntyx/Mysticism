@@ -17,6 +17,7 @@ public final class MeshCollision {
     public static void clear(UUID player) { SERVER.remove(player); CLIENT.remove(player); }
     public static void clearClient() { CLIENT.clear(); }
     public record Hit(double time, Vec3d normal, TerrainMeshFrame.Cell cell) {}
+    private static final double SUPPORT_LIFT = .025, GROUND_REACH = .125, WALKABLE_Y = .3;
     private record Bucket(int x,int y,int z) {}
     private record Shape(TerrainMeshFrame.Cell cell,Box local,Box bounds) {}
     public static final class Index {
@@ -64,7 +65,13 @@ public final class MeshCollision {
         public boolean clearRay(Vec3d from,Vec3d to) {
             // Chunked so each segment stays on the bucket grid; a hit in ANY segment blocks the whole ray.
             Vec3d total=to.subtract(from);double length=total.length();
-            if(length<=1e-9)return !sweep(tinyBody(from),total).isEmpty();
+            if(length<=1e-9) {
+                // A stationary sweep has no entering normal, including when embedded. Test
+                // occupancy explicitly instead of inverting an empty hit into "blocked air".
+                Box point=tinyBody(from);
+                for(Shape shape:nearby(point))if(penetration(point,shape)!=null)return false;
+                return true;
+            }
             int pieces=(int)Math.min(64,Math.max(1,(int)Math.ceil(length/60)));
             Vec3d piece=total.multiply(1.0/pieces);Vec3d at=from;
             for(int i=0;i<pieces;i++) {
@@ -88,7 +95,25 @@ public final class MeshCollision {
             }
             return moved;
         }
-        private Vec3d slide(Box body,Vec3d wanted) {
+        /** Find actual upward contact, not the first wall/ceiling hit or a carrier block flag.
+         * The small lift tolerates the solver's contact skin; deep initial penetration is not support. */
+        public Optional<Hit> support(Box body,double reach) {
+            return supportSweep(body,Math.max(0,reach)+SUPPORT_LIFT);
+        }
+        private Optional<Hit> supportSweep(Box body,double depth) {
+            Box probe=body.offset(0,SUPPORT_LIFT,0);
+            Vec3d down=new Vec3d(0,-depth,0);
+            Hit best=null;
+            for(Shape shape:nearby(probe.stretch(down).expand(1e-5))) {
+                if(penetration(probe,shape)!=null)continue;
+                Hit hit=intersect(probe,down,shape);
+                if(hit!=null && hit.normal.y>WALKABLE_Y && (best==null || hit.time<best.time))best=hit;
+            }
+            return Optional.ofNullable(best);
+        }
+        public Optional<Hit> ground(Box body) { return support(body,GROUND_REACH); }
+
+        private Vec3d slide(Box body,Vec3d wanted,boolean walking) {
             Vec3d moved=Vec3d.ZERO,remaining=wanted;
             for(int i=0;i<4 && remaining.lengthSquared()>1e-12;i++) {
                 var hit=sweep(body.offset(moved),remaining);
@@ -96,9 +121,59 @@ public final class MeshCollision {
                 double t=Math.max(0,hit.get().time-1e-5/Math.max(1e-5,remaining.length()));
                 moved=moved.add(remaining.multiply(t));remaining=remaining.multiply(1-t);
                 double into=remaining.dotProduct(hit.get().normal);
-                if(into<0)remaining=remaining.subtract(hit.get().normal.multiply(into));else break;
+                if(into<0) {
+                    Vec3d normal=hit.get().normal;
+                    // A grounded upright walker keeps their requested X/Z. Projecting gravity
+                    // onto a tilted face creates sideways creep, undoing crouch's edge limit.
+                    // Solve the floor constraint vertically instead; walls/flight/jumps still slide.
+                    if(walking && normal.y>WALKABLE_Y)remaining=remaining.add(0,-into/normal.y,0);
+                    else remaining=remaining.subtract(normal.multiply(into));
+                } else break;
             }
             return moved;
+        }
+
+        /** Shared server/client movement kernel, independent of vanilla block support. */
+        public Vec3d move(Box original,Vec3d wanted,boolean flying,double stepHeight) {
+            if(wanted.length()>256)wanted=wanted.multiply(256/wanted.length());
+            Vec3d correction=depenetrate(original);
+            Box body=original.offset(correction);
+            boolean grounded=!flying && ground(body).isPresent();
+            boolean walking=grounded && wanted.y<=0;
+            Vec3d result=Vec3d.ZERO;
+            int pieces=Math.min(64,Math.max(1,(int)Math.ceil(wanted.length()/4)));
+            Vec3d piece=wanted.multiply(1.0/pieces);
+            for(int p=0;p<pieces;p++)result=result.add(slide(body.offset(result),piece,walking));
+            if(!flying && (grounded || wanted.y<0 && result.y>wanted.y+1e-5)
+                    && result.subtract(wanted).horizontalLengthSquared()>1e-8 && stepHeight>0) {
+                Vec3d up=slide(body,new Vec3d(0,stepHeight,0),false);
+                Vec3d over=slide(body.offset(up),new Vec3d(wanted.x,0,wanted.z),walking);
+                Vec3d down=slide(body.offset(up).offset(over),new Vec3d(0,wanted.y-up.y,0),walking);
+                Vec3d stepped=up.add(over).add(down);
+                if(stepped.horizontalLengthSquared()>result.horizontalLengthSquared()+1e-8)result=stepped;
+            }
+            // Both ordinary and stepped paths start AFTER depenetration; never lose that correction.
+            return correction.add(result);
+        }
+
+        /** Vanilla-style axis/diagonal backoff, but enabled and limited by mesh contacts only. */
+        public Vec3d sneak(Box body,Vec3d wanted,double stepHeight) {
+            if(wanted.y>0 || ground(body).isEmpty())return wanted;
+            double reach=Math.max(GROUND_REACH,stepHeight),x=wanted.x,z=wanted.z;int guard=0;
+            while(x!=0 && !supportedAfterMove(body,x,0,stepHeight,reach) && guard++<128)x=trim(x);
+            if(guard>=128)x=0;guard=0;
+            while(z!=0 && !supportedAfterMove(body,0,z,stepHeight,reach) && guard++<128)z=trim(z);
+            if(guard>=128)z=0;guard=0;
+            while(x!=0 && z!=0 && !supportedAfterMove(body,x,z,stepHeight,reach) && guard++<128){x=trim(x);z=trim(z);}
+            if(guard>=128){x=0;z=0;}
+            return new Vec3d(x,wanted.y,z);
+        }
+        private boolean supportedAfterMove(Box body,double x,double z,double stepHeight,double reach) {
+            // Probe the collision-resolved footprint: on a rising affine face, a horizontal
+            // offset alone embeds the body and falsely treats the entire slope as a ledge.
+            // Zero Y preserves the reach limit (gravity must not extend safe-drop distance).
+            Vec3d resolved=move(body,new Vec3d(x,0,z),false,stepHeight);
+            return support(body.offset(resolved),reach).isPresent();
         }
     }
     private static int grid(double x){return (int)Math.floor(x/8);}
@@ -114,63 +189,36 @@ public final class MeshCollision {
         Index i=index(player);
         // No fabricated floor. Preparation supplies geometry before entry; packet delay simply has no surfaces yet.
         if(i==null)return wanted;
-        return move(i,player.getBoundingBox(),wanted,player.getAbilities().flying,player.getStepHeight(),player.isOnGround());
+        return i.move(player.getBoundingBox(),wanted,player.getAbilities().flying,player.getStepHeight());
     }
-    /** Entity-free movement core shared by server/client players and the runtime regressions: the full
-     * depenetrate/slide/step resolution against one visible frame, so no motion path is untestable. */
+    /** Entity-free adapter retained for movement/arrival regressions. Vanilla's stale onGround
+     * flag is deliberately not support authority: the shared kernel probes this exact frame. */
     public static Vec3d move(Index i,Box body,Vec3d wanted,boolean flying,double stepHeight,boolean onGround) {
-        if(wanted.length()>256)wanted=wanted.multiply(256/wanted.length());
-        Vec3d result=i.depenetrate(body);
-        // Bound swept traversal for unusually fast flight/teleports rather than tunnelling through a grid overflow.
-        int pieces=Math.min(64,Math.max(1,(int)Math.ceil(wanted.length()/4)));
-        Vec3d piece=wanted.multiply(1.0/pieces);
-        for(int p=0;p<pieces;p++)result=result.add(i.slide(body.offset(result),piece));
-        if(!flying && (onGround || wanted.y<0 && result.y>wanted.y+1e-5)
-                && result.subtract(wanted).horizontalLengthSquared()>1e-8) {
-            if(stepHeight>0) {
-                Vec3d up=i.slide(body,new Vec3d(0,stepHeight,0));
-                Vec3d over=i.slide(body.offset(up),new Vec3d(wanted.x,0,wanted.z));
-                Vec3d down=i.slide(body.offset(up).offset(over),new Vec3d(0,wanted.y-up.y,0));
-                Vec3d stepped=up.add(over).add(down);
-                if(stepped.horizontalLengthSquared()>result.horizontalLengthSquared()+1e-8)result=stepped;
-            }
-        }
-        return result;
+        return i.move(body,wanted,flying,stepHeight);
     }
     /** Vanilla's carrier-air ledge check would prevent all sneaking; use the real mesh below the future footprint. */
     public static Vec3d sneak(PlayerEntity p,Vec3d wanted,MovementType type) {
         Index i=index(p);
-        if(i==null || p.getAbilities().flying || !p.isSneaking() || !p.isOnGround() || type!=MovementType.SELF && type!=MovementType.PLAYER)return wanted;
-        return sneak(i,p.getBoundingBox(),wanted,Math.max(.6,p.getStepHeight()));
+        if(i==null || p.getAbilities().flying || !p.isSneaking() || type!=MovementType.SELF && type!=MovementType.PLAYER)return wanted;
+        return i.sneak(p.getBoundingBox(),wanted,p.getStepHeight());
     }
-    /** Entity-free sneak-edge core over one visible frame. */
-    public static Vec3d sneak(Index i,Box body,Vec3d wanted,double ledge) {
-        Vec3d down=new Vec3d(0,-Math.max(.6,ledge),0);double x=wanted.x,z=wanted.z;int guard=0;
-        while(x!=0 && !supported(i,body.offset(x,0,0),down) && guard++<128)x=trim(x);
-        if(guard>=128)x=0;guard=0;
-        while(z!=0 && !supported(i,body.offset(0,0,z),down) && guard++<128)z=trim(z);
-        if(guard>=128)z=0;guard=0;
-        while(x!=0 && z!=0 && !supported(i,body.offset(x,0,z),down) && guard++<128){x=trim(x);z=trim(z);}
-        if(guard>=128){x=0;z=0;}return new Vec3d(x,wanted.y,z);
+    public static Vec3d sneak(Index i,Box body,Vec3d wanted,double stepHeight) {
+        return i.sneak(body,wanted,stepHeight);
     }
-    private static boolean supported(Index i,Box body,Vec3d down){return i.sweep(body,down).filter(h->h.normal.y>.3).isPresent();}
     private static double trim(double x){return Math.abs(x)<=.05?0:x-Math.copySign(.05,x);}
     public static Optional<Hit> ground(PlayerEntity player) {
-        return ground(player,.15);
+        Index i=index(player);
+        return i==null?Optional.empty():i.ground(player.getBoundingBox());
     }
-    /** Entity-free ground-contact probe over one visible frame. */
-    public static Optional<Hit> ground(Index i,Box body) {
-        return ground(body,i,.15);
-    }
-    /** Support discovery below a descending actor runs the SAME contact query with a deeper reach,
-     * so a walk approach can prepare (align/prewarm) before the body actually settles. */
+    public static Optional<Hit> ground(Index i,Box body) { return i.ground(body); }
+    /** Depth is the full downward sweep from the lifted body (as used to invert contact time).
+     * Approach discovery grants no acquisition authority; ordinary contact stays at .15. */
     public static Optional<Hit> ground(PlayerEntity player,double depth) {
         Index i=index(player);return i==null?Optional.empty():ground(player.getBoundingBox(),i,depth);
     }
-    /** Downward support contact against one index; shared by resting contact and approach discovery. */
     public static Optional<Hit> ground(Box body,Index index,double depth) {
         if(!Double.isFinite(depth) || depth<=0)return Optional.empty();
-        return index.sweep(body.offset(0,.025,0),new Vec3d(0,-depth,0)).filter(h->h.normal.y>.3);
+        return index.supportSweep(body,depth);
     }
     public static boolean clearRay(ServerPlayerEntity player,Vec3d from,Vec3d to) {
         Index i=index(player);return i!=null && from.distanceTo(to)<=128 && i.clearRay(from,to);
