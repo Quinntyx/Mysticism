@@ -2,8 +2,9 @@
 
 This cache is independent of the blocking `EmbeddingProvider` implementation.
 It does not change model provisioning, select a fallback model, or replace a
-provider health check. Restoring the in-process inference provider is a separate
-unit: this checkout's `EmbeddingService` still implements HTTP inference.
+provider health check. The retained integration now defaults to in-process
+`EmbeddedEmbeddingService`; `EmbeddingService` is an explicit legacy HTTP option,
+not a fallback. See [native contract](nomic-embedding-contract.md).
 
 ## Behavior and configuration
 
@@ -72,12 +73,18 @@ nonfinite vectors, late decode failure/all-or-nothing restoration, checksums,
 truncation, file bounds, inference failure/retry, failed readiness preservation,
 shutdown cancellation/idempotence and expendable load/save errors.
 
-Tests are deterministic cache/lifecycle checks, not real Nomic inference, live
-Minecraft/IntelliJ launch, gameplay or GPU validation. Run the canonical Gradle
+These fixtures are deterministic cache/lifecycle checks, not model inference or
+live gameplay. The separate real `embeddedInferenceProbe` now also verifies
+native default-helper cache save/restart and weighted callbacks using the exact
+approved file; evidence is in [runtime-merge-0035](runtime-merge-0035.md).
+Neither check claims live Minecraft/IntelliJ or GPU validation. Run the canonical Gradle
 `build` to execute all discovered runtime suites, packaging fixtures and the
 production remap/verifier.
 
-### Verified in this unit
+### Historical standalone cache-unit verification
+
+The retained integration now runs 20 runtime suites; see its handoff above.
+The following five-suite record belongs to the original cache-only parent.
 
 Canonical command (installed Gradle 8.13 / Java 21, no software installation,
 classpath overrides, exclusions or external model calls):

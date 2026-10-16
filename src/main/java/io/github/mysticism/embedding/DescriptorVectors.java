@@ -25,19 +25,35 @@ public final class DescriptorVectors {
         @Override public Vec384f vector(){return vector.clone();}
     }
     private static void validateWeight(double weight){if(!Double.isFinite(weight)||weight<0)throw new IllegalArgumentException("Weights must be finite and nonnegative");}
-    /** L2-normalized weighted mean of individually normalized descriptors, stable caller order. */
-    public static Vec384f compose(List<WeightedVector> input){
-        List<WeightedVector> parts=List.copyOf(input);double total=0;
-        for(var part:parts)total+=part.weight();
-        if(!Double.isFinite(total)||total<=0)throw new IllegalArgumentException("Positive finite total weight required");
-        double[] sums=new double[EmbeddingSpace.DIMENSIONS];
-        for(var part:parts){Vec384f vector=part.vector();EmbeddingSpace.requireCurrent(vector);if(part.weight()==0)continue;
-            if(vector.length()==0)throw new IllegalArgumentException("Zero descriptor vector");
-            float[] normalized=vector.norm();for(int i=0;i<sums.length;i++)sums[i]+=normalized[i]*(part.weight()/total);
+    /** L2-normalized weighted mean of individually normalized native descriptors.
+     * Scale weights before accumulating: a finite weight distribution need not have
+     * a representable total. The common mean divisor cancels in final L2, so keep
+     * the compensated sum in double precision until normalization, not float first.
+     */
+    public static Vec384f compose(List<WeightedVector> input) {
+        List<WeightedVector> parts = List.copyOf(input);
+        double scale = 0;
+        for (var part : parts) scale = Math.max(scale, part.weight());
+        if (scale == 0) throw new IllegalArgumentException("Positive weight required");
+        double[] sums = new double[EmbeddingSpace.DIMENSIONS];
+        double[] compensation = new double[sums.length];
+        for (var part : parts) {
+            if (part.weight() == 0) continue;
+            Vec384f vector = part.vector();
+            EmbeddingSpace.requireCurrent(vector);
+            float[] normalized = NativeEmbeddingOutput.normalize(vector.data()).data();
+            double weight = part.weight() / scale;
+            for (int i = 0; i < sums.length; i++) {
+                double value = normalized[i] * weight;
+                double previous = sums[i], next = previous + value;
+                compensation[i] += Math.abs(previous) >= Math.abs(value)
+                        ? (previous - next) + value : (value - next) + previous;
+                sums[i] = next;
+            }
         }
-        float[] values=new float[sums.length];for(int i=0;i<values.length;i++)values[i]=(float)sums[i];
-        Vec384f result=new Vec384f(values);if(result.length()<1e-12f)throw new IllegalArgumentException("Weighted descriptors cancel to zero");
-        return new Vec384f(result.norm());
+        for (int i = 0; i < sums.length; i++) sums[i] += compensation[i];
+        // Reject exact cancellation, not a finite nonzero mean below an arbitrary epsilon.
+        return NativeEmbeddingOutput.normalize(sums);
     }
     /** Snapshot inputs and one provider generation. Cache hits must not turn weighted composition
      * into server/render tick work. Sequential inference still avoids flooding the model queue. */

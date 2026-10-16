@@ -4,7 +4,7 @@ This replaces the obsolete shared projection frame / placed-block prototype. Eac
 
 ## Debug workflow
 
-1. Provide an Ollama-compatible embedding backend at `http://127.0.0.1:11434/` with `nomic-embed-text-v2-moe:latest`. Installation/model download is the user's responsibility; neither was performed by this workflow. Java system properties `mysticism.embedding.endpoint`, `mysticism.embedding.model` and `mysticism.embedding.revision` configure the endpoint/pinned profile. `/myst embed status` reports readiness.
+1. Provision the exact approved native v2 GGUF in a supported local cache (or set `mysticism.embedding.modelPath`); see [offline native assets](embedded-model-assets.md). The default provider executes inside Minecraft's JVM, with no external server or runtime download. `/myst embed status` reports live readiness and actionable failures. HTTP is an explicit optional deployment, never a fallback.
 2. In the ordinary world, `/latent target here` (or `/spirit capture`) captures a shallow landmark+block destination. Wait for its asynchronous confirmation. `/latent target item minecraft:amethyst_shard` chooses a deep concept target. A capture is a snapshot, not a live tracking link.
 3. `/spirit enter` prepares the current source view. Shallow source entities are visible/synced but cannot be interacted with. Ordinary jumps stay shallow.
 4. Double-jump/flight toggle or `/spirit deep` starts deep flight. Moving left, right or forward gradually rotates the basis to pursue the saved target. No survival hidden-dimension rotation controls are provided.

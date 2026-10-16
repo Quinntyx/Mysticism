@@ -29,18 +29,17 @@ regenerate wrapper tooling using installed Gradle without fetching a distributio
   --gradle-distribution-sha256-sum 20f1b1176237254a6fc204d8434196fa11a4cfb387567519c61556e8710aed78
 ```
 
-Long-running commands in the assigned development environment must run in a
-visible tmux pane. Example (use the printed pane ID for send/capture):
+Long-running commands in the assigned development environment use the
+`tmux-jobs` skill helper in the original tmux session/pane, with explicit argv:
 
 ```sh
-tmux new-window -n mysticism-build -P -F '#{pane_id}' 'bash --noprofile --norc'
-# In that pane, from this checkout:
-"$GRADLE" --no-daemon --console=plain build
-rc=$?
-printf 'BUILD_EXIT=%s\n' "$rc"
-tmux wait-for -S mysticism-build-done
-# Elsewhere: tmux wait-for mysticism-build-done
-# Then: tmux capture-pane -p -t <pane-id> -S -3000
+JOBS=/home/zlare/.config/pi/profiles/main/skills/tmux-jobs/bin/tmux-jobs
+"$JOBS" --origin "$TMUX_PANE" run --cwd "$PWD" --label canonical-build -- \
+  /usr/bin/env JAVA_HOME=/usr/lib/jvm/java-21-openjdk "$GRADLE" \
+  --no-daemon --console=plain --rerun-tasks build
+# Preserve returned pane/run; monitor bounded intervals and inspect retained output:
+"$JOBS" --origin "$TMUX_PANE" wait --pane <pane> --run <run> --seconds 10
+"$JOBS" --origin "$TMUX_PANE" capture --pane <pane> --run <run> --lines 200
 ```
 
 ## Tests: no additional framework dependencies
@@ -61,17 +60,22 @@ javac --release 21 -d build/build-selftest scripts/selftest/*.java
 java -ea -cp build/build-selftest io.github.mysticism.build.PackagingSelfTest
 ```
 
-**Feature-agent integration contract:** place Java checks in `src/test/java`, with
-class names ending in `Test` (including `SelfTest`) and a
-`public static void main(String[] args)` method. `selfTest` discovers top-level
-classes from the compiled test output, executes them in sorted fully qualified
-name order, and propagates exceptions/`AssertionError` as a failed Gradle task.
-Assertions are explicitly enabled and checked. Do not add JUnit dependencies.
-Test compilation/runtime includes common and client outputs plus their existing
-runtime dependencies. `check`, `test` and `build` run `selfTest` and
-`buildSelfTest`; the framework-based Gradle `Test` action is disabled. An empty
-feature-test set is explicitly reported, not presented as tested functionality.
-Tests must not call live embedding services, download weights, or bootstrap a game.
+**Runtime regression contract:** place current Java checks in `src/runtimeTest/java`
+(or retained embedding checks in `src/test/java/io/github/mysticism/embedding`),
+with class names ending in `Test` (including `SelfTest`) and a
+`public static void main(String[] args)` method. `runtimeSelfTest` discovers
+compiled top-level classes in sorted name order and propagates failures.
+Assertions are explicitly enabled and checked. No JUnit dependency is used.
+Compilation/runtime includes common/client outputs and their dependencies.
+`check` and `build` run `runtimeSelfTest` and `buildSelfTest`; the framework `test`
+action is deliberately disabled. Historical shared-frame prototype suites outside
+these source roots are not claimed as executed. Runtime resources are in
+`src/runtimeTest/resources`. Twenty suites are currently discovered.
+Ordinary tests do not contact services, fetch weights or bootstrap a game.
+The JNI ABI suite loads the packaged native runtime but does not claim model
+inference. Explicit real-weight verification is separate: `embeddedInferenceProbe`.
+With the exact asset already provisioned, this task uses the default offline
+provider, not HTTP. See [native contract](docs/nomic-embedding-contract.md).
 
 ## Production artifact
 
@@ -94,22 +98,27 @@ Fabric API and Fabric Loader are installed separately by the modpack/runtime.
 The artifact verifier checks entrypoint and mixin resources, localization at
 `assets/mysticism/lang/en_us.json`, expanded version, MIT license packaging,
 Java 21 bytecode and intermediary Minecraft class references. No icon is declared
-until an actual icon is supplied. Finder metadata and DJL/PyTorch/tokenizer
-runtimes must not enter the production artifact. Artifact checks are static;
-they do not substitute for a dedicated-server/client launch, GUI-scale/reload
-checks, or an embedding-service integration test.
+until an actual icon is supplied. Finder metadata, model weights and unrelated
+DJL/PyTorch/tokenizer runtimes must not enter the artifact. The verifier requires
+the native provider classes, pinned llama JNI resources and Java dependencies,
+and rejects nested duplicate logging. Artifact checks remain static: they do not
+substitute for a Minecraft/client launch, GL validation or a real forward pass.
 
-## Branch integration status
+## Current retained integration
 
-This build intentionally has no DJL dependencies or local/native model runtime.
-The original source still imports DJL in `EmbeddingService`, `EmbeddingCommand`,
-`KnnIndex`, `SimpleKnnIndex` and `ItemEmbeddingIndexState`. Until the separately
-owned JDK HTTP embedding migration removes those imports, full compilation is
-expected to fail. Do not restore local-model dependencies to disguise that source
-integration requirement. Any additional compilation errors must be fixed by the
-agent owning the affected source, then rerun `build` and `verifyProductionJar`.
+Default inference is now in-process native Nomic v2 (full 768), with verified
+local assets and no external-server prerequisite. The canonical build and the
+explicit real-model probe passed on the retained combined scope. Commands,
+retained tmux handles, suite counts, actual observations and remaining gameplay
+risks are recorded in [runtime-merge-0035](docs/runtime-merge-0035.md).
 
-### Checks actually performed on the build-portability branch
+## Historical portability-branch evidence (superseded, not current blockers)
+
+The records below predate source integration/native restoration. Their DJL
+compile failures and diagnostic artifacts describe only that historical branch.
+Current compilation has no DJL shim or excluded build task.
+
+### Checks actually performed on the old build-portability branch
 
 - Cached Gradle and the generated wrapper both report **8.13**, running Java **21**.
   Wrapper generation used the installed binary; no Gradle distribution was fetched.
