@@ -15,7 +15,7 @@ final class LifecycleEmbeddingProvider implements EmbeddingProvider {
     private final Supplier<? extends EmbeddingProvider> factory;
     private final Semaphore modelLease;
     private final ReentrantLock calls = new ReentrantLock();
-    private EmbeddingProvider delegate;
+    private volatile EmbeddingProvider delegate;
     private boolean leased, closed;
     private volatile boolean stopRequested;
 
@@ -57,8 +57,12 @@ final class LifecycleEmbeddingProvider implements EmbeddingProvider {
         } finally { calls.unlock(); }
     }
 
-    // Lifecycle signalling is a volatile write only: no model code or locks on the server thread.
-    void requestStop() { stopRequested = true; }
+    // Only lock/IO-free cancellation signalling runs on the lifecycle thread, never disposal.
+    @Override public void requestStop() {
+        stopRequested = true;
+        EmbeddingProvider current = delegate;
+        if (current != null) current.requestStop();
+    }
 
     private void requireRunning() throws InterruptedException {
         if (closed || stopRequested || Thread.currentThread().isInterrupted())

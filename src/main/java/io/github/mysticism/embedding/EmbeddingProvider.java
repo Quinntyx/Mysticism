@@ -17,5 +17,10 @@ public interface EmbeddingProvider extends AutoCloseable {
     EmbeddingProfile profile();
     void checkReady() throws Exception;
     Vec384f getEmbedding(String descriptor) throws Exception;
+    /** Cancellation signal only: bounded, lock/IO-free, idempotent; never free native state.
+     * Needed when a native loader ignores or clears the worker's interrupt flag. */
+    default void requestStop() {}
+    /** Returns only after teardown completes. The engine supplies an off-thread, drained
+     * owner; asynchronous close would release the process lease before JNI is safe. */
     @Override void close();
 }

@@ -12,11 +12,13 @@ import java.util.function.BooleanSupplier;
 final class EmbeddingProviderSession implements AutoCloseable {
     private final EmbeddingProvider provider;
     private boolean busy, closing, disposeRequested, disposed;
+    private EmbeddingModelException modelFailure;
 
     EmbeddingProviderSession(EmbeddingProvider provider) { this.provider = provider; }
 
     private synchronized void acquire() throws InterruptedException {
         while (busy && !closing) wait();
+        if (modelFailure != null) throw modelFailure;
         if (closing) throw new CancellationException("Embedding provider session closed");
         busy = true;
     }
@@ -47,10 +49,21 @@ final class EmbeddingProviderSession implements AutoCloseable {
         try {
             if (!current.getAsBoolean()) return null;
             Vec384f borrowed = provider.getEmbedding(descriptor);
-            EmbeddingSpace.requireCurrent(borrowed);
-            Vec384f owned = borrowed.clone();
-            if (owned.length() == 0) throw new IllegalArgumentException("Provider returned zero embedding");
-            return new Vec384f(owned.norm());
+            try {
+                EmbeddingSpace.requireCurrent(borrowed);
+                // Normalize while the borrowed output is still exclusively owned. The
+                // stable full-native L2 implementation also detaches its input array.
+                return NativeEmbeddingOutput.normalize(borrowed.data());
+            } catch (IllegalArgumentException invalid) {
+                throw new EmbeddingModelException("Provider returned an invalid current-model vector", invalid);
+            }
+        } catch (EmbeddingModelException failure) {
+            synchronized (this) {
+                // Revoke BEFORE releasing ownership: another waiter must neither enter
+                // a broken runtime nor win a race with engine failure publication.
+                modelFailure = failure; closing = true; notifyAll();
+            }
+            throw failure;
         } finally { release(); }
     }
 
@@ -61,7 +74,7 @@ final class EmbeddingProviderSession implements AutoCloseable {
             closing = true;
             notifyAll();
         }
-        if (provider instanceof LifecycleEmbeddingProvider owned) owned.requestStop();
+        provider.requestStop();
     }
 
     /** Called only after worker termination. Empty launches must not accumulate behind

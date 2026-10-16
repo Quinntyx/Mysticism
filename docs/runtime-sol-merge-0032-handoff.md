@@ -1,4 +1,8 @@
-# Retained runtime integration: merge-0032
+# Retained runtime integration: merge-0032 (pre-native record)
+
+Historical checks for `cdc2de4a2622455bdd8cb078391f968f83529402`.
+The earlier HTTP-only blocker below is superseded by the
+[native integration and candidate-specific evidence](runtime-sol-merge-0032-native-validation.md).
 
 Owned branch: `feat-runtime-sol-merge-0032`, development work only. This completes
 its already-started merge of `f9eff09692e519a336aebccc14527ab9fe675ba6` into

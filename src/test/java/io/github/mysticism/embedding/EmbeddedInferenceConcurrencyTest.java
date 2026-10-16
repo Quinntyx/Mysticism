@@ -115,8 +115,6 @@ public final class EmbeddedInferenceConcurrencyTest {
             axis(get(e.embed("767")), 767);
             check(provider.calls.get() == 24, "Cache miss after concurrent inference");
             failed(e.embed("throw"), IllegalStateException.class);
-            failed(e.embed("zero"), IllegalArgumentException.class);
-            failed(e.embed("wrong-profile"), IllegalArgumentException.class);
             axis(get(e.embed("100")), 100);
             check(!provider.overlap.get(), "Failure recovery bypassed session ownership");
         } finally { provider.gate.countDown(); e.close(); }
@@ -124,6 +122,21 @@ public final class EmbeddedInferenceConcurrencyTest {
         check(e.awaitClosed(Duration.ofSeconds(2)), "Worker drain/cleanup did not finish");
         check(provider.closes.get() == 1 && "Mysticism-EmbedCleanup".equals(provider.closingThread),
                 "Provider not closed exactly once on cleanup thread");
+    }
+    private static void invalidModelOutputs() throws Exception {
+        for (String invalid : List.of("zero", "wrong-profile")) {
+            var provider = new BorrowingProvider();
+            var e = engine(new LifecycleEmbeddingProvider(() -> provider), 4, 3000);
+            try {
+                get(e.readiness());
+                failed(e.embed(invalid), EmbeddingModelException.class);
+                check(e.state().phase() == EmbeddingReadiness.Phase.FAILED, "Invalid native output retained readiness");
+                failed(e.embed("1"), IllegalStateException.class);
+                check(provider.calls.get() == 1, "Broken native generation ran another inference");
+            } finally { e.close(); }
+            check(e.awaitClosed(Duration.ofSeconds(2)), "Invalid generation did not drain");
+            check(provider.closes.get() == 1 && !provider.overlap.get(), "Invalid generation leaked or raced disposal");
+        }
     }
     private static void expiredWaiters() throws Exception {
         BorrowingProvider provider = new BorrowingProvider(); provider.holdFirst = true;
@@ -198,7 +211,7 @@ public final class EmbeddedInferenceConcurrencyTest {
         await(provider.disposed);
     }
     public static void main(String[] args) throws Exception {
-        borrowedOutput(); concurrentRequests(false); concurrentRequests(true); expiredWaiters();
+        borrowedOutput(); concurrentRequests(false); concurrentRequests(true); invalidModelOutputs(); expiredWaiters();
         shutdownDuringCall(false); shutdownDuringCall(true); independentSessions(); cancelledSubscriber();
         System.out.println("EmbeddedInferenceConcurrencyTest passed: " + checks + " checks (unsafe provider fixtures; no model inference)");
     }
