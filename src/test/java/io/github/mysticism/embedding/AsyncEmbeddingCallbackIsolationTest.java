@@ -36,7 +36,8 @@ public final class AsyncEmbeddingCallbackIsolationTest {
     }
     private static void isolatedTimeouts() throws Exception {
         Provider p=new Provider();CountDownLatch entered=new CountDownLatch(1),release=new CountDownLatch(1);
-        try(var e=new AsyncEmbeddingEngine(p,1,8,2,Duration.ofMillis(120))) {
+        // Exercise short request deadlines without timing cold JVM/class loading as readiness.
+        try(var e=new AsyncEmbeddingEngine(p,1,8,2,Duration.ofMillis(120),Duration.ofSeconds(2))) {
             e.readiness().get(1,TimeUnit.SECONDS);
             var first=e.embed("shared");check(p.started.await(1,TimeUnit.SECONDS),"Provider started");
             var sibling=e.embed("shared");
@@ -83,7 +84,7 @@ public final class AsyncEmbeddingCallbackIsolationTest {
         while(permits.availablePermits()!=AsyncEmbeddingEngine.CALLBACK_CAPACITY && System.nanoTime()<until)Thread.sleep(1);
         check(permits.availablePermits()==AsyncEmbeddingEngine.CALLBACK_CAPACITY,"Prior callbacks leaked reservations");
         Provider p=new Provider();CountDownLatch entered=new CountDownLatch(AsyncEmbeddingEngine.CALLBACK_CAPACITY),release=new CountDownLatch(1);
-        var e=new AsyncEmbeddingEngine(p,1,8,2,Duration.ofMillis(300));
+        var e=new AsyncEmbeddingEngine(p,1,8,2,Duration.ofMillis(300),Duration.ofSeconds(2));
         try {
             e.readiness().get(1,TimeUnit.SECONDS);
             until=System.nanoTime()+TimeUnit.SECONDS.toNanos(1);

@@ -48,7 +48,7 @@ tmux wait-for -S mysticism-build-done
 `buildSelfTest` compiles only `scripts/selftest/*.java` against the JDK. It runs
 positive and negative packaging fixtures plus runner discovery/failure fixtures,
 and is independent of Minecraft source compilation. It checks missing resources/licenses/icons, unexpanded metadata,
-model-runtime leakage (including nested jars), Java versions and unmapped Minecraft
+unapproved model-runtime leakage (including nested jars), approved JNI/dependency presence, Java versions and unmapped Minecraft
 class references, including field/method, name-and-type and method-type descriptors.
 Arbitrary string literals are not treated as linkage references. The Gradle task
 also validates the decoded `depends.java` value with its existing JsonSlurper,
@@ -99,9 +99,28 @@ runtimes must not enter the production artifact. Artifact checks are static;
 they do not substitute for a dedicated-server/client launch, GUI-scale/reload
 checks, or an embedding-service integration test.
 
-## Branch integration status
+## Embedded IntelliJ launch/resource unit
 
-This build intentionally has no DJL dependencies or local/native model runtime.
+See [embedded-intellij-runtime.md](docs/embedded-intellij-runtime.md) for local
+bundle provisioning, Loom/IntelliJ JVM arguments, SPI lifecycle and regression
+boundaries. Actual checks and remaining inference blockers are recorded in
+[embedded-intellij-validation.md](docs/embedded-intellij-validation.md). The default provider is in-process; HTTP is explicit opt-in. This
+checkout contains the real pinned JNI runtime/adapter on both the IDE classpath
+and in the packaged artifact. Approved weights are not bundled; the exact separately
+authorized model is now provisioned in this machine's Mysticism cache. Real local
+inference and the unrelated-cwd launch probe have passed; see the linked validation
+record for evidence and its GUI/gameplay boundary. Use `embeddedIntellijInferenceProbe`
+for an opt-in real forward pass with the current Loom client embedding options.
+See the linked model-path and optional resource-bundle instructions; no external
+service is required.
+`runtimeSelfTest` discovers current embedding and `src/runtimeTest/java` suites;
+`check` also verifies actual Loom run arguments and serialized IntelliJ XML.
+
+## Historical branch integration status (not current build results)
+
+The following notes describe the earlier build-portability branch, not this
+checkout's current source or canonical build. This earlier build intentionally
+had no DJL dependencies or local/native model runtime.
 The original source still imports DJL in `EmbeddingService`, `EmbeddingCommand`,
 `KnnIndex`, `SimpleKnnIndex` and `ItemEmbeddingIndexState`. Until the separately
 owned JDK HTTP embedding migration removes those imports, full compilation is
