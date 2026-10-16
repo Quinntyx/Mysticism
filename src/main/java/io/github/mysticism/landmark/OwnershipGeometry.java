@@ -56,7 +56,7 @@ final class OwnershipGeometry {
             }
             pages.add(new GeometryPage(LandmarkIds.geometryPage(dimension,id,base,8),revision,bounds,new BlockPalette(palette),tree));
         }
-        if(pages.size()>LandmarkNbt.MAX_GEOMETRY_REFS)throw new IllegalArgumentException("ownership page budget");
+        if(pages.size()>LandmarkNbt.MAX_OBSERVATION_GEOMETRY_PAGES)throw new IllegalArgumentException("ownership page budget");
         return new SourceGeometry(pages,frontiers);
     }
     static Bounds bounds(BlockPoint anchor,SourceGeometry geometry){Bounds b=Bounds.cube(anchor.x(),anchor.y(),anchor.z(),1);for(var p:geometry.pages())b=b.union(p.bounds());return b;}

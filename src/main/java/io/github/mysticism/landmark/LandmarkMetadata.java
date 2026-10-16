@@ -7,7 +7,8 @@ public record LandmarkMetadata(Landmark header,List<String> geometryKeys) {
     public LandmarkMetadata {
         if(!header.geometry().pages().isEmpty()) throw new IllegalArgumentException("metadata contains geometry");
         geometryKeys=List.copyOf(geometryKeys);
-        if(geometryKeys.size()>4096 || header.geometry().frontiers().size()>4096 || header.ownership().claims().size()>256)
+        // Aggregate geometry refs are paged on disk; only per-header fields have a cap.
+        if(header.geometry().frontiers().size()>LandmarkNbt.MAX_FRONTIERS || header.ownership().claims().size()>LandmarkNbt.MAX_CLAIMS)
             throw new IllegalArgumentException("metadata limits");
         java.util.Set<String> pageIds=new java.util.HashSet<>();
         for(String key:geometryKeys) {

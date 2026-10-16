@@ -336,7 +336,7 @@ lineage. Never publish topology with a sequence of independent `stagePut` calls.
 `stageActivity()` retains opaque references and CAS-updates activity/claims without leaf
 reconstruction; each retained reference still consumes one bounded advance operation.
 
-Save key is `mysticism.landmarks.v1`. Geometry versions and landmark metadata versions are
+Native source save key is `mysticism.landmarks.source-v2`. Geometry versions and landmark metadata versions are
 independent immutable PersistentStates, keyed `mysticism.landmark.geometry.<id>.<revision>`
 and `mysticism.landmark.record.<id>.<CAS revision>.<canonical-NBT SHA-256>`. The digest
 recursively sorts compound keys, preserves list order, and includes typed primitive bytes.
@@ -344,11 +344,22 @@ Cancelled attempts at the same committed CAS revision therefore never reserve or
 another metadata version, including after save/restart. Legacy revision-only record keys
 remain readable; new writes always use content addressing and verify the referenced digest.
 Geometry versions remain extractor-assigned and immutable: changed masks need new versions.
-Metadata refs are limited to 4096 geometry
-pages, 4096 frontiers, and 256 claims; excessive metadata must be partitioned upstream and
-is rejected, never silently truncated. Metadata is encoded to derive its key during staging;
-geometry is encoded only when advanced. Unchanged versions consume bounded work without
-being dirtied. `advance(maxPages,maxLeaves)` shares the page-operation budget among topology
+Aggregate geometry references have no fixed landmark-size ceiling. Headers up to 4096 refs
+retain the legacy inline record layout (schema 1). Larger records use metadata schema 2:
+one `geometryIndex` root key plus an exact `geometryCount`, with an empty inline list.
+Old readers reject schema 2 rather than silently accepting empty geometry. Immutable
+`mysticism.landmark.references.<canonical-NBT SHA-256>` directory pages hold at most 256
+opaque geometry keys and an optional next-page key, with no fixed root-list/depth ceiling.
+The count, key digest, page size/type, chain termination and unique geometry page IDs are
+validated; absent/corrupt directory pages fail loudly, never truncate or invent terrain.
+Reference pages stage tail-first before the metadata record and final catalogue publication.
+`stageSourcePatch` retains unread geometry keys verbatim; paging never splits source identity
+or changes ownership, geometry detail or native embedding profiles/bits. Activity/merge/split
+metadata publication uses the same directory codec. The 4096-page **hydrated observation**
+budget, 4096-frontier and 256-claim header limits remain; these are not aggregate source
+geometry-reference limits. Metadata/reference directories are encoded to derive their keys
+during staging; geometry is encoded only when advanced. Unchanged versions consume bounded
+work without being dirtied. `advance(maxPages,maxLeaves)` shares the page-operation budget among topology
 validation visits, immutable page writes/reference checks and final manifest publication;
 old-leaf preservation checks additionally consume at most maxLeaves (1..32768) per call.
 `advance(maxPages)` uses 32768 for that leaf budget. `validatedLeaves()` counts checked old
@@ -361,7 +372,8 @@ pages are staged. Cancellation leaves old topology and unreferenced immutable pa
 
 Vanilla `PersistentStateManager.save()` performs disk writes; staging does not force IO.
 States use `DataFixTypes.SAVED_DATA_COMMAND_STORAGE` (required non-null in Yarn 1.21.1),
-with independent strict landmark schema 1; no automatic custom-schema migration. Missing
+with strict manifest/profile/geometry schema 1 and inline/paged metadata record schemas
+1/2; no automatic embedding/custom-schema migration. Missing
 or invalid refs/pages/embeddings fail loudly. Vanilla conflates missing files with decoder
 failures; this store only creates a page after positively checking file absence. An existing
 unreadable geometry/record file throws and is never dirtied or replaced, even when vanilla
@@ -376,9 +388,15 @@ whole-world memory eviction or disk compaction.
 `encodeLandmark(Landmark,List<String> geometryKeys)`,
 `decodeLandmark(NbtCompound,Function<String,GeometryPage> geometryLoader)`,
 `encodeMetadata(LandmarkMetadata)`, `decodeMetadata(NbtCompound)`,
+`decodeMetadata(NbtCompound,Function<String,NbtCompound> referenceLoader)`,
 `hydrate(LandmarkMetadata,List<GeometryPage>)`,
 `putBounds(NbtCompound,String,Bounds)`, `getBounds(NbtCompound,String)`.
-Encoders return compounds except putBounds. Store also exposes standard
+Encoders return compounds except putBounds. Large `encodeMetadata` results are only the
+record header; use store-managed publication (its internal `encodeMetadataPages` stages the
+required directory blobs too), not standalone header persistence. Cold metadata directory
+reads and key construction are linear in reference count and synchronous on the store
+owner thread; this is not a spatial acceleration index or bounded whole-tick IO guarantee.
+Store also exposes standard
 `fromNbt(NbtCompound,RegistryWrapper.WrapperLookup)` / `writeNbt(...)` PersistentState hooks.
 Manifest aliases/tombstones/lineage are validated without loading geometry pages.
 `GeometryDecoder(NbtCompound)` offers `advance(int maxLeaves)`, `leafCount()`, `complete()`

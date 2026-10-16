@@ -66,7 +66,7 @@ public final class GenerationSurveyContiguousGrowthTest {
     }
     private static void commit(LandmarkStore.PendingMutation mutation){
         int steps=0;
-        while(!mutation.complete()){mutation.advance(1,512);check(++steps<1000,"local page validation/publication drains");}
+        while(!mutation.complete()){mutation.advance(1,512);check(++steps<10000,"budgeted page validation/publication drains");}
     }
     private static Landmark publish(LandmarkStore store,SourceLandmarks.Prepared p){
         var old=p.prior();long revision=old==null?0:old.revision()+1;
@@ -91,11 +91,13 @@ public final class GenerationSurveyContiguousGrowthTest {
             public int height(int x,int z){return 64;}
             public String biome(int x,int z,int y){return BIOME;}
         };
-        // Radius four: 9x9 ADJACENT generated chunks, not distant disjoint windows.
-        for(int z=-4;z<=4;z++)for(int x=-4;x<=4;x++)lifecycle.loaded(server,DIM,x,z,-64,320,columns);
-        var work=lifecycle.started(server);check(work.pending()==81,"one retained flat-terrain probe per adjacent chunk");
+        // Radius nine: 19x19 ADJACENT chunks. This actually crosses the observed
+        // 4096-reference failure (4800 final pages), not just a local expansion budget.
+        int radius=9,probes=(radius*2+1)*(radius*2+1);
+        for(int z=-radius;z<=radius;z++)for(int x=-radius;x<=radius;x++)lifecycle.loaded(server,DIM,x,z,-64,320,columns);
+        var work=lifecycle.started(server);check(work.pending()==probes,"one retained flat-terrain probe per adjacent chunk");
         check(work.next(false).isEmpty(),"unready embeddings do not fake generation publication");
-        var positions=new ArrayList<BlockPos>();String canonical=null;int attempts=0;boolean restarted=false;
+        var positions=new ArrayList<BlockPos>();String canonical=null;int attempts=0,crossedAt=0;boolean restarted=false;
         Set<String> untouched=Set.of();
         while(work.pending()>0){
             var attempt=work.next(true).orElseThrow();var pos=attempt.position();var region=flatTerrain(pos);
@@ -114,20 +116,37 @@ public final class GenerationSurveyContiguousGrowthTest {
             var actual=owners(store,new Bounds(pos.getX(),64,pos.getZ(),pos.getX()+1L,67,pos.getZ()+1L));
             boolean published=actual.ownerAt(pos).orElse("").equals(canonical);
             check(published&&actual.ownerAt(pos.down()).orElseThrow().equals(canonical),"retire a probe only after actual persisted air/floor ownership commits");
-            work.completed(attempt,published);positions.add(pos);check(++attempts<=81,"no probe permanently fails at old cell/page budgets");
+            work.completed(attempt,published);positions.add(pos);check(++attempts<=probes,"no probe permanently fails at old cell/page/header budgets");
+            if(crossedAt==0&&store.metadata(canonical).orElseThrow().geometryKeys().size()>LandmarkNbt.MAX_INLINE_GEOMETRY_REFS){
+                crossedAt=attempts;check(attempts<probes-1,"fixture must publish more adjoining probes AFTER crossing the old ceiling");
+                var before=store.metadata(canonical).orElseThrow();states.save();states=manager(path);store=LandmarkStore.open(states,path);
+                var after=store.metadata(canonical).orElseThrow();
+                check(after.geometryKeys().equals(before.geometryKeys()),"cold paged directory retains every unread geometry version at the crossing");
+                check(after.header().baseEmbedding().equals(before.header().baseEmbedding()),"paging does not migrate/truncate native embeddings");
+                check(store.cacheStats().reconstructedLeaves()==0,"cold directory metadata never hydrates geometry");
+                check(owners(store,new Bounds(pos.getX(),64,pos.getZ(),pos.getX()+1L,67,pos.getZ()+1L)).ownerAt(pos).orElseThrow().equals(canonical),
+                    "first publication beyond 4096 has real persisted ownership, not only a header/status");
+            }
             // Cold parents are read by later surveys after the old 131072-cell ceiling.
             if(attempts==45){
                 states.save();states=manager(path);store=LandmarkStore.open(states,path);restarted=true;
                 check(store.usesNativeSourceProfile(LandmarkProfiles.current()),"native v2 store survives the mid-growth restart");
             }
         }
-        check(restarted&&attempts==81&&work.chunks()==0,"all contiguous generation debt drains with published ownership");
+        check(restarted&&crossedAt>0&&attempts==probes&&work.chunks()==0,"all contiguous generation debt drains across the persisted reference ceiling");
         var metadata=store.metadata(canonical).orElseThrow();
-        check(metadata.geometryKeys().size()>512,"fixture crosses the old full-parent 512-page ceiling");
-        states.save();var cold=LandmarkStore.open(manager(path),path);var pages=read(cold,canonical,null);
+        check(metadata.geometryKeys().size()==4800,"radius-nine survey crosses the reported 4096 ceiling with all 4800 refs");
+        // Activity-only CAS must preserve the paged directory without geometry hydration.
+        long reconstructed=store.cacheStats().reconstructedLeaves();
+        var activity=new ActivityMetadata(.4,1);
+        commit(store.stageActivity(new LandmarkRepository.RevisionRef(canonical,metadata.revision()),activity,metadata.header().ownership()));
+        check(store.metadata(canonical).orElseThrow().geometryKeys().equals(metadata.geometryKeys()),"activity update retains all paged source refs");
+        check(store.cacheStats().reconstructedLeaves()==reconstructed,"activity-only directory publication never reconstructs source leaves");
+        states.save();var coldStates=manager(path);var cold=LandmarkStore.open(coldStates,path);var pages=read(cold,canonical,null);
         long owned=pages.stream().flatMap(p->p.knownCells().stream()).mapToLong(c->volume(c.bounds())).sum();
         check(owned>OwnershipGeometry.CELL_BUDGET,"fixture crosses the old 131072 expanded-cell ceiling: "+owned);
-        check(owned==153L*153*18,"all overlapping survey windows persist their exact ownership union without truncation: "+owned);
+        check(owned==313L*313*18,"all overlapping survey windows persist their exact ownership union without truncation: "+owned);
+        check(cold.metadata(canonical).orElseThrow().header().activity().equals(activity),"activity-only update of a large record survives cold reload");
         check(cold.ids().equals(List.of(canonical)),"no chunk-shaped identities or duplicate competing ownership are introduced");
         for(var pos:positions){
             var actual=owners(cold,new Bounds(pos.getX(),59,pos.getZ(),pos.getX()+1L,79,pos.getZ()+1L));
@@ -135,7 +154,48 @@ public final class GenerationSurveyContiguousGrowthTest {
             check(actual.ownerAt(new BlockPos(pos.getX(),59,pos.getZ())).isEmpty(),"unknown below observed surface-band remains unowned");
             check(actual.ownerAt(new BlockPos(pos.getX(),78,pos.getZ())).isEmpty(),"unknown above the observation remains unowned");
         }
-        System.out.println("Contiguous generation persisted fixture: "+path+" ("+owned+" cells, "+pages.size()+" pages)");
+        directoryPublicationIsAtomic(cold,coldStates,path,canonical,pages.getFirst());
+        System.out.println("Contiguous generation persisted fixture: "+path+" ("+owned+" cells, "+pages.size()+" pages; crossed 4096 at probe "+crossedAt+"/"+probes+")");
+    }
+    private static void directoryPublicationIsAtomic(LandmarkStore store,PersistentStateManager states,Path path,String id,GeometryPage oldPage)throws Exception{
+        var before=store.metadata(id).orElseThrow();var h=before.header();
+        var page=new GeometryPage(oldPage.id(),oldPage.revision()+1,oldPage.bounds(),oldPage.palette(),oldPage.cells());
+        var geometry=new SourceGeometry(List.of(page),h.geometry().frontiers());
+        var next=new Landmark(id,h.dimension(),h.algorithmVersion(),h.kind(),h.biome(),h.anchor(),h.bounds(),h.baseEmbedding(),h.baseImportance(),
+            h.activity(),h.ownership(),geometry,h.revision()+1,"cancelled directory staging regression");
+        String replaced="mysticism.landmark.geometry."+oldPage.id()+"."+oldPage.revision();
+        var mutation=store.stageSourcePatch(next,h.revision(),List.of(replaced));int steps=0;
+        // Stage even the NEW root/header, but never its final manifest. One page of work
+        // per advance applies to the directory too, not a single unbudgeted giant header.
+        while(mutation.remainingPages()>1){check(mutation.advance(1,512)==1,"directory staging shares the one-page work budget");check(++steps<10000,"directory staging converges");}
+        check(!mutation.complete()&&store.metadata(id).orElseThrow().geometryKeys().equals(before.geometryKeys()),"unpublished directory does not change any ownership reference");
+        states.save();mutation.cancel();
+        var restartedStates=manager(path);var restarted=LandmarkStore.open(restartedStates,path);
+        check(restarted.metadata(id).orElseThrow().equals(before),"cold reload after cancellation ignores all staged new directory/record pages");
+        // A retry after restart reuses staged immutable index pages without conflicts.
+        commit(restarted.stageSourcePatch(next,h.revision(),List.of(replaced)));restartedStates.save();
+        var reloaded=LandmarkStore.open(manager(path),path);var after=reloaded.metadata(id).orElseThrow();
+        var expected=new HashSet<>(before.geometryKeys());expected.remove(replaced);expected.add("mysticism.landmark.geometry."+page.id()+"."+page.revision());
+        check(after.revision()==h.revision()+1&&new HashSet<>(after.geometryKeys()).equals(expected),"retry publishes the new root with every unread ref preserved");
+        check(read(reloaded,id,page.bounds()).contains(page),"changed reference resolves to real persisted geometry after restart");
+        Path directoryPage=path.resolve(LandmarkNbt.encodeMetadata(after).getString("geometryIndex")+".dat");
+        byte[] original=Files.readAllBytes(directoryPage),corrupt={1,2,3,4};
+        try{
+            Files.write(directoryPage,corrupt);
+            var corruptStates=manager(path);var corruptStore=LandmarkStore.open(corruptStates,path);
+            try{corruptStore.metadata(id);throw new AssertionError("corrupt directory accepted as empty terrain");}
+            catch(IllegalStateException expectedFailure){checks++;}
+            corruptStates.save();
+            check(Arrays.equals(corrupt,Files.readAllBytes(directoryPage)),"existing corrupt directory is never dirtied/replaced by a metadata read/save");
+        }finally{Files.write(directoryPage,original);}
+        Path retained=directoryPage.resolveSibling(directoryPage.getFileName()+".retained");
+        Files.move(directoryPage,retained);
+        try{
+            var missing=LandmarkStore.open(manager(path),path);
+            try{missing.metadata(id);throw new AssertionError("missing directory accepted as empty terrain");}
+            catch(IllegalStateException expectedFailure){checks++;}
+        }finally{Files.move(retained,directoryPage);}
+        check(LandmarkStore.open(manager(path),path).metadata(id).orElseThrow().equals(after),"restored immutable directory reads all original refs without repair/migration");
     }
     private static void patchRejectsOwnershipLoss()throws Exception{
         Path path=Files.createTempDirectory("generation-patch-");var store=LandmarkStore.open(manager(path),path);

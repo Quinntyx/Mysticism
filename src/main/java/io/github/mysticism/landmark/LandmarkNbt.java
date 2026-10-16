@@ -8,7 +8,10 @@ import java.util.function.Function;
 /** Versioned strict NBT codecs. Corrupt/new-schema data fails loudly; it is never replaced by an empty world. */
 public final class LandmarkNbt {
     public static final int SCHEMA=1;
-    public static final int MAX_GEOMETRY_REFS=4096, MAX_FRONTIERS=4096, MAX_CLAIMS=256;
+    private static final int PAGED_METADATA_SCHEMA=2;
+    /** Hydrated observation/legacy inline limits, NOT a canonical landmark growth limit. */
+    public static final int MAX_OBSERVATION_GEOMETRY_PAGES=4096, MAX_INLINE_GEOMETRY_REFS=4096;
+    public static final int MAX_FRONTIERS=4096, MAX_CLAIMS=256;
     private LandmarkNbt() {}
     private static void require(NbtCompound n,String key,int type) {
         if(!n.contains(key,type)) throw new IllegalArgumentException("missing/wrong NBT field: "+key);
@@ -110,7 +113,7 @@ public final class LandmarkNbt {
         public GeometryPage result() { if(result==null) throw new IllegalStateException("geometry read incomplete"); return result; }
     }
     public static NbtCompound encodeLandmark(Landmark l,List<String> geometryKeys) {
-        if(geometryKeys.size()!=l.geometry().pages().size() || geometryKeys.size()>MAX_GEOMETRY_REFS
+        if(geometryKeys.size()!=l.geometry().pages().size() || geometryKeys.size()>MAX_OBSERVATION_GEOMETRY_PAGES
                 || l.geometry().frontiers().size()>MAX_FRONTIERS || l.ownership().claims().size()>MAX_CLAIMS) throw new IllegalArgumentException("metadata page limit; partition observations/claims first");
         NbtCompound n=fresh(); n.putString("id",l.id()); n.putString("dimension",l.dimension()); n.putString("algorithm",l.algorithmVersion()); n.putString("kind",l.kind().name()); n.putString("biome",l.biome());
         n.putLongArray("anchor",new long[]{l.anchor().x(),l.anchor().y(),l.anchor().z()}); putBounds(n,"bounds",l.bounds());
@@ -133,16 +136,45 @@ public final class LandmarkNbt {
             throw new IllegalArgumentException("page reference mismatch");
         return new Landmark(l.id(),l.dimension(),l.algorithmVersion(),l.kind(),l.biome(),l.anchor(),l.bounds(),l.baseEmbedding(),l.baseImportance(),l.activity(),l.ownership(),new SourceGeometry(pages,l.geometry().frontiers()),l.revision(),l.provenance());
     }
-    public static NbtCompound encodeMetadata(LandmarkMetadata metadata) {
-        NbtCompound n=encodeLandmark(metadata.header(),List.of()); NbtList refs=new NbtList();
-        metadata.geometryKeys().forEach(key->refs.add(NbtString.of(key))); n.put("geometry",refs); return n;
+    record MetadataPages(NbtCompound record,List<GeometryReferenceIndex.Page> references) {}
+    /** Small/legacy headers stay byte-for-byte compatible. Large reference directories
+     * are independently bounded blobs; never expand geometry or partition source IDs. */
+    static MetadataPages encodeMetadataPages(LandmarkMetadata metadata) {
+        NbtCompound n=encodeLandmark(metadata.header(),List.of());
+        if(metadata.geometryKeys().size()<=MAX_INLINE_GEOMETRY_REFS){
+            NbtList refs=new NbtList();metadata.geometryKeys().forEach(key->refs.add(NbtString.of(key)));
+            n.put("geometry",refs);return new MetadataPages(n,List.of());
+        }
+        var index=GeometryReferenceIndex.encode(metadata.geometryKeys());
+        // Old readers must reject this record, not mistake its empty inline list for
+        // absent geometry. This record-layout version does not change embedding profiles.
+        n.putInt("schema",PAGED_METADATA_SCHEMA);
+        n.putString("geometryIndex",index.root());n.putInt("geometryCount",metadata.geometryKeys().size());
+        return new MetadataPages(n,index.pages());
     }
+    /** For a large header, persist encodeMetadataPages' reference pages as well. */
+    public static NbtCompound encodeMetadata(LandmarkMetadata metadata) { return encodeMetadataPages(metadata).record(); }
     public static LandmarkMetadata decodeMetadata(NbtCompound n) {
-        version(n); require(n,"anchor",NbtElement.LONG_ARRAY_TYPE); long[] a=n.getLongArray("anchor"); if(a.length!=3) throw new IllegalArgumentException("anchor length");
+        return decodeMetadata(n,key->{throw new IllegalArgumentException("paged metadata requires reference loader");});
+    }
+    public static LandmarkMetadata decodeMetadata(NbtCompound n,Function<String,NbtCompound> referenceLoader) {
+        require(n,"schema",NbtElement.INT_TYPE);int schema=n.getInt("schema");
+        if(schema!=SCHEMA&&schema!=PAGED_METADATA_SCHEMA)throw new IllegalArgumentException("unsupported landmark metadata schema");
+        require(n,"anchor",NbtElement.LONG_ARRAY_TYPE); long[] a=n.getLongArray("anchor"); if(a.length!=3) throw new IllegalArgumentException("anchor length");
         EmbeddingProfile profile=decodeProfile(compound(n,"profile")); require(n,"embedding",NbtElement.INT_ARRAY_TYPE); int[] bits=n.getIntArray("embedding");
         if(bits.length!=profile.dimensions()) throw new IllegalArgumentException("embedding dimension");
         float[] values=new float[bits.length]; for(int i=0;i<bits.length;i++) values[i]=Float.intBitsToFloat(bits[i]);
-        List<String> keys=new ArrayList<>(); for(NbtElement ref:list(n,"geometry",NbtElement.STRING_TYPE,MAX_GEOMETRY_REFS)) keys.add(ref.asString());
+        List<String> keys=new ArrayList<>();
+        NbtList inline=list(n,"geometry",NbtElement.STRING_TYPE,MAX_INLINE_GEOMETRY_REFS);
+        if(schema==PAGED_METADATA_SCHEMA){
+            String root=string(n,"geometryIndex");require(n,"geometryCount",NbtElement.INT_TYPE);
+            int count=n.getInt("geometryCount");
+            if(!inline.isEmpty()||count<=MAX_INLINE_GEOMETRY_REFS)throw new IllegalArgumentException("ambiguous/noncanonical geometry directory");
+            keys=GeometryReferenceIndex.decode(root,count,referenceLoader);
+        }else{
+            if(n.contains("geometryIndex")||n.contains("geometryCount"))throw new IllegalArgumentException("paged directory requires metadata schema 2");
+            for(NbtElement ref:inline)keys.add(ref.asString());
+        }
         List<Ownership.Claim> claims=new ArrayList<>(); for(NbtElement e:list(n,"claims",NbtElement.COMPOUND_TYPE,MAX_CLAIMS)) { NbtCompound c=(NbtCompound)e; claims.add(new Ownership.Claim(UUID.fromString(string(c,"player")),number(c,"tick"))); }
         List<FrontierFace> frontiers=new ArrayList<>(); for(NbtElement e:list(n,"frontiers",NbtElement.COMPOUND_TYPE,MAX_FRONTIERS)) {
             NbtCompound f=(NbtCompound)e; frontiers.add(new FrontierFace(string(f,"dimension"),getBounds(f,"missing"),FrontierFace.Direction.valueOf(string(f,"direction")),number(f,"revision"),string(f,"cursor")));

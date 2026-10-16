@@ -7,8 +7,6 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.util.WorldSavePath;
 import net.minecraft.world.PersistentState;
 import net.minecraft.world.PersistentStateManager;
-import java.io.*;
-import java.security.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
@@ -101,7 +99,7 @@ public final class LandmarkStore extends PersistentState {
         checkThread(); id=resolve(id); Ref ref=records.get(id); if(ref==null) return Optional.empty();
         LandmarkMetadata value=metadataCache.get(ref.key);
         if(value==null) {
-            value=LandmarkNbt.decodeMetadata(load(ref.key));
+            value=LandmarkNbt.decodeMetadata(load(ref.key),this::load);
             String legacy="mysticism.landmark.record."+value.id()+"."+value.revision();
             if(!ref.key.equals(legacy) && !ref.key.equals(recordKey(value))) throw new IllegalStateException("metadata content/reference mismatch");
             metadataCache.put(ref.key,value);
@@ -245,27 +243,13 @@ public final class LandmarkStore extends PersistentState {
         }
     }
     private static void checkKey(String key) {
-        if(!key.matches("mysticism[.]landmark[.](geometry[.]lm-[0-9a-f]{64}[.][0-9]+|record[.]lm-[0-9a-f]{64}[.][0-9]+([.][0-9a-f]{64})?)")) throw new IllegalArgumentException("invalid landmark page key");
+        if(!GeometryReferenceIndex.validKey(key) && !key.matches("mysticism[.]landmark[.](geometry[.]lm-[0-9a-f]{64}[.][0-9]+|record[.]lm-[0-9a-f]{64}[.][0-9]+([.][0-9a-f]{64})?)")) throw new IllegalArgumentException("invalid landmark page key");
     }
     private static String geometryKey(GeometryPage p) { return "mysticism.landmark.geometry."+p.id()+"."+p.revision(); }
     // CAS revisions name committed identities, not staging attempts. Content addressing makes
     // cancelled/restarted attempts independent without overwriting any immutable metadata.
     private static String recordKey(LandmarkMetadata value) {
-        try {
-            MessageDigest hash=MessageDigest.getInstance("SHA-256");
-            var output=new DataOutputStream(new DigestOutputStream(OutputStream.nullOutputStream(),hash));
-            hashNbt(output,LandmarkNbt.encodeMetadata(value));
-            return "mysticism.landmark.record."+value.id()+"."+value.revision()+"."+HexFormat.of().formatHex(hash.digest());
-        } catch(IOException | NoSuchAlgorithmException e) { throw new IllegalStateException("metadata digest",e); }
-    }
-    private static void hashNbt(DataOutput out,NbtElement value) throws IOException {
-        out.writeByte(value.getType());
-        if(value instanceof NbtCompound compound) {
-            var keys=new TreeSet<>(compound.getKeys()); out.writeInt(keys.size());
-            for(String key:keys) { out.writeUTF(key); hashNbt(out,compound.get(key)); }
-        } else if(value instanceof NbtList list) {
-            out.writeInt(list.size()); for(NbtElement element:list) hashNbt(out,element);
-        } else value.write(out);
+        return "mysticism.landmark.record."+value.id()+"."+value.revision()+"."+GeometryReferenceIndex.digest(LandmarkNbt.encodeMetadata(value));
     }
     private void unlocked() { checkThread(); if(pending!=null) throw new IllegalStateException("another landmark mutation is pending"); }
     /** expectedRevision=-1 creates a seed; otherwise compare-and-set a canonical live ID. */
@@ -300,7 +284,7 @@ public final class LandmarkStore extends PersistentState {
             if(retainedIds.contains(key.substring(0,key.lastIndexOf('.'))))throw new IllegalArgumentException("source patch overwrites an unread page");
             keys.add(key);writes.add(new PageWrite(key,()->LandmarkNbt.encodeGeometry(page)));
         }
-        // Codec validation keeps the normal metadata/ref/frontier limits and native profile.
+        // Validate the local observation/header; aggregate remote references are paged.
         var header=LandmarkNbt.decodeMetadata(LandmarkNbt.encodeLandmark(local,local.geometry().pages().stream().map(LandmarkStore::geometryKey).toList())).header();
         LandmarkMetadata next=new LandmarkMetadata(header,List.copyOf(keys));
         appendMetadataWrites(writes,List.of(next));
@@ -315,7 +299,7 @@ public final class LandmarkStore extends PersistentState {
         LandmarkMetadata next=new LandmarkMetadata(old.header().withActivity(activity,ownership),old.geometryKeys());
         List<PageWrite> writes=new ArrayList<>();
         for(String key:old.geometryKeys()) writes.add(new PageWrite(key,null)); // required immutable references; never recreated
-        writes.add(new PageWrite(recordKey(next),()->LandmarkNbt.encodeMetadata(next)));
+        appendMetadataWrites(writes,List.of(next));
         pending=new PendingMutation(List.copyOf(writes),List.of(next),Set.of(),Map.of(),Map.of(),Map.of(),profile);pending.changesSource=false; return pending;
     }
     /** Metadata/CAS merge with opaque references. Distinct page AABBs must be disjoint;
@@ -398,7 +382,7 @@ public final class LandmarkStore extends PersistentState {
         EmbeddingProfile nextProfile=profile;
         for(Landmark l:values) {
             if(nextProfile==null) nextProfile=l.baseEmbedding().profile(); else nextProfile.requireCompatible(l.baseEmbedding().profile());
-            if(l.geometry().pages().size()>LandmarkNbt.MAX_GEOMETRY_REFS || l.geometry().frontiers().size()>LandmarkNbt.MAX_FRONTIERS || l.ownership().claims().size()>LandmarkNbt.MAX_CLAIMS)
+            if(l.geometry().pages().size()>LandmarkNbt.MAX_OBSERVATION_GEOMETRY_PAGES || l.geometry().frontiers().size()>LandmarkNbt.MAX_FRONTIERS || l.ownership().claims().size()>LandmarkNbt.MAX_CLAIMS)
                 throw new IllegalArgumentException("metadata page limits");
             for(GeometryPage p:l.geometry().pages()) {
                 String key=geometryKey(p); checkKey(key); GeometryPage prior=unique.putIfAbsent(key,p);
@@ -411,7 +395,12 @@ public final class LandmarkStore extends PersistentState {
         pending=new PendingMutation(List.copyOf(writes),metadata,Set.copyOf(removals),Map.copyOf(newAliases),Map.copyOf(retired),Map.copyOf(history),nextProfile); return pending;
     }
     private static void appendMetadataWrites(List<PageWrite> writes,List<LandmarkMetadata> values) {
-        for(LandmarkMetadata value:values) writes.add(new PageWrite(recordKey(value),()->LandmarkNbt.encodeMetadata(value)));
+        for(LandmarkMetadata value:values) {
+            var encoded=LandmarkNbt.encodeMetadataPages(value);
+            // Tail-first directory staging participates in advance's existing page budget.
+            for(var page:encoded.references())writes.add(new PageWrite(page.key(),page::nbt));
+            writes.add(new PageWrite(recordKey(value),encoded::record));
+        }
     }
     private PendingMutation stageMetadata(List<LandmarkMetadata> values,Set<String> removals,Map<String,String> newAliases,Map<String,Long> retired,Map<String,List<String>> history) {
         List<PageWrite> writes=new ArrayList<>(); Set<String> keys=new TreeSet<>();
