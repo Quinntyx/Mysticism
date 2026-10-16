@@ -1,0 +1,107 @@
+package io.github.mysticism.landmark;
+
+import java.util.*;
+import java.util.function.Predicate;
+
+/** Fair three-lane scheduler for the single-op source pipeline. Wider source discovery
+ * (hint cascades, frontier retries, activity growth) must never block movement-critical
+ * reads (terrain mesh/collision/support sampling) or hold the pipeline while waiting for
+ * real embedding readiness:
+ * <ul>
+ *   <li>Read ops preempt a running non-read op under a bounded fair-share quota,
+ *       including resource owners: movement sampling needs no store/activity lock.</li>
+ *   <li>Requested/resource-owning discovery still advances under sustained reads (one tick per quota),
+ *       and requested ops keep FIFO order; a preempted op resumes where it was parked.</li>
+ *   <li>An inadmissible op (e.g. gated on embedding readiness) is skipped without losing
+ *       its place: it can never block later ops in its own lane or the other lanes.</li>
+ *   <li>Requested and background ops (view-distance observations and hint cascades) alternate
+ *       discovery turns when both are admissible. Background work round-robins at parkable
+ *       boundaries; continuous reads/requests cannot starve real source generation. A started
+ *       resource owner retains discovery precedence until it releases its resources.</li>
+ * </ul>
+ * Ops are identified by identity; the caller owns all op state and lifecycle. */
+final class SourceSchedule<T> {
+    final ArrayDeque<T> readLane=new ArrayDeque<>();
+    final ArrayDeque<T> discoveryLane=new ArrayDeque<>();
+    final ArrayDeque<T> backgroundLane=new ArrayDeque<>();
+    private final int fairShare;
+    private final Predicate<T> readOp,backgroundOp;
+    private int debt;
+    private boolean backgroundTurn;
+    /** Suspended only for movement reads, never for another discovery (in any lane). */
+    private T resourceOwner;
+    /** @param fairShare how many read ops may go first before a waiting discovery op runs */
+    SourceSchedule(int fairShare,Predicate<T> readOp,Predicate<T> backgroundOp){
+        if(fairShare<1)throw new IllegalArgumentException("source schedule fair share");
+        this.fairShare=fairShare;this.readOp=Objects.requireNonNull(readOp);this.backgroundOp=Objects.requireNonNull(backgroundOp);
+    }
+    /** Movement-critical read; newest first, matching the previous read priority. */
+    void read(T op){readLane.addFirst(op);}
+    /** Requested discovery/topology op (public API callers with a real future). */
+    void discover(T op){discoveryLane.addLast(op);}
+    /** Wider view-distance IO and hint cascades share bounded discovery turns. */
+    void background(T op){backgroundLane.addLast(op);}
+    int readPending(){return readLane.size();}
+    int discoveryPending(){return discoveryLane.size()+(resourceOwner!=null&&!backgroundOp.test(resourceOwner)?1:0);}
+    int backgroundPending(){return backgroundLane.size()+(resourceOwner!=null&&backgroundOp.test(resourceOwner)?1:0);}
+    /** Decide the op to advance this tick. Resource owners may yield to movement reads,
+     * but retain precedence over ALL other discovery, including requested work ahead of
+     * a background owner. Thus locks stay releasable without delaying movement by the
+     * entire geometry/publication stage. Quota expiry grants one discovery advance, not
+     * permission to run that op to completion. A read already running is never interrupted. */
+    T pick(T current,Predicate<T> admissible,Predicate<T> parkable){
+        Objects.requireNonNull(admissible);Objects.requireNonNull(parkable);
+        if(current!=null&&!readOp.test(current)){
+            if(!parkable.test(current)){
+                if(resourceOwner!=null)throw new IllegalStateException("another source resource owner is suspended");
+                resourceOwner=current;current=null;
+            }else if(!readLane.isEmpty()||!admissible.test(current)||
+                    (backgroundOp.test(current)?!discoveryLane.isEmpty()||!backgroundLane.isEmpty():!backgroundLane.isEmpty())){
+                // Requested FIFO is preserved. Parkable background work rotates so a waiting
+                // model/IO future cannot monopolize every background turn across the horizon.
+                if(backgroundOp.test(current))backgroundLane.addLast(current);
+                else discoveryLane.addFirst(current);
+                current=null;
+            }
+        }
+        if(current!=null)return current;
+        boolean readWaiting=!readLane.isEmpty();
+        if(resourceOwner!=null){
+            if(readWaiting&&debt<fairShare){debt++;return readLane.removeFirst();}
+            // Finish the lock-owning stage even if model readiness changed meanwhile.
+            T owner=resourceOwner;resourceOwner=null;debt=0;return owner;
+        }
+        T requested=firstAdmissible(discoveryLane,admissible);
+        T background=firstAdmissible(backgroundLane,admissible);
+        if(readWaiting&&(debt<fairShare||requested==null&&background==null)){
+            debt=Math.min(fairShare,debt+1);return readLane.removeFirst();
+        }
+        if(background!=null&&(requested==null||backgroundTurn)){
+            debt=0;backgroundTurn=false;return removeAdmissible(backgroundLane,admissible);
+        }
+        if(requested!=null){debt=0;backgroundTurn=true;return removeAdmissible(discoveryLane,admissible);}
+        return null;
+    }
+    /** Cancel and remove every queued op matching the predicate, in all lanes, invoking the
+     * action exactly once per matched op (used for guarded invalidation and shutdown, so a
+     * parked op can never resume stale work or retain the activity mutation pause). */
+    void cancelIf(Predicate<T> matches,java.util.function.Consumer<T> action){
+        Objects.requireNonNull(matches);Objects.requireNonNull(action);
+        if(resourceOwner!=null&&matches.test(resourceOwner)){
+            T owner=resourceOwner;resourceOwner=null;action.accept(owner);
+        }
+        for(var lane:List.of(readLane,discoveryLane,backgroundLane))
+            for(Iterator<T> it=lane.iterator();it.hasNext();){T op=it.next();if(matches.test(op)){it.remove();action.accept(op);}}
+    }
+    List<T> snapshot(){var out=new ArrayList<T>();if(resourceOwner!=null)out.add(resourceOwner);out.addAll(readLane);out.addAll(discoveryLane);out.addAll(backgroundLane);return List.copyOf(out);}
+    void forEach(java.util.function.Consumer<T> action){snapshot().forEach(action);}
+    private T firstAdmissible(ArrayDeque<T> lane,Predicate<T> admissible){
+        for(T op:lane)if(admissible.test(op))return op;
+        return null;
+    }
+    /** Remove and return the first admissible op, skipping (not dropping) gated ones. */
+    private T removeAdmissible(ArrayDeque<T> lane,Predicate<T> admissible){
+        for(Iterator<T> it=lane.iterator();it.hasNext();){T op=it.next();if(admissible.test(op)){it.remove();return op;}}
+        return null;
+    }
+}

@@ -17,10 +17,13 @@ import java.util.*;
 import java.util.concurrent.*;
 
 /** Real bounded source-coordinate pipeline. Chunks are read-only IO, not ownership or identity.
- * One live operation per server; detached topology/encoding work runs on a bounded worker.
+ * One advancing operation per server; resource owners suspend only for movement reads.
+ * Detached topology/encoding work runs on a bounded worker.
  * No generation, source writes, joins, model inference or catalogue hydration on tick. */
 public final class SourceLandmarks {
     public static final String ALGORITHM="source-octree-v2";
+    /** Read quota per discovery turn. Admissible requested/background lanes alternate turns. */
+    static final int DISCOVERY_FAIR_SHARE=5,READ_BUDGET=64,DISCOVERY_BUDGET=64;
     public record Cell(BlockPoint position,BlockPalette.State material,String biome,boolean sky) {
         public boolean air(){return Set.of("minecraft:air","minecraft:cave_air","minecraft:void_air").contains(material.blockId());}
     }
@@ -55,9 +58,17 @@ public final class SourceLandmarks {
     /** Near-view refinement and growth use exact generated material samples. */
     public static CompletableFuture<Optional<LandmarkMetadata>> refine(MinecraftServer server,String dimension,BlockPos position){return ensureSourceLocation(server,dimension,position);}
     public static CompletableFuture<Region> region(MinecraftServer server,String dimension,Bounds bounds,int maxCells){
+        return region(server,dimension,bounds,maxCells,false);
+    }
+    /** Progressive view-distance observation. Unlike movement/support reads, this work may
+     * yield between bounded sampling advances; a 32^3 tile must not stall a walk probe. */
+    public static CompletableFuture<Region> discoveryRegion(MinecraftServer server,String dimension,Bounds bounds,int maxCells){
+        return region(server,dimension,bounds,maxCells,true);
+    }
+    private static CompletableFuture<Region> region(MinecraftServer server,String dimension,Bounds bounds,int maxCells,boolean discovery){
         Session s=session(server);checkBounds(bounds,maxCells);var future=new CompletableFuture<Region>();
         if(!SourceDimensions.isSource(dimension)){future.complete(new Region(dimension,bounds,List.of(),false));return future;}
-        s.offer(new Read(s,dimension,bounds,future));return future;
+        s.offer(discovery?new DiscoveryRead(s,dimension,bounds,future):new Read(s,dimension,bounds,future));return future;
     }
     /** Exact persisted ownership of both known AIR and SOLID source blocks. Missing map
      * entries grant no ownership. Does not wait for model readiness or access source chunks.
@@ -121,7 +132,7 @@ public final class SourceLandmarks {
         if(!SourceDimensions.isSource(world.getRegistryKey().getValue().toString()))return;
         Session s=SESSIONS.get(world.getServer());if(s!=null){s.invalidate(world.getRegistryKey().getValue().toString(),pos);s.hint(world.getRegistryKey().getValue().toString(),pos.toImmutable(),DiscoveryPrioritizer.PLAYER);}
     }
-    public static int pending(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.requests.size()+s.hints.size()+s.retries.size()+(s.active==null?0:1);}
+    public static int pending(MinecraftServer server){Session s=SESSIONS.get(server);return s==null?0:s.schedule.readPending()+s.schedule.discoveryPending()+s.schedule.backgroundPending()+s.hints.size()+s.retries.size()+(s.active==null?0:1);}
     /** Immediate availability signal for runtime consumers (terrain selection/navigation): fired on
      * the server thread when an Ensure publishes a new or grown landmark. Previous lists the
      * pre-publication identities (empty for a seed); replacement lists the canonical live IDs. */
@@ -142,7 +153,7 @@ public final class SourceLandmarks {
                 return RequestProgress.WAITING_EMBEDDINGS;
             return RequestProgress.RUNNING;
         }
-        for (var op : s.requests) if (op.future == future)
+        for (var op : s.schedule.snapshot()) if (op.future == future)
             return op instanceof Ensure && !ready ? RequestProgress.WAITING_EMBEDDINGS : RequestProgress.QUEUED;
         return RequestProgress.UNAVAILABLE;
     }
@@ -216,29 +227,38 @@ public final class SourceLandmarks {
     }
     private static final class Session {
         static final int REQUEST_BUDGET=64,RETRY_BUDGET=64,HINT_BUDGET=128;static final long AGED_REQUEST_TICKS=DiscoveryPrioritizer.AGING_TICKS;
-        final MinecraftServer server;final LandmarkStore store;final ItemEmbeddingIndexState itemIndex;final ExecutorService worker=new ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(4),Thread.ofPlatform().daemon().name("mysticism-source").factory(),new ThreadPoolExecutor.AbortPolicy());
+        final MinecraftServer server;final LandmarkStore store;final ItemEmbeddingIndexState itemIndex;final ExecutorService worker=new ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(16),Thread.ofPlatform().daemon().name("mysticism-source").factory(),new ThreadPoolExecutor.AbortPolicy());
         final ArrayDeque<SourceOwnership.Request> ownerRequests=new ArrayDeque<>();
+        final SourceSchedule<Operation<?>> schedule=new SourceSchedule<>(DISCOVERY_FAIR_SHARE,op->op instanceof Read,op->op.background);
+        Ensure hintCascade;
+        final java.util.function.LongSupplier observationClock;
         final VisibleDiscoverySweep visibleSweep=new VisibleDiscoverySweep();
         // Fits several full radius-32 source neighborhoods; never an unbounded world catalogue.
         final DiscoveryCoverage completedBackfill=new DiscoveryCoverage(16384);
         int visibleCursor;
         final DiscoveryInvalidation.RetryQueue<FrontierRetry> retries=new DiscoveryInvalidation.RetryQueue<>(RETRY_BUDGET);final Map<CompletableFuture<?>,String> auxiliary=new IdentityHashMap<>();final ArrayList<Operation<?>> requests=new ArrayList<>();final DiscoveryPrioritizer hints=new DiscoveryPrioritizer(HINT_BUDGET);Operation<?> active;String status="Ready";int playerCursor,lastCells;private List<DiscoveryPrioritizer.Anchor> anchorCache;private long anchorCacheTick=-1;
-        Session(MinecraftServer server){this.server=server;store=LandmarkStore.get(server);itemIndex=ItemEmbeddingIndexState.get(server);}
+        Session(MinecraftServer server){this.server=server;observationClock=()->server.getOverworld().getTime();store=LandmarkStore.get(server);itemIndex=ItemEmbeddingIndexState.get(server);}
         <T> CompletableFuture<T> computeAndDeliver(String dim,java.util.function.Supplier<T> computation){
             var out=new CompletableFuture<T>();if(auxiliary.size()>=64){out.completeExceptionally(new RejectedExecutionException("source auxiliary budget"));return out;}auxiliary.put(out,dim);
             try{CompletableFuture.supplyAsync(computation,worker).whenComplete((value,error)->server.execute(()->{auxiliary.remove(out);if(SESSIONS.get(server)!=this)out.cancel(false);else if(error!=null)out.completeExceptionally(error);else out.complete(value);}));}catch(RuntimeException failure){auxiliary.remove(out);out.completeExceptionally(failure);}return out;
         }
-        /** Player-blocking discovery requests displace queued lower-priority work instead of being
-         * rejected; read observations stay ahead of everything and equal priorities keep FIFO order. */
-        void offer(Operation<?> op) {
-            op.enqueued=server.getTicks();
-            pruneRequests();
-            if(requests.size()>=REQUEST_BUDGET) {
-                int victim=DiscoveryPrioritizer.evictionVictim(requests,op,server.getTicks(),AGED_REQUEST_TICKS);
-                if(victim<0) {op.future.completeExceptionally(new RejectedExecutionException("source request budget"));return;}
-                requests.remove(victim).cancel(new CancellationException("superseded by a higher-priority source request"));
+        /** Real execution lanes are bounded independently. Requests retain FIFO within
+         * urgency; background hints are distance/age-prioritized before materialization. */
+        void offer(Operation<?> op){
+            op.enqueued=server==null?0:server.getTicks();
+            if(op instanceof Read){
+                if(schedule.readPending()>=READ_BUDGET){op.future.completeExceptionally(new RejectedExecutionException("source read budget"));return;}
+                schedule.read(op);return;
             }
-            requests.add(DiscoveryPrioritizer.insertionIndex(requests,op),op);
+            if(op.background){
+                if(schedule.backgroundPending()>=DISCOVERY_BUDGET){op.future.completeExceptionally(new RejectedExecutionException("source background budget"));return;}
+                schedule.background(op);return;
+            }
+            if(schedule.discoveryPending()>=DISCOVERY_BUDGET){op.future.completeExceptionally(new RejectedExecutionException("source request budget"));return;}
+            schedule.discover(op);
+        }
+        <T> CompletableFuture<T> spawn(java.util.function.Supplier<T> task){
+            try{return CompletableFuture.supplyAsync(task,worker);}catch(RejectedExecutionException busy){return null;}
         }
         void hint(String dim,BlockPos p) {hint(dim,p,DiscoveryPrioritizer.FRONTIER);}
         void hint(String dim,BlockPos p,int tier) {
@@ -246,7 +266,7 @@ public final class SourceLandmarks {
             var point=new BlockPoint(p.getX(),p.getY(),p.getZ());
             if(tier==DiscoveryPrioritizer.BACKFILL && completedBackfill.contains(dim,point))return;
             if(!SourceDimensions.isSource(dim))return;
-            offerDiscoveryHint(hints,retries,dim,point,tier,anchors(),server.getTicks());
+            offerDiscoveryHint(hints,retries,dim,point,tier,anchors(),server==null?0:server.getTicks());
         }
         /** Four already-loaded chunk lookups per tick, round-robin across source observers.
          * Revisit the full visible radius, not only the first 128 chunk-load events. Missing
@@ -273,6 +293,7 @@ public final class SourceLandmarks {
         }
         /** Online source-dimension observers, cached per tick; anchors for priority selection and eviction. */
         List<DiscoveryPrioritizer.Anchor> anchors() {
+            if(server==null)return List.of(); // Detached execution seam has no world observers.
             if(anchorCache!=null&&anchorCacheTick==server.getTicks())return anchorCache;
             ArrayList<DiscoveryPrioritizer.Anchor> list=new ArrayList<>();
             for(var p:server.getPlayerManager().getPlayerList()) {
@@ -298,10 +319,12 @@ public final class SourceLandmarks {
         void available(String dim,Bounds area){
             completedBackfill.invalidate(dim,area);
             if(active!=null)active.sourceAvailable(dim,area);
+            schedule.forEach(op->op.sourceAvailable(dim,area));
         }
         void invalidate(String dim,BlockPos pos){invalidate(dim,Bounds.cube(pos.getX(),pos.getY(),pos.getZ(),1),"source edit invalidated snapshot");}
         void invalidate(String dim,Bounds area,String reason){
             completedBackfill.invalidate(dim,area);
+            cancelQueued(op->op.dimension.equals(dim)&&op.guarded!=null&&op.guarded.intersects(area),reason);
             invalidateObservation(active,dim,area,reason,(p,window)->{if(window!=null)retries.offer(new FrontierRetry(dim,window,true));else hint(dim,p);});
         }
         void tick(){
@@ -319,34 +342,47 @@ public final class SourceLandmarks {
             }
             if(server.getTicks()%100==0){var players=server.getPlayerManager().getPlayerList();for(int n=0;n<Math.min(4,players.size());n++){var p=players.get(Math.floorMod(playerCursor++,players.size()));if(SourceDimensions.isSource(p.getServerWorld().getRegistryKey().getValue().toString()))hint(p.getServerWorld().getRegistryKey().getValue().toString(),p.getBlockPos(),DiscoveryPrioritizer.PLAYER);}}
             seedVisibleLocality();
-            boolean ready=EmbeddingHelper.isReady()||itemIndex.isPopulated();
-            active=restartAvailable(active,requests,server.getTicks());
-            pruneRequests();
-            if(active==null){
-                var chosen=nextOperation(hints,requests,anchors(),server.getTicks(),ready);
-                if(chosen instanceof DiscoveryPrioritizer.Hint hint){
-                    hints.remove(hint);var key=hint.key();
-                    active=new Ensure(this,key.dimension(),new BlockPos((int)key.pos().x(),(int)key.pos().y(),(int)key.pos().z()),null,false,true,new CompletableFuture<>(),hint.tier());
-                    active.enqueued=hint.enqueuedTick();
-                }else if(chosen instanceof Operation<?> op){requests.remove(op);active=op;}
-                // One shared dispatch budget for hints AND explicit operations. Merely peeking,
-                // waiting for readiness or pruning cancelled requests must not consume turns.
-                if(active!=null)hints.dispatched(active);
+            advanceScheduled(EmbeddingHelper.isReady()||itemIndex.isPopulated());
+        }
+        /** Shared production/regression path: one bounded advance, no inline worker fallback. */
+        private void advanceScheduled(boolean ready){
+            schedule.cancelIf(op->op.future.isDone(),op->{op.cancel(new CancellationException("source caller completed/cancelled"));op.release();});
+            if(hintCascade!=null&&hintCascade.future.isDone())hintCascade=null;
+            if(ready&&hintCascade==null&&!hints.isEmpty()&&schedule.backgroundPending()<DISCOVERY_BUDGET){
+                long now=server==null?0:server.getTicks();
+                var hint=(DiscoveryPrioritizer.Hint)hints.next(List.of(),server==null?List.of():anchors(),now,AGED_REQUEST_TICKS,true);
+                if(hint!=null){hints.remove(hint);var key=hint.key();
+                    hintCascade=new Ensure(this,key.dimension(),new BlockPos((int)key.pos().x(),(int)key.pos().y(),(int)key.pos().z()),null,false,true,new CompletableFuture<>(),hint.tier());
+                    hintCascade.enqueued=hint.enqueuedTick();hintCascade.background=true;schedule.background(hintCascade);hints.dispatched(hintCascade);
+                }
             }
+            active=schedule.pick(active,op->admissible(op,ready),Session::parkable);
             if(active==null)return;
+            if(active.availabilityChanged&&!active.done&&!active.future.isDone()){
+                var replacement=active.freshObservation();
+                if(replacement!=null){replacement.background=active.background;replacement.enqueued=active.enqueued;active.discardAttempt();active.release();if(hintCascade==active)hintCascade=(Ensure)replacement;active=replacement;}
+                else active.cancel(new CancellationException("source availability invalidated snapshot"));
+            }
             try{if(active.future.isCancelled())active.cancel(new CancellationException());if(!active.done)active.advance();if(active.done){active.release();active=null;status="Ready";}}
             catch(RuntimeException e){
                 status="Deferred: "+e.getMessage();
-                // A refresh pass defeated only by a concurrently committed revision is re-hinted;
-                // losing the hint would leave the edited/generated terrain undiscovered forever.
                 String dim=active.dimension;BlockPos resume=DiscoveryInvalidation.transientStaleness(e)?active.refreshPoint():null;
                 Bounds window=resume==null?null:active.refreshArea();
                 active.cancel(e);active.release();active=null;
                 if(window!=null)retries.offer(new FrontierRetry(dim,window,true));else if(resume!=null)hint(dim,resume);
             }
         }
-        void unload(String dim){ownerRequests.removeIf(request->{if(request.dimension.equals(dim)){request.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});retries.removeIf(r->r.dimension.equals(dim));auxiliary.entrySet().removeIf(e->{if(e.getValue().equals(dim)){e.getKey().cancel(false);return true;}return false;});if(active!=null&&active.dimension.equals(dim)){active.cancel(new CancellationException("source dimension unloaded"));active.release();active=null;}requests.removeIf(op->{if(op.dimension.equals(dim)){op.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});hints.removeDimension(dim);visibleSweep.removeDimension(dim);completedBackfill.removeDimension(dim);}
-        void close(){ownerRequests.forEach(request->request.cancel(new CancellationException("server stopping")));ownerRequests.clear();auxiliary.keySet().forEach(f->f.cancel(false));auxiliary.clear();retries.clear();if(active!=null){active.cancel(new CancellationException("server stopping"));active.release();}requests.forEach(op->op.cancel(new CancellationException("server stopping")));requests.clear();hints.clear();visibleSweep.clear();completedBackfill.clear();worker.shutdownNow();}
+        private boolean admissible(Operation<?> op,boolean ready){
+            if(op instanceof Read||op instanceof DiscoveryRead)return true;
+            if(op instanceof Ensure ensure&&ensure.waitingEmbedding)return EmbeddingHelper.isReady();
+            return ready;
+        }
+        private static boolean parkable(Operation<?> op){return op.geometryRead==null&&op.resume==null&&!(op.mutation!=null&&!op.mutation.complete());}
+        private void cancelQueued(java.util.function.Predicate<Operation<?>> matches,String reason){
+            schedule.cancelIf(matches,op->{invalidateObservation(op,op.dimension,op.guarded,reason,(p,area)->{if(area!=null)retries.offer(new FrontierRetry(op.dimension,area,true));else hint(op.dimension,p);});op.cancel(new CancellationException(reason));op.release();});
+        }
+        void unload(String dim){ownerRequests.removeIf(request->{if(request.dimension.equals(dim)){request.cancel(new CancellationException("source dimension unloaded"));return true;}return false;});retries.removeIf(r->r.dimension.equals(dim));auxiliary.entrySet().removeIf(e->{if(e.getValue().equals(dim)){e.getKey().cancel(false);return true;}return false;});if(active!=null&&active.dimension.equals(dim)){active.cancel(new CancellationException("source dimension unloaded"));active.release();active=null;}cancelQueued(op->op.dimension.equals(dim),"source dimension unloaded");hints.removeDimension(dim);visibleSweep.removeDimension(dim);completedBackfill.removeDimension(dim);retries.removeIf(r->r.dimension.equals(dim));}
+        void close(){ownerRequests.forEach(request->request.cancel(new CancellationException("server stopping")));ownerRequests.clear();auxiliary.keySet().forEach(f->f.cancel(false));auxiliary.clear();if(active!=null){active.cancel(new CancellationException("server stopping"));active.release();}schedule.cancelIf(op->true,op->{op.cancel(new CancellationException("server stopping"));op.release();});requests.clear();retries.clear();hints.clear();visibleSweep.clear();completedBackfill.clear();worker.shutdownNow();}
         ServerWorld world(String dimension){return SourceDimensions.isSource(dimension)?server.getWorld(RegistryKey.of(RegistryKeys.WORLD,Identifier.of(dimension))):null;}
     }
     /** Edit/unload remains terminal for the caller, but discovery coverage is retained. */
@@ -390,7 +426,7 @@ public final class SourceLandmarks {
     }
     // Package-visible operation lifecycle permits deterministic regressions without a game bootstrap.
     abstract static class Operation<T> implements DiscoveryPrioritizer.Scheduled {
-        final Session s;String dimension;Bounds bounds,guarded;final CompletableFuture<T> future;boolean done,availabilityChanged;int tier=DiscoveryPrioritizer.FRONTIER;long enqueued;
+        final Session s;String dimension;Bounds bounds,guarded;final CompletableFuture<T> future;boolean done,availabilityChanged,background;int tier=DiscoveryPrioritizer.FRONTIER;long enqueued;
         GeneratedSourceReader reader;CompletableFuture<Region> snapshot;CompletableFuture<Landmark> hydrated;LandmarkStore.GeometryRead geometryRead;LandmarkStore.PendingMutation mutation;CompletableFuture<?> work;Runnable resume;
         LandmarkExtractionService.TopologyPlan history;
         Operation(Session s,String dimension,Bounds bounds,CompletableFuture<T> future){this.s=s;this.dimension=dimension;this.bounds=bounds;this.guarded=bounds;this.future=future;}
@@ -409,20 +445,28 @@ public final class SourceLandmarks {
         void discardAttempt(){done=true;if(reader!=null)reader.cancel();if(geometryRead!=null)geometryRead.cancel();if(work!=null)work.cancel(false);if(mutation!=null&&!mutation.complete())mutation.cancel();if(history!=null)history.cancel();}
         void cancel(Throwable failure){discardAttempt();future.completeExceptionally(failure);}
         void release(){if(resume!=null){resume.run();resume=null;}}
-        boolean observe(){if(snapshot!=null)return snapshot.isDone();if(reader==null){ServerWorld world=s.world(dimension);if(world==null)throw new IllegalStateException("source world unavailable");reader=new GeneratedSourceReader(world,bounds,s.worker);}s.status="Source read";boolean complete=reader.advance(512);s.lastCells=reader.lastSampled;if(complete){snapshot=reader.resultAsync();work=snapshot;}return false;}
+        boolean observe(){if(snapshot!=null)return snapshot.isDone();if(reader==null){ServerWorld world=s.world(dimension);if(world==null)throw new IllegalStateException("source world unavailable");reader=new GeneratedSourceReader(world,bounds,s.worker);}s.status="Source read";boolean complete=this instanceof DiscoveryRead?reader.advanceDiscovery():reader.advance(512);s.lastCells=reader.lastSampled;if(complete){var next=reader.resultAsync();if(next==null)return false; // saturated worker; retry completion next tick
+            snapshot=next;work=snapshot;}return false;}
     }
     static final class Read extends Operation<Region> {
         Read(Session s,String dimension,Bounds bounds,CompletableFuture<Region> future){super(s,dimension,bounds,future);tier=DiscoveryPrioritizer.READ;}
         @Override Operation<Region> freshObservation(){return new Read(s,dimension,bounds,future);}
         void advance(){if(observe())complete(snapshot.getNow(null));}
     }
+    private static final class DiscoveryRead extends Operation<Region> {
+        DiscoveryRead(Session s,String dimension,Bounds bounds,CompletableFuture<Region> future){super(s,dimension,bounds,future);background=true;tier=DiscoveryPrioritizer.FRONTIER;}
+        @Override Operation<Region> freshObservation(){return new DiscoveryRead(s,dimension,bounds,future);}
+        void advance(){if(observe())complete(snapshot.getNow(null));}
+    }
     record Prepared(Landmark prior,String id,String biome,Landmark.Kind kind,BlockPoint anchor,SourceGeometry geometry,List<DescriptorVectors.WeightedDescriptor> descriptors,Map<String,Double> items,String adjoining,boolean revisit){
+        Prepared(Landmark prior,String id,String biome,Landmark.Kind kind,BlockPoint anchor,SourceGeometry geometry,List<DescriptorVectors.WeightedDescriptor> descriptors,Map<String,Double> items,String adjoining){this(prior,id,biome,kind,anchor,geometry,descriptors,items,adjoining,false);}
         Prepared revisitWindow(){return new Prepared(prior,id,biome,kind,anchor,geometry,descriptors,items,adjoining,true);}
     }
     static final class Ensure extends Operation<Optional<LandmarkMetadata>> {
         final BlockPos position;final String preferred;final boolean activity,refresh;String cursor;boolean catalogEnd,waitingEmbedding;
         final ArrayDeque<LandmarkMetadata> candidates=new ArrayDeque<>();final List<Landmark> parents=new ArrayList<>();final List<GeometryPage> pages=new ArrayList<>();
         final Map<String,Double> importance=new HashMap<>();Region observed;CompletableFuture<Prepared> prepared;CompletableFuture<Vec384f> embedding;Prepared value;Landmark published;long time,catalogRevision=-1;int seaLevel;
+        Ensure(Session s,String dimension,BlockPos pos,String preferred,boolean activity,CompletableFuture<Optional<LandmarkMetadata>> future){this(s,dimension,pos,preferred,activity,future,DiscoveryPrioritizer.PLAYER);}
         Ensure(Session s,String dimension,BlockPos pos,String preferred,boolean activity,CompletableFuture<Optional<LandmarkMetadata>> future,int tier){this(s,dimension,pos,preferred,activity,false,future,tier);}
         Ensure(Session s,String dimension,BlockPos pos,String preferred,boolean activity,boolean refresh,CompletableFuture<Optional<LandmarkMetadata>> future,int tier){super(s,dimension,new Bounds(pos.getX()-12L,pos.getY()-12L,pos.getZ()-12L,pos.getX()+13L,pos.getY()+13L,pos.getZ()+13L),future);this.position=pos;this.preferred=preferred;this.activity=activity;this.refresh=refresh;this.tier=tier;}
         @Override Operation<Optional<LandmarkMetadata>> freshObservation(){return new Ensure(s,dimension,position,preferred,activity,refresh,future,tier);}
@@ -440,14 +484,14 @@ public final class SourceLandmarks {
                 for(var face:published.geometry().frontiers())if(published.kind()==Landmark.Kind.CAVE||face.cursor().equals(DiscoveryInvalidation.REFRESH_FRONTIER)){var b=face.missingBounds();s.hint(dimension,new BlockPos((int)b.minX(),(int)b.minY(),(int)b.minZ()));}
                 if(value.adjoining!=null)s.offer(new Transfer(s,published.id(),value.adjoining,activity?bounds:null,true,activity,new CompletableFuture<>()));
             }return;}
-            if(observed==null){if(observe()){observed=snapshot.getNow(null);time=s.server.getOverworld().getTime();seaLevel=reader.world.getSeaLevel();}return;}
+            if(observed==null){if(observe()){observed=snapshot.getNow(null);time=s.observationClock.getAsLong();seaLevel=reader.seaLevel;}return;}
             // Pause only at topology reads/staging; never while waiting for model readiness.
             if(prepared==null){
                 if(hydrated!=null){if(!hydrated.isDone())return;parents.add(hydrated.getNow(null));hydrated=null;return;}
-                if(geometryRead!=null){geometryRead.advance(1,512);pages.addAll(geometryRead.drain());if(pages.size()>512)throw new IllegalArgumentException("source parent page budget");if(geometryRead.complete()){if(!geometryRead.isCurrent())throw new IllegalStateException("stale source geometry");var meta=geometryRead.metadata();var immutable=List.copyOf(pages);hydrated=CompletableFuture.supplyAsync(()->LandmarkNbt.hydrate(meta,immutable),s.worker);work=hydrated;pages.clear();geometryRead=null;}return;}
+                if(geometryRead!=null){geometryRead.advance(1,512);pages.addAll(geometryRead.drain());if(pages.size()>512)throw new IllegalArgumentException("source parent page budget");if(geometryRead.complete()){if(!geometryRead.isCurrent())throw new IllegalStateException("stale source geometry");var meta=geometryRead.metadata();var immutable=List.copyOf(pages);var next=s.spawn(()->LandmarkNbt.hydrate(meta,immutable));if(next==null)return;hydrated=next;work=hydrated;pages.clear();geometryRead=null;}return;}
                 if(!candidates.isEmpty()){if(!s.store.geometryReadAvailable())return;var m=candidates.removeFirst();importance.put(m.id(),SpiritActivityService.importance(s.server,m));guarded=guarded.union(m.header().bounds());geometryRead=s.store.beginGeometryRead(m.id());return;}
                 if(!catalogEnd){if(catalogRevision<0)catalogRevision=s.store.ownershipRevision();if(catalogRevision!=s.store.ownershipRevision())throw new IllegalStateException("stale source catalog");var page=s.store.sourceRangePage(dimension,bounds,cursor,4,4);cursor=page.nextId();catalogEnd=page.end();candidates.addAll(page.landmarks());if(parents.size()+candidates.size()>64)throw new IllegalArgumentException("local overlap operation budget");return;}
-                List<Landmark> snapshot=List.copyOf(parents);prepared=CompletableFuture.supplyAsync(()->prepare(observed,snapshot,position,preferred,activity,time,seaLevel,Map.copyOf(importance),refresh),s.worker);work=prepared;return;
+                List<Landmark> snapshot=List.copyOf(parents);var next=s.spawn(()->prepare(observed,snapshot,position,preferred,activity,time,seaLevel,Map.copyOf(importance),refresh));if(next==null)return;prepared=next;work=prepared;return;
             }
             if(!prepared.isDone())return;if(value==null){DiscoveryInvalidation.requireCurrentParents(s.store,catalogRevision,parents);value=prepared.getNow(null);if(value==null){s.rememberBackfill(this);complete(Optional.empty());return;}}
             if(embedding==null){
@@ -554,7 +598,7 @@ public final class SourceLandmarks {
         void advance(){
             if(mutation!=null){mutation.advance(1,512);if(mutation.complete()){if(history!=null){history.commit();history=null;}LandmarkExtractionService.COMMITTED_TOPOLOGY.invoker().committed(s.server,parents.stream().map(Landmark::id).toList(),parents.stream().map(l->s.store.resolve(l.id())).distinct().toList());complete(true);}return;}
             if(hydrated!=null){if(!hydrated.isDone())return;parents.add(hydrated.getNow(null));hydrated=null;return;}
-            if(geometryRead!=null){geometryRead.advance(1,512);pages.addAll(geometryRead.drain());if(pages.size()>512)throw new IllegalArgumentException("transfer page budget");if(geometryRead.complete()){if(!geometryRead.isCurrent())throw new IllegalStateException("stale transfer geometry");var meta=geometryRead.metadata();var immutable=List.copyOf(pages);hydrated=CompletableFuture.supplyAsync(()->LandmarkNbt.hydrate(meta,immutable),s.worker);work=hydrated;pages.clear();geometryRead=null;}return;}
+            if(geometryRead!=null){geometryRead.advance(1,512);pages.addAll(geometryRead.drain());if(pages.size()>512)throw new IllegalArgumentException("transfer page budget");if(geometryRead.complete()){if(!geometryRead.isCurrent())throw new IllegalStateException("stale transfer geometry");var meta=geometryRead.metadata();var immutable=List.copyOf(pages);var next=s.spawn(()->LandmarkNbt.hydrate(meta,immutable));if(next==null)return;hydrated=next;work=hydrated;pages.clear();geometryRead=null;}return;}
             if(parents.size()<2){if(!s.store.geometryReadAvailable())return;String id=parents.isEmpty()?receiverId:donorId;var m=s.store.metadata(id);if(m.isEmpty()||!SourceDimensions.isSource(m.get().header().dimension()) || s.store.resolve(receiverId).equals(s.store.resolve(donorId))){complete(false);return;}dimension=m.get().header().dimension();guarded=guarded==null?m.get().header().bounds():guarded.union(m.get().header().bounds());geometryRead=s.store.beginGeometryRead(m.get().id());return;}
             if(resume==null){try{pause();}catch(IllegalStateException busy){return;}}
             if(prepared==null){Landmark receiver=parents.getFirst(),donor=parents.getLast();if(!receiver.dimension().equals(donor.dimension())){complete(false);return;}
@@ -564,7 +608,7 @@ public final class SourceLandmarks {
                     merge=false; // stronger nearby activity can acquire one real adjacent cell
                 }
                 if(merge){var proof=new LandmarkRepository.VerifiedConnectivity(parents.stream().map(l->new LandmarkRepository.RevisionRef(l.id(),l.revision())).toList(),"activity convergence; worker-verified physical source adjacency");history=LandmarkExtractionService.prepareTopology(s.server,new LandmarkExtractionService.TopologyChange(LandmarkExtractionService.TopologyKind.MERGE,proof.fragments(),List.of(),proof));}
-                prepared=CompletableFuture.supplyAsync(()->exchange(receiver,donor,bounds,merge,allowSteal&&!merge),s.worker);work=prepared;return;
+                var next=s.spawn(()->exchange(receiver,donor,bounds,merge,allowSteal&&!merge));if(next==null)return;prepared=next;work=prepared;return;
             }
             if(!prepared.isDone())return;value=prepared.getNow(null);if(value==null){if(history!=null){history.cancel();history=null;}complete(false);return;}
             var refs=parents.stream().map(l->new LandmarkRepository.RevisionRef(l.id(),l.revision())).toList();

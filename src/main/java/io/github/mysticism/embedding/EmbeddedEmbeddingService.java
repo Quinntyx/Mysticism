@@ -18,7 +18,15 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
         @Override void close();
     }
     interface Loader { Model load(Path path, BooleanSupplier cancelled) throws Exception; }
-    interface Asset extends AutoCloseable { Path resolve() throws Exception; @Override void close(); }
+    interface Asset extends AutoCloseable {
+        Path resolve() throws Exception;
+        default Model load(Loader loader, BooleanSupplier cancelled) throws Exception {
+            Path path = resolve();
+            if (cancelled.getAsBoolean()) throw new CancellationException("Native v2 asset loading cancelled");
+            return loader.load(path, cancelled);
+        }
+        @Override void close();
+    }
     private final Asset asset;
     private final Loader loader;
     private final ReentrantLock work = new ReentrantLock();
@@ -26,25 +34,7 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
     private Model model; // guarded by work, including JNI lifetime
 
     public EmbeddedEmbeddingService() {
-        asset = new Asset() {
-            private PinnedEmbeddingModel pinned;
-            private boolean stopped;
-            public Path resolve() throws Exception {
-                PinnedEmbeddingModel selected;
-                synchronized (this) {
-                    if (stopped) throw new CancellationException("Model provisioning cancelled");
-                    // Even home/cache metadata checks belong on the preparation worker.
-                    if (pinned == null) pinned = PinnedEmbeddingModel.configured();
-                    selected = pinned;
-                }
-                return selected.resolve();
-            }
-            public void close() {
-                PinnedEmbeddingModel selected;
-                synchronized (this) { stopped = true; selected = pinned; }
-                if (selected != null) selected.close();
-            }
-        };
+        asset = new LocalNomicV2ModelAsset();
         loader = LlamaEmbeddingModel::new;
     }
     EmbeddedEmbeddingService(Asset asset, Loader loader) { this.asset = asset; this.loader = loader; }
@@ -55,9 +45,7 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
         try {
             requireOpen();
             if (model != null) return;
-            Path path = asset.resolve();
-            requireOpen();
-            Model candidate = loader.load(path, () -> closed || Thread.currentThread().isInterrupted());
+            Model candidate = asset.load(loader, () -> closed || Thread.currentThread().isInterrupted());
             try {
                 requireOpen();
                 if (candidate.dimensions() != EmbeddingSpace.NATIVE_DIMENSIONS)
@@ -69,11 +57,15 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
         } finally { releaseIfClosed(); work.unlock(); }
     }
     @Override public Vec384f getEmbedding(String descriptor) throws Exception {
+        return getEmbedding(descriptor, () -> true);
+    }
+    @Override public Vec384f getEmbedding(String descriptor, BooleanSupplier current) throws Exception {
         validateDescriptor(descriptor);
         work.lockInterruptibly();
         try {
             requireOpen();
-            if (model == null) throw new IllegalStateException("Embedded inference not prepared");
+            if (!current.getAsBoolean()) throw new CancellationException("Embedding request expired while waiting for native context");
+            if (model == null) throw new EmbeddingModelException("Embedded inference not prepared");
             Vec384f vector = infer(model, descriptor);
             requireOpen();
             return vector;
@@ -83,10 +75,24 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
         validateDescriptor(descriptor);
         String input = "search_document: " + descriptor;
         // Use the actual GGUF tokenizer (including special tokens), never a character heuristic.
-        int tokens = model.tokens(input);
-        if (tokens < 1 || tokens > NativeEmbeddingOutput.MAX_TOKENS)
+        int tokens;
+        try { tokens = model.tokens(input); }
+        catch (RuntimeException | LinkageError failure) {
+            throw modelFailure("tokenization", failure);
+        }
+        if (tokens < 1) throw new EmbeddingModelException("Embedded native v2 tokenizer returned no tokens");
+        // A valid tokenizer reporting input overflow is a descriptor error, not model loss.
+        if (tokens > NativeEmbeddingOutput.MAX_TOKENS)
             throw new IllegalArgumentException("Nomic v2 input must have 1..512 tokens; truncation is forbidden");
-        return decodeEmbedding(model.embed(input));
+        try { return decodeEmbedding(model.embed(input)); }
+        catch (RuntimeException | LinkageError failure) {
+            throw modelFailure("inference/output validation", failure);
+        }
+    }
+    private static EmbeddingModelException modelFailure(String operation, Throwable failure) {
+        if (failure instanceof EmbeddingModelException modelFailure) return modelFailure;
+        return new EmbeddingModelException("Embedded native v2 " + operation + " failed: "
+                + EmbeddingReadiness.describe(failure), failure);
     }
     private static void validateDescriptor(String descriptor) {
         if (descriptor == null || descriptor.isBlank() || descriptor.length() > 8192)

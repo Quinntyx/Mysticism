@@ -19,8 +19,11 @@ import java.util.*;
 final class SourceMeshBuilder {
     static final Box UNIT=new Box(0,0,0,1,1,1);
     record Tile(TerrainMeshFrame.Material material,List<Box> collision,int color,int light,boolean air,boolean cube) {}
-    record Node(BlockPos position,int side,Tile tile,String ownerId) {
+    /** Mesh batches may be exact rectangular unions; authoritative source ownership remains octree-native. */
+    record Node(BlockPos position,int side,Tile tile,String ownerId,Vec3d size) {
+        Node(BlockPos position,int side,Tile tile,String ownerId){this(position,side,tile,ownerId,new Vec3d(side,side,side));}
         Node(BlockPos position,int side,Tile tile){this(position,side,tile,"");}
+        Node(BlockPos position,Vec3d size,Tile tile,String ownerId){this(position,(int)Math.min(size.x,Math.min(size.y,size.z)),tile,ownerId,size);}
     }
     record Key(int x,int y,int z,int side) {}
     static Tile read(ServerWorld world,BlockPos position) {
@@ -32,6 +35,11 @@ final class SourceMeshBuilder {
         else if(state.getBlock() instanceof GrassBlock || state.isOf(Blocks.FERN) || state.isOf(Blocks.LARGE_FERN) || state.isOf(Blocks.SHORT_GRASS) || state.isOf(Blocks.TALL_GRASS))color=biome.getGrassColorAt(position.getX(),position.getZ());
         int light=(world.getLightLevel(LightType.BLOCK,position)<<4)|(world.getLightLevel(LightType.SKY,position)<<20);
         return tile(state,world,position,color,light);
+    }
+    static DiscoveryMeshPipeline.Resolved storedDiscovery(BlockPalette.State material,BlockPos position) {
+        BlockState state=resolve(new TerrainMeshFrame.Material(material.blockId(),material.properties()));
+        return new DiscoveryMeshPipeline.Resolved(tile(state,EmptyBlockView.INSTANCE,position,0xffffff,0xf000f0),
+                !state.getBlock().hasDynamicBounds());
     }
     static Tile stored(BlockPalette.State material,BlockPos position) {
         return tile(resolve(new TerrainMeshFrame.Material(material.blockId(),material.properties())),EmptyBlockView.INSTANCE,position,0xffffff,0xf000f0);
@@ -78,8 +86,11 @@ final class SourceMeshBuilder {
         int x=MathHelper.floor(origin.x)-side/2,y=MathHelper.floor(origin.y)-side/2,z=MathHelper.floor(origin.z)-side/2;
         return new Bounds(x,y,z,(long)x+side,(long)y+side,(long)z+side);
     }
-    static List<Node> compact(Map<BlockPos,Tile> source,Vec3d fineCenter) {return compact(source,fineCenter,Map.of());}
-    static List<Node> compact(Map<BlockPos,Tile> source,Vec3d fineCenter,Map<BlockPos,String> exactOwners) {
+    static List<Node> compact(Map<BlockPos,Tile> source,Vec3d fineCenter) {return compact(source,fineCenter,Map.of(),false);}
+    static List<Node> compact(Map<BlockPos,Tile> source,Vec3d fineCenter,Map<BlockPos,String> exactOwners) {return compact(source,fineCenter,exactOwners,false);}
+    /** mergeUnowned merges uniform tiles that have no exact owner yet (render-distance discovery
+     * far field). Near-field compaction keeps strict per-owner provenance and never merges these. */
+    static List<Node> compact(Map<BlockPos,Tile> source,Vec3d fineCenter,Map<BlockPos,String> exactOwners,boolean mergeUnowned) {
         Map<Key,Tile> nodes=new HashMap<>();Map<Key,String> owners=new HashMap<>();
         source.forEach((p,t)->{if(!t.air){Key key=new Key(p.getX(),p.getY(),p.getZ(),1);nodes.put(key,t);owners.put(key,exactOwners.getOrDefault(p,""));}});
         for(int side=1;side<16;side*=2) {
@@ -92,7 +103,7 @@ final class SourceMeshBuilder {
                 for(int child=0;child<8;child++) {
                     Key key=new Key(p.x+((child&1)==0?0:side),p.y+((child&2)==0?0:side),p.z+((child&4)==0?0:side),side);
                     Tile t=nodes.get(key);String id=owners.getOrDefault(key,"");
-                    if(t==null || !t.cube || id.isEmpty() || owner!=null && !owner.equals(id) || common!=null && !t.equals(common)){equal=false;break;}
+                    if(t==null || !t.cube || id.isEmpty() && !mergeUnowned || owner!=null && !owner.equals(id) || common!=null && !t.equals(common)){equal=false;break;}
                     common=t;owner=id;
                 }
                 if(!equal)continue;
@@ -114,11 +125,93 @@ final class SourceMeshBuilder {
         List<Node> result=new ArrayList<>(near);for(Node node:base)outside(node,cut,result);
         result.sort(Comparator.comparingDouble(n->distanceSquared(nodeBox(n),center)));return List.copyOf(result);
     }
-    private static Box nodeBox(Node n){BlockPos p=n.position();return new Box(p.getX(),p.getY(),p.getZ(),(double)p.getX()+n.side(),(double)p.getY()+n.side(),(double)p.getZ()+n.side());}
+    /** Sparse near observation mask. Air counts as sampled; unknown gaps do not. Index at bounded
+     * aligned octree levels so unit far nodes do not scan every near sample on each compaction. */
+    static List<Node> replaceNear(List<Node> base,List<Node> near,Set<BlockPos> sampled,Vec3d center) {
+        var mask=new SampledMask(sampled);
+        List<Node> result=new ArrayList<>(near);
+        for(Node node:base)outsideSamples(node,mask,result);
+        result.sort(Comparator.comparingDouble((Node n)->distanceSquared(nodeBox(n),center))
+                .thenComparingLong(n->n.position().asLong()).thenComparingDouble(n->n.size().x)
+                .thenComparingDouble(n->n.size().y).thenComparingDouble(n->n.size().z));
+        return List.copyOf(result);
+    }
+    private static void outsideSamples(Node node,SampledMask mask,List<Node> result) {
+        Bounds box=nodeBounds(node);long sampled=mask.count(box);
+        if(sampled==0){result.add(node);return;}
+        if(sampled==(box.maxX()-box.minX())*(box.maxY()-box.minY())*(box.maxZ()-box.minZ()))return;
+        // Bisect exact mesh extents, including odd prisms; never visit every sample for each far
+        // node or repeatedly subtract a growing fragment list for highly fragmented observations.
+        int sx=(int)node.size().x,sy=(int)node.size().y,sz=(int)node.size().z;
+        int hx=Math.max(1,sx/2),hy=Math.max(1,sy/2),hz=Math.max(1,sz/2);
+        for(int x=0;x<sx;x+=hx)for(int y=0;y<sy;y+=hy)for(int z=0;z<sz;z+=hz)
+            outsideSamples(new Node(node.position().add(x,y,z),
+                    new Vec3d(Math.min(hx,sx-x),Math.min(hy,sy-y),Math.min(hz,sz-z)),node.tile(),node.ownerId()),mask,result);
+    }
+    private static final class SampledMask {
+        private static final int ROOT_SIDE=32;
+        private final Map<Key,Integer> counts=new HashMap<>();
+        private Bounds extent;
+        SampledMask(Set<BlockPos> samples) {
+            for(BlockPos p:samples) {
+                Bounds cell=Bounds.cube(p.getX(),p.getY(),p.getZ(),1);
+                extent=extent==null?cell:extent.union(cell);
+                for(int side=1;side<=ROOT_SIDE;side*=2) {
+                    Key key=new Key(Math.floorDiv(p.getX(),side)*side,Math.floorDiv(p.getY(),side)*side,
+                            Math.floorDiv(p.getZ(),side)*side,side);
+                    counts.merge(key,1,Integer::sum);
+                }
+            }
+        }
+        long count(Bounds node) {
+            long result=0;
+            if(extent==null || !extent.intersects(node))return 0;
+            long minX=Math.max(extent.minX(),node.minX()),minY=Math.max(extent.minY(),node.minY()),minZ=Math.max(extent.minZ(),node.minZ());
+            long maxX=Math.min(extent.maxX(),node.maxX()),maxY=Math.min(extent.maxY(),node.maxY()),maxZ=Math.min(extent.maxZ(),node.maxZ());
+            for(long x=Math.floorDiv(minX,ROOT_SIDE)*ROOT_SIDE;x<maxX;x+=ROOT_SIDE)
+                for(long y=Math.floorDiv(minY,ROOT_SIDE)*ROOT_SIDE;y<maxY;y+=ROOT_SIDE)
+                    for(long z=Math.floorDiv(minZ,ROOT_SIDE)*ROOT_SIDE;z<maxZ;z+=ROOT_SIDE)
+                        result+=count(new Key((int)x,(int)y,(int)z,ROOT_SIDE),node);
+            return result;
+        }
+        private long count(Key key,Bounds node) {
+            Integer count=counts.get(key);if(count==null)return 0;
+            Bounds box=Bounds.cube(key.x,key.y,key.z,key.side);
+            if(!box.intersects(node))return 0;
+            if(node.contains(box))return count;
+            if(count==key.side*key.side*key.side)
+                return (Math.min(box.maxX(),node.maxX())-Math.max(box.minX(),node.minX()))
+                        *(Math.min(box.maxY(),node.maxY())-Math.max(box.minY(),node.minY()))
+                        *(Math.min(box.maxZ(),node.maxZ())-Math.max(box.minZ(),node.minZ()));
+            long result=0;int half=key.side/2;
+            for(int child=0;child<8;child++)
+                result+=count(new Key(key.x+((child&1)==0?0:half),key.y+((child&2)==0?0:half),
+                        key.z+((child&4)==0?0:half),half),node);
+            return result;
+        }
+    }
+    static Box nodeBox(Node n){BlockPos p=n.position();return new Box(p.getX(),p.getY(),p.getZ(),p.getX()+n.size().x,p.getY()+n.size().y,p.getZ()+n.size().z);}
+    private static Bounds nodeBounds(Node n){BlockPos p=n.position();return new Bounds(p.getX(),p.getY(),p.getZ(),p.getX()+(long)n.size().x,p.getY()+(long)n.size().y,p.getZ()+(long)n.size().z);}
+    private static void piece(Node n,long x,long y,long z,long xx,long yy,long zz,List<Node> result) {
+        if(xx>x && yy>y && zz>z)result.add(new Node(new BlockPos((int)x,(int)y,(int)z),new Vec3d(xx-x,yy-y,zz-z),n.tile(),n.ownerId()));
+    }
     private static void outside(Node n,Bounds cut,List<Node> result) {
-        BlockPos p=n.position();int side=n.side();Bounds box=new Bounds(p.getX(),p.getY(),p.getZ(),(long)p.getX()+side,(long)p.getY()+side,(long)p.getZ()+side);
-        if(!box.intersects(cut)){result.add(n);return;}if(cut.contains(box)||side==1)return;
-        int half=side/2;for(int child=0;child<8;child++)outside(new Node(p.add((child&1)==0?0:half,(child&2)==0?0:half,(child&4)==0?0:half),half,n.tile(),n.ownerId()),cut,result);
+        Bounds b=nodeBounds(n);
+        if(!b.intersects(cut)){result.add(n);return;}if(cut.contains(b))return;
+        if(n.size().x==n.size().y && n.size().y==n.size().z && Integer.bitCount((int)n.size().x)==1) {
+            int half=(int)n.size().x/2;
+            for(int child=0;child<8;child++)outside(new Node(n.position().add((child&1)==0?0:half,(child&2)==0?0:half,(child&4)==0?0:half),half,n.tile(),n.ownerId()),cut,result);
+            return; // Preserve the existing power-of-two octree refinement path.
+        }
+        // Exact rectangular subtraction, never fill a hole or extend beyond observed source cells.
+        long x=Math.max(b.minX(),cut.minX()),y=Math.max(b.minY(),cut.minY()),z=Math.max(b.minZ(),cut.minZ());
+        long xx=Math.min(b.maxX(),cut.maxX()),yy=Math.min(b.maxY(),cut.maxY()),zz=Math.min(b.maxZ(),cut.maxZ());
+        piece(n,b.minX(),b.minY(),b.minZ(),x,b.maxY(),b.maxZ(),result);
+        piece(n,xx,b.minY(),b.minZ(),b.maxX(),b.maxY(),b.maxZ(),result);
+        piece(n,x,b.minY(),b.minZ(),xx,y,b.maxZ(),result);
+        piece(n,x,yy,b.minZ(),xx,b.maxY(),b.maxZ(),result);
+        piece(n,x,y,b.minZ(),xx,yy,z,result);
+        piece(n,x,y,zz,xx,yy,b.maxZ(),result);
     }
     /** Refine a persisted coarse leaf only inside the bounded exact-mask window, preserving far geometry. */
     static List<Node> splitOwnership(List<Node> source,Map<BlockPos,String> owners,Bounds range,Vec3d center) {
@@ -127,17 +220,28 @@ final class SourceMeshBuilder {
         return List.copyOf(result);
     }
     private static void splitOwner(Node node,Map<BlockPos,String> owners,Bounds range,Vec3d center,List<Node> result) {
-        BlockPos p=node.position();int side=node.side();Bounds box=new Bounds(p.getX(),p.getY(),p.getZ(),(long)p.getX()+side,(long)p.getY()+side,(long)p.getZ()+side);
+        BlockPos p=node.position();Bounds box=nodeBounds(node);
         if(!box.intersects(range)){result.add(node);return;}
         String owner=null;boolean uniform=range.contains(box);
-        if(uniform)for(BlockPos cell:BlockPos.iterate(p,p.add(side-1,side-1,side-1))) {
+        if(uniform)for(BlockPos cell:BlockPos.iterate(p,new BlockPos((int)box.maxX()-1,(int)box.maxY()-1,(int)box.maxZ()-1))) {
             String id=owners.getOrDefault(cell,"");
             if(id.isEmpty() || owner!=null && !owner.equals(id)){uniform=false;break;}owner=id;
         }
-        if(side>1 && distanceSquared(nodeBox(node),center)<49)uniform=false;
-        if(side==1 || uniform){result.add(new Node(p,side,node.tile(),owners.getOrDefault(p,"")));return;}
-        int half=side/2;
-        for(int child=0;child<8;child++)splitOwner(new Node(p.add((child&1)==0?0:half,(child&2)==0?0:half,(child&4)==0?0:half),half,node.tile(),node.ownerId()),owners,range,center,result);
+        boolean unit=node.size().equals(new Vec3d(1,1,1));
+        if(!unit && distanceSquared(nodeBox(node),center)<49)uniform=false;
+        if(unit || uniform){result.add(new Node(p,node.size(),node.tile(),owners.getOrDefault(p,"")));return;}
+        // Bisect each non-unit dimension. Cubic inputs still split as an octree; mesh prisms
+        // refine exactly at ownership boundaries without attributing an entire slab to one owner.
+        int sx=(int)node.size().x,sy=(int)node.size().y,sz=(int)node.size().z;
+        int hx=Math.max(1,sx/2),hy=Math.max(1,sy/2),hz=Math.max(1,sz/2);
+        for(int x=0;x<sx;x+=hx)for(int y=0;y<sy;y+=hy)for(int z=0;z<sz;z+=hz)
+            splitOwner(new Node(p.add(x,y,z),new Vec3d(Math.min(hx,sx-x),Math.min(hy,sy-y),Math.min(hz,sz-z)),node.tile(),node.ownerId()),owners,range,center,result);
+    }
+    static long key(String owner,Vec3d source,Vec3d size) {
+        long h=key(owner,source,(int)size.x);
+        if(size.x==size.y && size.y==size.z)return h; // Existing cubic keys stay stable.
+        h=(h^Double.doubleToLongBits(size.y))*0x100000001b3L;
+        return (h^Double.doubleToLongBits(size.z))*0x100000001b3L;
     }
     static long key(String owner,Vec3d source,int side) {
         long h=0xcbf29ce484222325L;

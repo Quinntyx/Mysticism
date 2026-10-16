@@ -35,11 +35,11 @@ public final class SelectionAvailabilityTest {
         check(published.squareDistance(sweepStart)>=radiusSquared(),"precondition: published landmark is outside the stale sweep-start radius");
         check(published.squareDistance(flown)<radiusSquared(),"precondition: published landmark is inside the current selection radius");
         var staleGate=new MeshRepresentatives();
-        staleGate.begin(sweepStart,IDENTITY);
+        staleGate.begin("minecraft:overworld",sweepStart,IDENTITY);
         staleGate.offer(metadata(new BlockPoint(0,0,0),3.2),published,.5);
         check(staleGate.finish().isEmpty(),"stale sweep-start gating rejects the freshly published landmark (documented defect)");
         var current=new MeshRepresentatives();
-        current.begin(sweepStart,IDENTITY);
+        current.begin("minecraft:overworld",sweepStart,IDENTITY);
         current.retarget(flown,IDENTITY); // the fixed sweep offers against the live observer frame
         current.offer(metadata(new BlockPoint(0,0,0),3.2),published,.5);
         var selected=current.finish();
@@ -52,13 +52,13 @@ public final class SelectionAvailabilityTest {
      * passed under the old origin can never cover the current locality again. */
     private static void sweepRestartWhenObserverLeavesSweptLocality() {
         var selection=new MeshRepresentatives();
-        selection.begin(vector(0,0,0),IDENTITY);
+        selection.begin("minecraft:overworld",vector(0,0,0),IDENTITY);
         check(!selection.sweepStale(vector(0,0,0)),"a fresh sweep is current at its origin");
         check(!selection.sweepStale(vector(.5,0,0)),"small movement keeps the sweep usable");
         Vec384f flown=vector(2,0,0);
         check(flown.squareDistance(vector(0,0,0))>=radiusSquared(),"precondition: observer left the swept locality");
         check(selection.sweepStale(flown),"drifted sweep is reported stale so the caller restarts from a fresh cursor");
-        selection.begin(flown,IDENTITY);
+        selection.begin("minecraft:overworld",flown,IDENTITY);
         check(!selection.sweepStale(flown),"restarted sweep is current at the new origin");
     }
 
@@ -66,7 +66,7 @@ public final class SelectionAvailabilityTest {
      * so candidates offered near an abandoned position never activate around the new position. */
     private static void staleCandidatesCannotActivateOutsideCurrentRadius() {
         var selection=new MeshRepresentatives();
-        selection.begin(vector(0,0,0),IDENTITY);
+        selection.begin("minecraft:overworld",vector(0,0,0),IDENTITY);
         selection.offer(metadata(new BlockPoint(1,0,0),0),vector(0,0,0),.5);
         selection.retarget(vector(4,0,0),IDENTITY); // observer flew far during the sweep
         check(selection.finish().isEmpty(),"stale candidates cannot activate outside the current radius");
@@ -77,7 +77,7 @@ public final class SelectionAvailabilityTest {
     private static void publishedOfferKeepsAccumulatedSelection() {
         var selection=new MeshRepresentatives();
         Vec384f q=vector(0,0,0);
-        selection.begin(q,IDENTITY);
+        selection.begin("minecraft:overworld",q,IDENTITY);
         selection.offer(metadata(new BlockPoint(1,0,0),0),vector(0,0,0),.5);
         selection.offer(metadata(new BlockPoint(2,0,0),0),vector(.8,0,0),.5); // beyond one cluster width
         selection.retarget(q,IDENTITY);
@@ -93,7 +93,7 @@ public final class SelectionAvailabilityTest {
     /** Reservoir bounds are population-independent even when generation publishes many landmarks. */
     private static void selectionRemainsBoundedUnderPublicationBursts() {
         var selection=new MeshRepresentatives();
-        selection.begin(vector(0,0,0),IDENTITY);
+        selection.begin("minecraft:overworld",vector(0,0,0),IDENTITY);
         for(int n=0;n<30;n++) {
             double a=n*2.399963; // golden-angle spread inside the selection radius
             double x=.3*n/30.0*Math.cos(a),y=.3*n/30.0*Math.sin(a),z=(n%7-3)*.15;
@@ -111,7 +111,7 @@ public final class SelectionAvailabilityTest {
     private static void publicationImmediatelyBeforeSweepCompletion() {
         var selection=new MeshRepresentatives();
         Vec384f sweepStart=vector(0,0,0);
-        selection.begin(sweepStart,IDENTITY);
+        selection.begin("minecraft:overworld",sweepStart,IDENTITY);
         // Catalog region already passed by the in-flight sweep.
         selection.offer(metadata(new BlockPoint(1,0,0),0),vector(0,0,0),.5);
         // Observer flies on; publication lands just before sweep completion.
@@ -143,7 +143,7 @@ public final class SelectionAvailabilityTest {
         check(b.squareDistance(current)>a.squareDistance(start),"precondition: B loses to A's stale closest distance");
         check(a.squareDistance(b)<MeshRepresentatives.CLUSTER*MeshRepresentatives.CLUSTER,
                 "precondition: same-cluster hysteresis cannot rescue B through a separate cluster slot");
-        selection.begin(start,IDENTITY);
+        selection.begin("minecraft:overworld",start,IDENTITY);
         selection.offer(old,a,.5);
         check(!selection.sweepStale(current),"small movement keeps the current sweep; no restart masks the defect");
         selection.retarget(current,IDENTITY);
@@ -166,7 +166,7 @@ public final class SelectionAvailabilityTest {
                 "precondition: farther B would displace A using A's stale distance");
         check(a.squareDistance(b)<MeshRepresentatives.CLUSTER*MeshRepresentatives.CLUSTER,
                 "precondition: A and B share a cluster");
-        selection.begin(start,IDENTITY);
+        selection.begin("minecraft:overworld",start,IDENTITY);
         selection.offer(old,a,.5);
         check(!selection.sweepStale(current),"movement toward A does not restart the sweep");
         selection.retarget(current,IDENTITY);

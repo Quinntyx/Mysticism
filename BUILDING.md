@@ -32,9 +32,17 @@ regenerate wrapper tooling using installed Gradle without fetching a distributio
 ```
 
 Long-running commands in the assigned development environment use the
-`tmux-jobs` skill's `bin/tmux-jobs`, original session/pane, actual argv, bounded
-`wait`, and retained pane/run token. Do not launch them with send-keys or wait-for
-completion channels. The canonical check is `./gradlew --no-daemon --console=plain build`.
+`tmux-jobs` skill helper in the original tmux session/pane, with explicit argv:
+
+```sh
+JOBS=/home/zlare/.config/pi/profiles/main/skills/tmux-jobs/bin/tmux-jobs
+"$JOBS" --origin "$TMUX_PANE" run --cwd "$PWD" --label canonical-build -- \
+  /usr/bin/env JAVA_HOME=/usr/lib/jvm/java-21-openjdk "$GRADLE" \
+  --no-daemon --console=plain --rerun-tasks build
+# Preserve returned pane/run; monitor bounded intervals and inspect retained output:
+"$JOBS" --origin "$TMUX_PANE" wait --pane <pane> --run <run> --seconds 10
+"$JOBS" --origin "$TMUX_PANE" capture --pane <pane> --run <run> --lines 200
+```
 
 ## Tests: no additional framework dependencies
 
@@ -105,31 +113,30 @@ Fabric API and Fabric Loader are installed separately by the modpack/runtime.
 
 The artifact verifier checks entrypoint and mixin resources, localization at
 `assets/mysticism/lang/en_us.json`, expanded version, MIT license packaging,
-Java 21 bytecode and intermediary Minecraft class references. It also requires
-the pinned llama JNI jar, supported native resource payloads and transitive Java
-libraries registered in metadata; missing payloads/dependencies, weight bundles,
-and duplicate logging jars are rejected. No icon is declared until an actual
-icon is supplied. Finder metadata and legacy DJL/PyTorch/tokenizers runtimes must
-not enter the production artifact. Artifact checks are static;
-they do not substitute for a dedicated-server/client launch, GUI-scale/reload
-checks, or an embedding-service integration test.
+Java 21 bytecode and intermediary Minecraft class references. No icon is declared
+until an actual icon is supplied. Finder metadata, model weights and unrelated
+DJL/PyTorch/tokenizer runtimes must not enter the artifact. The verifier requires
+the native provider classes, pinned llama JNI resources and Java dependencies,
+and rejects nested duplicate logging. Artifact checks remain static: they do not
+substitute for a Minecraft/client launch, GL validation or a real forward pass.
 
-## Historical build-portability branch validation (not current runtime status)
+## Current retained integration
 
-The following records earlier branch work. Current source compiles without DJL,
-uses in-process JNI embeddings by default, and runs discovered runtime suites;
-the old unresolved-DJL blocker and external-server prerequisite do not describe
-this retained runtime unit.
+Default inference is now in-process native Nomic v2 (full 768), with verified
+local assets and no external-server prerequisite. The retained merge-0068 combines merge-0058 with merge-0066. The latter combines the
+supported-walking/arrival/preprocessing history from merge-0060 with the source
+discovery/dimension/shallow/native/transition history from merge-0065. Parent
+verification records remain historical evidence, not proof for this candidate.
+Current reconciliation and validation are recorded in
+[merge-0068](docs/runtime-sol-merge-0068.md).
 
-That earlier build intentionally had no DJL dependencies or local/native model runtime.
-The original source still imports DJL in `EmbeddingService`, `EmbeddingCommand`,
-`KnnIndex`, `SimpleKnnIndex` and `ItemEmbeddingIndexState`. Until the separately
-owned JDK HTTP embedding migration removes those imports, full compilation is
-expected to fail. Do not restore local-model dependencies to disguise that source
-integration requirement. Any additional compilation errors must be fixed by the
-agent owning the affected source, then rerun `build` and `verifyProductionJar`.
+## Historical portability-branch evidence (superseded, not current blockers)
 
-### Checks actually performed on the build-portability branch
+The records below predate source integration/native restoration. Their DJL
+compile failures and diagnostic artifacts describe only that historical branch.
+Current compilation has no DJL shim or excluded build task.
+
+### Checks actually performed on the old build-portability branch
 
 - Cached Gradle and the generated wrapper both report **8.13**, running Java **21**.
   Wrapper generation used the installed binary; no Gradle distribution was fetched.

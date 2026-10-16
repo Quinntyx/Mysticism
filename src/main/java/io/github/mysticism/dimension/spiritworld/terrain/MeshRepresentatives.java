@@ -14,6 +14,7 @@ final class MeshRepresentatives {
     private LandmarkMetadata closest;
     private Vec384f closestVector;
     private double closestDistance=Double.POSITIVE_INFINITY;
+    private String dimension;
     private Vec384f q,sweepOrigin;
     private Basis384f basis;
     private static final class Cluster {
@@ -23,7 +24,10 @@ final class MeshRepresentatives {
         Cluster(LandmarkMetadata m,Vec384f v,double importance){seed=m.id();center=v.clone();best=m;bestVector=v.clone();sum=new double[v.data().length];this.importance=importance;}
         void observe(Vec384f v,double w){float[] d=v.data();for(int i=0;i<d.length;i++)sum[i]+=d[i]*w;weight+=w;norm+=v.l2sq()*w;}
     }
-    void begin(Vec384f q,Basis384f basis) {
+    void begin(String dimension,Vec384f q,Basis384f basis) {
+        Objects.requireNonNull(dimension);
+        if(!dimension.equals(this.dimension))clusters.clear();
+        this.dimension=dimension;
         this.q=q.clone();sweepOrigin=q.clone();this.basis=basis.clone();closest=null;closestVector=null;closestDistance=Double.POSITIVE_INFINITY;
         for(Cluster c:clusters){Arrays.fill(c.sum,0);c.weight=0;c.norm=0;c.bestSeen=false;c.observed=null;c.observedVector=null;}
     }
@@ -46,6 +50,7 @@ final class MeshRepresentatives {
         return sweepOrigin==null || current==null || current.squareDistance(sweepOrigin)>=RADIUS*RADIUS;
     }
     void offer(LandmarkMetadata metadata,Vec384f vector,double importance) {
+        if(!metadata.header().dimension().equals(dimension))return;
         double distance=vector.squareDistance(q);
         if(!Double.isFinite(distance) || distance>=RADIUS*RADIUS)return;
         importance=Math.max(0,Math.min(1,importance));

@@ -107,9 +107,10 @@ tasks.register('embeddedInferenceProbe', JavaExec) {
     mainClass = 'io.github.mysticism.embedding.EmbeddedInferenceProbe'
     enableAssertions = true
     doFirst {
-        setArgs([providers.gradleProperty('embeddingModelPath').getOrElse(
-                layout.buildDirectory.file('embedding-inference-probe/nomic-v2.gguf').get().asFile.absolutePath),
-                providers.gradleProperty('embeddingProvision').getOrElse('false')])
+        def provision = providers.gradleProperty('embeddingProvision').getOrElse('false')
+        def defaultPath = provision == 'true' ?
+                layout.buildDirectory.file('embedding-inference-probe/nomic-v2.gguf').get().asFile.absolutePath : ''
+        setArgs([providers.gradleProperty('embeddingModelPath').getOrElse(defaultPath), provision])
     }
 }
 

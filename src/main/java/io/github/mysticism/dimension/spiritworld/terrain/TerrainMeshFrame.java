@@ -58,6 +58,14 @@ public record TerrainMeshFrame(long revision, boolean shallow, String sourceDime
         public Vec3d point(double x,double y,double z) {
             return min.add(axisX.multiply(x)).add(axisY.multiply(y)).add(axisZ.multiply(z));
         }
+        /** Inverse of this accepted render/collision cell, preserving exact fractional feet.
+         * Source coordinates move with the projected frame; they are not a navigation target. */
+        public Vec3d sourcePoint(Vec3d world) {
+            Vec3d v=world.subtract(min);double det=axisX.dotProduct(axisY.crossProduct(axisZ));
+            return sourceMin.add(v.dotProduct(axisY.crossProduct(axisZ))/det*size.x,
+                    v.dotProduct(axisZ.crossProduct(axisX))/det*size.y,
+                    v.dotProduct(axisX.crossProduct(axisY))/det*size.z);
+        }
         public Box bounds(Box b) {
             Vec3d base=point(b.minX,b.minY,b.minZ);
             double xx=axisX.x*b.getLengthX(),yx=axisY.x*b.getLengthY(),zx=axisZ.x*b.getLengthZ();

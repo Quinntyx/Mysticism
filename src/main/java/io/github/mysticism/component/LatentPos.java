@@ -25,9 +25,25 @@ public final class LatentPos implements ComponentV3, AutoSyncedComponent {
     public int receivedSequence() { return receivedSequence; }
     public long receivedCorrectionRevision() { return receivedCorrectionRevision; }
     public Vec384f receivedPose() { return receivedPose == null ? null : receivedPose.clone(); }
+    /** True only for client-side player instances: sync application consults prediction. */
+    private final boolean clientSide;
+    /** Client predictor hook; never set on server instances, so persistence is untouched. */
+    private SyncReconciler reconciler;
 
-    public LatentPos() { }
-    public LatentPos(Vec384f initial) { set(initial); }
+    /** Client-side arrival policy for an authoritative sync. Runs on the client main thread. */
+    public interface SyncReconciler {
+        /** @return the vector this component must hold after the sync (may mutate either argument). */
+        Vec384f reconcile(Vec384f serverValue, Vec384f current);
+    }
+
+    public LatentPos() { this(false); }
+    public LatentPos(Vec384f initial) { this(false); set(initial); }
+    /** Entity-component factories pass the owning world side; server instances never reconcile. */
+    public LatentPos(boolean clientSide) { this.clientSide = clientSide; }
+
+    /** Installed by the client predictor on the LOCAL player's component only. */
+    public void setSyncReconciler(SyncReconciler reconciler) { this.reconciler = reconciler; }
+    public boolean hasSyncReconciler() { return reconciler != null; }
 
     public Vec384f get() { return v; }
     /** ZERO can be a real semantic coordinate; magnitude cannot distinguish it from a reset. */
@@ -42,15 +58,15 @@ public final class LatentPos implements ComponentV3, AutoSyncedComponent {
     // Restore the RegistryWrapper.WrapperLookup parameter
     @Override
     public void readFromNbt(NbtCompound tag, RegistryWrapper.WrapperLookup wrapperLookup) {
+        Vec384f decoded = Vec384f.ZERO();
         if (EmbeddingNbt.compatible(tag) && tag.contains("v", NbtElement.INT_ARRAY_TYPE)) {
             try {
-                this.v = Vec384f.fromBits(tag.getIntArray("v"));
-                // Current-profile older saves have a coordinate array but no availability marker.
-                coordinateAvailable = !tag.contains("coordinateAvailable") || tag.getBoolean("coordinateAvailable"); return;
-            }
-            catch (IllegalArgumentException incompatible) { /* Discard obsolete/corrupt semantic data. */ }
-        }
-        this.v = Vec384f.ZERO(); coordinateAvailable = false;
+                decoded = Vec384f.fromBits(tag.getIntArray("v"));
+                coordinateAvailable = !tag.contains("coordinateAvailable") || tag.getBoolean("coordinateAvailable");
+            } catch (IllegalArgumentException incompatible) { coordinateAvailable = false; }
+        } else coordinateAvailable = false;
+        var policy = clientSide ? reconciler : null;
+        this.v = policy == null ? decoded : policy.reconcile(decoded, this.v);
     }
 
     // Restore the RegistryWrapper.WrapperLookup parameter

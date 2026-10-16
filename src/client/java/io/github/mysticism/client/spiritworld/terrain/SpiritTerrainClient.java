@@ -120,11 +120,7 @@ public final class SpiritTerrainClient {
         } finally {if(!adopted)closeBuffers(rebuilt);}
     }
     private static void drawModel(net.minecraft.client.render.block.BlockRenderManager models,BlockState state,TerrainMeshFrame.Cell c,Vec3d anchor,VertexConsumer consumer,Box primitive) {
-        Vec3d min=c.min().subtract(anchor),x=c.axisX(),y=c.axisY(),z=c.axisZ();
-        if(primitive!=null){min=c.point(primitive.minX,primitive.minY,primitive.minZ).subtract(anchor);x=x.multiply(primitive.getLengthX());y=y.multiply(primitive.getLengthY());z=z.multiply(primitive.getLengthZ());}
-        Matrix4f transform=new Matrix4f().m00((float)x.x).m01((float)x.y).m02((float)x.z)
-                .m10((float)y.x).m11((float)y.y).m12((float)y.z).m20((float)z.x).m21((float)z.y).m22((float)z.z)
-                .m30((float)min.x).m31((float)min.y).m32((float)min.z);
+        Matrix4f transform=TerrainModelTransform.position(c,anchor,primitive);
         MatrixStack stack=new MatrixStack();stack.multiplyPositionMatrix(transform);
         stack.peek().getNormalMatrix().set(new Matrix3f(transform).invert().transpose());
         int color=c.color();models.getModelRenderer().render(stack.peek(),consumer,state,models.getModel(state),

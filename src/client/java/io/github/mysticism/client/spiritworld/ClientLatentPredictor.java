@@ -4,6 +4,7 @@ import io.github.mysticism.activity.TraversalSteering;
 import io.github.mysticism.component.MysticismEntityComponents;
 import io.github.mysticism.dimension.spiritworld.terrain.MeshCollision;
 import io.github.mysticism.navigation.MovementIntegration;
+import io.github.mysticism.navigation.WalkingModePolicy;
 import io.github.mysticism.navigation.MovementProvenance;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
@@ -61,7 +62,7 @@ public final class ClientLatentPredictor {
                     mc.player.getComponent(MysticismEntityComponents.LATENT_BASIS), nav, predicting && !corrected);
             if (predicting && !corrected) {
                 Vec3d delta = MovementIntegration.clientSemantic(now.subtract(lastPos), correction, false);
-                if (nav.deep() && nav.supportApproach()) TraversalSteering.advance(q, basis, delta.x, delta.y, delta.z);
+                if (nav.deep() && nav.supportApproach()) WalkingModePolicy.advanceSupport(q, basis, delta.x, delta.y, delta.z);
                 else if (nav.deep() && nav.landingApproach()) TraversalSteering.approachStep(q, target, delta.x, delta.y, delta.z);
                 else if (nav.deep()) TraversalSteering.deepStep(q, basis, target, delta.x, delta.y, delta.z, nav.hasShallowTarget(), ClientPoseSync::recordPredictionPose);
                 else if (!nav.landmarkId().isEmpty()) TraversalSteering.advance(q, basis, delta.x, delta.y, delta.z);

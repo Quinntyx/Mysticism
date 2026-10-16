@@ -89,7 +89,7 @@ public final class LoadedSourceBackfillTest {
         check(references(SourceLandmarks.class,"LoadedSourceBackfill"),"source discovery uses the bounded backfill plan");
         var session=Arrays.stream(SourceLandmarks.class.getDeclaredClasses()).filter(c->c.getSimpleName().equals("Session")).findFirst().orElseThrow();
         check(references(session,"offerDiscoveryHint"),"entry hints use the lossless production admission path");
-        check(references(session,"DiscoveryPrioritizer")&&references(session,"nextOperation"),"entry and visible sweep share fair extraction scheduling");
+        check(references(session,"DiscoveryPrioritizer")&&references(session,"SourceSchedule"),"entry and visible sweep share fair extraction scheduling");
         check(references(SourceLandmarks.class,"FrontierRetry"),"entry retains refresh scans for loaded chunks");
     }
 

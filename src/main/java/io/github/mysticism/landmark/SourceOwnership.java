@@ -28,6 +28,10 @@ public final class SourceOwnership {
         public long ownershipRevision(){return revision;}
         public Map<BlockPos,String> owners(){return owners;}
         public Optional<String> ownerAt(BlockPos position){return Optional.ofNullable(owners.get(position));}
+        /** Coordinates alone are not an ownership key: reject a foreign window's snapshot. */
+        public Optional<String> ownerAt(String expectedDimension,BlockPos position){
+            return dimension.equals(Objects.requireNonNull(expectedDimension))?ownerAt(position):Optional.empty();
+        }
         public boolean isCurrent(MinecraftServer server){
             if(!server.isOnThread())throw new IllegalStateException("source ownership server thread");
             return LandmarkStore.get(server)==store && store.ownershipRevision()==revision;
@@ -74,8 +78,8 @@ public final class SourceOwnership {
                 return;
             }
             if(!candidates.isEmpty()){
-                if(!store.geometryReadAvailable())return;
-                var candidate=candidates.removeFirst();owner=candidate.id();read=store.beginGeometryRead(owner,bounds);return;
+                if(!store.ownershipReadAvailable())return;
+                var candidate=candidates.removeFirst();owner=candidate.id();read=store.beginOwnershipRead(owner,bounds);return;
             }
             if(!end){var batch=store.sourceRangePage(dimension,bounds,cursor,4,4);cursor=batch.nextId();end=batch.end();candidates.addAll(batch.landmarks());return;}
             done=true;future.complete(new Region(this));
