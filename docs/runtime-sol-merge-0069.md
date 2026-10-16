@@ -112,6 +112,55 @@ Final combined validation (no model-path override):
 - `git diff --check` and conflict-marker inspection passed before final staging.
   The full canonical command above was run without excluded verification tasks.
 
+## P1 follow-up: keep the accepted flight replay through final pose acceptance
+
+Baseline: published merge `266d82aab0517b28a2f5649dfb60144618efe212`.
+The review identified a real conflicting authority: the flight gate could accept a
+claim reproduced by a recent published frame, then final pose acceptance discarded
+that result and teleported to the provisional current-frame sweep.
+
+- Validation now returns the selected replayed pose and correction, not only a
+  boolean. It chooses the closest replay: a newer tolerated near miss cannot mask
+  an exact older-frame result. Sub-tolerance wall clipping is retained, not replaced
+  with unchecked packet coordinates; crossing walls in every retained frame remains
+  rejected. Missing frame history falls back to the current sweep.
+- The network handler carries one packet-scoped decision from validation to final
+  pose acceptance. It initializes only after the main-thread guard, consumes only a
+  matching request once, and clears state at packet completion. Ordinary walking,
+  vanilla speed/teleport guards and rejection paths retain their prior handling.
+- Correction accounting uses the same selected replay as the accepted pose,
+  replacing only the packet's provisional depenetration while preserving prior-tick,
+  client-side and other-player evidence.
+- `SpiritFlightAcceptanceTest` executes **603 checks** of the production validation,
+  sweep, final acceptance and correction-accounting cores, including **192 sustained
+  movement/direction-change steps**, genuine wall contact, conflicting frame results,
+  history eviction, unavailable history and foreign packet/player isolation. Its
+  negative control demonstrates the former final-acceptance correction on the same
+  historical-frame fixture.
+- `SpiritIntegratedMixinApplicationTest` now includes the previously omitted
+  `SpiritMeshMovementAcceptanceMixin` alongside the collision/flight/walking hooks.
+  Real Mixin transformation of the actual Minecraft network-handler bytecode and ASM
+  verification confirm the shared decision handoff and final-acceptance call site.
+  This is not execution of a live Minecraft network session.
+
+The full combined command recorded above was rerun after the code/test repairs:
+
+- Original pane `%3745`; job pane `%3746`, run
+  `df4eba9af2304e1ba3bed3c4403699cf`, exit **0**, **BUILD SUCCESSFUL in 2m 4s**,
+  **17 tasks executed**. All **148 discovered main-based runtime classes**, runner
+  discovery/failure fixtures, packaging fixtures and `verifyProductionJar` passed.
+- Actual native inference again passed using the exact authorized SHA-256 asset
+  through normal cache discovery (no model-path override), JNI **b10682-5ea1b124e**,
+  all **768 coordinates**, no HTTP service, no substitute/download. Real default
+  helper/cache restart/composition/client-executor callbacks also passed.
+- Actual packaged Kuwahara/fog OpenGL execution again passed under Xvfb with
+  **Mesa 26.2.3-arch1.1 / llvmpipe LLVM 22.1.8**, OpenGL **4.6 Core**, including
+  RGBA32F/RGBA8 resize targets and wider fog. Physical-GPU/gameplay limitations below
+  still apply.
+- Follow-up production jar SHA-256:
+  `9094334bc4d06b457110368815382ca012501e3531569ecb7d9e45f49e5433dc`.
+  `git diff --check` passed. Both original merge parents remain in the ancestry.
+
 ## Coverage limits / remaining acceptance
 
 No live Minecraft gameplay, IntelliJ launch, multiplayer latency session,

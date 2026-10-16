@@ -1,6 +1,9 @@
 package io.github.mysticism.mixin;
 
 import io.github.mysticism.dimension.spiritworld.terrain.MeshMovementValidation;
+import io.github.mysticism.dimension.spiritworld.terrain.MeshCollision;
+import io.github.mysticism.navigation.SpiritFlightReplayAccess;
+import net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket;
 import io.github.mysticism.navigation.SpiritNavigationService;
 import net.minecraft.server.network.ServerPlayerInteractionManager;
 import net.minecraft.server.network.ServerPlayNetworkHandler;
@@ -10,6 +13,9 @@ import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.WorldView;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Redirect;
 
@@ -30,8 +36,32 @@ import org.spongepowered.asm.mixin.injection.Redirect;
  * Invalid movement, pending teleports and the speed guard keep vanilla handling; shallow
  * walking keeps ordinary vanilla validation on both gates. */
 @Mixin(ServerPlayNetworkHandler.class)
-public abstract class SpiritFlightPredictionMixin {
+public abstract class SpiritFlightPredictionMixin implements SpiritFlightReplayAccess {
     @Shadow public ServerPlayerEntity player;
+    @Unique private MeshMovementValidation.Decision mysticism$flightMeshDecision;
+    @Unique private Vec3d mysticism$correctionBeforeSweep;
+
+    // HEAD also runs on Netty. Do not touch this handler's packet state until the thread guard.
+    @Inject(method="onPlayerMove",at=@At(value="INVOKE",target=
+            "Lnet/minecraft/network/NetworkThreadUtils;forceMainThread(Lnet/minecraft/network/packet/Packet;Lnet/minecraft/network/listener/PacketListener;Lnet/minecraft/server/world/ServerWorld;)V",
+            shift=At.Shift.AFTER))
+    private void mysticism$beginFlightMeshPacket(PlayerMoveC2SPacket packet,CallbackInfo ci) {
+        mysticism$flightMeshDecision=null;
+        mysticism$correctionBeforeSweep=MeshCollision.correctionSnapshot(player.getUuid(),false);
+    }
+    @Inject(method="onPlayerMove",at=@At("RETURN"))
+    private void mysticism$endFlightMeshPacket(PlayerMoveC2SPacket packet,CallbackInfo ci) {
+        mysticism$flightMeshDecision=null;
+        mysticism$correctionBeforeSweep=null;
+    }
+    @Override
+    public MeshMovementValidation.Decision mysticism$takeFlightMeshDecision(Vec3d requested) {
+        var decision=mysticism$flightMeshDecision;
+        mysticism$flightMeshDecision=null; // never authorize a later/second pose write
+        if(decision==null || !decision.replays(requested) || mysticism$correctionBeforeSweep==null)return null;
+        MeshCollision.acceptReplayCorrection(player.getUuid(),false,mysticism$correctionBeforeSweep,decision.correction());
+        return decision;
+    }
     @Shadow private boolean isPlayerNotCollidingWithBlocks(WorldView world, Box box, double newX, double newY, double newZ) { throw new AssertionError(); }
     @Redirect(method = "onPlayerMove",
             at = @At(value = "INVOKE", target = "Lnet/minecraft/server/network/ServerPlayerInteractionManager;isCreative()Z"))
@@ -47,6 +77,7 @@ public abstract class SpiritFlightPredictionMixin {
             return isPlayerNotCollidingWithBlocks(world, preMoveBox, d, e, f);
         // true = unsafe (vanilla teleports back); accepted only when the player's own recent
         // published mesh frame reproduces the claimed move.
-        return !MeshMovementValidation.allowsMeshMove(player.getUuid(), preMoveBox, new Vec3d(d, e, f), true);
+        mysticism$flightMeshDecision=MeshMovementValidation.validate(player.getUuid(), preMoveBox, new Vec3d(d, e, f), true);
+        return !mysticism$flightMeshDecision.allowed();
     }
 }

@@ -29,6 +29,14 @@ public final class MeshCollision {
         if (player == null || correction.equals(Vec3d.ZERO)) return;
         (clientSide ? CLIENT_CORRECTIONS : SERVER_CORRECTIONS).merge(player, correction, Vec3d::add);
     }
+    /** Server packet sweeps are provisional until lag-compensated pose acceptance. Preserve prior
+     * tick evidence, but replace this packet's provisional correction with its selected replay. */
+    public static Vec3d correctionSnapshot(UUID player,boolean clientSide) {
+        return (clientSide ? CLIENT_CORRECTIONS : SERVER_CORRECTIONS).getOrDefault(player,Vec3d.ZERO);
+    }
+    public static void acceptReplayCorrection(UUID player,boolean clientSide,Vec3d beforeSweep,Vec3d accepted) {
+        (clientSide ? CLIENT_CORRECTIONS : SERVER_CORRECTIONS).put(player,beforeSweep.add(accepted));
+    }
     private static final Map<UUID,Vec3d> SERVER_CORRECTIONS=new java.util.concurrent.ConcurrentHashMap<>(), CLIENT_CORRECTIONS=new java.util.concurrent.ConcurrentHashMap<>();
     private static void recordCorrection(PlayerEntity p,Vec3d correction) { recordCorrection(p.getUuid(),p.getWorld().isClient,correction); }
     public record Hit(double time, Vec3d normal, TerrainMeshFrame.Cell cell) {}
@@ -322,8 +330,11 @@ public final class MeshCollision {
     }
     /** Replay accepted displacement without applying depenetration twice. */
     public static Vec3d replayClaimed(Index i,Box body,Vec3d claimed,boolean flying) {
+        return replayResolved(i,body,claimed,flying).movement();
+    }
+    static Resolution replayResolved(Index i,Box body,Vec3d claimed,boolean flying) {
         Vec3d correction=i.depenetrate(body,flying?.5:4);
-        return resolveMotion(i,body,claimed.subtract(correction),!flying && supported(i,body.offset(correction)),flying?.5:4).movement();
+        return resolveMotion(i,body,claimed.subtract(correction),!flying && supported(i,body.offset(correction)),flying?.5:4);
     }
     /** Actual mesh support contact, shared by the player adapter and entity-free regressions. */
     public static Optional<Hit> ground(Index index,Box body) {

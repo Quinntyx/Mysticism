@@ -48,7 +48,7 @@ public final class SpiritIntegratedMixinApplicationTest {
         boolean client = Boolean.getBoolean("mysticism.test.integratedClient");
         String resource = client ? "mysticism.client.mixins.json" : "mysticism.mixins.json";
         List<String> retained = client ? List.of("SpiritJoinWorldHandoffMixin", "SpiritRespawnHandoffMixin", "SpiritArrivalReseedMixin", "SpiritCarrierPushMixin")
-                : List.of("SpiritFlightPredictionMixin", "SpiritMeshMovementMixin", "SpiritFlightToggleMixin",
+                : List.of("SpiritFlightPredictionMixin", "SpiritMeshMovementMixin", "SpiritMeshMovementAcceptanceMixin", "SpiritFlightToggleMixin",
                         "SpiritMeshCollisionMixin", "SpiritMeshSneakMixin", "SpiritTravelMixin", "EntityFlagAccess", "SpiritTeleportMixin");
         try (var stream = SpiritIntegratedMixinApplicationTest.class.getClassLoader().getResourceAsStream(resource)) {
             check(stream != null, "Missing production config " + resource);
@@ -144,11 +144,29 @@ public final class SpiritIntegratedMixinApplicationTest {
                             "Flight reconciliation must survive the combined common config");
                     var packet = method(after, "onPlayerMove");
                     for (String suffix : List.of("$flightPredictionTolerance", "$meshMoveValidation",
-                            "$spiritShortCircuit", "$beforeMove", "$acceptedMove")) {
+                            "$spiritShortCircuit", "$beforeMove", "$acceptedMove", "$acceptSweptPose",
+                            "$beginFlightMeshPacket", "$endFlightMeshPacket")) {
                         var hook = after.methods.stream().filter(m -> m.name.endsWith(suffix)).findFirst().orElseThrow();
                         check(calls(packet, after.name, hook.name) > 0, "Combined movement path lost " + suffix);
                         new Analyzer<>(new BasicVerifier()).analyze(after.name, hook);
                     }
+                    check(after.interfaces.contains(PREFIX+"navigation/SpiritFlightReplayAccess"),
+                            "Combined handler must carry per-packet flight replay authority");
+                    var acceptance=after.methods.stream().filter(m->m.name.endsWith("$acceptSweptPose")).findFirst().orElseThrow();
+                    check(calls(packet,after.name,acceptance.name)==1,"Only the post-sweep pose write consumes a replay");
+                    check(calls(acceptance,PREFIX+"navigation/SpiritFlightReplayAccess","mysticism$takeFlightMeshDecision")==1,
+                            "Final acceptance must consume the SAME validated packet replay");
+                    check(calls(acceptance,PREFIX+"navigation/SpiritMovementAcceptance","accept")==1,
+                            "Applied acceptance must use production replay/sweep arbitration");
+                    var consume=method(after,"mysticism$takeFlightMeshDecision");
+                    check(calls(consume,PREFIX+"dimension/spiritworld/terrain/MeshMovementValidation$Decision","replays")==1,
+                            "Replay consumption must require matching packet coordinates");
+                    check(calls(consume,PREFIX+"dimension/spiritworld/terrain/MeshCollision","acceptReplayCorrection")==1,
+                            "Final pose and correction provenance must select the same replay");
+                    new Analyzer<>(new BasicVerifier()).analyze(after.name,consume);
+                    var collision=after.methods.stream().filter(m->m.name.endsWith("$meshMoveValidation")).findFirst().orElseThrow();
+                    check(calls(collision,PREFIX+"dimension/spiritworld/terrain/MeshMovementValidation","validate")==1,
+                            "Combined flight gate must retain the replay, not only a boolean verdict");
                     var teleport=after.methods.stream().filter(m->m.name.equals("requestTeleport")
                             && m.desc.equals("(DDDFFLjava/util/Set;)V")).findFirst().orElseThrow();
                     for (String suffix : List.of("$beforeSpiritTeleport","$afterSpiritTeleport")) {

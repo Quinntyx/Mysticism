@@ -90,7 +90,7 @@ public final class SpiritFlightMixinApplicationTest {
                         "Applied non-static redirect must consume the invocation receiver before WorldView");
                 check(calls(movement, after.name, collision.name) == 1 && calls(movement, after.name, creative.name) == 1,
                         "Both applied hooks must be called by real onPlayerMove");
-                check(calls(collision, "io/github/mysticism/dimension/spiritworld/terrain/MeshMovementValidation", "allowsMeshMove") == 1,
+                check(calls(collision, "io/github/mysticism/dimension/spiritworld/terrain/MeshMovementValidation", "validate") == 1,
                         "Applied collision hook must still validate actual mesh motion");
                 check(calls(collision, after.name, "isPlayerNotCollidingWithBlocks") == 1,
                         "Applied hook must preserve the vanilla fallback");

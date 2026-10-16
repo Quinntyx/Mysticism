@@ -91,7 +91,7 @@ public final class SpiritFlightPredictionContractTest {
             byte[] bytecode = in.readAllBytes();
             check(contains(bytecode, "isCreative"), "mixin still redirects the creative exemption gate");
             check(contains(bytecode, "isPlayerNotCollidingWithBlocks"), "mixin still redirects the collision gate with mesh validation");
-            check(contains(bytecode, "allowsMeshMove"), "mixin decision must consult mesh movement validation");
+            check(contains(bytecode, "validate"), "mixin decision must retain mesh movement replay authority");
         }
     }
     private static boolean contains(byte[] data, String token) {
