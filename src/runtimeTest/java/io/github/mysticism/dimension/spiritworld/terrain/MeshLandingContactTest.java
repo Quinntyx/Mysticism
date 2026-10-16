@@ -45,7 +45,7 @@ public final class MeshLandingContactTest {
         double velocity = -.4;
         for (int tick = 0; tick < 80; tick++) {
             Vec3d requested = new Vec3d(0, velocity - .08, 0);
-            Vec3d applied = index.slide(body.offset(index.depenetrate(body)), requested);
+            Vec3d applied = index.move(body, requested, true, 0);
             body = body.offset(applied);
             velocity = applied.y == requested.y ? (velocity - .08) * .98 : 0;
         }
@@ -54,7 +54,7 @@ public final class MeshLandingContactTest {
         double velocity2 = -.2;
         for (int tick = 0; tick < 20; tick++) { // standing: repeated gravity requests must not sink or alternate
             Vec3d requested = new Vec3d(0, velocity2 - .08, 0);
-            Vec3d applied = index.slide(body.offset(index.depenetrate(body)), requested);
+            Vec3d applied = index.move(body, requested, true, 0);
             body = body.offset(applied);
             velocity2 = applied.y == requested.y ? (velocity2 - .08) * .98 : 0;
             check(Math.abs(body.minY - surfacePoint.y) < 1e-3, "resting body stays on its support without correction oscillation (tick "

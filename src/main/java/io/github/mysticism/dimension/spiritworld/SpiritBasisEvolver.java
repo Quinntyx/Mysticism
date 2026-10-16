@@ -2,8 +2,12 @@ package io.github.mysticism.dimension.spiritworld;
 
 import io.github.mysticism.activity.TraversalSteering;
 import io.github.mysticism.component.MysticismEntityComponents;
+import io.github.mysticism.component.LatentPos;
+import io.github.mysticism.component.LatentBasis;
+import io.github.mysticism.dimension.spiritworld.terrain.MeshCollision;
 import io.github.mysticism.dimension.spiritworld.terrain.SpiritTerrainService;
-import io.github.mysticism.navigation.MotionAlignment;
+import io.github.mysticism.navigation.MovementIntegration;
+import io.github.mysticism.navigation.MovementProvenance;
 import io.github.mysticism.navigation.SpiritNavigationService;
 import net.fabricmc.fabric.api.entity.event.v1.*;
 import net.fabricmc.fabric.api.event.lifecycle.v1.*;
@@ -12,10 +16,12 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.util.math.Vec3d;
 import java.util.*;
 
-/** Per-player original movement-driven basis evolution. No global frame, target following or teleport drift. */
+/** Per-player original movement-driven basis evolution. No global frame, target following or teleport drift.
+ *  Integration is robust to tick variation and accumulated frame timing: lag bursts integrate in full,
+ *  while teleports and collision corrections (provenance + depenetration accounting) never advance q/basis. */
 public final class SpiritBasisEvolver {
     /** Bounded PHYSICAL movement drives navigation decisions; epoch-filtered SEMANTIC movement drives q/basis integration. */
-    record TickMovement(Vec3d physical, Vec3d semantic) {}
+    record TickMovement(Vec3d physical, Vec3d semantic, boolean requiresReconciliation) {}
 
     /**
      * Physical stays epoch-agnostic so real movement signals survive lifecycle transitions (a jump
@@ -24,9 +30,15 @@ public final class SpiritBasisEvolver {
      * exactly matching ClientLatentPredictor.
      */
     static TickMovement tickMovement(Vec3d last, Vec3d now, Long recordedEpoch, long epoch) {
-        Vec3d physical = MotionAlignment.boundedDelta(last, now);
+        return tickMovement(last, now, recordedEpoch, epoch, Vec3d.ZERO, false);
+    }
+
+    static TickMovement tickMovement(Vec3d last, Vec3d now, Long recordedEpoch, long epoch,
+                                     Vec3d correction, boolean teleported) {
+        var sample = MovementIntegration.server(last == null ? Vec3d.ZERO : now.subtract(last), correction, teleported);
         boolean continuous = recordedEpoch != null && recordedEpoch == epoch;
-        return new TickMovement(physical, continuous ? physical : Vec3d.ZERO);
+        return new TickMovement(sample.stateDelta(), continuous ? sample.semanticDelta() : Vec3d.ZERO,
+                sample.requiresReconciliation());
     }
 
     private static final Map<MinecraftServer, Map<UUID, Vec3d>> LAST_POS = new IdentityHashMap<>();
@@ -38,6 +50,9 @@ public final class SpiritBasisEvolver {
         Map<UUID, Long> epochs = LAST_EPOCH.computeIfAbsent(server, s -> new HashMap<>());
         Set<UUID> live = new HashSet<>();
         for (var p : server.getPlayerManager().getPlayerList()) {
+            // Provenance is drained for every player every tick; stale markers can never skip a later window.
+            boolean teleported = MovementProvenance.drainServerTeleport(p.getUuid());
+            Vec3d correction = MeshCollision.drainCorrection(p);
             if (!p.getWorld().getRegistryKey().equals(SpiritTerrainService.WORLD)) {
                 positions.remove(p.getUuid()); epochs.remove(p.getUuid()); SpiritNavigationService.update(p, Vec3d.ZERO, Vec3d.ZERO); continue;
             }
@@ -47,7 +62,7 @@ public final class SpiritBasisEvolver {
             Long recorded = epochs.put(p.getUuid(), epoch);
             // Bounded physical movement feeds navigation (jump grace, blend cancel); the
             // epoch-filtered delta feeds semantic integration only, exactly like the client.
-            TickMovement movement = tickMovement(last, now, recorded, epoch);
+            TickMovement movement = tickMovement(last, now, recorded, epoch, correction, teleported);
             var basis = p.getComponent(MysticismEntityComponents.LATENT_BASIS).get();
             var q = p.getComponent(MysticismEntityComponents.LATENT_POS).get();
             var target = p.getComponent(MysticismEntityComponents.LATENT_ATTUNEMENT).target();
@@ -55,12 +70,24 @@ public final class SpiritBasisEvolver {
                 TraversalSteering.deepStep(q, basis, target, movement.semantic().x, movement.semantic().y, movement.semantic().z,
                         p.getComponent(MysticismEntityComponents.SPIRIT_NAVIGATION).hasShallowTarget());
             // Periodic authoritative reconciliation also delivers touch interpolation to a stationary recipient.
-            if (server.getTicks() % 4 == 0) {
+            boolean reconcile = reconcileSuppressedWindow(new MovementIntegration.Sample(
+                    movement.physical(), movement.semantic(), movement.requiresReconciliation()),
+                    p.getComponent(MysticismEntityComponents.LATENT_POS),
+                    p.getComponent(MysticismEntityComponents.LATENT_BASIS));
+            if (reconcile || server.getTicks() % 4 == 0) {
                 MysticismEntityComponents.LATENT_BASIS.sync(p); MysticismEntityComponents.LATENT_POS.sync(p);
             }
         }
         positions.keySet().retainAll(live);
         epochs.keySet().retainAll(live);
+    }
+    /** Mark both independent streams whenever the server declined a window the client predicted.
+     * Return whether the caller must broadcast them immediately, even on a non-cadence tick. */
+    public static boolean reconcileSuppressedWindow(MovementIntegration.Sample sample, LatentPos pos, LatentBasis basis) {
+        if (!sample.requiresReconciliation()) return false;
+        pos.markAuthoritativeCorrection();
+        basis.markAuthoritativeCorrection();
+        return true;
     }
     public static void init() {
         if (initialized) return; initialized = true;

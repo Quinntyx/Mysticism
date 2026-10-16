@@ -190,9 +190,9 @@ public final class SpiritVisualControlsSelfTest {
         check(manager.indexOf("controls.markApplied(framePasses") > manager.indexOf("checkGl(\"restoring scene depth\")"), "success only after depth restoration");
         check(manager.contains("if (!framePasses.anyEnabled()) return;"), "master/all-off avoids source-scene replacement and chain");
         check(manager.contains("SpiritVisualCommands.init();"), "runtime command registration is wired");
-        check(manager.contains("if (!depthReady) {") && manager.contains("fail(\"scene depth snapshot not observed\""),
+        check(manager.contains("if (!frame.depthReady()) {") && manager.contains("fail(\"scene depth snapshot not observed\""),
                 "missing depth stops the chain and selects native-fog fallback, not perpetual pending/suppression");
-        check(manager.contains("setSamplerUniform(\"OccupancySampler\",medium);")
+        check(manager.contains("setSamplerUniform(\"OccupancySampler\", medium == 0 ? sceneDepth.getColorAttachment() : medium);")
                 && !manager.contains("if (medium!=0) KUWAHARA_SHADER.setSamplerUniform"), "clear stale sampler ID when fog disabled/unavailable");
     }
     private static JsonObject json(String path) throws Exception { return JsonParser.parseString(resource(path)).getAsJsonObject(); }

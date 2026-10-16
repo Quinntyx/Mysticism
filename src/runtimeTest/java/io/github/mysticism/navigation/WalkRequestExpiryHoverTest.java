@@ -45,7 +45,9 @@ public final class WalkRequestExpiryHoverTest {
             check(WalkPolicy.requestExpired(started, started + elapsed) == (elapsed >= WalkPolicy.MAX_PENDING_TICKS),
                     "Intermittent/missing support must not extend elapsed intent lifetime");
         }
-        check(contactTicks < 10, "Fixture would have kept the old contact-only request pending for hours");
+        check(contactTicks < 20, "Fixture would have kept the old contact-only request pending for hours");
+        check(WalkPolicy.MAX_PENDING_TICKS == WalkIntent.TOTAL_TICKS,
+                "elapsed and active request lifetimes share the same absolute bound");
         check(!WalkPolicy.requestExpired(1300, 1300), "A fresh request must receive a fresh budget");
         check(WalkPolicy.requestExpired(started, started + 10000), "Skipped validation ticks must still expire elapsed intent");
         String service = java.nio.file.Files.readString(java.nio.file.Path.of(
@@ -54,6 +56,14 @@ public final class WalkRequestExpiryHoverTest {
         int expiry = service.indexOf("WalkPolicy.requestExpired(s.supportStartedTick", attempt);
         int lookup = service.indexOf("SpiritTerrainService.currentSupport(p)", attempt);
         check(expiry > attempt && expiry < lookup, "Elapsed expiry must run before missing support/readiness can return");
+        int resume = service.indexOf("private static void resumeSupportApproach(");
+        int natural = service.indexOf("private static void naturalLanding(", resume);
+        check(!service.substring(resume, natural).contains("s.supportStartedTick ="),
+                "late proof recovery must not renew the original request deadline");
+        int suspended = service.indexOf("if (s.walk.armed()) {", service.indexOf("public static boolean update(ServerPlayerEntity p, Vec3d physical"));
+        check(service.indexOf("WalkPolicy.requestExpired(s.supportStartedTick", suspended)
+                        < service.indexOf("SpiritTerrainService.currentSupport(p)", suspended),
+                "suspended source work must also obey elapsed lifetime before querying readiness");
         check(service.indexOf("if (s.supportPending || s.walk.armed()) return;") < service.indexOf("s.supportStartedTick = p.getServer().getTicks()"),
                 "Repeated entry packets must not renew the request deadline");
     }

@@ -10,6 +10,8 @@ import java.util.TreeMap;
 public record TerrainMeshFrame(long revision, boolean shallow, String sourceDimension,
         Vec3d sourceOrigin, Vec3d carrierOrigin, List<Material> materials, List<Cell> cells) {
     public static final int MAX_CELLS = 2048, MAX_MATERIALS = 256, MAX_SHAPES = 8;
+    /** Allowed source-local shape envelope, also bounds neighboring collision-producer queries. */
+    public static final double MIN_LOCAL_SHAPE = -2, MAX_LOCAL_SHAPE = 3;
     public TerrainMeshFrame {
         if (revision < 0 || sourceDimension == null || sourceDimension.length() > 256)
             throw new IllegalArgumentException("mesh identity");
@@ -51,7 +53,8 @@ public record TerrainMeshFrame(long revision, boolean shallow, String sourceDime
             if(collision.size()>MAX_SHAPES)throw new IllegalArgumentException("shape budget");
             for(Box b:collision) {
                 finite(new Vec3d(b.minX,b.minY,b.minZ));finite(new Vec3d(b.maxX,b.maxY,b.maxZ));
-                if(b.minX < -2 || b.minY < -2 || b.minZ < -2 || b.maxX > 3 || b.maxY > 3 || b.maxZ > 3
+                if(b.minX < MIN_LOCAL_SHAPE || b.minY < MIN_LOCAL_SHAPE || b.minZ < MIN_LOCAL_SHAPE
+                        || b.maxX > MAX_LOCAL_SHAPE || b.maxY > MAX_LOCAL_SHAPE || b.maxZ > MAX_LOCAL_SHAPE
                         || b.getLengthX()<=0 || b.getLengthY()<=0 || b.getLengthZ()<=0)
                     throw new IllegalArgumentException("local collision bounds");
             }
@@ -68,6 +71,14 @@ public record TerrainMeshFrame(long revision, boolean shallow, String sourceDime
                     axisY.dotProduct(projectedNormal) / size.y, axisZ.dotProduct(projectedNormal) / size.z);
             double length = pulled.length();
             return Double.isFinite(length) && length > 1e-12 ? pulled.multiply(1 / length) : Vec3d.ZERO;
+        }
+        /** Inverse of this accepted render/collision cell, preserving exact fractional feet.
+         * Source coordinates move with the projected frame; they are not a navigation target. */
+        public Vec3d sourcePoint(Vec3d world) {
+            Vec3d v=world.subtract(min);double det=axisX.dotProduct(axisY.crossProduct(axisZ));
+            return sourceMin.add(v.dotProduct(axisY.crossProduct(axisZ))/det*size.x,
+                    v.dotProduct(axisZ.crossProduct(axisX))/det*size.y,
+                    v.dotProduct(axisX.crossProduct(axisY))/det*size.z);
         }
         public Box bounds(Box b) {
             Vec3d base=point(b.minX,b.minY,b.minZ);

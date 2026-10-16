@@ -19,7 +19,11 @@ public final class LatentAttunement implements ComponentV3, AutoSyncedComponent 
     public Vec384f get(){return current.clone();}
     public Vec384f target(){return target.clone();}
     public Vec384f personal(){return personal.clone();}
+    /** True when the navigation target was set by an explicit request rather than background drift. */
+    public boolean explicitTarget(){return explicitTarget;}
     public long revision(){return revision;}
+    /** Explicit ZERO targets are real coordinates, not the implicit unset default. */
+    public boolean hasTarget(){return explicitTarget || target.length()>1e-6;}
     /** Explicit commands replace the navigation target; terrain steering must never call this. */
     public void set(Vec384f value){target=checked(value);explicitTarget=true; if(current.length()==0)current=target.clone(); revision++;}
     public void followPersonal(){explicitTarget=false;target=personal.clone();revision++;}

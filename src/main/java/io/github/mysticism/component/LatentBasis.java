@@ -5,7 +5,9 @@ import io.github.mysticism.vector.Vec384f;
 import io.github.mysticism.embedding.EmbeddingNbt;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtElement;
+import net.minecraft.network.RegistryByteBuf;
 import net.minecraft.registry.RegistryWrapper;
+import net.minecraft.server.network.ServerPlayerEntity;
 import org.ladysnake.cca.api.v3.component.ComponentV3;
 import org.ladysnake.cca.api.v3.component.sync.AutoSyncedComponent;
 
@@ -20,12 +22,39 @@ public final class LatentBasis implements ComponentV3, AutoSyncedComponent {
 
     // Requires Basis384f to have public constructors.
     private Basis384f basis = new Basis384f();
+    /** Monotonic per-instance wire sequence for sync ordering; not persisted, session-local. */
+    private int syncSequence;
+    // Correction provenance is session-local and travels WITH the pose, not a separate nav packet.
+    private long correctionRevision;
+    private int receivedSequence;
+    private long receivedCorrectionRevision;
+    private Basis384f receivedPose;
 
-    public LatentBasis() {}
+    public void markAuthoritativeCorrection() { correctionRevision++; }
+    public int receivedSequence() { return receivedSequence; }
+    public long receivedCorrectionRevision() { return receivedCorrectionRevision; }
+    public Basis384f receivedPose() { return receivedPose == null ? null : receivedPose.clone(); }
+    /** True only for client-side player instances: sync application consults prediction. */
+    private final boolean clientSide;
+    /** Client predictor hook; never set on server instances, so persistence is untouched. */
+    private SyncReconciler reconciler;
 
-    public LatentBasis(Basis384f initial) {
-        set(initial);
+    /** Client-side arrival policy for an authoritative sync. Runs on the client main thread. */
+    public interface SyncReconciler {
+        /** @return the basis this component must hold after the sync (may mutate either argument). */
+        Basis384f reconcile(Basis384f serverValue, Basis384f current);
     }
+
+    public LatentBasis() { this(false); }
+
+    public LatentBasis(Basis384f initial) { this(false); set(initial); }
+
+    /** Entity-component factories pass the owning world side; server instances never reconcile. */
+    public LatentBasis(boolean clientSide) { this.clientSide = clientSide; }
+
+    /** Installed by the client predictor on the LOCAL player's component only. */
+    public void setSyncReconciler(SyncReconciler reconciler) { this.reconciler = reconciler; }
+    public boolean hasSyncReconciler() { return reconciler != null; }
 
     /** Returns the live basis (mutable). */
     public Basis384f get() {
@@ -58,11 +87,16 @@ public final class LatentBasis implements ComponentV3, AutoSyncedComponent {
 
     @Override
     public void readFromNbt(NbtCompound tag, RegistryWrapper.WrapperLookup wrapperLookup) {
+        Basis384f decoded = null;
         if (EmbeddingNbt.compatible(tag) && tag.contains("b", NbtElement.INT_ARRAY_TYPE)) {
-            try { this.basis = Basis384f.fromBits(tag.getIntArray("b")); return; }
-            catch (IllegalArgumentException incompatible) { /* Discard obsolete/corrupt semantic data. */ }
+            try { decoded = Basis384f.fromBits(tag.getIntArray("b")); }
+            catch (IllegalArgumentException incompatible) { decoded = null; }
         }
-        this.basis = new Basis384f();
+        if (decoded == null) decoded = new Basis384f();
+        // Server load and non-predicting clients adopt plainly; the predicting client consults
+        // the installed policy so syncs never regress healthy in-flight basis prediction.
+        var policy = clientSide ? reconciler : null;
+        this.basis = policy == null ? decoded : policy.reconcile(decoded, this.basis);
     }
 
     @Override
@@ -70,5 +104,44 @@ public final class LatentBasis implements ComponentV3, AutoSyncedComponent {
         EmbeddingNbt.stamp(tag);
         tag.putIntArray("b", this.basis.toBits());
         tag.remove("embeddingArchive");
+    }
+
+    /**
+     * Client-side authoritative sync application with movement-ordering reconciliation; see
+     * {@link LatentPos#applySyncPacket}. Reordered/stale snapshots are rejected by the wire
+     * sequence from {@link #writeSyncPacket}; a fresh snapshot is held only while its divergence
+     * from the locally integrated basis is explained by unacknowledged in-flight movement.
+     */
+    @Override
+    public void applySyncPacket(RegistryByteBuf buf) {
+        int sequence = buf.readVarInt();
+        NbtCompound tag = buf.readNbt();
+        if (tag == null) return;
+        // Ordering already applies before this instance is recognized as the local predictor.
+        // Otherwise a stale replacement/peer packet can leave pose and cached frontier disagreeing.
+        if (receivedSequence != 0 && sequence <= receivedSequence) return;
+        LatentBasis incoming = new LatentBasis();
+        // The read path ignores the registry lookup; the wire format is self-describing bits.
+        incoming.readFromNbt(tag, null);
+        long revision = tag.getLong("poseCorrectionRevision");
+        this.set(LatentSync.reconcile(this, sequence, revision, this.basis, incoming.basis));
+        // Capture authority even when this component is not yet registered as the local predictor.
+        // A later replacement-context initialization inherits its real wire frontier.
+        if (sequence > receivedSequence) {
+            receivedSequence = sequence;
+            receivedCorrectionRevision = revision;
+            receivedPose = incoming.basis.clone();
+        }
+    }
+
+    /** Embeds the monotonic wire sequence before the basis NBT; see {@link LatentPos#writeSyncPacket}. */
+    @Override
+    public void writeSyncPacket(RegistryByteBuf buf, ServerPlayerEntity recipient) {
+        if (this.syncSequence == Integer.MAX_VALUE) this.syncSequence = 0;
+        buf.writeVarInt(++this.syncSequence);
+        NbtCompound tag = new NbtCompound();
+        this.writeToNbt(tag, buf.getRegistryManager());
+        tag.putLong("poseCorrectionRevision", correctionRevision);
+        buf.writeNbt(tag);
     }
 }

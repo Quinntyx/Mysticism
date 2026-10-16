@@ -14,18 +14,18 @@ public final class SourceSelector {
                          BlockPalette.State material,BlockSample.Occupancy occupancy,
                          LandmarkEmbedding embedding,double importance){}
     public record Batch(List<Sample> samples,boolean complete,String cursor){public Batch{samples=List.copyOf(samples);}}
-    public static Request begin(MinecraftServer server,LandmarkEmbedding embedding,double radius,long frameGeneration,Bounds sourceRange){
+    public static Request begin(MinecraftServer server,String dimension,LandmarkEmbedding embedding,double radius,long frameGeneration,Bounds sourceRange){
         if(!server.isOnThread())throw new IllegalStateException("source selector server thread");
         LandmarkProfiles.current().requireCompatible(embedding.profile());
         if(!Double.isFinite(radius)||radius<=0)throw new IllegalArgumentException("semantic radius");
-        return new Request(server,embedding,radius,frameGeneration,sourceRange);
+        return new Request(server,Objects.requireNonNull(dimension),embedding,radius,frameGeneration,sourceRange);
     }
     public static final class Request {
-        final MinecraftServer server;final LandmarkStore store;final LandmarkEmbedding embedding;final double radius;final Bounds sourceRange;final long frameGeneration;
+        final MinecraftServer server;final LandmarkStore store;final String dimension;final LandmarkEmbedding embedding;final double radius;final Bounds sourceRange;final long frameGeneration;
         String cursor;boolean end,cancelled;final ArrayDeque<LandmarkMetadata> candidates=new ArrayDeque<>();final ArrayDeque<Sample> staged=new ArrayDeque<>();
         LandmarkMetadata current;LandmarkEmbedding currentEmbedding;double currentImportance;LandmarkStore.GeometryRead read;
         final ArrayDeque<GeometryPage> pages=new ArrayDeque<>();GeometryPage currentPage;SparseOctree<BlockSample>.Cursor cells;
-        Request(MinecraftServer server,LandmarkEmbedding embedding,double radius,long generation,Bounds sourceRange){this.server=server;store=LandmarkStore.get(server);this.embedding=new LandmarkEmbedding(embedding.profile(),embedding.vector());this.radius=radius;frameGeneration=generation;this.sourceRange=sourceRange;}
+        Request(MinecraftServer server,String dimension,LandmarkEmbedding embedding,double radius,long generation,Bounds sourceRange){this.server=server;this.dimension=dimension;store=LandmarkStore.get(server);this.embedding=new LandmarkEmbedding(embedding.profile(),embedding.vector());this.radius=radius;frameGeneration=generation;this.sourceRange=sourceRange;}
         public long generation(){return frameGeneration;}
         public boolean complete(){return cancelled||(end&&candidates.isEmpty()&&read==null&&staged.isEmpty()&&pages.isEmpty()&&cells==null);}
         public void cancel(){cancelled=true;if(read!=null)read.cancel();read=null;candidates.clear();staged.clear();pages.clear();cells=null;currentPage=null;}
@@ -46,11 +46,11 @@ public final class SourceSelector {
             }
             if(!candidates.isEmpty()){
                 current=candidates.removeFirst();currentEmbedding=SpiritActivityService.effectiveEmbedding(server,current);currentImportance=SpiritActivityService.importance(server,current);
-                if(currentEmbedding.distanceSquared(embedding)<radius*radius && (sourceRange==null||sourceRange.intersects(current.header().bounds())) && store.geometryReadAvailable())read=store.beginGeometryRead(current.id(),sourceRange);
+                if(current.header().dimension().equals(dimension) && currentEmbedding.distanceSquared(embedding)<radius*radius && (sourceRange==null||sourceRange.intersects(current.header().bounds())) && store.geometryReadAvailable())read=store.beginGeometryRead(current.id(),sourceRange);
                 else if(!store.geometryReadAvailable()){candidates.addFirst(current);}
                 return drain(maxSamples);
             }
-            if(!end){var page=store.semanticRangePage(embedding,radius,cursor,metadataBudget,metadataBudget,m->SpiritActivityService.effectiveEmbedding(server,m));cursor=page.nextId();end=page.end();candidates.addAll(page.landmarks());}
+            if(!end){var page=store.semanticRangePage(dimension,embedding,radius,cursor,metadataBudget,metadataBudget,m->SpiritActivityService.effectiveEmbedding(server,m));cursor=page.nextId();end=page.end();candidates.addAll(page.landmarks());}
             return drain(maxSamples);
         }
         private Batch drain(int limit){List<Sample> out=new ArrayList<>();while(out.size()<limit&&!staged.isEmpty())out.add(staged.removeFirst());return new Batch(out,complete(),cursor);}

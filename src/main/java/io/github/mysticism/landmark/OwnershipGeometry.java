@@ -54,7 +54,10 @@ final class OwnershipGeometry {
                 tree=tree.with(cube,new BlockSample(v.air?BlockSample.Occupancy.AIR:BlockSample.Occupancy.SOLID,palette.indexOf(v.state)),256);
                 for(long x=cube.minX();x<cube.maxX();x++)for(long y=cube.minY();y<cube.maxY();y++)for(long z=cube.minZ();z<cube.maxZ();z++)assigned.add(new BlockPoint(x,y,z));
             }
-            pages.add(new GeometryPage(LandmarkIds.geometryPage(dimension,id,base,8),revision,bounds,new BlockPalette(palette),tree));
+            var page=new GeometryPage(LandmarkIds.geometryPage(dimension,id,base,8),revision,bounds,new BlockPalette(palette),tree);
+            // An aborted publication leaves immutable staged pages behind. Coordinate/CAS
+            // identity alone would reserve that key forever for obsolete terrain.
+            pages.add(new GeometryPage(LandmarkIds.geometryPageVersion(page),revision,bounds,page.palette(),tree));
         }
         if(pages.size()>LandmarkNbt.MAX_GEOMETRY_REFS)throw new IllegalArgumentException("ownership page budget");
         return new SourceGeometry(pages,frontiers);

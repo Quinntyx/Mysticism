@@ -77,17 +77,14 @@ public final class SpiritEntryTransitionTest {
         if (hook.invisibleAnnotations != null) annotations.addAll(hook.invisibleAnnotations);
         check(annotations.size() == 1, "Expected one redirect annotation");
         var annotation = annotations.getFirst();
-        check(annotation.desc.equals("Lorg/spongepowered/asm/mixin/injection/Redirect;"),
+        check(annotation.desc.equals("Lorg/spongepowered/asm/mixin/injection/ModifyArg;"),
                 "Entry must redirect the GUI call, not cancel the transfer method");
         check(value(annotation, "method").equals(List.of(targetMethod)), "Wrong method selector");
-        for (String cardinality : List.of("require", "expect", "allow"))
-            check(value(annotation, cardinality).equals(1), "Fail closed if the target call changes: " + cardinality);
         var at = (AnnotationNode) value(annotation, "at");
         check(value(at, "value").equals("INVOKE") && value(at, "target").equals(invocation),
                 "Wrong redirected invocation");
-        call(hook, "io/github/mysticism/client/spiritworld/SpiritEntryTransition", "hideLoadingScreen",
-                "(Ljava/lang/String;Ljava/lang/String;Z)Z");
-        call(hook, PLAYER, "isAlive", "()Z");
+        check(value(annotation, "index").equals(0), "Only GUI argument may be changed");
+        call(hook, "io/github/mysticism/client/spiritworld/SpiritTransitionClient", "respawning", "()Z");
         for (var instruction : hook.instructions) {
             check(instruction.getOpcode() != Opcodes.PUTFIELD && instruction.getOpcode() != Opcodes.PUTSTATIC,
                     "GUI hook must not mutate player/world/loading fields");
@@ -125,7 +122,7 @@ public final class SpiritEntryTransitionTest {
             var config = JsonParser.parseReader(new InputStreamReader(stream, StandardCharsets.UTF_8)).getAsJsonObject();
             check(config.get("required").getAsBoolean(), "Required client hooks");
             check(config.get("package").getAsString().equals("io.github.mysticism.client.mixin"), "Mixin package");
-            for (String hook : List.of("SpiritEntryWorldMixin", "SpiritEntryLoadingMixin")) {
+            for (String hook : List.of("SpiritJoinWorldHandoffMixin", "SpiritRespawnHandoffMixin")) {
                 int count = 0;
                 for (var entry : config.getAsJsonArray("client")) if (entry.getAsString().equals(hook)) count++;
                 check(count == 1, "Register " + hook + " exactly once");
@@ -183,11 +180,11 @@ public final class SpiritEntryTransitionTest {
                         && type.desc.equals("net/minecraft/network/packet/c2s/play/TeleportConfirmC2SPacket")),
                 "Vanilla teleport confirmation remains in the unmodified position handler");
 
-        redirect("SpiritEntryWorldMixin", "mysticism$keepSourceView",
-                "(L" + CLIENT + ";" + SCREEN + "L" + WORLD + ";" + REASON + ")V", "joinWorld",
+        redirect("SpiritJoinWorldHandoffMixin", "mysticism$omitResetScreen",
+                "(" + SCREEN + ")" + SCREEN, "joinWorld",
                 "L" + CLIENT + ";reset(" + SCREEN + ")V");
-        redirect("SpiritEntryLoadingMixin", "mysticism$keepSpiritView",
-                "(L" + CLIENT + ";" + SCREEN + "L" + PLAYER + ";L" + WORLD + ";" + REASON + ")V", "startWorldLoading",
+        redirect("SpiritRespawnHandoffMixin", "mysticism$omitTerrainScreen",
+                "(" + SCREEN + ")" + SCREEN, "startWorldLoading",
                 "L" + CLIENT + ";setScreen(" + SCREEN + ")V");
     }
 

@@ -26,6 +26,13 @@ public abstract class SpiritNativeSceneMixin {
         if (spirit()) result.cancel();
     }
 
+    @Inject(method = "drawBlockOutline(Lnet/minecraft/client/util/math/MatrixStack;Lnet/minecraft/client/render/VertexConsumer;Lnet/minecraft/entity/Entity;DDDLnet/minecraft/util/math/BlockPos;Lnet/minecraft/block/BlockState;)V",
+            at = @At("HEAD"), cancellable = true)
+    private void mysticism$hideCarrierBlockOutline(CallbackInfo result) {
+        // Vanilla crosshair geometry belongs to the invisible carrier, not the distorted mesh.
+        if (spirit()) result.cancel();
+    }
+
     @Inject(method = "renderEntity", at = @At("HEAD"), cancellable = true)
     private void mysticism$hideCarrierEntities(Entity entity, double x, double y, double z,
             float tickDelta, MatrixStack matrices, VertexConsumerProvider vertices, CallbackInfo result) {

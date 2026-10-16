@@ -7,6 +7,7 @@ import org.ladysnake.cca.api.v3.component.ComponentRegistry;
 import org.ladysnake.cca.api.v3.entity.EntityComponentFactoryRegistry;
 import org.ladysnake.cca.api.v3.entity.EntityComponentInitializer;
 import org.ladysnake.cca.api.v3.entity.RespawnCopyStrategy;
+import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.util.Identifier;
 
@@ -25,14 +26,21 @@ public final class MysticismEntityComponents implements EntityComponentInitializ
 
     @Override
     public void registerEntityComponentFactories(EntityComponentFactoryRegistry registry) {
-        // Players: persist + copy on respawn
-        registry.registerForPlayers(LATENT_POS,   p -> new LatentPos(),   RespawnCopyStrategy.ALWAYS_COPY);
-        registry.registerForPlayers(LATENT_BASIS, p -> new LatentBasis(), RespawnCopyStrategy.ALWAYS_COPY);
+        // Players: persist + copy on respawn. The owning world side decides whether sync
+        // application consults the client predictor (server instances never do).
+        registry.registerForPlayers(LATENT_POS,   p -> new LatentPos(ownsClientWorld(p)),   RespawnCopyStrategy.ALWAYS_COPY);
+        registry.registerForPlayers(LATENT_BASIS, p -> new LatentBasis(ownsClientWorld(p)), RespawnCopyStrategy.ALWAYS_COPY);
         registry.registerForPlayers(LATENT_ATTUNEMENT, p -> new LatentAttunement(), RespawnCopyStrategy.ALWAYS_COPY);
         registry.registerForPlayers(SPIRIT_NAVIGATION, p -> new SpiritNavigation(), RespawnCopyStrategy.ALWAYS_COPY);
 
         // Your custom glyph/entity can carry a latent vector too (no respawn semantics needed)
 //        registry.registerFor(LatentGlyphEntity.class, LATENT_POS, e -> new LatentPos());
+    }
+
+    /** Component factories run during entity init; a null world is treated as server-side. */
+    private static boolean ownsClientWorld(PlayerEntity player) {
+        var world = player.getWorld();
+        return world != null && world.isClient;
     }
 
     // Convenience helpers

@@ -8,11 +8,11 @@
     {"name": "OutSize", "type": "float", "count": 2, "values": [1,1]},
     {"name": "InverseViewProjection", "type": "matrix4x4", "count": 16, "values": [1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]},
     {"name": "CameraModulo", "type": "float", "count": 3, "values": [0,0,0]},
-    {"name": "OpaqueRadius", "type": "float", "count": 1, "values": [64]},
-    {"name": "NearBubble", "type": "float", "count": 1, "values": [5]},
+    {"name": "OpaqueRadius", "type": "float", "count": 1, "values": [192]},
+    {"name": "VisibleRadius", "type": "float", "count": 1, "values": [96]},
     {"name": "HasOccupancy", "type": "int", "count": 1, "values": [0]},
     {"name": "OccupancyCameraOffset", "type": "float", "count": 3, "values": [0,0,0]},
-    {"name": "MinExtinction", "type": "float", "count": 1, "values": [0.11708060]},
+    {"name": "HorizonOpticalDepth", "type": "float", "count": 1, "values": [6.90775528]},
     {"name": "FogSteps", "type": "int", "count": 1, "values": [40]},
     {"name": "FogEnabled", "type": "int", "count": 1, "values": [1]}
   ]

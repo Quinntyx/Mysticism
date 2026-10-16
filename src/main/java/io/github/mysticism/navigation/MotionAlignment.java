@@ -11,8 +11,9 @@ import org.jetbrains.annotations.Nullable;
  * divergence is left for the periodic authoritative sync to correct (the visible rubber band).
  */
 public final class MotionAlignment {
-    /** Same bounded-delta guard both call sites used before this rule was shared. */
-    private static final double MAX_INTEGRATED_MOVEMENT_SQUARED = 16;
+    /** Same reposition bound as the provenance-aware server and client integrators. */
+    private static final double MAX_INTEGRATED_MOVEMENT_SQUARED =
+            MovementIntegration.REPOSITION_LIMIT * MovementIntegration.REPOSITION_LIMIT;
 
     private MotionAlignment() {}
 

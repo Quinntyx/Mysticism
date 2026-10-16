@@ -47,7 +47,7 @@ public final class SpiritIntegratedMixinApplicationTest {
     static InputStream config() {
         boolean client = Boolean.getBoolean("mysticism.test.integratedClient");
         String resource = client ? "mysticism.client.mixins.json" : "mysticism.mixins.json";
-        List<String> retained = client ? List.of("SpiritEntryWorldMixin", "SpiritEntryLoadingMixin", "SpiritArrivalReseedMixin", "SpiritCarrierPushMixin")
+        List<String> retained = client ? List.of("SpiritJoinWorldHandoffMixin", "SpiritRespawnHandoffMixin", "SpiritArrivalReseedMixin", "SpiritCarrierPushMixin")
                 : List.of("SpiritFlightPredictionMixin", "SpiritMeshMovementMixin", "SpiritFlightToggleMixin",
                         "SpiritMeshCollisionMixin", "SpiritMeshSneakMixin", "SpiritTravelMixin", "EntityFlagAccess", "SpiritTeleportMixin");
         try (var stream = SpiritIntegratedMixinApplicationTest.class.getClassLoader().getResourceAsStream(resource)) {
@@ -176,13 +176,21 @@ public final class SpiritIntegratedMixinApplicationTest {
                     String vanilla = target.endsWith("MinecraftClient") ? "reset" : "setScreen";
                     String owner = "net/minecraft/client/MinecraftClient";
                     check(calls(method(before, entry), owner, vanilla) == 1, "Vanilla entry GUI call present");
-                    check(calls(method(after, entry), owner, vanilla) == 0, "Entry GUI call actually redirected");
-                    var hook = after.methods.stream().filter(m -> m.name.endsWith("$keepSourceView")
-                            || m.name.endsWith("$keepSpiritView")).findFirst().orElseThrow();
+                    check(calls(method(after, entry), owner, vanilla) == 1, "Vanilla transfer/reset call is preserved");
+                    var hook = after.methods.stream().filter(m -> m.name.endsWith("$omitResetScreen")
+                            || m.name.endsWith("$omitTerrainScreen")).findFirst().orElseThrow();
                     check(calls(method(after, entry), after.name, hook.name) == 1, "Entry must invoke its applied GUI hook");
-                    check(calls(hook, PREFIX + "client/spiritworld/SpiritEntryTransition", "hideLoadingScreen") == 1,
+                    check(calls(hook, PREFIX + "client/spiritworld/SpiritTransitionClient", "respawning") == 1,
                             "Applied entry hook must retain the live-source policy");
-                    check(calls(hook, owner, vanilla) == 1, "Applied entry hook must retain vanilla fallback/reset");
+                    check(calls(hook, owner, vanilla) == 0, "GUI selector must not duplicate transfer/reset");
+                    if (target.endsWith("ClientPlayNetworkHandler")) {
+                        var respawn=method(after,"onPlayerRespawn");
+                        for (String suffix : List.of("$begin", "$restorePose")) {
+                            var callback=after.methods.stream().filter(m->m.name.endsWith(suffix)).findFirst().orElseThrow();
+                            check(calls(respawn,after.name,callback.name)==1,"Scoped handoff lost "+suffix);
+                            new Analyzer<>(new BasicVerifier()).analyze(after.name,callback);
+                        }
+                    }
                     new Analyzer<>(new BasicVerifier()).analyze(after.name, method(after, entry));
                     new Analyzer<>(new BasicVerifier()).analyze(after.name, hook);
                 }

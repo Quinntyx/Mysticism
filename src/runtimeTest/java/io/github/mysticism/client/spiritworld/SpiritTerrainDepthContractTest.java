@@ -24,9 +24,9 @@ public final class SpiritTerrainDepthContractTest {
         String end = between(shader, "WorldRenderEvents.END.register", "ClientTickEvents.END_CLIENT_TICK.register");
         check(!start.contains("SpiritMediumTexture.prepare") && !start.contains("bindCurrentMedium("),
                 "START must not upload/bind last frame's terrain samples");
-        check(depth.contains("sceneDepth.copyDepthFrom(client.getFramebuffer())") && depth.contains("depthReady = true"),
+        check(depth.contains("sceneDepth.copyDepthFrom(client.getFramebuffer())") && depth.contains("frame.captureDepth(surface(client.getFramebuffer()))"),
                 "capture MAIN scene depth after custom opaque mesh/entities, before Fabulous/hand clears");
-        check(end.contains("if (!frameReady || sessionWorld == null) return;") && end.contains("if (!depthReady)") && end.contains("depthReady = false"),
+        check(end.contains("if (!frame.ready() || sessionWorld == null) return;") && end.contains("if (!frame.depthReady())") && end.contains("frame.consume(surface(main))"),
                 "postpass consumes exactly one current-world depth snapshot");
         int sampler = end.indexOf("setSamplerUniform(\"DepthSampler\", sceneDepth.getDepthAttachment())");
         int medium = end.indexOf("bindCurrentMedium(context.camera().getPos())");
@@ -48,16 +48,25 @@ public final class SpiritTerrainDepthContractTest {
         String render = terrain.substring(terrain.indexOf("private static void render("));
         check(render.contains("mediumField.update(frame,camera,visibleSurfaces)") && render.contains("samples.occupancy(),samples.center()"),
                 "world render refreshes uploaded model geometry/current camera without requiring a packet");
+        String build = between(terrain, "private static BuiltTerrain build(", "private static void upload(");
         String upload = between(terrain, "private static void upload(", "private static void drawModel(");
-        check(upload.contains("modelBounds.world(anchor),cell.opacity()") && upload.contains("if(!modelBounds.empty())")
-                        && upload.indexOf("visibleSurfaces=List.copyOf(surfaces)") > upload.indexOf("vbo.upload(built)"),
-                "only successful nonempty model uploads publish measured density bounds");
+        check(build.contains("modelBounds.world(anchor),cell.opacity()") && build.contains("if(!modelBounds.empty())")
+                        && build.indexOf("staged.complete(),List.copyOf(surfaces)") > build.indexOf("vbo.upload(built)")
+                        && upload.indexOf("visibleSurfaces=rebuilt.surfaces()") > upload.indexOf("gate.commit(target)"),
+                "only a successful staged model upload publishes measured density bounds with its committed revision");
         check(render.contains("client.getFramebuffer().beginWrite(false)") && render.contains("RenderSystem.depthMask(true)"),
                 "custom terrain targets real MAIN depth");
         check(render.indexOf("b.buffer.draw(") < render.indexOf("if(drewMesh)ShaderManager.afterMeshDepth()"),
                 "mesh-depth report requires an actual successful draw");
-        check(render.contains("closeBuffers();dirty=false;clearMedium()") && terrain.contains("mediumField.clear();ShaderManager.clearMediumSamples()"),
-                "clear/disconnect/failed upload discards density for absent geometry");
+        String clear = between(terrain, "public static void clear()", "private static void clearMedium()");
+        check(clear.contains("gate.clear()") && clear.contains("closeBuffers()")
+                        && clear.contains("visibleSurfaces=List.of();clearMedium()")
+                        && terrain.contains("mediumField.clear();ShaderManager.clearMediumSamples()"),
+                "clear/disconnect discards density together with absent geometry");
+        check(render.indexOf("catch(RuntimeException error){reportFailure(client,error);}")
+                        < render.indexOf("var frame=gate.committed()")
+                        && !upload.contains("clearMedium()"),
+                "a failed replacement upload retains and draws the prior coherent mesh and its medium");
         String layers = read("src/client/java/io/github/mysticism/client/spiritworld/SpiritRenderLayers.java");
         check(layers.contains(".target(MAIN_TARGET).depthTest(LEQUAL_DEPTH_TEST).writeMaskState(ALL_MASK)"),
                 "custom layer uses surface depth testing and color+depth writes, not a Fabulous side target");
@@ -65,7 +74,7 @@ public final class SpiritTerrainDepthContractTest {
         String glsl = read("src/main/resources/assets/mysticism/shaders/program/spirit_fog.fsh");
         check(glsl.contains("texelFetch(DepthSampler, pixel, 0)") && glsl.contains("min(distanceToScene, OpaqueRadius)"),
                 "fog integrates only up to the scene's nearest depth, never through a near custom mesh");
-        check(glsl.contains("depth >= 0.9999999 ? OpaqueRadius") && glsl.contains("endDistance - NearBubble"),
+        check(glsl.contains("depth >= 0.9999999 ? OpaqueRadius") && glsl.contains("endDistance - VisibleRadius"),
                 "clear depth gets sky fog while nearby terrain retains the source bubble");
         check(SpiritMediumField.GRID == 16 && SpiritMediumField.VOXEL_SIZE == 8 && SpiritMediumField.HALF_EXTENT == 64
                         && glsl.contains("vec3(64.0)) / 8.0") && glsl.contains("ivec3(16)"),

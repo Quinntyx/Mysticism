@@ -51,7 +51,7 @@ public final class DeepWalkContactPremiseTest {
 
     /** Exact ground probe/filter used by currentSupport. */
     private static MeshCollision.Hit ground(TerrainMeshFrame frame, Box body) {
-        return new MeshCollision.Index(frame).ground(body).map(MeshCollision.GroundContact::hit)
+        return new MeshCollision.Index(frame).groundContact(body).map(MeshCollision.GroundContact::hit)
                 .orElseThrow(() -> new AssertionError("fixture lost ground contact"));
     }
 
@@ -139,7 +139,7 @@ public final class DeepWalkContactPremiseTest {
         MeshCollision.Index index = new MeshCollision.Index(f);
         check(index.sweep(body.offset(0, .025, 0), new Vec3d(0, -.15, 0)).orElseThrow().cell().key() == wall.key(),
                 "fixture needs an earlier wall hit to reproduce the merge hazard");
-        var contact = index.ground(body).orElseThrow();
+        var contact = index.groundContact(body).orElseThrow();
         check(contact.hit().cell().key() == floor.key(), "walk contact selects the actual supporting floor");
         var evidence = TerrainEvidence.inspect(f, body).contact().orElseThrow();
         check(evidence.key() == contact.hit().cell().key(), "diagnostic evidence and walk contact name the same geometry");

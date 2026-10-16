@@ -23,6 +23,8 @@ public final class SpiritBasisEvolverTickMovementTest {
         jumpTakeoffImmediatelyAfterShallowAcquisition();
         sameEpochContinuity();
         reanchoredInputs();
+        correctionAccountedWindows();
+        productionCallbackUsesAccountedWindow();
         System.out.println("SpiritBasisEvolverTickMovementTest passed: " + checks + " checks");
     }
 
@@ -63,6 +65,41 @@ public final class SpiritBasisEvolverTickMovementTest {
                 SpiritBasisEvolver.tickMovement(now, now.add(descending), 7L, 8L);
         check(walked.physical().y < 0 && walked.semantic().equals(Vec3d.ZERO),
                 "edge walk keeps its physical signal but integrates no semantic movement across the transition");
+    }
+
+    private static void correctionAccountedWindows() {
+        Vec3d before = new Vec3d(0, 64, 0), burst = new Vec3d(6, 0, 0);
+        var accepted = SpiritBasisEvolver.tickMovement(before, before.add(burst), 7L, 7L, Vec3d.ZERO, false);
+        check(accepted.physical().equals(burst) && accepted.semantic().equals(burst),
+                "actual evolver admits the full 4-8-block chosen window");
+        check(!accepted.requiresReconciliation(), "ordinary burst is not forced authority");
+        Vec3d jump = new Vec3d(.2, .42, 0);
+        for (long epoch : new long[]{7, 8}) {
+            var corrected = SpiritBasisEvolver.tickMovement(before, before.add(jump), 7L, epoch,
+                    new Vec3d(0, .02, 0), false);
+            check(corrected.physical().squaredDistanceTo(jump) < 1e-20, "correction must not erase jump state decisions");
+            zero(corrected.semantic(), "overlap correction is not semantic travel even in the same epoch");
+            check(corrected.requiresReconciliation(), "overlap forces unchanged authoritative pose delivery");
+        }
+        for (Vec3d displacement : new Vec3d[]{Vec3d.ZERO, new Vec3d(.05, 0, 0), burst}) {
+            var teleport = SpiritBasisEvolver.tickMovement(before, before.add(displacement), 7L, 7L,
+                    Vec3d.ZERO, true);
+            zero(teleport.physical(), "even sub-block teleport is not chosen navigation");
+            zero(teleport.semantic(), "even sub-block teleport is not chosen semantic travel");
+            check(teleport.requiresReconciliation(), "re-baselined teleport still retires stale prediction");
+        }
+    }
+
+    private static void productionCallbackUsesAccountedWindow() {
+        try {
+            String code = java.nio.file.Files.readString(java.nio.file.Path.of(
+                    "src/main/java/io/github/mysticism/dimension/spiritworld/SpiritBasisEvolver.java"));
+            check(code.contains("tickMovement(last, now, recorded, epoch, correction, teleported)"),
+                    "real server callback consumes drained provenance, not the compatibility overload");
+            check(code.contains("boolean reconcile = reconcileSuppressedWindow(new MovementIntegration.Sample(")
+                            && code.contains("if (reconcile || server.getTicks() % 4 == 0)"),
+                    "real correction window publishes forced authority immediately, not only at cadence");
+        } catch (java.io.IOException error) { throw new AssertionError(error); }
     }
 
     private static void reanchoredInputs() {

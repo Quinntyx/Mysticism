@@ -112,11 +112,12 @@ public final class ShallowJumpLandingGraceTest {
         }
         // Pin integration of the tested mutation in BOTH success paths, not merely an unused helper.
         String source=java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/io/github/mysticism/navigation/SpiritNavigationService.java"));
-        String support=source.substring(source.indexOf("private static void attemptSupport("),source.indexOf("private static float basisError("));
+        String support=source.substring(source.indexOf("private static void attemptSupport("),source.indexOf("public static boolean commitSupportMapping("));
         String landing=source.substring(source.indexOf("private static boolean attemptLanding("),source.indexOf("public static Optional<SpiritScenePayload.Binding> binding("));
         for(String path:new String[]{support,landing}) {
             int seeded=path.indexOf("recordAcquiredSupport(s, p.getY())");
-            check(seeded>path.indexOf("nav.shallow(") && seeded<path.lastIndexOf("flight(p, false)"),
+            int committed=Math.max(path.indexOf("nav.shallow("),path.indexOf("commitSupportMapping(nav, support"));
+            check(committed>=0 && seeded>committed && seeded<path.lastIndexOf("flight(p, false)"),
                     "Each validated acquisition must seed support before the walk handoff");
         }
     }

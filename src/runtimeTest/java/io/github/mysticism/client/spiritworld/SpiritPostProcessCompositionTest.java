@@ -105,16 +105,16 @@ public final class SpiritPostProcessCompositionTest {
                 check(samplers.contains("DepthSampler"), "painting, volume and live-source fog consume ORIGINAL scene depth");
         }
         String fog = resource("program/spirit_fog.fsh");
-        check(fog.contains("span * t * t * t * (2.0 - t)"), "CPU reference matches normalized radial integral");
-        check(fog.contains("radialIntegral(segmentEnd) - radialIntegral(segmentStart)"), "exact per-segment radial optical length");
-        check(fog.contains("exp(-sigma * opticalLength)"), "Beer-Lambert composition");
+        check(fog.contains("HorizonOpticalDepth * (b * b * b - a * a * a)"), "CPU reference matches exact quadratic ramp integral");
+        check(fog.contains("exp(-opticalDepth * (density(worldSample) + 0.7 * occupied))"), "Beer-Lambert composition");
+        check(!fog.contains("NearBubble") && !fog.contains("MinExtinction"), "no obsolete tiny-radius profile remains");
         check(fog.contains("depth >= 0.9999999 ? OpaqueRadius"), "sky marches to opaque horizon");
         check(fog.contains("texelFetch(DepthSampler, pixel, 0)"), "depth is not interpolated at silhouettes");
         check(fog.contains("scene.rgb * transmittance + scattering, 1.0"), "alpha-zero sky still receives fog");
         check(fog.contains("CameraModulo + offset") && fog.contains("occupancy(offset)"), "world-space density and terrain occupancy retained");
         String painterly = resource("program/kuwahara.fsh");
         check(painterly.contains("sampleDepth > centerDepth ||"), "no background pigment through foreground terrain");
-        check(painterly.contains("clamp(KernelRadius, 1, 3)"), "bounded painterly quality retained");
+        check(painterly.contains("clamp(KernelRadius, 0, 3)"), "bounded painterly quality retained");
         String transition = resource("program/spirit_transition.fsh");
         check(transition.contains("mix(original, transformed, clamp(EffectStrength, 0.0, 1.0))"), "one crossfade after BOTH effects");
 
@@ -125,7 +125,7 @@ public final class SpiritPostProcessCompositionTest {
         int render = manager.indexOf("KUWAHARA_SHADER.render(context.tickCounter()");
         int restore = manager.indexOf("main.copyDepthFrom(sceneDepth)");
         check(snapshot >= 0 && snapshot < bind && bind < render && render < restore, "stable original depth through both passes, restored before hand");
-        check(manager.contains("framePasses.fogMode(inSpiritWorld(), effectStrength(), frameReady, failed)"),
+        check(manager.contains("framePasses.fogMode(inSpiritWorld(), effectStrength(), frame.ready(), failed)"),
                 "production uses tested toggle-aware analytic/volume ownership policy");
         var settings = new SpiritVisualControls(SpiritRenderSettings.Quality.MEDIUM).settings();
         for (boolean enabled : new boolean[]{false,true}) for (boolean fogEnabled : new boolean[]{false,true})
@@ -155,23 +155,16 @@ public final class SpiritPostProcessCompositionTest {
         check(!SpiritRenderSettings.useVolumetricFog(true, false, .001f), "inactive threshold agrees with world-frame gate");
     }
 
-    private static double radialIntegral(double distance) {
-        double span = SpiritRenderSettings.OPAQUE_RADIUS - SpiritRenderSettings.NEAR_BUBBLE;
-        double t = Math.max(0, Math.min(1, (distance - SpiritRenderSettings.NEAR_BUBBLE) / span));
-        return span * t * t * t * (2 - t);
-    }
-
     private record Fog(double transmission, double scattering) {}
 
-    /** Exact radial profile with fixed density/light fixtures, mirroring the bounded shader loop. */
-    private static Fog fog(double distance, int count, double medium) {
-        double end = Math.min(distance, SpiritRenderSettings.OPAQUE_RADIUS);
-        double step = Math.max(0, end - SpiritRenderSettings.NEAR_BUBBLE) / count;
+    /** The production exact quadratic ramp, with fixed medium fixtures. */
+    private static Fog fog(SpiritRenderSettings.FogRange range, double distance, int count, double medium) {
+        double end = Math.min(distance, range.opaqueRadius());
+        double step = Math.max(0, end - range.visibleRadius()) / count;
         double t = 1, scattering = 0;
         for (int i = 0; i < count && t > .001; i++) {
-            double start = SpiritRenderSettings.NEAR_BUBBLE + i * step;
-            double opticalLength = radialIntegral(start + step) - radialIntegral(start);
-            double segment = Math.exp(-SpiritRenderSettings.MIN_EXTINCTION * medium * opticalLength);
+            double start = range.visibleRadius() + i * step;
+            double segment = Math.exp(-medium * range.opticalDepth(start, start + step));
             scattering += t * (1 - segment);
             t *= segment;
         }
@@ -180,27 +173,27 @@ public final class SpiritPostProcessCompositionTest {
     }
 
     private static void usefulHorizon() {
-        near(SpiritRenderSettings.OPAQUE_RADIUS, 64, 0, "existing opacity contract");
-        check(SpiritRenderSettings.MIN_LOADING_RADIUS >= 80, "existing loading contract");
-        for (var quality : SpiritRenderSettings.Quality.values()) {
-            for (double medium : new double[]{1, 1.25, 1.5, 2.2}) { // density floor..fully occupied ceiling
-                double previous = 1;
-                for (int distance = 0; distance <= 128; distance++) {
-                    Fog f = fog(distance, quality.fogSteps, medium);
-                    // Early-out changes which final segment is evaluated once already opaque;
-                    // below that cutoff the remaining transmission is deliberately insignificant.
-                    check(Math.max(.001, f.transmission) <= Math.max(.001, previous) + 1e-14,
-                            "monotonic optical depth above the opaque early-out cutoff");
-                    check(f.transmission >= 0 && f.transmission <= 1, "bounded transmission");
-                    if (distance <= SpiritRenderSettings.NEAR_BUBBLE) near(f.transmission, 1, 0, "protected near bubble is clear");
-                    if (distance >= 64) check(f.transmission <= .001 + 1e-14, "opaque terrain AND sky horizon at every quality");
-                    previous = f.transmission;
+        for (int chunks : new int[]{2, 4, 12, 32}) {
+            var range = SpiritRenderSettings.fogRange(chunks);
+            near(range.opaqueRadius(), chunks * 16, 0, "horizon follows configured render distance, not sparse locality");
+            for (var quality : SpiritRenderSettings.Quality.values()) {
+                for (double medium : new double[]{1, 1.25, 1.5, 2.2}) {
+                    double previous = 1;
+                    for (int distance = 0; distance <= range.opaqueRadius() * 2; distance++) {
+                        Fog f = fog(range, distance, quality.fogSteps, medium);
+                        check(Math.max(.001, f.transmission) <= Math.max(.001, previous) + 1e-14,
+                                "monotonic optical depth above early-out cutoff");
+                        check(f.transmission >= 0 && f.transmission <= 1, "bounded transmission");
+                        if (distance <= range.visibleRadius()) near(f.transmission, 1, 0, "clear half-radius foreground");
+                        if (distance >= range.opaqueRadius()) check(f.transmission <= .001 + 1e-14, "opaque terrain AND sky horizon at every quality");
+                        previous = f.transmission;
+                    }
+                    double middle = range.opaqueRadius() * .75;
+                    check(fog(range, middle, quality.fogSteps, medium).transmission > .14, "mid-distance landmarks remain useful even in dense medium");
+                    near(fog(range, middle, quality.fogSteps, medium).transmission,
+                            Math.exp(-medium * range.opticalDepth(0, middle)), 1e-14,
+                            "exact integration, no quality-dependent opacity drift before cutoff");
                 }
-                check(fog(8, quality.fogSteps, medium).transmission > .99, "near terrain remains legible");
-                check(fog(20, quality.fogSteps, medium).transmission > .6, "landmark silhouettes survive near-mid range");
-                near(fog(32, quality.fogSteps, medium).transmission,
-                        Math.exp(-SpiritRenderSettings.MIN_EXTINCTION * medium * radialIntegral(32)), 1e-14,
-                        "exact radial integration, no quality-dependent opacity drift");
             }
         }
     }
@@ -245,8 +238,8 @@ public final class SpiritPostProcessCompositionTest {
             pigment[24] = .95;
             double painted = paint(pigment, depths, quality.kernelRadius);
             check(Math.abs(painted - pigment[24]) > .1, "painterly changes noisy un-fogged terrain");
-            for (double distance : new double[]{3, 20, 32, 64}) {
-                Fog f = fog(distance, quality.fogSteps, 1.25);
+            for (double distance : new double[]{3, 96, 128, 192}) {
+                Fog f = fog(SpiritRenderSettings.DEFAULT_FOG_RANGE, distance, quality.fogSteps, 1.25);
                 double output = pigment[24];
                 for (String stage : stages) {
                     output = switch (stage) {
@@ -258,7 +251,7 @@ public final class SpiritPostProcessCompositionTest {
                     };
                 }
                 near(output, composite(painted, f), 0, "graph applies both effects to the same scene");
-                if (distance >= 20 && distance <= 32) {
+                if (distance == 128) {
                     check(Math.abs(output - painted) > .02, "fog not dropped by painterly pass");
                     check(Math.abs(output - composite(pigment[24], f)) > .02, "fog does not erase painterly at useful distances");
                     check(Math.abs(output - composite(output, f)) > .02, "a second fog layer would change the result");

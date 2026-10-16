@@ -39,17 +39,20 @@ public final class EmbeddingService implements EmbeddingProvider {
     private static String canonicalModel(String model) { return model.contains(":")?model:model+":latest"; }
     private void verifyRevision() throws Exception {
         JsonObject response=request("api/tags",null);
-        JsonArray models=response.getAsJsonArray("models");
-        if(models==null)throw new IllegalStateException("Ollama /api/tags missing models");
-        for(JsonElement entry:models) {
-            JsonObject model=entry.getAsJsonObject();
-            if(model.has("name") && canonicalModel(model.get("name").getAsString()).equals(canonicalModel(EmbeddingSpace.MODEL))) {
-                String digest=model.get("digest").getAsString().replaceFirst("^sha256:", "");
-                if(!EmbeddingSpace.REVISION.equals(digest))throw new IllegalStateException("Ollama model revision mismatch; refusing mixed embeddings");
-                return;
+        try {
+            JsonArray models=response.getAsJsonArray("models");
+            if(models==null)throw new EmbeddingModelException("Model catalogue missing models");
+            for(JsonElement entry:models) {
+                JsonObject model=entry.getAsJsonObject();
+                if(model.has("name") && canonicalModel(model.get("name").getAsString()).equals(canonicalModel(EmbeddingSpace.MODEL))) {
+                    String digest=model.get("digest").getAsString().replaceFirst("^sha256:", "");
+                    if(!EmbeddingSpace.REVISION.equals(digest))throw new EmbeddingModelException("Model revision mismatch; refusing mixed embeddings");
+                    return;
+                }
             }
-        }
-        throw new IllegalStateException("Ollama model not provisioned: "+EmbeddingSpace.MODEL+" (administrator must provision explicitly)");
+            throw new EmbeddingModelException("Model not provisioned: "+EmbeddingSpace.MODEL);
+        } catch (EmbeddingModelException failure) { throw failure; }
+        catch (RuntimeException malformed) { throw new EmbeddingModelException("Invalid model catalogue metadata", malformed); }
     }
     public Vec384f getEmbedding(String descriptor) throws Exception {
         verifyRevision();
@@ -58,14 +61,17 @@ public final class EmbeddingService implements EmbeddingProvider {
         return vector;
     }
     private Vec384f infer(String descriptor) throws Exception {
-        if(descriptor==null || descriptor.isBlank() || descriptor.length()>8192)throw new IllegalArgumentException("Descriptor must be nonempty and at most 8192 characters");
+        String input=NomicV2Tokenizer.prepareDocument(descriptor);
         JsonObject body=new JsonObject();body.addProperty("model",EmbeddingSpace.MODEL);
-        body.addProperty("input","search_document: "+descriptor);
+        body.addProperty("input",input);
         body.addProperty("truncate",false); // 512-token overflow must be explicit, not silently changed semantics
         JsonObject response=request("api/embed",body.toString());
-        if(!response.has("model") || !canonicalModel(response.get("model").getAsString()).equals(canonicalModel(EmbeddingSpace.MODEL)))
-            throw new IllegalStateException("Ollama response model mismatch");
-        return decodeEmbedding(response);
+        try {
+            if(!response.has("model") || !canonicalModel(response.get("model").getAsString()).equals(canonicalModel(EmbeddingSpace.MODEL)))
+                throw new EmbeddingModelException("Inference response model mismatch");
+            return decodeEmbedding(response);
+        } catch (EmbeddingModelException failure) { throw failure; }
+        catch (RuntimeException malformed) { throw new EmbeddingModelException("Invalid native v2 model output: "+EmbeddingReadiness.describe(malformed), malformed); }
     }
     /** Approved native v2 profile: retain all 768 coordinates, L2; no old vector resizing. */
     public static Vec384f decodeEmbedding(JsonObject response) {
@@ -74,17 +80,15 @@ public final class EmbeddingService implements EmbeddingProvider {
         JsonArray values=batch.get(0).getAsJsonArray();
         if(values.size()!=EmbeddingSpace.NATIVE_DIMENSIONS)throw new IllegalArgumentException("Expected native Nomic v2 768 dimensions, got "+values.size());
         if(EmbeddingSpace.DIMENSIONS!=EmbeddingSpace.NATIVE_DIMENSIONS)throw new IllegalStateException("Parent must activate native Nomic v2 dimensions/profile before inference");
-        float[] reduced=new float[EmbeddingSpace.NATIVE_DIMENSIONS];
+        double[] nativeOutput=new double[EmbeddingSpace.NATIVE_DIMENSIONS];
         for(int i=0;i<values.size();i++) {
             JsonElement value=values.get(i);
             if(!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber())throw new IllegalArgumentException("Non-numeric embedding");
             double number=value.getAsDouble();
             if(!Double.isFinite(number) || Math.abs(number)>Float.MAX_VALUE)throw new IllegalArgumentException("Nonfinite embedding");
-            reduced[i]=(float)number;
+            nativeOutput[i]=number;
         }
-        Vec384f vector=new Vec384f(reduced);
-        if(vector.length()==0)throw new IllegalArgumentException("Zero embedding");
-        return new Vec384f(vector.norm());
+        return NativeEmbeddingOutput.normalize(nativeOutput);
     }
     private JsonObject request(String path,String body) throws Exception {
         if(closed)throw new IllegalStateException("Embedding provider closed");
@@ -93,10 +97,13 @@ public final class EmbeddingService implements EmbeddingProvider {
         CompletableFuture<HttpResponse<byte[]>> future=client.sendAsync(request.build(), info->new LimitedBody());
         try {
             HttpResponse<byte[]> response=future.get(timeout.toMillis(),TimeUnit.MILLISECONDS);
+            if(response.statusCode()==404)throw new EmbeddingModelException("Model or inference API not available (HTTP 404 for "+path+")");
             if(response.statusCode()!=200)throw new IllegalStateException("Ollama HTTP "+response.statusCode()+" for "+path);
-            JsonElement parsed=JsonParser.parseString(new String(response.body(),StandardCharsets.UTF_8));
-            if(!parsed.isJsonObject())throw new IllegalArgumentException("Expected JSON response object");
-            return parsed.getAsJsonObject();
+            try {
+                JsonElement parsed=JsonParser.parseString(new String(response.body(),StandardCharsets.UTF_8));
+                if(!parsed.isJsonObject())throw new IllegalArgumentException("Expected JSON response object");
+                return parsed.getAsJsonObject();
+            } catch (RuntimeException malformed) { throw new EmbeddingModelException("Malformed inference protocol response", malformed); }
         } catch(InterruptedException e){Thread.currentThread().interrupt();throw e;}
         finally { if(!future.isDone())future.cancel(true); }
     }

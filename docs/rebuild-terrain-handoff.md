@@ -183,3 +183,43 @@ Passed: `git diff --check` at committed checkpoints, the owner/acquisition/fract
 * Raw sample admission has a hard 65536-tile staging ceiling in addition to the 32768 retention target and 512-removal pass. If mask capacity is exhausted, nonrecordable AIR is ineligible for eviction; if safe retention cannot make room, new sample admission stops rather than resurrecting stale stone or growing indefinitely. Known live updates remain admissible at the ceiling. A saturated local window reports this condition. Extreme long-travel/sparse-sampling saturation can therefore defer new discovery until room is available or the window is retired; this is a conservative remaining limitation, not an invented floor or silent AIR deletion.
 * Expanded `DiscoveryBudgetTest` exercises the real append stage and immutable published frames: every retained solid of the non-cubic one-layer fixture is covered in both shallow and affine deep views, within the original cell budgets; distant quadrants have actual SAT ray hits. Additional checks cover checkerboard/unmergeable horizon admission, deterministic input ordering, exact holes/owners/partial shapes, incremental persisted-reservoir bounds and distant coverage, reflected-key uniqueness, coarse persisted AIR subtraction, duplicate tile/mask union, AIR eviction through `replaceNear` and publication/SAT, stream restart, fresh-solid replacement, independent mask cloning, and hard tile/mask admission ceilings.
 * Validation: in visible tmux pane `%1184`, Java 21 and cached Gradle 8.13: `gradle --offline --no-daemon --console=plain --max-workers=2 build` passed (`DISCOVERY_REPAIR_BUILD_EXIT=0`). Canonical `runtimeSelfTest` discovered and passed all 5 main-based classes; `DiscoveryBudgetTest` passed 276485 assertions; `buildSelfTest`, common/client compilation, remapping and `verifyProductionJar` passed. Existing annotation/mixin/deprecation warnings and intentional invalid-embedding-fixture warnings remain. No live Minecraft/client/GPU launch, external service, model download, system install or performance profiling was performed. This is the scoped discovery repair, not a claim that the other ten runtime workstreams were independently validated here.
+
+## Corrective round 3: teleport relocation, rigid-observer publication and coverage readiness
+
+* Vanilla/external teleports (`/tp`, plugins, knockback above 4 blocks per tick — the same threshold as the evolver's semantic-travel clamp) now RELOCATE the shallow carrier with the body instead of draining the source mapping into `origin + teleport delta`. A teleport never travels through source space: the mapped source position is preserved, the loaded source window re-roots around the relocated body immediately (`publish(force)`), and the mapping can no longer chase ungenerated regions below a falling body. Deep mode is unaffected except that its observer-following re-root now publishes through the transition guard.
+* `MeshCollision.transitionClear(old,next,body,observerDelta)` skips cells whose motion equals the observer's movement since the accepted frame (exact, 1e-6-tolerant rigid translation): such cells keep their accepted relative relationship to the body and cannot sweep through it. True surface motion, or geometry appearing near the body, is still held. This removes the false "Terrain transition held" publication deadlock that previously left teleported players beside displayed terrain with no usable collision.
+* New truthful readiness surface: `SpiritTerrainService.coverage(player)` and per-transition actionbar status report whether the source cells under/around the body are KNOWN (air counts as known) and whether a region stream is in flight. Unknown cells report "Spirit terrain loading…"; resolved coverage reports "Spirit terrain ready". No fabricated floor, gravity change or body/q teleport is introduced while coverage loads.
+* Session additions: `lastBody` (per-tick body position for relocation detection), `frameAnchor` (body position at the last accepted frame, feeding the observer delta), `coverageReady` (last reported readiness, reset when the local window is replaced).
+
+## Retained teleport review corrections
+
+* Shallow local cells now use `candidate.carrierOrigin - accepted.carrierOrigin` for rigid-motion publication, not the body's displacement since `frameAnchor`. Walking 0.3 blocks between publications followed by a 100-block teleport no longer falsely holds the nearby wall's swept corridor. Same-local-producer keys come from both frames' provenance; independent deep representatives retained in an acquired shallow view still use observer displacement. Genuine surface motion and new intruding shapes still hold. Multiple pending relocations accumulate against the accepted carrier. Failed transport also rolls back `frameAnchor` with frame/provenance/revision.
+* `Coverage` exposes `ready`, `bodyKnown`, `supportKnown`, `collisionKnown`, `streaming`. Readiness resolves the whole body and the SAME raised/downward support-sweep footprint as collision, including edge floor samples. Known AIR is resolved even below the feet: readiness does not imply ground/support or grant source ownership/exit authority. Non-air must actually occur in the accepted local producer frame with matching source transform, material and collision primitives; omitted, held, stale or wrong-carrier meshes cannot report ready. Source-identical uniform octree cubes may cover several samples; they cannot substitute for slabs/stairs. No invisible collision floor is supplied.
+* Reports run after tick ingestion, compaction and publication/maintenance attempts. Initial loading and a change in its cause are reported; unresolved source cells are distinguished from resolved samples awaiting matching collision publication. A held unrelated far change does not invalidate an already matching local collision patch. These are server-accepted-frame checks, not a client/GPU acknowledgement.
+* Regression: `src/runtimeTest/java/io/github/mysticism/dimension/spiritworld/terrain/TeleportMeshCoverageTest.java` is discovered by `runtimeSelfTest`. It exercises the intervening-walk control, accumulated relocations, mixed shallow/deep producer controls, real SAT support after relocation, unknown center/edge/deeper probe samples, known-air resolution, absent/omitted/stale/wrong-transform frames, fractional origins, slab-shape changes and coarse-cube consistency. Full Gradle `build --rerun-tasks` includes the discovered runtime suite, packaging fixtures and remapped production-jar verifier. Live `/tp`, client rendering/prediction and model inference have not been exercised here; embedding implementation is unchanged.
+
+## Retained integration: mesh support + walk acquisition + teleport + selection
+
+The `feat-runtime-sol-merge-0041` integration resolves the `MeshCollision` conflict
+without replacing either parent's behavior. The entity-free `ground(Index,Box)`
+and player adapter share the same probe constants as `supportFootprint`; real
+mesh contact/swept landing still gates stepping and sneaking, never the vanilla
+grounded claim. Observer/carrier rigid relocation is retained alongside the
+bounded separating-plane affine interval proof required for supported walk
+alignment. Endpoint-only locality culling is deliberately not restored: a wall
+with two distant endpoints can still cross the player between them.
+
+`TeleportMeshCoverageTest` adds 16 integration checks (69 total): both signs of
+5-degree affine support survive teleport and subsequent guarded walk alignment,
+real grounding remains available despite misleading AABB overlap, axis-changing
+intrusion is held, and distant-to-distant wall crossings are rejected through
+the actual observer/carrier-aware publication overload.
+
+Canonical installed Gradle 8.13 `--no-daemon --console=plain build --rerun-tasks`
+passed with all 10 discovered runtime main classes, build/packaging/runner
+fixtures, common/client compilation, remapping and production-jar verification.
+The framework `test` action is intentionally disabled; historical discarded
+prototype suites remain excluded by the existing discovery configuration.
+No live game, GPU/client acknowledgement, multiplayer latency, or actual model
+inference was tested. Embedding implementation/profile policy is unchanged;
+this unit does not claim the separately assigned in-process embedding repair.

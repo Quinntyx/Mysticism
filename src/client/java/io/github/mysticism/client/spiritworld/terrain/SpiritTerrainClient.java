@@ -20,87 +20,116 @@ import org.joml.Matrix4f;
 import org.lwjgl.opengl.GL30;
 import java.util.*;
 
-/** Actual MAIN depth-writing observer terrain renderer and client-predicted collision cache. */
+/** Actual MAIN depth-writing observer terrain renderer and client-predicted collision cache.
+ * Display and prediction commit together: an incoming frame only replaces collision, fog and
+ * occlusion after its GPU upload succeeded, so both never describe different geometry revisions. */
 public final class SpiritTerrainClient {
     private SpiritTerrainClient() {}
     private static final RenderLayer LAYER=SpiritRenderLayers.texturedMain(SpriteAtlasTexture.BLOCK_ATLAS_TEXTURE);
-    private static TerrainMeshFrame frame;
-    private static final SpiritMediumField mediumField=new SpiritMediumField();
+    private static final TerrainRevisionGate gate=new TerrainRevisionGate();
+    private static final long RETRY_NANOS=500_000_000L;
     private static boolean initialized,dirty;
     private static String failure;
-    private static final List<Batch> gpu=new ArrayList<>();
+    private static long nextRetry;
+    private static List<Batch> gpu=List.of();
+    private static final SpiritMediumField mediumField=new SpiritMediumField();
     private static List<SpiritMediumField.Surface> visibleSurfaces=List.of();
     private record Group(int x,int y,int z) {}
-    private record Batch(VertexBuffer buffer,Box bounds) {}
+    private record Batch(VertexBuffer buffer,Box bounds) implements AutoCloseable {
+        @Override public void close(){buffer.close();}
+    }
     public static void init() {
         if(initialized)return;initialized=true;
-        MeshCollision.clientFrames(uuid->{var p=MinecraftClient.getInstance().player;return p!=null && uuid.equals(p.getUuid())?frame:null;});
+        MeshCollision.clientFrames(uuid->{var p=MinecraftClient.getInstance().player;return p!=null && uuid.equals(p.getUuid())?gate.committed():null;});
         // VBOs use positionMatrix directly, so no AFTER_ENTITIES matrix-stack dependency/order race.
         WorldRenderEvents.BEFORE_ENTITIES.register(SpiritTerrainClient::render);
-        InvalidateRenderStateCallback.EVENT.register(()->{closeBuffers();dirty=true;});
+        InvalidateRenderStateCallback.EVENT.register(()->{dirty=true;nextRetry=0;}); // Rebuild swaps atomically; committed display stays until success.
         ClientPlayConnectionEvents.DISCONNECT.register((handler,client)->clear());
         ClientLifecycleEvents.CLIENT_STOPPING.register(client->clear());
     }
-    /** Transport has already validated current connection/entry epoch and reconstructed bounded deltas. */
+    /** Transport has already validated current connection/entry epoch and reconstructed bounded deltas.
+     * The frame is held as pending: collision/fog/occlusion follow only after a successful display upload. */
     public static void accept(TerrainMeshFrame incoming) {
         MinecraftClient client=MinecraftClient.getInstance();
         if(!client.isOnThread())throw new IllegalStateException("mesh client thread");
-        if(frame!=null && incoming.revision()<=frame.revision())return;
-        if(client.player!=null && (frame==null || frame.shallow()!=incoming.shallow()))MeshCollision.clearClient();
-        frame=incoming;dirty=true;failure=null;
-        // Medium is refreshed from the actual render camera with this mesh, not a packet-time eye pose.
+        if(!gate.accept(incoming))return;
+        // Coalescing fresh network revisions must not bypass a failed-upload retry backoff.
+        dirty=true;
     }
-    public static Optional<TerrainMeshFrame> frame(){return Optional.ofNullable(frame);}
+    public static Optional<TerrainMeshFrame> frame(){return Optional.ofNullable(gate.committed());}
     public static Optional<String> failure(){return Optional.ofNullable(failure);}
-    public static void clear(){MeshCollision.clearClient();frame=null;dirty=false;failure=null;closeBuffers();clearMedium();}
+    public static void clear(){MeshCollision.clearClient();gate.clear();dirty=false;failure=null;nextRetry=0;closeBuffers();visibleSurfaces=List.of();clearMedium();}
     private static void clearMedium(){mediumField.clear();ShaderManager.clearMediumSamples();}
-    private static void closeBuffers(){for(Batch b:gpu)b.buffer.close();gpu.clear();visibleSurfaces=List.of();}
-    private static void upload(MinecraftClient client) {
-        closeBuffers();if(frame==null)return;
-        var models=client.getBlockRenderManager();List<BlockState> palette=frame.materials().stream().map(TerrainMaterials::resolve).toList();
-        List<SpiritMediumField.Surface> surfaces=new ArrayList<>();
-        Map<Group,List<TerrainMeshFrame.Cell>> groups=new LinkedHashMap<>();
-        Vec3d anchor=frame.carrierOrigin();
-        for(var cell:frame.cells()) {
-            if(cell.opacity()<=0)continue;
-            var center=cell.bounds().getCenter().subtract(anchor);
-            Group key=new Group((int)Math.floor(center.x/16),(int)Math.floor(center.y/16),(int)Math.floor(center.z/16));
-            // Bound GPU object count. Excess far groups share a single overflow VBO, still fog/frustum culled as a batch.
-            if(!groups.containsKey(key) && groups.size()>=63)key=new Group(Integer.MIN_VALUE,0,0);
-            groups.computeIfAbsent(key,k->new ArrayList<>()).add(cell);
-        }
-        for(var cells:groups.values()) {
-            BufferAllocator allocator=new BufferAllocator(65536);
-            try {
-                BufferBuilder builder=new BufferBuilder(allocator,LAYER.getDrawMode(),LAYER.getVertexFormat());
-                TerrainVertexConsumer.Bounds emitted=new TerrainVertexConsumer.Bounds();
-                for(var cell:cells) {
-                    BlockState state=palette.get(cell.material());
-                    TerrainVertexConsumer.Bounds modelBounds=new TerrainVertexConsumer.Bounds();
-                    VertexConsumer consumer=new TerrainVertexConsumer(builder,cell.opacity(),modelBounds);
-                    if(state.getRenderType()==BlockRenderType.MODEL)drawModel(models,state,cell,anchor,consumer,null);
-                    else for(Box shape:cell.collision())drawModel(models,Blocks.STONE.getDefaultState(),cell,anchor,consumer,shape);
-                    if(!modelBounds.empty()) {
-                        emitted.include(modelBounds);
-                        surfaces.add(new SpiritMediumField.Surface(modelBounds.world(anchor),cell.opacity()));
+    private static void closeBuffers(){var previous=gpu;gpu=List.of();closeBuffers(previous);}
+    private static void closeBuffers(List<Batch> buffers){for(Batch b:buffers)b.close();}
+    /** Builds fresh batches WITHOUT touching displayed buffers; the caller swaps atomically on success. */
+    private record BuiltTerrain(List<Batch> batches,List<SpiritMediumField.Surface> surfaces) {}
+    private static BuiltTerrain build(MinecraftClient client,TerrainMeshFrame frame) {
+        try(var staged=new TerrainBatchBuild<Batch>()) {
+            List<SpiritMediumField.Surface> surfaces=new ArrayList<>();
+            var models=client.getBlockRenderManager();List<BlockState> palette=frame.materials().stream().map(TerrainMaterials::resolve).toList();
+            Map<Group,List<TerrainMeshFrame.Cell>> groups=new LinkedHashMap<>();
+            Vec3d anchor=frame.carrierOrigin();
+            for(var cell:frame.cells()) {
+                if(cell.opacity()<=0)continue;
+                var center=cell.bounds().getCenter().subtract(anchor);
+                Group key=new Group((int)Math.floor(center.x/16),(int)Math.floor(center.y/16),(int)Math.floor(center.z/16));
+                // Bound GPU object count. Excess far groups share a single overflow VBO, still fog/frustum culled as a batch.
+                if(!groups.containsKey(key) && groups.size()>=63)key=new Group(Integer.MIN_VALUE,0,0);
+                groups.computeIfAbsent(key,k->new ArrayList<>()).add(cell);
+            }
+            for(var cells:groups.values()) {
+                BufferAllocator allocator=new BufferAllocator(65536);
+                try {
+                    BufferBuilder builder=new BufferBuilder(allocator,LAYER.getDrawMode(),LAYER.getVertexFormat());
+                    TerrainVertexConsumer.Bounds emitted=new TerrainVertexConsumer.Bounds();
+                    for(var cell:cells) {
+                        TerrainVertexConsumer.Bounds modelBounds=new TerrainVertexConsumer.Bounds();
+                        BlockState state=palette.get(cell.material());
+                        VertexConsumer consumer=new TerrainVertexConsumer(builder,cell.opacity(),modelBounds);
+                        if(state.getRenderType()==BlockRenderType.MODEL)drawModel(models,state,cell,anchor,consumer,null);
+                        else for(Box shape:cell.collision())drawModel(models,Blocks.STONE.getDefaultState(),cell,anchor,consumer,shape);
+                        if(!modelBounds.empty()) {
+                            emitted.include(modelBounds);
+                            surfaces.add(new SpiritMediumField.Surface(modelBounds.world(anchor),cell.opacity()));
+                        }
                     }
-                }
-                BuiltBuffer built=builder.endNullable();
-                if(built==null)continue;
-                VertexBuffer vbo=new VertexBuffer(VertexBuffer.Usage.DYNAMIC);
-                try {vbo.bind();vbo.upload(built);gpu.add(new Batch(vbo,emitted.world(anchor)));}
-                catch(RuntimeException failure){vbo.close();throw failure;}
-                finally{VertexBuffer.unbind();} // upload owns/closes BuiltBuffer in Yarn 1.21.1
-            } finally{allocator.close();}
+                    BuiltBuffer built=builder.endNullable();
+                    if(built==null)continue;
+                    VertexBuffer vbo;
+                    try {vbo=new VertexBuffer(VertexBuffer.Usage.DYNAMIC);}
+                    catch(RuntimeException failure){built.close();throw failure;}
+                    staged.add(new Batch(vbo,emitted.world(anchor)));
+                    try {vbo.bind();}
+                    catch(RuntimeException failure){built.close();throw failure;}
+                    try {vbo.upload(built);}
+                    finally{VertexBuffer.unbind();} // upload owns/closes BuiltBuffer in Yarn 1.21.1
+                } finally{allocator.close();}
+            }
+            return new BuiltTerrain(staged.complete(),List.copyOf(surfaces));
         }
-        visibleSurfaces=List.copyOf(surfaces);dirty=false;
+    }
+    /** Atomic coherent commit: new buffers replace old only after a full successful build.
+     * Any failure retains the previously displayed AND predicted revision untouched. */
+    private static void upload(MinecraftClient client) {
+        var target=gate.pending()!=null?gate.pending():gate.committed();
+        if(target==null){dirty=false;return;}
+        BuiltTerrain rebuilt=build(client,target);
+        boolean adopted=false;
+        try {
+            boolean flip=gate.shallowFlipPending();
+            // No network callbacks interleave this render-thread transaction. Medium publication is
+            // prepared before changing display/prediction; it does not perform a GPU upload.
+            if(!gate.commit(target))return;
+            var previous=gpu;gpu=rebuilt.batches();visibleSurfaces=rebuilt.surfaces();adopted=true;
+            mediumField.clear(); // next render samples the new uploaded geometry at the current camera
+            if(flip)MeshCollision.clearClient();
+            dirty=false;failure=null;
+            closeBuffers(previous);
+        } finally {if(!adopted)closeBuffers(rebuilt.batches());}
     }
     private static void drawModel(net.minecraft.client.render.block.BlockRenderManager models,BlockState state,TerrainMeshFrame.Cell c,Vec3d anchor,VertexConsumer consumer,Box primitive) {
-        Vec3d min=c.min().subtract(anchor),x=c.axisX(),y=c.axisY(),z=c.axisZ();
-        if(primitive!=null){min=c.point(primitive.minX,primitive.minY,primitive.minZ).subtract(anchor);x=x.multiply(primitive.getLengthX());y=y.multiply(primitive.getLengthY());z=z.multiply(primitive.getLengthZ());}
-        Matrix4f transform=new Matrix4f().m00((float)x.x).m01((float)x.y).m02((float)x.z)
-                .m10((float)y.x).m11((float)y.y).m12((float)y.z).m20((float)z.x).m21((float)z.y).m22((float)z.z)
-                .m30((float)min.x).m31((float)min.y).m32((float)min.z);
+        Matrix4f transform=TerrainModelTransform.position(c,anchor,primitive);
         MatrixStack stack=new MatrixStack();stack.multiplyPositionMatrix(transform);
         stack.peek().getNormalMatrix().set(new Matrix3f(transform).invert().transpose());
         int color=c.color();models.getModelRenderer().render(stack.peek(),consumer,state,models.getModel(state),
@@ -108,31 +137,40 @@ public final class SpiritTerrainClient {
     }
     private static void render(WorldRenderContext context) {
         MinecraftClient client=MinecraftClient.getInstance();
-        if(client.player==null || client.world==null || !client.world.getRegistryKey().equals(SpiritTerrainService.WORLD)) {if(frame!=null)clear();return;}
-        if(frame==null)return;
+        if(client.player==null || client.world==null || !client.world.getRegistryKey().equals(SpiritTerrainService.WORLD)) {if(gate.committed()!=null||gate.pending()!=null)clear();return;}
+        if(gate.committed()==null && gate.pending()==null)return;
         int oldDraw=GL30.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING),oldRead=GL30.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING);
         try {
-            if(dirty)upload(client);
-            Vec3d camera=context.camera().getPos();Vec3d offset=frame.carrierOrigin().subtract(camera);
-            int viewDistanceChunks=client.options.getClampedViewDistance();
-            if(gpu.isEmpty())clearMedium();
-            else mediumField.update(frame,camera,visibleSurfaces).ifPresent(samples->ShaderManager.setMediumSamples(samples.occupancy(),samples.center()));
-            Matrix4f view=new Matrix4f(context.positionMatrix()).translate((float)offset.x,(float)offset.y,(float)offset.z);
-            client.getFramebuffer().beginWrite(false);RenderSystem.enableDepthTest();RenderSystem.depthMask(true);
-            LAYER.startDrawing();
-            boolean drewMesh=false;
-            try {
-                for(Batch b:gpu) {
-                    if(!TerrainVisibility.isVisible(b.bounds,camera,viewDistanceChunks,context.frustum()))continue;
-                    b.buffer.bind();b.buffer.draw(view,context.projectionMatrix(),RenderSystem.getShader());drewMesh=true;
-                }
-            } finally{VertexBuffer.unbind();LAYER.endDrawing();}
-            if(drewMesh)ShaderManager.afterMeshDepth();
+            if(dirty && System.nanoTime()>=nextRetry) {
+                try {upload(client);}
+                catch(RuntimeException error){reportFailure(client,error);}
+                // A failed upload must STILL draw the prior committed revision this frame.
+            }
+            var frame=gate.committed();
+            if(frame!=null && !gpu.isEmpty()) {
+                Vec3d camera=context.camera().getPos();Vec3d offset=frame.carrierOrigin().subtract(camera);
+                int viewDistanceChunks=client.options.getClampedViewDistance();
+                mediumField.update(frame,camera,visibleSurfaces).ifPresent(samples->ShaderManager.setMediumSamples(samples.occupancy(),samples.center()));
+                Matrix4f view=new Matrix4f(context.positionMatrix()).translate((float)offset.x,(float)offset.y,(float)offset.z);
+                client.getFramebuffer().beginWrite(false);RenderSystem.enableDepthTest();RenderSystem.depthMask(true);
+                LAYER.startDrawing();
+                boolean drewMesh=false;
+                try {
+                    for(Batch b:gpu) {
+                        if(!TerrainVisibility.isVisible(b.bounds,camera,viewDistanceChunks,context.frustum()))continue;
+                        b.buffer.bind();b.buffer.draw(view,context.projectionMatrix(),RenderSystem.getShader());drewMesh=true;
+                    }
+                } finally{VertexBuffer.unbind();LAYER.endDrawing();}
+                if(drewMesh)ShaderManager.afterMeshDepth();
+            }
         } catch(RuntimeException error) {
-            closeBuffers();dirty=false;clearMedium();
-            if(!Objects.equals(failure,error.toString())){failure=error.toString();client.player.sendMessage(net.minecraft.text.Text.literal("Spirit mesh unavailable: "+error.getMessage()),true);}
+            reportFailure(client,error);
         } finally {
             GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER,oldDraw);GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER,oldRead);
         }
+    }
+    private static void reportFailure(MinecraftClient client,RuntimeException error) {
+        nextRetry=System.nanoTime()+RETRY_NANOS;
+        if(!Objects.equals(failure,error.toString())){failure=error.toString();client.player.sendMessage(net.minecraft.text.Text.literal("Spirit mesh unavailable: "+error.getMessage()),true);}
     }
 }

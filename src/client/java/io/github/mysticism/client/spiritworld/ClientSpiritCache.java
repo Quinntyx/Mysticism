@@ -55,6 +55,15 @@ public final class ClientSpiritCache {
         continuityOffset=Vec3d.ZERO; previousContinuityOffset=Vec3d.ZERO;
         frameHistory=false;
     }
+    /** Discard prediction, not the authenticated terrain/session, after real authority corrections.
+     * Even an unchanged authoritative q must replace an ahead-of-authority render prediction. */
+    public static void resetPrediction() {
+        mirrorPos=null; mirrorBasis=null; refreshedPos=null; refreshedBasis=null;
+        mirrorEpoch=Long.MIN_VALUE;
+        previousLatentPos=null; previousLatentBasis=null;
+        continuityOffset=Vec3d.ZERO; previousContinuityOffset=Vec3d.ZERO;
+        frameHistory=false; observerReady=false;
+    }
     public static boolean accept(SpiritFramePayload payload) {
         var s=payload.session();
         if (connection==null || world==null || player==null || !s.dimension().equals(dimension) || !s.player().equals(playerId)

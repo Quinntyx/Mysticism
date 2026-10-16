@@ -2,6 +2,7 @@
 uniform sampler2D DiffuseSampler;
 uniform sampler2D DepthSampler;
 uniform int KernelRadius;
+uniform int SampleStride;
 uniform int KuwaharaEnabled;
 in vec2 texCoord;
 out vec4 fragColor;
@@ -9,9 +10,13 @@ out vec4 fragColor;
 void main() {
     // Off is an identity pass, not a radius clamped back up to one.
     if (KuwaharaEnabled == 0) { fragColor = texture(DiffuseSampler, texCoord); return; }
-    int radius = clamp(KernelRadius, 1, 3);
+    int radius = clamp(KernelRadius, 0, 3);
     ivec2 size = textureSize(DiffuseSampler, 0);
     ivec2 center = clamp(ivec2(texCoord * vec2(size)), ivec2(0), size - ivec2(1));
+    vec4 original = texelFetch(DiffuseSampler, center, 0);
+    if (radius == 0) { fragColor = original; return; }
+    // Keep the brush visible at high framebuffer resolutions without increasing tap count.
+    int stride = clamp(SampleStride, 1, 4);
     // Coherent axis-aligned neighborhood: 9/25/49 unique taps, shared by four quadrants.
     // No virtual-grid snapping, random rotations, duplicated quadrants or per-pixel tap arrays.
     vec3 sum[4];
@@ -23,7 +28,7 @@ void main() {
         if (abs(y) > radius) continue;
         for (int x = -3; x <= 3; ++x) {
             if (abs(x) > radius) continue;
-            ivec2 pixel = clamp(center + ivec2(x, y), ivec2(0), size - ivec2(1));
+            ivec2 pixel = clamp(center + ivec2(x, y) * stride, ivec2(0), size - ivec2(1));
             float sampleDepth = texelFetch(DepthSampler, pixel, 0).r;
             // Never spread background glyph color onto a foreground wall. A symmetric window-
             // depth threshold alone admits a 12-block glyph through a 10-block wall (<0.0015).
@@ -44,12 +49,18 @@ void main() {
     }
     vec3 result = vec3(0.0);
     float total = 0.0;
+    float quadrantSize = float((radius + 1) * (radius + 1));
     for (int q = 0; q < 4; ++q) {
-        vec3 mean = sum[q] / max(weight[q], 1.0);
+        // Depth rejection can leave only the center. Its zero variance is NOT evidence of a
+        // smooth region: previously it outweighed real neighborhoods and made slopes a no-op.
+        if (weight[q] < 2.0) continue;
+        vec3 mean = sum[q] / weight[q];
         float value = dot(mean, vec3(0.2126, 0.7152, 0.0722));
         float variance = max(0.0, squareSum[q] / max(weight[q], 1.0) - value * value);
-        float w = 1.0 / (0.001 + variance);
+        float coverage = weight[q] / quadrantSize;
+        float w = coverage * coverage / (0.001 + variance);
         result += mean * w; total += w;
     }
-    fragColor = vec4(result / max(total, 0.00001), texelFetch(DiffuseSampler, center, 0).a);
+    // Isolated silhouettes really have no compatible neighborhood; keep them unchanged.
+    fragColor = vec4(total > 0.0 ? result / total : original.rgb, original.a);
 }

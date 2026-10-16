@@ -8,7 +8,7 @@ import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
 import static net.minecraft.server.command.CommandManager.literal;
 
-/** V1 debug controls; no survival UI or return-to-entry substitute. */
+/** Per-player movement/source diagnostics; no return-to-entry substitute. */
 public final class SpiritCommand {
     private SpiritCommand() {}
     public static void register(CommandDispatcher<ServerCommandSource> dispatcher) {
@@ -24,11 +24,14 @@ public final class SpiritCommand {
                     var p = context.getSource().getPlayerOrThrow();
                     SpiritNavigationService.enterDeep(p); return status(p);
                 }))
-                .then(literal("capture").executes(context -> SpiritNavigationService.captureHere(context.getSource().getPlayerOrThrow()) ? 1 : 0)));
+                .then(literal("capture").executes(context -> SpiritNavigationService.captureHere(context.getSource().getPlayerOrThrow()) ? 1 : 0))
+                .then(literal("discover").executes(context -> {
+                    var p = context.getSource().getPlayerOrThrow();
+                    boolean queued = SpiritNavigationService.retrySourceDiscovery(p);
+                    status(p); return queued ? 1 : 0;
+                })));
     }
     private static int status(ServerPlayerEntity p) {
-        // Real current navigation progress: mode, semantic readiness, live walk-request state,
-        // retry cooldown, landing approach, captured target and pending discovery.
         p.sendMessage(Text.literal(SpiritNavigationService.status(p)), false);
         return 1;
     }

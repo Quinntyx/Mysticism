@@ -145,7 +145,7 @@ public final class DiscoveredLandmarkPersistenceTest {
         check(store.ids().isEmpty(),"empty fresh-profile catalogue survives restart");
         check(store.semanticRangePage(embedding(current),.1,null,4,4).landmarks().isEmpty(),"reset does not promote prior profile entries");
         Landmark fresh=discover(current,"minecraft:dirt",2,List.of());
-        check(old.id().equals(fresh.id())&&old.geometry().pages().getFirst().id().equals(fresh.geometry().pages().getFirst().id()),"real rediscovery reuses deterministic source seed and page ID");
+        check(old.id().equals(fresh.id())&&!old.geometry().pages().getFirst().id().equals(fresh.geometry().pages().getFirst().id()),"real rediscovery retains source seed, while changed material has a distinct immutable content page");
         publish(store.stagePut(fresh,-1)); // pre-fix: immutable page version conflict with retained old source geometry
         manager.save();
         for(var entry:oldPages.entrySet()) check(Arrays.equals(entry.getValue(),Files.readAllBytes(entry.getKey())),"reset/rediscovery never overwrites retained immutable pages");

@@ -3,6 +3,11 @@
 Current composition follow-up: [runtime-postprocess-composition-handoff.md](runtime-postprocess-composition-handoff.md)
 supersedes this historical document's fog-first ordering and constant-extinction model.
 
+> Historical implementation/review record. The current client distance contract and
+> canonical regression results are in [runtime-fog-range.md](runtime-fog-range.md).
+> Its render-option-scaled fog supersedes the fixed 40/64/80-block presentation
+> guidance below; fog must not conceal missing source generation or certify collision.
+
 ## Parent registrations (not edited here)
 
 Existing `MysticismClient` calls remain valid/idempotent: `SpiritWorldRenderer.init()` now

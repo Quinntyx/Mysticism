@@ -53,6 +53,30 @@ tasks.register('buildSelfTest', JavaExec) {
             if (!rejected) throw new GradleException('Invalid Java requirement was accepted')
         }
         logger.lifecycle('Decoded metadata checks passed (literal/Unicode escaped Java 21, invalid/missing rejection)')
+
+        // Integration regression: both retained optional probes must survive together,
+        // without making headless CI require a display, model weights or a service.
+        [embeddedInferenceProbe: 'io.github.mysticism.embedding.EmbeddedInferenceProbe',
+         kuwaharaGpuTest: 'io.github.mysticism.client.spiritworld.KuwaharaGlProbe'].each { name, main ->
+            def probe = tasks.named(name).get()
+            if (!(probe instanceof JavaExec) || probe.mainClass.get() != main || !probe.enableAssertions ||
+                    !probe.taskDependencies.getDependencies(probe).contains(tasks.named('runtimeTestClasses').get())) {
+                throw new GradleException("Invalid retained verification probe: ${name}")
+            }
+        }
+        def buildDependencies = new HashSet()
+        def visit
+        visit = { task ->
+            if (buildDependencies.add(task.name)) {
+                task.taskDependencies.getDependencies(task).each { visit(it) }
+            }
+        }
+        visit(tasks.named('build').get())
+        if (!buildDependencies.containsAll(['runtimeSelfTest', 'buildSelfTest', 'verifyProductionJar']) ||
+                buildDependencies.any { it in ['embeddedInferenceProbe', 'kuwaharaGpuTest'] }) {
+            throw new GradleException('Build must run all deterministic runtime/packaging suites, not optional inference/GPU probes')
+        }
+        logger.lifecycle('Retained verification graph checks passed (both probes registered, headless build suites retained)')
     }
 }
 
@@ -91,10 +115,24 @@ tasks.register('embeddedInferenceProbe', JavaExec) {
     systemProperty 'mysticism.embedding.nativeDirectory', layout.buildDirectory.dir('embedding-inference-probe/native').get().asFile.absolutePath
     enableAssertions = true
     doFirst {
-        setArgs([providers.gradleProperty('embeddingModelPath').getOrElse(
-                layout.buildDirectory.file('embedding-inference-probe/nomic-v2.gguf').get().asFile.absolutePath),
-                providers.gradleProperty('embeddingProvision').getOrElse('false')])
+        def provision = providers.gradleProperty('embeddingProvision').getOrElse('false')
+        def defaultPath = provision == 'true' ?
+                layout.buildDirectory.file('embedding-inference-probe/nomic-v2.gguf').get().asFile.absolutePath : ''
+        setArgs([providers.gradleProperty('embeddingModelPath').getOrElse(defaultPath), provision])
     }
+}
+
+// Explicit display-dependent suite using Minecraft's existing LWJGL dependencies.
+// Kept separate so a headless CPU build never silently claims GPU verification.
+// Run with an existing display or: xvfb-run -a gradle ... build kuwaharaGpuTest
+// No model service, game bootstrap or extra downloaded test dependencies.
+tasks.register('kuwaharaGpuTest', JavaExec) {
+    group = 'verification'
+    description = 'Execute the packaged Kuwahara/post chain in an offscreen OpenGL context (display required).'
+    dependsOn tasks.named('runtimeTestClasses')
+    classpath = sourceSets.runtimeTest.runtimeClasspath
+    mainClass = 'io.github.mysticism.client.spiritworld.KuwaharaGlProbe'
+    enableAssertions = true
 }
 
 tasks.register('verifyProductionJar', JavaExec) {

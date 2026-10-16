@@ -69,7 +69,7 @@ public final class WalkDiscoveryRuntimeTest {
         public Box boundingBox(){return BODY;}
         public Basis384f basis(){return grid.clone();}
         public Vec384f coordinate(){return q.clone();}
-        public Optional<MeshCollision.GroundContact> groundContact(){return hasGround?new MeshCollision.Index(session.frame).ground(BODY):Optional.empty();}
+        public Optional<MeshCollision.GroundContact> groundContact(){return hasGround?new MeshCollision.Index(session.frame).groundContact(BODY):Optional.empty();}
         Optional<MeshCollision.Hit> ground(){return groundContact().map(MeshCollision.GroundContact::hit);}
         public Optional<LandmarkMetadata> metadata(String id){return Optional.ofNullable(metadata.get(id));}
         public Optional<String> exactOwner(Window w,Vec3d at){return ownershipCurrent?Optional.ofNullable(owners.get(BlockPos.ofFloored(at))):Optional.empty();}
@@ -183,7 +183,7 @@ public final class WalkDiscoveryRuntimeTest {
     }
     private static void naturalContactBeforeDiscovery() {
         Fixture f = new Fixture(false);
-        check(f.ground().isPresent() && f.candidate().isEmpty(),
+        check(f.groundContact().isPresent() && f.candidate().isEmpty(),
                 "Real displayed support can exist before its walking target is discovered");
         var intent = io.github.mysticism.navigation.NaturalLandingPolicy.evaluate(
                 true, true, false, false, false, true,
@@ -224,8 +224,8 @@ public final class WalkDiscoveryRuntimeTest {
         f.producer.origin=SOURCE.add(0,.3*s,0);
         var initial=projectSupport(f,from);
         acceptFrame(f.session,initial,ignored->{});
-        var hit=f.ground().orElseThrow();
-        check(Math.abs(hit.normal().y-Math.cos(angle))<1e-6 && hit.normal().y<.99,
+        var hit=f.groundContact().orElseThrow();
+        check(Math.abs(hit.hit().normal().y-Math.cos(angle))<1e-6 && hit.hit().normal().y<.99,
                 "measured real 10-degree source-flat contact starts below final acquisition normal");
         check(MeshCollision.bodyClear(f.session.frame,BODY),"tilted floor does not actually penetrate resting body");
         check(f.session.frame.cells().getFirst().bounds().intersects(BODY.expand(-1e-5)),
@@ -244,7 +244,7 @@ public final class WalkDiscoveryRuntimeTest {
             // Basis application follows the guard, then the normal frame-publication transaction.
             f.grid.i=proposed.i;f.grid.j=proposed.j;f.grid.k=proposed.k;
             f.accept(built);
-            check(!f.session.shallow && f.ground().isPresent(),"flight retains real support during alignment "+step);
+            check(!f.session.shallow && f.groundContact().isPresent(),"flight retains real support during alignment "+step);
             check(f.support().landmarkId().equals(f.b.id()),"support ownership survives frame transition "+step);
         }
         support=f.support();
@@ -259,15 +259,15 @@ public final class WalkDiscoveryRuntimeTest {
     }
 
     private static void sourceFloorContactBandStillNeedsProof() {
-        for(double gap:new double[]{.11,.121}) {
+        for(double gap:new double[]{.11,.124}) {
             Fixture f=new Fixture(false);
             f.producer.origin=SOURCE.add(0,gap,0);
             acceptFrame(f.session,projectSupport(f,f.grid),ignored->{});
-            check(f.ground().isPresent(),"visible mesh ground probe includes source gap "+gap);
+            check(f.groundContact().isPresent(),"visible mesh ground probe includes source gap "+gap);
             check(f.discover(),"contact-band fixture discovers real owner");
             var support=f.support();
-            check(acquireCurrentSupport(f.session,f,support)==(gap<.12),
-                    "source-floor proof retains the existing .12 tolerance, not the broader mesh probe: "+gap);
+            check(acquireCurrentSupport(f.session,f,support)==(gap<=.125),
+                    "source-floor proof uses the same actual-shape grounding band as displayed terrain: "+gap);
         }
         Fixture unknown=new Fixture(false);
         unknown.producer.origin=SOURCE.add(0,.11,0);

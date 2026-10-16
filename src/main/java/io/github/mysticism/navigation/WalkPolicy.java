@@ -30,7 +30,7 @@ public final class WalkPolicy {
     /** Ticks without any current support candidate before a walk request cancels itself. */
     public static final int STALL_CANCEL_TICKS = 200;
     /** Total walk-request budget backstop; generous so slow real validations finish. */
-    public static final int MAX_PENDING_TICKS = 1200;
+    public static final int MAX_PENDING_TICKS = WalkIntent.TOTAL_TICKS;
     /** Bounded retry pressure: failed acquisitions re-attempt at most every 10 ticks, 60 times. */
     public static final int ACQUIRE_RETRY_TICKS = 10;
     public static final int MAX_ACQUIRE_FAILURES = 60;

@@ -1,6 +1,5 @@
 package io.github.mysticism.embedding;
 
-import io.github.mysticism.vector.EmbeddingSpace;
 import java.io.*;
 import java.net.*;
 import java.nio.channels.*;
@@ -10,13 +9,13 @@ import java.time.Duration;
 import java.util.HexFormat;
 import java.util.concurrent.CancellationException;
 
-/** The exact GGUF (weights AND tokenizer) in the approved Nomic v2 manifest.
- * Asset IO is worker-only. No Ollama process, moving tag, installer or alternative model.
+/** Explicit opt-in probe provisioning only, NOT the Minecraft runtime asset path.
+ * Ordinary initialization is read-only via LocalNomicV2ModelAsset/NomicV2ModelAssets.
  */
 final class PinnedEmbeddingModel implements AutoCloseable {
-    static final String MANIFEST = "ff9c2f10ef5e3722623a1b396e1e04efc27a93112c83e9b7b7b9ca1d05620965";
-    static final String SHA256 = "a5db3381f2e514d3490a3a31fe70eb1a65e95016c85c6c2c23223b810806594f";
-    static final long BYTES = 957680480L;
+    static final String MANIFEST = NomicV2ModelAssets.APPROVED_REVISION;
+    static final String SHA256 = NomicV2ModelAssets.APPROVED_GGUF_SHA256;
+    static final long BYTES = NomicV2ModelAssets.APPROVED_GGUF_BYTES;
     static final URI SOURCE = URI.create("https://registry.ollama.ai/v2/library/nomic-embed-text-v2-moe/blobs/sha256:" + SHA256);
     private final Path target;
     private final URI source;
@@ -25,18 +24,6 @@ final class PinnedEmbeddingModel implements AutoCloseable {
     private final boolean download;
     private volatile boolean closed;
     private volatile HttpURLConnection connection;
-
-    static PinnedEmbeddingModel configured() {
-        if (!EmbeddingSpace.REVISION.equals(MANIFEST) || !EmbeddingSpace.MODEL.equals("nomic-embed-text-v2-moe:latest"))
-            throw new IllegalArgumentException("Embedded inference requires the pinned Nomic v2 profile; use provider=ollama for an approved alternate deployment");
-        String explicit = System.getProperty("mysticism.embedding.modelPath");
-        Path home = Path.of(System.getProperty("user.home"));
-        Path existing = home.resolve(".ollama/models/blobs/sha256-" + SHA256);
-        Path path = explicit != null ? Path.of(explicit) : Files.isRegularFile(existing) ? existing :
-                home.resolve(".cache/mysticism/models/sha256-" + SHA256 + ".gguf");
-        boolean download = explicit == null && Boolean.parseBoolean(System.getProperty("mysticism.embedding.download", "true"));
-        return new PinnedEmbeddingModel(path, SOURCE, SHA256, BYTES, download, Duration.ofMinutes(10));
-    }
 
     // Package-private asset injection for small local transport/integrity fixtures, never native inference.
     PinnedEmbeddingModel(Path target, URI source, String hash, long bytes, boolean download, Duration timeout) {
@@ -51,7 +38,7 @@ final class PinnedEmbeddingModel implements AutoCloseable {
         check(end);
         if (Files.exists(target)) { verify(target, end); return target; }
         if (!download) throw new FileNotFoundException("Pinned Nomic v2 GGUF missing: " + target +
-                "; provision this exact SHA256 or enable mysticism.embedding.download (no server is needed)");
+                "; supply this exact SHA256 with -PembeddingModelPath=<file> or explicitly use -PembeddingProvision=true (probe only; no server is needed)");
         Files.createDirectories(target.getParent());
         Path lockPath = target.resolveSibling(target.getFileName() + ".lock");
         // Serialize cache publication across JVMs. Never lock a server tick or lifecycle monitor.

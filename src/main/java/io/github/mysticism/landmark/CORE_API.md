@@ -306,13 +306,21 @@ source/semantic ranges never copy or reconstruct geometry NBT. Range calls are s
 source-AABB/semantic-radius operations; require `maxScanned >= ids().size()` and reject
 result overflow instead of truncating. Metadata LRU holds at most 128 decoded headers.
 
-One geometry cursor can be active. Advance with 1..8 pages and 1..32768 leaves of work;
-return value counts newly reconstructed leaves (cached pages count against the page budget).
-Drain the immutable batch before advancing again. Incomplete reads retain only one partial
-page and a batch of at most eight pages. Check `isCurrent()` before publishing an asynchronous
-result; activity changes also invalidate its metadata revision. Decoded geometry LRU is
-bounded by `DECODED_PAGE_LIMIT=8` and `DECODED_LEAF_LIMIT=65536`; original page versions
-are immutable and repeated resident reads reuse them. `find()` never performs cold geometry
+One public discovery/extraction geometry cursor can be active. SourceOwnership.Request
+has one separate package-private cursor slot, so an exact movement/support proof can progress
+while discovery retains its cursor across ticks. It does not admit competing discovery or
+additional ownership decoders. Both slots are server-thread confined; completion/cancellation
+releases only that cursor's own slot. Ownership still checks the source-topology revision on
+every phase and uses its existing one-page/512-leaf budget.
+
+Advance with 1..8 pages and 1..32768 leaves of work; return value counts newly reconstructed
+leaves (cached pages count against the page budget). Drain the immutable batch before advancing
+again. Each incomplete read retains only one partial page and a batch of at most eight pages.
+Check `isCurrent()` before publishing an asynchronous result; activity changes also invalidate
+its metadata revision. Decoded geometry LRU is shared by both slots and bounded by
+`DECODED_PAGE_LIMIT=8` and `DECODED_LEAF_LIMIT=65536`; original page versions are immutable
+and repeated resident reads reuse them. If another cursor completes the same page, the reader
+discards its superseded partial decoder before advancing to the next immutable key. `find()` never performs cold geometry
 reads: warm all required pages first, or stream larger landmarks page-by-page via the cursor.
 `find()` throws if the full geometry exceeds these residency limits or has missing resident
 pages. **Merge/split never call find and do not require resident parent geometry.**

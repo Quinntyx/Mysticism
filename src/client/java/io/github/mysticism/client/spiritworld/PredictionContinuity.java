@@ -1,6 +1,7 @@
 package io.github.mysticism.client.spiritworld;
 
 import net.minecraft.util.math.Vec3d;
+import io.github.mysticism.navigation.MovementIntegration;
 
 /** Client prediction continuity state for latent semantic travel.
  * The predictor integrates movement only across an unbroken (player, world, pose, epoch, mode,
@@ -34,7 +35,8 @@ public final class PredictionContinuity {
         if (ClientLatentPredictor.integratesMovement(this.player == player, this.world == world, lastPos != null,
                 lastEpoch, epoch, lastDeep, deep, semanticReady)) {
             Vec3d candidate = now.subtract(lastPos);
-            if (candidate.lengthSquared() <= 16) delta = candidate; // teleport-scale movement is never chosen
+            if (candidate.lengthSquared() <= MovementIntegration.REPOSITION_LIMIT * MovementIntegration.REPOSITION_LIMIT)
+                delta = candidate; // Provenance separately excludes even sub-block corrections.
         }
         this.player = player; this.world = world; lastPos = now; lastEpoch = epoch; lastDeep = deep;
         return delta;

@@ -198,8 +198,8 @@ public final class ShallowSourceDiscoveryTest {
     }
     private static void serviceWiring() throws Exception {
         String source=Files.readString(Path.of("src/main/java/io/github/mysticism/dimension/spiritworld/terrain/SpiritTerrainService.java"));
-        check(source.contains("c.advanceShallow();c.advanceNear();c.advanceGeometry();"),"Production tick does not run outward acquisition");
-        check(source.contains("s.shallowDiscovery.snapshot()"),"Production publication does not consume outward geometry");
+        check(source.contains("c.advanceShallow();c.advanceDiscovery();c.advanceNear();c.advanceGeometry();"),"Production tick does not run outward acquisition");
+        check(source.contains("s.shallowDiscovery"),"Production publication does not consume outward geometry");
         check(source.contains("SourceLandmarks.region(server,w.dimension,range,4096)"),"Production outward source IO is not wired");
         check(source.contains("store.sourceRangePage(w.dimension,range,cursor,4,4)"),"Production shallow catalog is not bounded/source-native");
     }

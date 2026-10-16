@@ -26,7 +26,9 @@ public final class SelfTestRunner {
             }
         }
         int count = 0;
+        AssertionError failures = new AssertionError("Runtime self-test failures");
         for (String name : names) {
+          try {
             Class<?> test = Class.forName(name, false, SelfTestRunner.class.getClassLoader());
             var main = test.getMethod("main", String[].class);
             if (!Modifier.isStatic(main.getModifiers()) || main.getReturnType() != void.class) {
@@ -45,6 +47,15 @@ public final class SelfTestRunner {
                 throw failure;
             }
             count++;
+          } catch (Exception | AssertionError failure) {
+            System.err.println("FAILED " + name + ": " + failure);
+            failure.printStackTrace();
+            failures.addSuppressed(failure);
+          }
+        }
+        if (failures.getSuppressed().length > 0) {
+            System.err.println("Runtime self-tests: " + count + " passed, " + failures.getSuppressed().length + " failed");
+            throw failures;
         }
         // A build-only branch may legitimately have no feature tests yet. Report it explicitly.
         System.out.println("Feature self-tests passed: " + count + " main-based classes");
