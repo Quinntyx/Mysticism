@@ -12,7 +12,12 @@ problems in this checkout.
 
 - Vertical discovery retains all represented absolute 32-block height bands,
   examining every Y in sixteen sampled columns with resumable shared tick budgets
-  and overflow/backpressure retention. Source ownership/growth and independent
+  and overflow/backpressure retention. A `SERVER_STARTING` lifecycle queue retains
+  spawn-chunk keys before the `SERVER_STARTED` Session exists; the Session adopts
+  that same queue. All loads are now key-only until one-per-tick, non-loading
+  heightmap/surface/frontier admission. Early chunk/world unloads and stop remove
+  retained keys; no bulk startup sweep or chunk tickets are introduced.
+  Source ownership/growth and independent
   per-player projection are unchanged. See [vertical discovery](vertical-discovery-handoff.md)
   for the sampling limits (not an exhaustive cave census).
 - The default embedded CPU/JNI provider uses verified existing local/cache native
@@ -42,7 +47,8 @@ Revalidated after the user provisioned the exact approved model asset. The prior
 missing-asset blocker is resolved; no substitute model or dimensions were used.
 Both original parent tips above remain ancestors of the candidate.
 
-Java 21, Gradle wrapper 8.13, original tmux session `$11`, origin `%3575`.
+Java 21, Gradle wrapper 8.13, original tmux session `$11`, origin `%3628` for
+this startup-order repair. Earlier model integration runs used origin `%3575`.
 No software installed, weights downloaded by this work, other checkouts edited
 or dev/main refs changed.
 
@@ -50,15 +56,20 @@ or dev/main refs changed.
 ./gradlew --no-daemon --console=plain build --rerun-tasks
 ```
 
-**PASS**, exit 0, 30 seconds; all 15 actionable tasks executed. Common/client and
+**PASS**, exit 0, 34 seconds; all 15 actionable tasks executed. Common/client and
 runtime compilation, remapping, `buildSelfTest`, `runtimeSelfTest`, and
 `verifyProductionJar` ran. Artifact: `build/libs/mysticism-1.0-SNAPSHOT.jar`.
-Final retained pane `%3589`, run `b8058db2899b47239db5f4a5cb4fa472`.
-An earlier full rerun also passed in 33 seconds (pane `%3580`, run
-`501ebb2d9b78467bb1553bc23b288cc1`). Both ran all 17 suites; the final
-rerun compiled the exact expanded probe source verified below.
+Retained pane `%3634`, run `a693d1df4d02447a964b39989dfd7801`.
+This repair adds `VerticalDiscoveryLifecycleTest`: **1000 checks** through the
+production lifecycle/scheduler helpers, retaining more than twice the scan cap
+of early spawn keys across Session adoption, backpressure, duplicate events,
+chunk/world unload, stop-before-started, server identity isolation and restart.
+A finite persistent backlog discovers isolated deep/middle/high cave bands with
+no further chunk-load event or player visit. Every sampled cell is accounted to
+the shared per-tick read budget and at most one snapshot is admitted per tick.
+These are lifecycle fixtures, not an actual Fabric/Minecraft startup execution.
 
-All **17 discovered** main-based suites executed with assertions enabled:
+All **18 discovered** main-based suites executed with assertions enabled:
 
 | Suite | Evidence/checks |
 | --- | ---: |
@@ -76,6 +87,7 @@ All **17 discovered** main-based suites executed with assertions enabled:
 | NativeEmbeddingOutputTest | 107 |
 | NomicV2ModelAssetsTest | 113 |
 | PinnedEmbeddingModelSelfTest | 25 |
+| VerticalDiscoveryLifecycleTest | 1000 |
 | VerticalDiscoveryTest | 8900 |
 | VerticalSchedulerTest | 43324 |
 | DiscoveryReadinessSelfTest | 18 |
@@ -93,8 +105,8 @@ Malformed-persistence traces are expected negative fixtures.
 ./gradlew --no-daemon --console=plain embeddedInferenceProbe -PembeddingProvision=false
 ```
 
-**PASS**, exit 0, 16 seconds. Retained pane `%3583`, run
-`dd6cd5a97d3446499012e992e91647f3`. The default read-only cache selection loaded
+**PASS**, exit 0, 15 seconds after the startup-order repair. Retained pane `%3637`,
+run `e270ecbb6aff4777beb9fa54ed09785c`. The default read-only cache selection loaded
 `/home/zlare/.cache/mysticism/models/sha256-a5db3381f2e514d3490a3a31fe70eb1a65e95016c85c6c2c23223b810806594f.gguf`:
 **957,680,480 bytes**, SHA256
 `a5db3381f2e514d3490a3a31fe70eb1a65e95016c85c6c2c23223b810806594f`.
@@ -102,8 +114,9 @@ This is real CPU forward-pass evidence with JNI `b10682-5ea1b124e`, not syntheti
 inference or a network endpoint. The probe does not provision weights and sets
 an unusable legacy endpoint to demonstrate the default embedded path ignores it.
 
-The same expanded probe also **PASSED**, exit 0, 15 seconds, with the explicit
-local-path override:
+On retained parent `e84ff3a1e47f19358f710dcade99264e9ffa6b42`, the same expanded
+probe also **PASSED**, exit 0, 15 seconds, with the explicit local-path override
+(not rerun as an explicit-path probe for this startup-only repair):
 
 ```sh
 ./gradlew --no-daemon --console=plain embeddedInferenceProbe -PembeddingProvision=false \

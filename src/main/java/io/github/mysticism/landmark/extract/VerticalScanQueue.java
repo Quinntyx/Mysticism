@@ -33,6 +33,13 @@ public final class VerticalScanQueue<K> {
         else scans.put(key, Objects.requireNonNull(snapshot.get()));
     }
 
+    /** Retain only a key until bounded tick admission. Used by chunk-load callbacks
+     * even before the source Session exists; no world/snapshot closure is retained. */
+    public void defer(K key) {
+        Objects.requireNonNull(key);
+        if (!scans.containsKey(key)) deferred.add(key);
+    }
+
     /** Snapshot and reader callbacks must use non-loading lookups and return null for
      * unloaded keys. Backpressure pauses observation and retains all completed seeds.
      * Returned reads share the source pipeline's tick budget; promotion does no block reads. */

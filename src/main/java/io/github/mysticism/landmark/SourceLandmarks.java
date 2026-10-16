@@ -25,22 +25,22 @@ public final class SourceLandmarks {
     }
     public record Region(String dimension,Bounds bounds,List<Cell> cells,boolean complete){public Region{cells=List.copyOf(cells);}}
     private static final Map<MinecraftServer,Session> SESSIONS=new IdentityHashMap<>();private static boolean initialized;
+    private static final VerticalDiscoveryLifecycle<MinecraftServer,VerticalChunk> DISCOVERY=new VerticalDiscoveryLifecycle<>(VERTICAL_QUEUE);
     private SourceLandmarks(){}
     public static void init(){
         if(initialized)return;initialized=true;
+        // Spawn chunks load between STARTING and STARTED, before LandmarkStore/Session
+        // initialization. Retain keys now; the Session adopts this exact queue later.
+        ServerLifecycleEvents.SERVER_STARTING.register(DISCOVERY::start);
         ServerLifecycleEvents.SERVER_STARTED.register(server->{var store=LandmarkStore.get(server);if(!store.usesNativeSourceProfile(LandmarkProfiles.current()))SpiritActivityService.discardGeneratedInfluences(server);store.clearGeneratedIfIncompatible(LandmarkProfiles.current());SESSIONS.put(server,new Session(server));});
         ServerTickEvents.END_SERVER_TICK.register(server->{Session s=SESSIONS.get(server);if(s!=null)s.tick();});
-        ServerLifecycleEvents.SERVER_STOPPING.register(server->{Session s=SESSIONS.remove(server);if(s!=null)s.close();});
-        ServerWorldEvents.UNLOAD.register((server,world)->{Session s=SESSIONS.get(server);if(s!=null)s.unload(world.getRegistryKey().getValue().toString());});
-        ServerChunkEvents.CHUNK_UNLOAD.register((world,chunk)->{Session s=SESSIONS.get(world.getServer());if(s!=null)s.vertical.remove(new VerticalChunk(world.getRegistryKey().getValue().toString(),chunk.getPos().x,chunk.getPos().z));if(s!=null&&s.active!=null){String dim=world.getRegistryKey().getValue().toString();Bounds area=new Bounds(chunk.getPos().getStartX(),world.getBottomY(),chunk.getPos().getStartZ(),chunk.getPos().getStartX()+16L,world.getTopY(),chunk.getPos().getStartZ()+16L);if(s.active.dimension.equals(dim)&&s.active.guarded!=null&&s.active.guarded.intersects(area))s.active.cancel(new CancellationException("source chunk unloaded during observation"));}});
+        ServerLifecycleEvents.SERVER_STOPPING.register(server->{DISCOVERY.stop(server);Session s=SESSIONS.remove(server);if(s!=null)s.close();});
+        ServerLifecycleEvents.SERVER_STOPPED.register(DISCOVERY::stop);
+        ServerWorldEvents.UNLOAD.register((server,world)->{String dim=world.getRegistryKey().getValue().toString();DISCOVERY.unloadWorld(server,key->key.dimension.equals(dim));Session s=SESSIONS.get(server);if(s!=null)s.unload(dim);});
+        ServerChunkEvents.CHUNK_UNLOAD.register((world,chunk)->{Session s=SESSIONS.get(world.getServer());DISCOVERY.unloaded(world.getServer(),new VerticalChunk(world.getRegistryKey().getValue().toString(),chunk.getPos().x,chunk.getPos().z));if(s!=null&&s.active!=null){String dim=world.getRegistryKey().getValue().toString();Bounds area=new Bounds(chunk.getPos().getStartX(),world.getBottomY(),chunk.getPos().getStartZ(),chunk.getPos().getStartX()+16L,world.getTopY(),chunk.getPos().getStartZ()+16L);if(s.active.dimension.equals(dim)&&s.active.guarded!=null&&s.active.guarded.intersects(area))s.active.cancel(new CancellationException("source chunk unloaded during observation"));}});
         ServerChunkEvents.CHUNK_LOAD.register((world,chunk)->{
-            if(!SourceDimensions.isSource(world.getRegistryKey().getValue().toString()))return;
-            Session s=SESSIONS.get(world.getServer());if(s==null)return;
-            int x=chunk.getPos().getStartX()+8,z=chunk.getPos().getStartZ()+8;
-            int y=chunk.sampleHeightmap(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,x&15,z&15);
-            s.hint(world.getRegistryKey().getValue().toString(),new BlockPos(x,y+1,z));
-            s.queueVertical(world,chunk);
-            if(s.retries.size()<64)s.retries.add(new FrontierRetry(world.getRegistryKey().getValue().toString(),new Bounds(chunk.getPos().getStartX()-1L,world.getBottomY(),chunk.getPos().getStartZ()-1L,chunk.getPos().getStartX()+17L,world.getTopY(),chunk.getPos().getStartZ()+17L)));
+            String dim=world.getRegistryKey().getValue().toString();
+            if(SourceDimensions.isSource(dim))DISCOVERY.loaded(world.getServer(),new VerticalChunk(dim,chunk.getPos().x,chunk.getPos().z));
         });
     }
     public static CompletableFuture<Optional<LandmarkMetadata>> ensureSourceLocation(MinecraftServer server,String dimension,BlockPos position){return ensure(server,dimension,position,null,false);}
@@ -109,22 +109,27 @@ public final class SourceLandmarks {
     private static final class Session {
         final MinecraftServer server;final LandmarkStore store;final ExecutorService worker=new ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(4),Thread.ofPlatform().daemon().name("mysticism-source").factory(),new ThreadPoolExecutor.AbortPolicy());
         final ArrayDeque<SourceOwnership.Request> ownerRequests=new ArrayDeque<>();
-        final VerticalScanQueue<VerticalChunk> vertical=new VerticalScanQueue<>(VERTICAL_QUEUE);
+        final VerticalScanQueue<VerticalChunk> vertical;
         final ArrayDeque<FrontierRetry> retries=new ArrayDeque<>();final Map<CompletableFuture<?>,String> auxiliary=new IdentityHashMap<>();final EmbeddingWorkQueue<Operation<?>> requests=new EmbeddingWorkQueue<>(64);final LinkedHashSet<Hint> hints=new LinkedHashSet<>();Operation<?> active;String status="Idle";int playerCursor,lastCells;
-        Session(MinecraftServer server){this.server=server;store=LandmarkStore.get(server);}
+        Session(MinecraftServer server){this.server=server;store=LandmarkStore.get(server);vertical=DISCOVERY.start(server);}
         <T> CompletableFuture<T> computeAndDeliver(String dim,java.util.function.Supplier<T> computation){
             var out=new CompletableFuture<T>();if(auxiliary.size()>=64){out.completeExceptionally(new RejectedExecutionException("source auxiliary budget"));return out;}auxiliary.put(out,dim);
             try{CompletableFuture.supplyAsync(computation,worker).whenComplete((value,error)->server.execute(()->{auxiliary.remove(out);if(SESSIONS.get(server)!=this)out.cancel(false);else if(error!=null)out.completeExceptionally(error);else out.complete(value);}));}catch(RuntimeException failure){auxiliary.remove(out);out.completeExceptionally(failure);}return out;
         }
         void offer(Operation<?> op){requests.offer(op,op instanceof Ensure,op instanceof Read,op.future,op::cancel,EmbeddingHelper.state());}
         void hint(String dim,BlockPos p){if(hints.size()<128)hints.add(new Hint(dim,p));}
-        /** Chunk load captures at most sixteen heightmap values; overflow retains only
-         * keys for bounded FIFO tick admission. Block reads are spread over ticks, including
-         * every vertical level at these columns, not two lucky deep bands. No tickets,
-         * generated-unloaded reads, inference, or ownership changes here. */
-        void queueVertical(ServerWorld world,WorldChunk chunk){
-            var key=new VerticalChunk(world.getRegistryKey().getValue().toString(),chunk.getPos().x,chunk.getPos().z);
-            vertical.offer(key,()->verticalSnapshot(world,chunk));
+        /** All loads, including pre-Session spawn loads, retain only keys. Tick admission
+         * captures at most one chunk's heightmaps and surface/frontier hints. No startup
+         * sweep, tickets, generated-unloaded reads, inference or ownership changes. */
+        VerticalSeeds.Scan admitVertical(VerticalChunk key){
+            ServerWorld world=world(key.dimension);
+            WorldChunk chunk=world==null?null:world.getChunkManager().getWorldChunk(key.x,key.z);
+            if(chunk==null)return null;
+            int x=chunk.getPos().getStartX()+8,z=chunk.getPos().getStartZ()+8;
+            int y=chunk.sampleHeightmap(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,8,8);
+            hint(key.dimension,new BlockPos(x,y+1,z));
+            if(retries.size()<64)retries.add(new FrontierRetry(key.dimension,new Bounds(chunk.getPos().getStartX()-1L,world.getBottomY(),chunk.getPos().getStartZ()-1L,chunk.getPos().getStartX()+17L,world.getTopY(),chunk.getPos().getStartZ()+17L)));
+            return verticalSnapshot(world,chunk);
         }
         VerticalSeeds.Scan verticalSnapshot(ServerWorld world,WorldChunk chunk){
             ArrayList<VerticalSeeds.Column> columns=new ArrayList<>();
@@ -138,10 +143,7 @@ public final class SourceLandmarks {
             return world==null?null:world.getChunkManager().getWorldChunk(key.x,key.z);
         }
         void advanceVertical(){
-            lastCells+=vertical.advance(VERTICAL_PROBE_BUDGET,key->{
-                WorldChunk chunk=loadedVerticalChunk(key);
-                return chunk==null?null:verticalSnapshot(world(key.dimension),chunk);
-            },key->{
+            lastCells+=vertical.advance(VERTICAL_PROBE_BUDGET,this::admitVertical,key->{
                 WorldChunk chunk=loadedVerticalChunk(key);
                 return chunk==null?null:p->chunk.getBlockState(new BlockPos((int)p.x(),(int)p.y(),(int)p.z())).isAir();
             },()->hints.size()<128,(key,p)->hint(key.dimension,new BlockPos((int)p.x(),(int)p.y(),(int)p.z())));
