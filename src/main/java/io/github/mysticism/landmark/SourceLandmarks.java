@@ -37,7 +37,10 @@ public final class SourceLandmarks {
         ServerLifecycleEvents.SERVER_STOPPING.register(server->{DISCOVERY.stop(server);Session s=SESSIONS.remove(server);if(s!=null)s.close();});
         ServerLifecycleEvents.SERVER_STOPPED.register(DISCOVERY::stop);
         ServerWorldEvents.UNLOAD.register((server,world)->{String dim=world.getRegistryKey().getValue().toString();DISCOVERY.unloadWorld(server,key->key.dimension.equals(dim));Session s=SESSIONS.get(server);if(s!=null)s.unload(dim);});
-        ServerChunkEvents.CHUNK_UNLOAD.register((world,chunk)->{Session s=SESSIONS.get(world.getServer());DISCOVERY.unloaded(world.getServer(),new VerticalChunk(world.getRegistryKey().getValue().toString(),chunk.getPos().x,chunk.getPos().z));if(s!=null&&s.active!=null){String dim=world.getRegistryKey().getValue().toString();Bounds area=new Bounds(chunk.getPos().getStartX(),world.getBottomY(),chunk.getPos().getStartZ(),chunk.getPos().getStartX()+16L,world.getTopY(),chunk.getPos().getStartZ()+16L);if(s.active.dimension.equals(dim)&&s.active.guarded!=null&&s.active.guarded.intersects(area))s.active.cancel(new CancellationException("source chunk unloaded during observation"));}});
+        // Chunk unload changes the observation adapter, not source ownership. Discard only
+        // the live vertical scan; GeneratedSourceReader restarts a partial slice from saved
+        // generated NBT (or a reloaded live chunk). Edits/world exit still invalidate it.
+        ServerChunkEvents.CHUNK_UNLOAD.register((world,chunk)->DISCOVERY.unloaded(world.getServer(),new VerticalChunk(world.getRegistryKey().getValue().toString(),chunk.getPos().x,chunk.getPos().z)));
         ServerChunkEvents.CHUNK_LOAD.register((world,chunk)->{
             String dim=world.getRegistryKey().getValue().toString();
             if(SourceDimensions.isSource(dim))DISCOVERY.loaded(world.getServer(),new VerticalChunk(dim,chunk.getPos().x,chunk.getPos().z));
@@ -97,13 +100,29 @@ public final class SourceLandmarks {
     private static void checkBounds(Bounds b,int maxCells){long volume=Math.multiplyExact(Math.multiplyExact(b.maxX()-b.minX(),b.maxY()-b.minY()),b.maxZ()-b.minZ());if(maxCells<1||maxCells>32768||volume>maxCells||b.minX()<Integer.MIN_VALUE||b.maxX()>Integer.MAX_VALUE||b.minY()<Integer.MIN_VALUE||b.maxY()>Integer.MAX_VALUE||b.minZ()<Integer.MIN_VALUE||b.maxZ()>Integer.MAX_VALUE)throw new IllegalArgumentException("source query bounds");}
     private record Hint(String dimension,BlockPos pos){}
     private record VerticalChunk(String dimension,int x,int z){}
-    private static final class FrontierRetry {
-        final String dimension;final Bounds bounds;String cursor;boolean end;final ArrayDeque<LandmarkMetadata> headers=new ArrayDeque<>();Iterator<FrontierFace> faces;
+    static final class FrontierRetry {
+        final String dimension;final Bounds bounds;String cursor;boolean end;
+        final ArrayDeque<LandmarkMetadata> headers=new ArrayDeque<>();Iterator<FrontierFace> faces;BlockPos pending;
         FrontierRetry(String dimension,Bounds bounds){this.dimension=dimension;this.bounds=bounds;}
-        boolean advance(Session s){
-            if(faces!=null){for(int n=0;n<8&&faces.hasNext();n++){var b=faces.next().missingBounds();if(bounds.contains(b.minX(),b.minY(),b.minZ()))s.hint(dimension,new BlockPos((int)b.minX(),(int)b.minY(),(int)b.minZ()));}if(!faces.hasNext())faces=null;return false;}
-            if(!headers.isEmpty()){var h=headers.removeFirst().header();if(h.kind()==Landmark.Kind.CAVE)faces=h.geometry().frontiers().iterator();return false;}
-            if(end)return true;var page=s.store.sourceRangePage(dimension,bounds,cursor,2,2);cursor=page.nextId();end=page.end();headers.addAll(page.landmarks());return false;
+        boolean advance(Session s){return advance(s.store,s::hint);}
+        boolean advance(LandmarkStore store,java.util.function.BiPredicate<String,BlockPos> hint){
+            if(faces!=null){
+                for(int n=0;n<8 && (pending!=null || faces.hasNext());n++){
+                    if(pending==null){
+                        var b=faces.next().missingBounds();if(!bounds.intersects(b))continue;
+                        pending=new BlockPos((int)Math.max(bounds.minX(),b.minX()),(int)Math.max(bounds.minY(),b.minY()),(int)Math.max(bounds.minZ(),b.minZ()));
+                    }
+                    // A saturated discovery queue must not consume the only reload retry.
+                    if(!hint.test(dimension,pending))return false;
+                    pending=null;
+                }
+                if(pending==null && !faces.hasNext())faces=null;
+                return false;
+            }
+            if(!headers.isEmpty()){faces=headers.removeFirst().header().geometry().frontiers().iterator();return false;}
+            if(end)return true;
+            var page=store.sourceRangePage(dimension,bounds,cursor,2,2);
+            cursor=page.nextId();end=page.end();headers.addAll(page.landmarks());return false;
         }
     }
     private static final class Session {
@@ -117,7 +136,8 @@ public final class SourceLandmarks {
             try{CompletableFuture.supplyAsync(computation,worker).whenComplete((value,error)->server.execute(()->{auxiliary.remove(out);if(SESSIONS.get(server)!=this)out.cancel(false);else if(error!=null)out.completeExceptionally(error);else out.complete(value);}));}catch(RuntimeException failure){auxiliary.remove(out);out.completeExceptionally(failure);}return out;
         }
         void offer(Operation<?> op){requests.offer(op,op instanceof Ensure,op instanceof Read,op.future,op::cancel,EmbeddingHelper.state());}
-        void hint(String dim,BlockPos p){if(hints.size()<128)hints.add(new Hint(dim,p));}
+        void retry(String dim,Bounds bounds){if(retries.size()<64 && retries.stream().noneMatch(r->r.dimension.equals(dim)&&r.bounds.equals(bounds)))retries.addLast(new FrontierRetry(dim,bounds));}
+        boolean hint(String dim,BlockPos p){Hint hint=new Hint(dim,p.toImmutable());return hints.contains(hint) || hints.size()<128 && hints.add(hint);}
         /** All loads, including pre-Session spawn loads, retain only keys. Tick admission
          * captures at most one chunk's heightmaps and surface/frontier hints. No startup
          * sweep, tickets, generated-unloaded reads, inference or ownership changes. */
@@ -128,7 +148,7 @@ public final class SourceLandmarks {
             int x=chunk.getPos().getStartX()+8,z=chunk.getPos().getStartZ()+8;
             int y=chunk.sampleHeightmap(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,8,8);
             hint(key.dimension,new BlockPos(x,y+1,z));
-            if(retries.size()<64)retries.add(new FrontierRetry(key.dimension,new Bounds(chunk.getPos().getStartX()-1L,world.getBottomY(),chunk.getPos().getStartZ()-1L,chunk.getPos().getStartX()+17L,world.getTopY(),chunk.getPos().getStartZ()+17L)));
+            retry(key.dimension,new Bounds(chunk.getPos().getStartX()-1L,world.getBottomY(),chunk.getPos().getStartZ()-1L,chunk.getPos().getStartX()+17L,world.getTopY(),chunk.getPos().getStartZ()+17L));
             return verticalSnapshot(world,chunk);
         }
         VerticalSeeds.Scan verticalSnapshot(ServerWorld world,WorldChunk chunk){

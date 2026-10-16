@@ -38,7 +38,7 @@ Call on server thread. Normal completions return on server thread; shutdown/unlo
 - Actual Nomic biome/structure/palette descriptors are submitted asynchronously; weighted compatible item-index vectors are the fallback, never random/fake vectors. Existing profiles are preserved through LandmarkProfiles.
 - Real adjacent unowned growth; exclusive contiguous source-mask transfer; converged physically adjoining merges through repository plans. Initial biome boundaries do not veto activity merges. Stronger activity can attempt a one-cell steal when a neighbor has not converged. Importance dampens changes and decays with a 35,040,000-tick half-life; chest contents join existing dwell/held/inventory/place/break/use/death/kill/spawn signals. Persistent influence state and merge lineage use existing stores.
 - Disposable old source-generation/catalogue and derived influences are discarded together. Current native source saves retain records, aliases and revisions. Player stats/inventory/source chunks are never cleared.
-- Lifecycle cancellation: player activity disconnect/respawn/dimension changes; source chunk unload/edit invalidates an active snapshot; dimension unload/server stop cancel reads, worker jobs, pending mutations and release activity pauses.
+- Lifecycle cancellation: player activity disconnect/respawn/dimension changes; source edits invalidate an active snapshot; dimension unload/server stop cancel reads, worker jobs, pending mutations and release activity pauses. Chunk unload/reload now switches the generated-only read adapter instead of cancelling discovery; see `runtime-source-unload-reload-handoff.md` for the correction and discovered regression coverage.
 
 ## Exact region ownership hook for TERRAIN (follow-up to terrain 87510e0)
 

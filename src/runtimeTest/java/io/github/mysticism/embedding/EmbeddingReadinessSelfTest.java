@@ -68,31 +68,30 @@ public final class EmbeddingReadinessSelfTest {
         check(failed(excess) instanceof RejectedExecutionException && bound.size() == 1, "Admission remains bounded");
     }
     private static void modelLoss() throws Exception {
-        var holdStarted = new CountDownLatch(1); var badStarted = new CountDownLatch(1);
-        var holdGate = new CountDownLatch(1); var badGate = new CountDownLatch(1);
+        var badStarted = new CountDownLatch(1); var badGate = new CountDownLatch(1);
         var failure = new EmbeddingModelException("pinned model revision changed"); var queuedCalls = new AtomicInteger();
         Provider provider = new Provider() {
             public Vec384f getEmbedding(String text) throws Exception {
-                if (text.equals("held")) { holdStarted.countDown(); holdGate.await(); }
                 if (text.equals("bad")) { badStarted.countDown(); badGate.await(); throw failure; }
-                if (text.equals("queued")) queuedCalls.incrementAndGet();
+                if (text.equals("queued") || text.equals("held")) queuedCalls.incrementAndGet();
                 return vector();
             }
-            public void close() { holdGate.countDown(); badGate.countDown(); }
+            public void close() { badGate.countDown(); }
         };
         try (var e = engine(provider, 2, 1500)) {
             get(e.readiness()); check(e.state().ready(), "Real health probe publishes readiness");
             check(get(e.embed("cached")).data()[767] == 1, "Keep all native v2 coordinates");
-            var held = e.embed("held"); check(holdStarted.await(1, TimeUnit.SECONDS), "Holding worker started");
             var bad = e.embed("bad"); check(badStarted.await(1, TimeUnit.SECONDS), "Failure worker started");
-            var queued = e.embed("queued"); var shared = e.embed("held"); badGate.countDown();
+            // One JNI predictor is exclusive. The second active worker waits at the outer
+            // ownership gate; the rest are queued, not simultaneous model calls.
+            var held = e.embed("held"); var queued = e.embed("queued"); var shared = e.embed("held"); badGate.countDown();
             check(failed(bad) == failure && failed(held) == failure && failed(queued) == failure && failed(shared) == failure,
                     "Model loss terminates active/queued/shared callers with original cause");
             check(e.state().phase() == EmbeddingReadiness.Phase.FAILED && !e.isReady(), "Startup success cannot mask model loss");
             check(failed(e.readiness()) == failure, "Later readiness subscribers see operational failure");
             check(e.cacheSize() == 0 && e.inflightSize() == 0 && queuedCalls.get() == 0, "No old cached vectors, leaked work or invalidated queue execution");
             check(failed(e.embed("cached")).getCause() == failure, "Cache cannot mask a missing/changed model");
-            holdGate.countDown(); eventually(() -> e.inflightSize() == 0);
+            eventually(() -> e.inflightSize() == 0);
         }
         Provider invalid = new Provider() { public Vec384f getEmbedding(String text) { return Vec384f.ZERO(); } };
         try (var e = engine(invalid, 1, 1500)) {

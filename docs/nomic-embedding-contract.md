@@ -98,8 +98,24 @@ compatible semantics. No v1 migration or first-256 reduction is performed.
 * `EmbeddingHelper.profile(): EmbeddingProfile` returns immutable
   `(model, revision, dimensions, semantics, fingerprint)`.
 * `EmbeddingHelper.readiness(): CompletableFuture<Void>` returns a caller-owned
-  copy. `isReady()` and `getInitializationStatus()` expose state. Lifecycle is
-  `initializeServer()` / `shutdown()`; the initializer handles these.
+  subscription with independently reserved delivery. `state()`, `isReady()` and
+  `getInitializationStatus()` expose operational readiness; failed initialization
+  or model loss remains FAILED with its real cause, not a normal STOPPED state.
+  Lifecycle is `initializeServer(server)` / `shutdown(server)`; a late old-server
+  stop cannot cancel its replacement. The initializer handles these events.
+* Factory selection, file hashing, loading and inference run lazily on workers.
+  A process lease covers the factory, all native calls and **completed native
+  teardown**, including world replacement. One exclusive session owns readiness,
+  tokenization/inference and full-native output detachment/normalization. Definitive
+  model failure revokes that session before any waiting worker can enter it.
+* Engine close signals stop without waiting, cancels pending callers and drains
+  every worker. Only then does its cleanup thread dispose native resources.
+  Embedded provider `requestStop()` is a lock/IO-free signal, while `close()`
+  completes teardown synchronously on that cleanup thread. Returning before JNI
+  close finishes would release the process lease early. Failed candidate cleanup
+  (including post-allocation verification failures) or native teardown poisons
+  the lease; a hung native call/close blocks reopening until it returns or the
+  JVM restarts. Cancelled unopened launches bypass the cleanup queue.
 * `EmbeddingHelper.getEmbedding(String descriptor): CompletableFuture<Vec384f>`
   accepts **unprefixed**, nonblank canonical text, at most 8192 Java characters.
   The provider sends `search_document: ` itself. Each success is independently
@@ -138,7 +154,12 @@ CompletableFuture<Vec384f> semantic = EmbeddingHelper.readiness()
 ```
 
 `EmbeddingProvider` is a blocking, closeable provider contract behind the async
-engine: `profile()`, `checkReady()`, `getEmbedding(String)`, `close()`.
+engine: `profile()`, `checkReady()`, `getEmbedding(String)`, `requestStop()`, `close()`.
+`profile()` is metadata-only; `requestStop()` is bounded, lock/IO-free cancellation,
+not disposal; `close()` must return only after teardown completes. The engine
+transfers provider ownership to its serialized session and supplies the drained,
+off-thread disposal owner. A failing native constructor must unwind its own partial
+allocations.
 `EmbeddingService(URI, Duration connectTimeout, Duration requestTimeout)` implements
 `GET /api/tags` and `POST /api/embed`, expects the declared model in the response
 and exactly one native 768-number embedding, retains all coordinates and
@@ -287,5 +308,10 @@ Real inference is a separate explicit task, not a silently skipped test:
 The probe verifies the SHA256/size, runs actual JNI tokenizer/forward passes,
 checks repeated inference, nonidentical descriptor outputs, all 768 coordinates,
 normalization, async readiness, cache ownership and real token-overflow rejection.
+It additionally exercises the production helper's default factory across three
+world identities in one JVM: concurrent full-coordinate comparisons against direct
+native references, cancellation at world replacement, late old-server stop isolation,
+completed JNI teardown and reopening. These are real model/lifecycle checks, not a
+Minecraft client/server bootstrap or an IntelliJ launch.
 Its endpoint is intentionally unreachable. It reports observed cosine values,
 not Minecraft-corpus quality, gameplay verification, or cross-platform results.

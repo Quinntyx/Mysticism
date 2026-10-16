@@ -119,6 +119,7 @@ public final class EmbeddingPipelineTest {
             get(engine.readiness());var first=engine.embed("same");check(f.started.await(1,TimeUnit.SECONDS),"Worker started");var second=engine.embed("same");var cancelled=engine.embed("same");cancelled.cancel(true);f.release.countDown();
             Vec384f a=get(first),b=get(second);a.mul(0);near(b.length(),1);near(get(engine.embed("same")).length(),1);check(f.calls.get()==1,"Deduplicated cache, caller cancellation isolated");
             get(engine.embed("two"));get(engine.embed("three"));check(engine.cacheSize()==2,"Bounded LRU");get(engine.embed("same"));check(f.calls.get()==4,"Oldest cache entry evicted");
+            engine.close();check(engine.awaitClosed(Duration.ofSeconds(2)),"Provider cleanup finished");
         }
         check(f.closed,"Provider closed");
         Fake broken=new Fake();broken.failWork=true;try(var e=engine(broken,4,Duration.ofSeconds(1))){get(e.readiness());failed(e.embed("fail"));check(e.inflightSize()==0,"Exception completes/removes promise");}

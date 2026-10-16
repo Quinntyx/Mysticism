@@ -123,7 +123,12 @@ about 1.9 GB of read IO per initialization; they do not run per descriptor.
 Native memory, supported CPU/platform and real MoE compatibility still need
 verification with the actual weights.
 
-## Regression coverage and actual verification
+## Regression coverage and historical verification
+
+The following records this imported parent's earlier checks and missing-asset
+failure, not current combined-candidate status. The authorized exact GGUF is now
+provisioned; see [merge-0032 validation](runtime-sol-merge-0032-native-validation.md)
+for candidate-specific real-model and regression evidence.
 
 The canonical check is:
 

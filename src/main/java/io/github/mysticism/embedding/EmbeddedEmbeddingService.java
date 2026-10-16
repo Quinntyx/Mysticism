@@ -32,6 +32,8 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
     private final ReentrantLock work = new ReentrantLock();
     private volatile boolean closed;
     private Model model; // guarded by work, including JNI lifetime
+    private boolean disposed;
+    private Throwable disposalFailure;
 
     public EmbeddedEmbeddingService() {
         asset = new LocalNomicV2ModelAsset();
@@ -45,7 +47,8 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
         try {
             requireOpen();
             if (model != null) return;
-            Model candidate = asset.load(loader, () -> closed || Thread.currentThread().isInterrupted());
+            Model candidate = asset.load((path, cancelled) -> track(loader.load(path, cancelled)),
+                    () -> closed || Thread.currentThread().isInterrupted());
             try {
                 requireOpen();
                 if (candidate.dimensions() != EmbeddingSpace.NATIVE_DIMENSIONS)
@@ -54,7 +57,7 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
                 requireOpen();
                 model = candidate; candidate = null;
             } finally { if (candidate != null) candidate.close(); }
-        } finally { releaseIfClosed(); work.unlock(); }
+        } finally { work.unlock(); }
     }
     @Override public Vec384f getEmbedding(String descriptor) throws Exception {
         validateDescriptor(descriptor);
@@ -65,7 +68,7 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
             Vec384f vector = infer(model, descriptor);
             requireOpen();
             return vector;
-        } finally { releaseIfClosed(); work.unlock(); }
+        } finally { work.unlock(); }
     }
     private static Vec384f infer(Model model, String descriptor) {
         validateDescriptor(descriptor);
@@ -111,19 +114,42 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
     private void requireOpen() {
         if (closed || Thread.currentThread().isInterrupted()) throw new CancellationException("Embedded inference closed/cancelled");
     }
-    private void releaseIfClosed() {
-        if (closed && model != null) { Model previous = model; model = null; previous.close(); }
+    /** Track even post-load verification failure cleanup performed inside the asset.
+     * A failed candidate teardown must poison the lifecycle lease just like normal close. */
+    private Model track(Model delegate) {
+        if (delegate == null) throw new IllegalStateException("Native loader returned no model");
+        return new Model() {
+            public int dimensions() { return delegate.dimensions(); }
+            public int tokens(String input) { return delegate.tokens(input); }
+            public float[] embed(String input) { return delegate.embed(input); }
+            public void close() {
+                try { delegate.close(); }
+                catch (RuntimeException | Error failure) { recordDisposalFailure(failure); throw failure; }
+            }
+        };
     }
+    private void recordDisposalFailure(Throwable failure) {
+        if (disposalFailure == null) disposalFailure = failure;
+        else if (disposalFailure != failure) disposalFailure.addSuppressed(failure);
+    }
+    @Override public void requestStop() { closed = true; }
     @Override public void close() {
-        closed = true;
-        // Native loading/execution may not honour interrupts immediately. Do not wait for it
-        // (or deallocate underneath JNI) on a Minecraft lifecycle/tick thread.
-        CompletableFuture.runAsync(asset::close);
-        if (work.tryLock()) {
-            Model previous;
-            try { previous = model; model = null; } finally { work.unlock(); }
-            if (previous != null) CompletableFuture.runAsync(previous::close);
-        }
-        // Otherwise the in-progress worker owns release in its finally block.
+        requestStop();
+        // The ENGINE never calls this on a server/deadline thread or while work is active.
+        // Complete teardown here, not in another future: the outer process lease must be
+        // retained through actual JNI close, including a hung or failed native teardown.
+        work.lock();
+        try {
+            if (!disposed) {
+                disposed = true;
+                try { asset.close(); }
+                catch (RuntimeException | Error failure) { recordDisposalFailure(failure); }
+                Model previous = model; model = null;
+                if (previous != null) try { previous.close(); }
+                catch (RuntimeException | Error failure) { /* tracked close retained the cause */ }
+            }
+            if (disposalFailure instanceof RuntimeException failure) throw failure;
+            if (disposalFailure instanceof Error failure) throw failure;
+        } finally { work.unlock(); }
     }
 }

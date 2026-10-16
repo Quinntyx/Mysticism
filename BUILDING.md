@@ -1,7 +1,10 @@
 # Building Mysticism
 
-Current retained source/native-v2 integration checks and real-inference blockers:
-[merge-0063 validation](docs/runtime-source-embedding-integration.md).
+Current combined source/discovery/lifecycle/picking/native-v2 integration checks:
+[merge-0067 validation](docs/runtime-sol-merge-0067-validation.md).
+The imported [merge-0032 native validation](docs/runtime-sol-merge-0032-native-validation.md)
+and [merge-0063 validation](docs/runtime-source-embedding-integration.md) preserve
+historical parent checks; the latter predates the approved model asset provisioning.
 
 ## Toolchain
 

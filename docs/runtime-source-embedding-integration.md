@@ -1,4 +1,8 @@
-# Retained source discovery / native v2 integration
+# Retained source discovery / native v2 integration (historical reference)
+
+Imported parent-unit record. Its missing-asset blocker predates the authorized
+exact cache asset; current combined retained-unit checks and evidence are in
+[merge-0032 native validation](runtime-sol-merge-0032-native-validation.md).
 
 Branch: `feat-runtime-sol-merge-0063`, targeting **dev**, never main.
 
