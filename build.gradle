@@ -182,6 +182,20 @@ tasks.register('verifyEmbeddedLaunchConfiguration') {
 }
 tasks.named('check') { dependsOn tasks.named('verifyEmbeddedLaunchConfiguration') }
 
+// Opt-in forward inference with exactly the embedding options used by the Loom client.
+// The child changes cwd like IntelliJ's Minecraft launch; no weights enter build/check.
+tasks.register('embeddedIntellijInferenceProbe', JavaExec) {
+    group = 'verification'
+    description = 'Run real embedded inference from an unrelated cwd using Loom client embedding options.'
+    dependsOn tasks.named('runtimeTestClasses'), tasks.named('verifyEmbeddedLaunchConfiguration')
+    classpath = sourceSets.runtimeTest.runtimeClasspath
+    mainClass = 'io.github.mysticism.embedding.EmbeddedIntellijInferenceProbe'
+    enableAssertions = true
+    doFirst {
+        setArgs(loom.runs.client.vmArgs.findAll { it.startsWith('-Dmysticism.embedding.') })
+    }
+}
+
 // Loom replaces the Java publication's dev artifact with remapJar.
 publishing {
     publications {

@@ -1,5 +1,55 @@
 # Retained IntelliJ embedding unit: validation boundary
 
+## Current result after authorized model provisioning
+
+The previous missing-weights blocker is resolved. The exact approved GGUF now
+exists at `/home/zlare/.cache/mysticism/models/sha256-a5db3381f2e514d3490a3a31fe70eb1a65e95016c85c6c2c23223b810806594f.gguf`.
+This retained checkout performed its **own successful real forward passes** (not
+just relying on the merge checkout's reported result). The model resolver verified
+all 957680480 bytes against the pinned SHA256. No model was downloaded, changed,
+truncated, remapped or checked into Git. Earlier commits `3377eba` and `40ab8ca`
+remain ancestors; no merge parents were requested for this unit.
+
+Retained tmux connection/session `$11`, original reopened-process origin `%3572`,
+window `@2177`:
+
+| Command/check | Actual result | Pane / run |
+| --- | --- | --- |
+| `./gradlew --no-daemon --console=plain build` | PASS, 24s; **13 discovered runtime classes** including the new launcher regression, packaging/runner/descriptor fixtures, actual production jar and Loom/IntelliJ serialization/classpath checks | `%3584` / `900a3785f64340a2a682d185a51dc40b` |
+| `./gradlew --no-daemon --console=plain -PembeddingModelPath=/home/zlare/.cache/mysticism/models/sha256-a5db3381f2e514d3490a3a31fe70eb1a65e95016c85c6c2c23223b810806594f.gguf embeddedInferenceProbe` | PASS, 11s; actual tokenizer, repeated/direct and concurrent/async inference, full 768 coordinates, normalization, tail, overflow rejection, cache isolation; no HTTP | `%3578` / `fbbd714db33540caa630aaec2a6b7588` |
+| `./gradlew --no-daemon --console=plain -PmysticismEmbeddingDownload=false -PmysticismEmbeddingNativeThreads=2 embeddedIntellijInferenceProbe` | PASS, 14s; default cache discovery with **no modelPath or provider override**, fresh child JVM and unrelated cwd with spaces, real readiness/inference across two helper lifecycles | `%3579` / `c181d96f3f6346d6a928b55bb7bd41d6` |
+| `./gradlew --no-daemon --console=plain '-PmysticismEmbeddingModelPath=build/embedding approved path/model with spaces.gguf' -PmysticismEmbeddingDownload=false -PmysticismEmbeddingNativeThreads=2 embeddedIntellijInferenceProbe` | PASS, 11s; actual Loom path forwarding with spaces, same real child/lifecycle checks | `%3581` / `89c96669f70847fc93babd0375b6ef32` |
+
+The spaced explicit model fixture is an ignored symlink under this checkout's
+`build/` to the approved cache file, not a substitute/copy or resource-bundle
+confinement bypass. JNI extraction is inside the probe's own cwd. JNI build is
+`b10682-5ea1b124e`; default cache and explicit-path runs both returned full finite,
+normalized native 768-coordinate outputs, nonzero tails and distinct oak/lava
+vectors. Two simultaneous descriptor requests are serviced through the real
+serialized JNI adapter; each helper generation shut down and initialized again.
+The direct probe observed oak/birch cosine 0.86688715 and oak/lava 0.8003141;
+these examples are **not a semantic-corpus quality claim**.
+
+The new opt-in `embeddedIntellijInferenceProbe` consumes the actual Loom client
+embedding JVM options and uses the same main runtime plus test entrypoint on its
+classpath. It verifies default embedded selection, disables downloads, and sets an
+unusable HTTP endpoint. It is deliberately not attached to `build/check`.
+`EmbeddedIntellijInferenceProbeTest` tests its argv/classpath/offline/default-selection
+guards with no model dependency and is discovered by the canonical runner.
+The first development run failed because the new probe had not created its native
+extraction directory; the probe setup was fixed and both real launch modes then
+passed. This was a probe setup failure, not a replacement model or muted failure.
+
+**Boundary/risks:** no IntelliJ GUI or Minecraft game was launched. The actual Loom
+XML serializer/classpath is checked, but existing ignored IntelliJ files remain
+user-owned and may still need their stale bundle VM option removed or updated as
+documented below. Linux x86_64 CPU inference is verified, not other platforms or
+production-load CPU/RAM behavior. llama.cpp logs missing newline/mask vocabulary
+metadata and unsupported GPU/speculative-context warnings for the pinned GGUF;
+forward inference passed without modifying the asset. Model-quality benchmarking,
+resource-cache eviction, and gameplay are outside this unit. The historical
+missing-model failures below are retained for provenance, **not current blockers**.
+
 ## Candidate behavior
 
 The original resource-bundle commit (`3377ebac7fb83f8fe4cf37a18e35acfeab09429f`)
@@ -20,7 +70,7 @@ The JNI runtime and all non-Minecraft dependencies are both on the IDE classpath
 and nested in production. Competing SLF4J/Logback dependencies are excluded.
 No projection, terrain, octree, render or collision implementation was changed.
 
-## Actual checks
+## Historical pre-provisioning checks
 
 Final canonical command:
 
@@ -81,7 +131,7 @@ Gradle 9 deprecation warnings remain. Persistence tests intentionally log reject
 malformed NBT; their assertions pass. The final run has no multiple-SLF4J-provider
 warning (the earlier JNI transitive Logback issue was fixed and guarded).
 
-## Real blocker, not a passing model claim
+## Historical missing-weights blocker (resolved above)
 
 Ran this separate opt-in probe without allowing weight provisioning:
 
@@ -101,14 +151,14 @@ Required GGUF: SHA256
 `a5db3381f2e514d3490a3a31fe70eb1a65e95016c85c6c2c23223b810806594f`,
 exactly **957680480 bytes**.
 
-The previous missing-adapter blocker is addressed in source, classpath, packaging
-and the real JNI loading check. The missing-weights / real-forward-pass blocker
-is **not** addressed by compilation, fixtures, XML generation or JNI ABI loading.
-Until an authorized approved model is provisioned and this probe passes, there is
-no verified real embedding inference, readiness, semantic quality or gameplay.
+At the time of those historical checks the missing-adapter blocker was addressed
+in source, classpath, packaging and JNI loading, but real inference remained
+unverified. Provisioning the exact authorized model and passing the real probes
+above now resolves that blocker; compilation and fixtures alone never did.
+Gameplay and broad semantic quality still have not been verified.
 
-Other risks: the 15-minute preparation bound and native CPU/RAM needs have not
-been measured with weights; macOS/Windows/ARM libraries have only static packaging
-checks; external SPI runtime behavior depends on its adapter; resource-cache
-eviction is not implemented. Preserve the native schema-2/full-768 contract,
+Other risks: the 15-minute preparation bound and production-scale native CPU/RAM
+needs have not been benchmarked; macOS/Windows/ARM libraries have only static
+packaging checks; external SPI runtime behavior depends on its adapter;
+resource-cache eviction is not implemented. Preserve the native schema-2/full-768 contract,
 with no v1 migration, truncation, dummy fallback or external-server prerequisite.

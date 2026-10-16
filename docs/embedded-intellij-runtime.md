@@ -154,5 +154,34 @@ run the **separate opt-in** probe (ordinary builds never fetch weights):
 
 The probe verifies the digest, tokenizer, native 768 inference, tail coordinates,
 normalization, repeated/concurrent requests and overflow rejection with an unusable
-HTTP endpoint. A missing asset must fail honestly. Neither these tests nor a
-successful probe constitute an IntelliJ GUI or gameplay launch.
+HTTP endpoint. A missing asset must fail honestly.
+
+To exercise the **actual Loom client embedding options** from an unrelated Minecraft
+cwd with spaces, use the additional opt-in launch probe:
+
+```sh
+# Default local cache discovery: no modelPath or provider override.
+./gradlew --no-daemon --console=plain \
+  -PmysticismEmbeddingDownload=false embeddedIntellijInferenceProbe
+
+# Explicit model path, resolved exactly as the client run configuration resolves it.
+./gradlew --no-daemon --console=plain \
+  -PmysticismEmbeddingModelPath=/absolute/path/to/approved-nomic-v2.gguf \
+  -PmysticismEmbeddingDownload=false embeddedIntellijInferenceProbe
+```
+
+This launches a fresh child JVM on the runtime test classpath using the client run's
+embedding JVM arguments (and the same main runtime/dependencies), rebases all classpath
+entries before changing cwd, and exercises `EmbeddingHelper` readiness, full native
+inference and shutdown/reinitialization twice. It checks full finite 768-coordinate
+vectors, nonzero tail, distinct descriptors and cache-copy isolation. It never forces
+the provider property: default embedded selection is part of the assertion. Downloads
+are forcibly disabled and the HTTP endpoint is deliberately unusable. Bundle/model
+validation is the real production code, not a fixture. An invalid bundle fails closed.
+The only extra setup is an existing native extraction directory within the probe cwd.
+The ordinary build discovers `EmbeddedIntellijInferenceProbeTest` for argv, absolute
+classpath, default-provider and offline guards **without loading any model**.
+
+These real probes passed on Linux x86_64 with the authorized exact cache asset; see
+[embedded-intellij-validation.md](embedded-intellij-validation.md) for run evidence.
+Neither these tests nor a successful probe constitute an IntelliJ GUI or gameplay launch.

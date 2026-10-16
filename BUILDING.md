@@ -106,8 +106,11 @@ bundle provisioning, Loom/IntelliJ JVM arguments, SPI lifecycle and regression
 boundaries. Actual checks and remaining inference blockers are recorded in
 [embedded-intellij-validation.md](docs/embedded-intellij-validation.md). The default provider is in-process; HTTP is explicit opt-in. This
 checkout contains the real pinned JNI runtime/adapter on both the IDE classpath
-and in the packaged artifact. Approved weights are not provisioned here: successful
-model inference remains blocked until the explicit integration probe actually passes.
+and in the packaged artifact. Approved weights are not bundled; the exact separately
+authorized model is now provisioned in this machine's Mysticism cache. Real local
+inference and the unrelated-cwd launch probe have passed; see the linked validation
+record for evidence and its GUI/gameplay boundary. Use `embeddedIntellijInferenceProbe`
+for an opt-in real forward pass with the current Loom client embedding options.
 See the linked model-path and optional resource-bundle instructions; no external
 service is required.
 `runtimeSelfTest` discovers current embedding and `src/runtimeTest/java` suites;
