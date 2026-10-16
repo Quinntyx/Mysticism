@@ -55,6 +55,7 @@ public final class EmbeddedIntellijLaunchTest {
                         public Vec384f getEmbedding(String text) {
                             throw new AssertionError("Diagnostic fixture must never invent embeddings");
                         }
+                        public void requestStop() { closed.set(true); }
                         public void close() {
                             try { record("close"); closed.set(true); } catch (Exception error) { throw new RuntimeException(error); }
                         }
@@ -138,7 +139,7 @@ public final class EmbeddedIntellijLaunchTest {
                 throw new AssertionError("Child launch timeout: " + mode);
             }
             check(child.exitValue() == 0, "Child launch regression failed: " + mode);
-            String expected = mode.endsWith("cancel") ? "open\nprobe\nclose\ncancelled\n" : "open\nprobe\nclose\n";
+            String expected = mode.endsWith("cancel") ? "open\nprobe\ncancelled\nclose\n" : "open\nprobe\nclose\n";
             check(Files.readString(marker).equals(expected), "Startup failure/cancellation must close runtime exactly once: " + mode);
         }
         System.out.println("EmbeddedIntellijLaunchTest: directory/exploded/jar child launches passed from unrelated cwd; no inference/game launch");
@@ -153,8 +154,8 @@ public final class EmbeddedIntellijLaunchTest {
             check(Files.exists(marker) && Files.readString(marker).contains("probe\n"), "Startup did not enter delegate");
             EmbeddingHelper.shutdown();
             end = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
-            while (!Files.readString(marker).contains("cancelled\n") && System.nanoTime() < end) Thread.sleep(5);
-            check(Files.readString(marker).equals("open\nprobe\nclose\ncancelled\n"), "Bridge shutdown did not promptly cancel native-like startup exactly once");
+            while (!Files.readString(marker).contains("close\n") && System.nanoTime() < end) Thread.sleep(5);
+            check(Files.readString(marker).equals("open\nprobe\ncancelled\nclose\n"), "Bridge shutdown did not promptly cancel native-like startup exactly once");
             check(readiness.isCompletedExceptionally(), "Cancelled startup revived readiness");
             check(!EmbeddingHelper.isReady(), "Shutdown provider remains ready");
         } finally { EmbeddingHelper.shutdown(); }
@@ -170,6 +171,10 @@ public final class EmbeddedIntellijLaunchTest {
                 check(expected.getCause().getMessage().contains("EXPECTED_RESOURCE_PROBE"), "Wrong failure: " + expected);
             }
             check(!EmbeddingHelper.isReady(), "No synthetic readiness after inference failure");
+            // Failure delivery is intentionally independent of native disposal. Wait for
+            // actual teardown, rather than assuming readiness failure ran close inline.
+            long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+            while ((!Files.exists(marker) || !Files.readString(marker).contains("close\n")) && System.nanoTime() < end) Thread.sleep(5);
             check(Files.readString(marker).equals("open\nprobe\nclose\n"), "Runtime factory invoked and cleaned up");
             check(Thread.currentThread().getContextClassLoader() == previous, "Runtime loader must not leak to Minecraft caller");
         } finally { EmbeddingHelper.shutdown(); }

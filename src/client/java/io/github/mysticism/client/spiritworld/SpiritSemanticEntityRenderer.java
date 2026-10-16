@@ -63,42 +63,34 @@ public final class SpiritSemanticEntityRenderer {
                 && client.world.getRegistryKey().getValue().equals(Identifier.of("mysticism","spirit"))
                 && SpiritSceneClient.snapshot().isPresent();
     }
-    public static boolean tryTouch(MinecraftClient client,double reach) {
-        if (!Double.isFinite(reach) || reach<=0 || client.player==null || !ClientSpiritCache.active()
-                || !ClientSpiritCache.deep() || !ClientSpiritCache.observerReady()) return false;
+    /** Shared read-only candidate query for crosshair feedback and the actual touch packet.
+     * Render models remain private; no fake EntityHitResult enters vanilla interaction code. */
+    public static Optional<SpiritTouchPicking.Touch> touchTarget(MinecraftClient client,double reach) {
+        if (!SpiritCrosshair.inSpiritWorld(client) || client.player==null
+                || client.getCameraEntity()!=client.player || client.player.isSpectator()
+                || world!=client.world || player!=client.player || !ClientSpiritCache.active()
+                || !ClientSpiritCache.deep() || !ClientSpiritCache.observerReady()) return Optional.empty();
         var snapshot=SpiritSceneClient.snapshot();
         var mesh=io.github.mysticism.client.spiritworld.terrain.SpiritTerrainClient.frame();
-        if (snapshot.isEmpty() || !snapshot.get().deep() || mesh.isEmpty()) return false;
-        var camera=client.gameRenderer.getCamera(); Vec3d from=camera.getPos();
-        Vec3d end=from.add(Vec3d.fromPolar(camera.getPitch(),camera.getYaw()).multiply(Math.min(4,reach)));
-        UUID selected=null; Vec3d selectedHit=null; double nearest=Double.POSITIVE_INFINITY;
+        if (snapshot.isEmpty() || !snapshot.get().deep() || mesh.isEmpty()) return Optional.empty();
+        var camera=client.gameRenderer.getCamera();
+        var peers=new ArrayList<SpiritTouchPicking.Peer>();
         for (var peer:snapshot.get().peers()) {
             if (!peer.deep() || peer.id().equals(client.player.getUuid())) continue;
             var visual=visuals.get("peer:"+peer.id());
-            if (visual==null || !visual.present || visual.alpha<.3 || visual.model==null) continue;
+            if (visual==null || !visual.present || visual.alpha<.3 || visual.model==null
+                    || failedTypes.contains(Registries.ENTITY_TYPE.getId(visual.model.getType()).toString())) continue;
             double height=visual.model.getHeight()*visual.size,width=visual.model.getWidth()*visual.size;
-            var box=Box.of(visual.position.add(0,height/2,0),width,height,width);
-            var hit=box.raycast(from,end); if (hit.isEmpty()) continue;
-            double distance=hit.get().squaredDistanceTo(from);
-            if (distance<nearest) { nearest=distance; selected=peer.id(); selectedHit=hit.get(); }
+            peers.add(new SpiritTouchPicking.Peer(peer.id(),Box.of(visual.position.add(0,height/2,0),width,height,width)));
         }
-        if (selected==null || !clearMeshRay(mesh.get(),from,selectedHit)) return false;
-        net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.send(new io.github.mysticism.net.SpiritTouchPayload(selected));
-        return true;
+        return SpiritTouchPicking.pick(mesh.get(),peers,camera.getPos(),
+                Vec3d.fromPolar(camera.getPitch(),camera.getYaw()),reach);
     }
-    /** Affine LOCAL shape ray, never a different reconstructed Source Mesh/solid cube. */
-    private static boolean clearMeshRay(io.github.mysticism.dimension.spiritworld.terrain.TerrainMeshFrame frame,Vec3d from,Vec3d to) {
-        for (var cell:frame.cells()) {
-            if (cell.opacity()<=0 || !cell.bounds().intersects(Box.of(from.lerp(to,.5),
-                    Math.abs(from.x-to.x)+.001,Math.abs(from.y-to.y)+.001,Math.abs(from.z-to.z)+.001))) continue;
-            Vec3d r0=cell.axisY().crossProduct(cell.axisZ()); double determinant=cell.axisX().dotProduct(r0);
-            if (Math.abs(determinant)<1e-9) return false; // visible degenerate surface: fail closed
-            Vec3d r1=cell.axisZ().crossProduct(cell.axisX()),r2=cell.axisX().crossProduct(cell.axisY());
-            Vec3d a=from.subtract(cell.min()),b=to.subtract(cell.min());
-            Vec3d localA=new Vec3d(a.dotProduct(r0)/determinant,a.dotProduct(r1)/determinant,a.dotProduct(r2)/determinant);
-            Vec3d localB=new Vec3d(b.dotProduct(r0)/determinant,b.dotProduct(r1)/determinant,b.dotProduct(r2)/determinant);
-            for (var shape:cell.collision()) if (shape.contains(localA) || shape.raycast(localA,localB).isPresent()) return false;
-        }
+    public static boolean tryTouch(MinecraftClient client,double reach) {
+        var selected=touchTarget(client,reach);
+        if (selected.isEmpty()) return false;
+        net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.send(
+                new io.github.mysticism.net.SpiritTouchPayload(selected.get().id()));
         return true;
     }
     /** Actual affine source cell, not a second terrain projection. <=2048 scalar probes/ghost. */

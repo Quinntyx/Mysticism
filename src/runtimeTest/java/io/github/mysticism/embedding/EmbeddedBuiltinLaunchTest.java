@@ -49,8 +49,8 @@ public final class EmbeddedBuiltinLaunchTest {
                 String message = expected.getCause().getMessage();
                 String required = switch (mode) {
                     case "relative" -> "must be an absolute local path";
-                    case "corrupt", "bundle" -> "Pinned Nomic v2 GGUF size mismatch";
-                    case "missing" -> "Pinned Nomic v2 GGUF missing";
+                    case "corrupt", "bundle" -> "Incomplete or wrong native v2 GGUF";
+                    case "missing" -> "Missing native v2 GGUF";
                     default -> "missing bundle";
                 };
                 check(message != null && message.contains(required), "Wrong built-in failure for " + mode + ": " + expected);

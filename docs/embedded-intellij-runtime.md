@@ -48,11 +48,10 @@ must never determine which model is used.
 
 Without a model path or bundle, the worker checks the exact pinned blob under
 `~/.ollama/models/blobs/sha256-<GGUF SHA256>` (just a file, no service), then
-`~/.cache/mysticism/models/sha256-<GGUF SHA256>.gguf`. If absent, the existing
-built-in provider permits fetching that immutable blob from the Ollama registry
-unless `mysticism.embedding.download=false`. A corrupt existing file is rejected,
-not replaced. An explicit missing path **never** triggers downloading elsewhere.
-The registry/network may be unavailable; offline use requires provisioned weights.
+`~/.cache/mysticism/models/sha256-<GGUF SHA256>.gguf`. If absent, readiness fails with the checked paths and approved digest. Asset selection
+is read-only: no downloads, model substitutions, or automatic service fallback.
+A corrupt existing file is rejected, not replaced. An explicit missing path never
+falls through to another cache. Offline operation requires provisioned weights.
 
 Optional Gradle properties forwarded to the client/server JVMs:
 

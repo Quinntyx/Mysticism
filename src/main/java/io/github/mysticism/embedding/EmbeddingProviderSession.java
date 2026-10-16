@@ -1,0 +1,100 @@
+package io.github.mysticism.embedding;
+
+import io.github.mysticism.vector.EmbeddingSpace;
+import io.github.mysticism.vector.Vec384f;
+import java.util.concurrent.CancellationException;
+import java.util.function.BooleanSupplier;
+
+/** Exclusive ownership of a provider's tokenizer, predictor and borrowed output buffers.
+ * No engine/lifecycle monitor is held during provider calls. Shutdown refuses new calls
+ * immediately, but never frees native state while a call still owns it.
+ */
+final class EmbeddingProviderSession implements AutoCloseable {
+    private final EmbeddingProvider provider;
+    private boolean busy, closing, disposeRequested, disposed;
+    private EmbeddingModelException modelFailure;
+
+    EmbeddingProviderSession(EmbeddingProvider provider) { this.provider = provider; }
+
+    private synchronized void acquire() throws InterruptedException {
+        while (busy && !closing) wait();
+        if (modelFailure != null) throw modelFailure;
+        if (closing) throw new CancellationException("Embedding provider session closed");
+        busy = true;
+    }
+
+    private void release() {
+        boolean dispose;
+        synchronized (this) {
+            busy = false;
+            dispose = disposeRequested && !disposed;
+            if (dispose) disposed = true;
+            notifyAll();
+        }
+        if (dispose) provider.close();
+    }
+
+    void checkReady() throws Exception {
+        acquire();
+        try { provider.checkReady(); }
+        finally { release(); }
+    }
+
+    /** Recheck deadline/engine ownership AFTER waiting for the native session. A timed-out
+     * waiter must not launch expensive inference when a prior native call finally returns.
+     * Detach and normalize the complete native vector BEFORE another call can reuse it.
+     */
+    Vec384f infer(String descriptor, BooleanSupplier current) throws Exception {
+        acquire();
+        try {
+            if (!current.getAsBoolean()) return null;
+            Vec384f borrowed = provider.getEmbedding(descriptor);
+            try {
+                EmbeddingSpace.requireCurrent(borrowed);
+                // Normalize while the borrowed output is still exclusively owned. The
+                // stable full-native L2 implementation also detaches its input array.
+                return NativeEmbeddingOutput.normalize(borrowed.data());
+            } catch (IllegalArgumentException invalid) {
+                throw new EmbeddingModelException("Provider returned an invalid current-model vector", invalid);
+            }
+        } catch (EmbeddingModelException failure) {
+            synchronized (this) {
+                // Revoke BEFORE releasing ownership: another waiter must neither enter
+                // a broken runtime nor win a race with engine failure publication.
+                modelFailure = failure; closing = true; notifyAll();
+            }
+            throw failure;
+        } finally { release(); }
+    }
+
+    /** Admission/cancellation only. Engine shutdown must not run native disposal on
+     * the exiting server thread, even when the provider is currently idle. */
+    void requestStop() {
+        synchronized (this) {
+            closing = true;
+            notifyAll();
+        }
+        provider.requestStop();
+    }
+
+    /** Called only after worker termination. Empty launches must not accumulate behind
+     * another session's hung native close on the cleanup executor. */
+    boolean closeUnopened() {
+        if (!(provider instanceof LifecycleEmbeddingProvider owned) || !owned.closeUnopened()) return false;
+        close(); // The lifecycle provider is already closed; no native resources exist.
+        return true;
+    }
+
+    @Override public void close() {
+        boolean dispose;
+        synchronized (this) {
+            closing = true; disposeRequested = true;
+            dispose = !busy && !disposed;
+            if (dispose) disposed = true;
+            notifyAll();
+        }
+        // An active owner performs this cleanup on return, even if it ignores interruption.
+        // Neither shutdown nor deadline delivery waits for that owner.
+        if (dispose) provider.close();
+    }
+}

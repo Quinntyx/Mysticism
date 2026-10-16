@@ -113,7 +113,9 @@ public final class EmbeddedRuntimeResourcesTest {
                         provider.checkReady();
                         throw new AssertionError("Unapproved fixture weights must not become ready");
                     } catch (IOException expected) {
-                        check(expected.getMessage().contains("Pinned Nomic v2 GGUF size mismatch"),
+                        check(expected instanceof NomicV2ModelAssets.AssetException
+                                        && expected.getMessage().contains("Incomplete or wrong native v2 GGUF")
+                                        && expected.getMessage().contains("expected " + NomicV2ModelAssets.APPROVED_GGUF_BYTES),
                                 "Built-in JNI adapter must verify approved weights, not require an external adapter/service");
                     }
                     check(Thread.currentThread().getContextClassLoader() == previous, "Failed built-in startup must restore caller classloader");

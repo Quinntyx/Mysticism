@@ -36,7 +36,13 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
         return CompletableFuture.failedFuture(new RejectedExecutionException("Embedding callback capacity exhausted; retry later"));
     }
 
-    private final EmbeddingProvider provider;
+    // Stop admission immediately, but dispose only after ALL workers have returned.
+    // The session owns serialization AND snapshots of the provider's borrowed output.
+    private static final ExecutorService CLEANUP = Executors.newSingleThreadExecutor(
+            r -> daemon(r, "Mysticism-EmbedCleanup"));
+    private final CountDownLatch providerClosed = new CountDownLatch(1);
+    private volatile Throwable closeFailure;
+    private final EmbeddingProviderSession provider;
     private final ThreadPoolExecutor workers;
     private final ScheduledThreadPoolExecutor timer;
     private final long deadlineMillis;
@@ -46,8 +52,7 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
     private final List<Subscriber<Void>> readySubscribers = new ArrayList<>();
     private ScheduledFuture<?> readyDeadline;
     private Throwable readinessError;
-    private boolean closed, ready, readinessTerminal;
-    private final java.util.concurrent.atomic.AtomicBoolean providerClosed = new java.util.concurrent.atomic.AtomicBoolean();
+    private boolean closed, stopped, ready, readinessTerminal;
     private static final class Request {
         final List<Subscriber<Vec384f>> subscribers = new ArrayList<>();
         Runnable task;
@@ -69,17 +74,39 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
                 || deadline.toMillis() < 1 || deadline.toMillis() > 120000)
             throw new IllegalArgumentException("Invalid embedding bounds");
         if (!provider.profile().equals(EmbeddingProfile.current())) throw new IllegalArgumentException("Provider profile mismatch");
-        this.provider = provider; this.deadlineMillis = deadline.toMillis(); this.cacheCapacity = cacheCapacity;
+        this.provider = new EmbeddingProviderSession(provider);
+        this.deadlineMillis = deadline.toMillis(); this.cacheCapacity = cacheCapacity;
         workers = new ThreadPoolExecutor(threads, threads, 0, TimeUnit.SECONDS,
                 new ArrayBlockingQueue<>(queueCapacity), r -> daemon(r, "Mysticism-EmbedWorker"),
-                new ThreadPoolExecutor.AbortPolicy());
+                new ThreadPoolExecutor.AbortPolicy()) {
+            @Override protected void terminated() {
+                if (AsyncEmbeddingEngine.this.provider.closeUnopened()) {
+                    providerClosed.countDown();
+                    return;
+                }
+                CLEANUP.execute(() -> {
+                    try { AsyncEmbeddingEngine.this.provider.close(); }
+                    catch (Throwable error) {
+                        closeFailure = error;
+                        System.getLogger("Mysticism").log(System.Logger.Level.ERROR,
+                                "Embedding resource shutdown failed; restart the process before reopening a native model", error);
+                    }
+                    finally { providerClosed.countDown(); }
+                });
+            }
+        };
         timer = new ScheduledThreadPoolExecutor(1, r -> daemon(r, "Mysticism-EmbedDeadline"));
         timer.setRemoveOnCancelPolicy(true);
         readyDeadline = timer.schedule(() -> finishReadiness(new TimeoutException("Embedding readiness deadline")), preparationDeadline.toMillis(), TimeUnit.MILLISECONDS);
-        workers.execute(() -> {
-            try { provider.checkReady(); finishReadiness(null); }
-            catch (Throwable error) { finishReadiness(error); }
-        });
+        try {
+            workers.execute(() -> {
+                try { this.provider.checkReady(); finishReadiness(null); }
+                catch (Throwable error) { finishReadiness(error); }
+            });
+        } catch (RejectedExecutionException error) {
+            // A very short readiness deadline may close the engine before submission.
+            finishReadiness(error);
+        }
     }
     private static Thread daemon(Runnable r, String name) {
         Thread thread = new Thread(r, name); thread.setDaemon(true); return thread;
@@ -93,12 +120,9 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
             subscribers = List.copyOf(readySubscribers); readySubscribers.clear();
         }
         for (var subscriber : subscribers) publish(subscriber, null, error);
-        if (error != null) {
-            workers.shutdownNow();
-            // Failure/timeout must cancel preparation and release an eventual native context.
-            // Provider cleanup cannot stall the deadline or subscriber delivery threads.
-            CompletableFuture.runAsync(this::closeProvider);
-        }
+        // Failed/expired preparation still owns real native resources. Drain before disposal,
+        // preserving FAILED (with its cause) rather than disguising it as an explicit stop.
+        if (error != null) shutdown(error);
     }
     public CompletableFuture<Void> readiness() {
         Subscriber<Void> subscriber = null; boolean terminal; Throwable error;
@@ -110,6 +134,21 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
         return subscriber == null ? overloaded() : subscriber.future;
     }
     public synchronized boolean isReady() { return ready && !closed; }
+    public synchronized EmbeddingReadiness state() {
+        if (stopped) return new EmbeddingReadiness(EmbeddingReadiness.Phase.STOPPED, new CancellationException("Embedding shutdown"));
+        if (!readinessTerminal) return new EmbeddingReadiness(EmbeddingReadiness.Phase.INITIALIZING, null);
+        return ready ? new EmbeddingReadiness(EmbeddingReadiness.Phase.READY, null)
+                : new EmbeddingReadiness(EmbeddingReadiness.Phase.FAILED, readinessError);
+    }
+    synchronized String initializationStatus() {
+        var snapshot = state();
+        return switch (snapshot.phase()) {
+            case READY -> "Ready";
+            case INITIALIZING -> "Initializing";
+            case STOPPED -> "Stopped";
+            case FAILED -> "Unavailable: " + EmbeddingReadiness.describe(snapshot.failure());
+        };
+    }
 
     public CompletableFuture<Vec384f> embed(String descriptor) {
         if (descriptor == null || descriptor.isBlank() || descriptor.length() > 8192)
@@ -117,7 +156,7 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
         String key = EmbeddingSpace.FINGERPRINT + ":" + descriptor;
         Subscriber<Vec384f> subscriber = null; Vec384f cached = null; Throwable rejection = null;
         synchronized (this) {
-            if (!ready || closed) rejection = new IllegalStateException("Embeddings unavailable; inspect readiness");
+            if (!ready || closed) rejection = new IllegalStateException("Embeddings unavailable; inspect readiness", state().failure());
             else {
                 cached = cache.get(key); if (cached != null) cached = cached.clone();
                 if (cached == null) {
@@ -147,47 +186,74 @@ public final class AsyncEmbeddingEngine implements AutoCloseable {
         if (rejection != null) publish(subscriber, null, rejection);
         return subscriber.future;
     }
+    private synchronized boolean isCurrent(String key, Request request) {
+        return !closed && pending.get(key) == request;
+    }
     private void run(String key, String descriptor, Request request) {
-        synchronized (this) { if (closed || pending.get(key) != request) return; }
+        if (!isCurrent(key, request)) return;
         try {
-            Vec384f value = provider.getEmbedding(descriptor); EmbeddingSpace.requireCurrent(value);
-            if (value.length() == 0) throw new IllegalArgumentException("Provider returned zero embedding");
-            finish(key, request, new Vec384f(value.norm()), null);
-        } catch (Throwable error) { finish(key, request, null, error); }
+            Vec384f value = provider.infer(descriptor, () -> isCurrent(key, request));
+            if (value != null) finish(key, request, value, null);
+        } catch (Throwable error) { finish(key, request, null, EmbeddingReadiness.unwrap(error)); }
     }
     private void finish(String key, Request request, Vec384f value, Throwable error) {
+        List<Request> invalidated = List.of();
+        boolean deliver, modelFailed = false;
         synchronized (this) {
-            if (pending.get(key) != request) return;
-            pending.remove(key);
-            if (request.deadline != null) request.deadline.cancel(false);
-            workers.remove(request.task);
-            if (error == null) {
+            deliver = pending.get(key) == request;
+            if (deliver) {
+                pending.remove(key);
+                if (request.deadline != null) request.deadline.cancel(false);
+                workers.remove(request.task);
+            }
+            // A late definitive model error still revokes readiness after its request
+            // deadline. Late successes cannot repopulate caches or redeliver subscribers.
+            if (!closed && ready && error instanceof EmbeddingModelException) {
+                modelFailed = true;
+                // A successful startup probe cannot authorize a missing/changed model forever.
+                // Fail the generation atomically; no cached result or queued old-model success
+                // can make a fresh discovery look ready. Current persisted anchors are separate.
+                ready = false; readinessError = error; cache.clear();
+                invalidated = List.copyOf(pending.values()); pending.clear();
+                for (var work : invalidated) {
+                    if (work.deadline != null) work.deadline.cancel(false);
+                    workers.remove(work.task);
+                }
+            } else if (deliver && error == null) {
                 cache.put(key, value.clone());
                 while (cache.size() > cacheCapacity) cache.remove(cache.keySet().iterator().next());
             }
         }
-        for (var subscriber : request.subscribers) publish(subscriber, error == null ? value.clone() : null, error);
+        if (deliver) for (var subscriber : request.subscribers) publish(subscriber, error == null ? value.clone() : null, error);
+        for (var work : invalidated) for (var subscriber : work.subscribers) publish(subscriber, null, error);
+        if (modelFailed) shutdown(error);
     }
     public synchronized int cacheSize() { return cache.size(); }
     public synchronized int inflightSize() { return pending.size(); }
-    public void close() {
+    public void close() { shutdown(null); }
+    private void shutdown(Throwable failure) {
         List<Request> cancelled; List<Subscriber<Void>> readyCancelled;
         CancellationException error = new CancellationException("Embedding shutdown");
         synchronized (this) {
+            if (failure == null) stopped = true;
             if (closed) return;
             closed = true; ready = false;
             readyCancelled = List.copyOf(readySubscribers); readySubscribers.clear();
-            if (!readinessTerminal) { readinessTerminal = true; readinessError = error; }
+            readinessTerminal = true; readinessError = failure == null ? error : failure;
             if (readyDeadline != null) readyDeadline.cancel(false);
             cancelled = List.copyOf(pending.values()); pending.clear(); cache.clear();
             for (Request request : cancelled) if (request.deadline != null) request.deadline.cancel(false);
         }
+        provider.requestStop();
         workers.shutdownNow(); timer.shutdownNow();
         for (var subscriber : readyCancelled) publish(subscriber, null, error);
         for (Request request : cancelled) for (var subscriber : request.subscribers) publish(subscriber, null, error);
-        closeProvider();
     }
-    private void closeProvider() {
-        if (providerClosed.compareAndSet(false, true)) provider.close();
+    /** Package-private bounded observation for lifecycle regressions; close itself never waits.
+     * False means native work/cleanup still owns the resource, not that it is safe to reopen. */
+    boolean awaitClosed(Duration timeout) throws InterruptedException {
+        if (!providerClosed.await(timeout.toMillis(), TimeUnit.MILLISECONDS)) return false;
+        if (closeFailure != null) throw new IllegalStateException("Embedding resource shutdown failed", closeFailure);
+        return true;
     }
 }

@@ -102,9 +102,26 @@ public final class GenerationSurveyStartupTest {
         var load=methods.get(bindings.get("CHUNK_LOAD"));
         check(load!=null&&load.indexOf("capture")>=0&&load.indexOf("sessions")>load.indexOf("capture"),"registered Fabric CHUNK_LOAD must survey before checking for a null Session");
         var start=methods.get(bindings.get("SERVER_STARTED"));
-        check(start!=null&&start.indexOf("started")>=0&&start.indexOf("session-constructor")>start.indexOf("started"),"registered SERVER_STARTED must construct Session with the retained lifecycle queue");
+        check(start!=null&&start.contains("session-constructor"),"registered SERVER_STARTED must construct the source Session");
+        // The combined vertical/generation Session adopts both retained queues inside
+        // its constructor. Follow that real call path rather than demanding an inline
+        // lifecycle call in the registered lambda.
+        List<String> constructorCalls=new ArrayList<>();
+        try(InputStream in=SourceLandmarks.class.getResourceAsStream("SourceLandmarks$Session.class")){
+            if(in==null)throw new AssertionError("missing compiled Session");
+            new ClassReader(in).accept(new ClassVisitor(Opcodes.ASM9){
+                @Override public MethodVisitor visitMethod(int access,String name,String descriptor,String signature,String[] exceptions){
+                    if(!name.equals("<init>"))return null;
+                    return new MethodVisitor(Opcodes.ASM9){
+                        @Override public void visitMethodInsn(int opcode,String owner,String call,String desc,boolean itf){constructorCalls.add(owner+"."+call);}
+                    };
+                }
+            },ClassReader.SKIP_DEBUG|ClassReader.SKIP_FRAMES);
+        }
+        check(constructorCalls.contains(source.substring(0,source.lastIndexOf('/')+1)+"GenerationSurveyLifecycle.started"),"Session must adopt the same generation queue populated before SERVER_STARTED");
+        check(constructorCalls.contains("io/github/mysticism/landmark/extract/VerticalDiscoveryLifecycle.start"),"Session must also adopt retained vertical discovery");
         var unload=methods.get(bindings.get("CHUNK_UNLOAD"));
-        check(unload!=null&&unload.indexOf("unloaded")>=0&&unload.indexOf("sessions")>unload.indexOf("unloaded"),"registered CHUNK_UNLOAD must release early work even without a Session");
+        check(unload!=null&&unload.indexOf("unloaded")>=0&&(unload.indexOf("sessions")==-1||unload.indexOf("sessions")>unload.indexOf("unloaded")),"registered CHUNK_UNLOAD must release early work even without a Session");
         var worldUnload=methods.get(bindings.get("UNLOAD"));
         check(worldUnload!=null&&worldUnload.indexOf("unloaded")>=0&&worldUnload.indexOf("sessions")>worldUnload.indexOf("unloaded"),"registered world UNLOAD must release early dimension work before Session lookup");
         check("stopped".equals(bindings.get("SERVER_STOPPING"))&&"stopped".equals(bindings.get("SERVER_STOPPED")),"both stop events use idempotent cleanup, including failed startup");

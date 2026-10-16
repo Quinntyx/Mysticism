@@ -103,8 +103,9 @@ public final class EmbeddedEmbeddingSelfTest {
         // A JNI-like load which ignores interruption must not hold shutdown or revive readiness.
         Asset slowAsset = new Asset(); Model late = new Model();
         CountDownLatch started = new CountDownLatch(1), finish = new CountDownLatch(1);
+        var cancellation = new AtomicReference<java.util.function.BooleanSupplier>();
         var slow = new EmbeddedEmbeddingService(slowAsset, (path, cancelled) -> {
-            started.countDown();
+            cancellation.set(cancelled); started.countDown();
             while (finish.getCount() > 0) { try { finish.await(); } catch (InterruptedException ignored) { /* native-like */ } }
             check(cancelled.getAsBoolean(), "Timed-out preparation did not cancel loader");
             return late;
@@ -112,12 +113,17 @@ public final class EmbeddedEmbeddingSelfTest {
         var engine = new AsyncEmbeddingEngine(slow, 1, 4, 4, Duration.ofMillis(50), Duration.ofMillis(150));
         try {
             check(started.await(1, TimeUnit.SECONDS), "Slow loader did not start"); failed(engine.readiness());
-            check(slowAsset.closed.await(2, TimeUnit.SECONDS), "Readiness timeout did not close provider");
-            long start = System.nanoTime(); engine.close(); slow.close();
+            long cancellationEnd = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (!cancellation.get().getAsBoolean() && System.nanoTime() < cancellationEnd) Thread.sleep(2);
+            check(cancellation.get().getAsBoolean(), "Readiness timeout did not signal the native loader");
+            check(slowAsset.closed.getCount() == 1, "Preparation asset freed before worker drain");
+            long start = System.nanoTime(); engine.close();
             check(System.nanoTime() - start < TimeUnit.MILLISECONDS.toNanos(100), "Shutdown waits for native load");
             finish.countDown();
             long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
             while (late.closes.get() == 0 && System.nanoTime() < end) Thread.sleep(5);
+            check(engine.awaitClosed(Duration.ofSeconds(2)), "Late JNI cleanup did not finish");
+            check(slowAsset.closed.getCount() == 0, "Drained preparation did not close asset");
             check(late.closes.get() == 1 && late.calls.get() == 0, "Late JNI context leaked/published");
             check(!engine.isReady(), "Late preparation revived failed readiness"); failed(engine.embed("late"));
         } finally { finish.countDown(); engine.close(); }

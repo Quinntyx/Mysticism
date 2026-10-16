@@ -6,11 +6,12 @@ package io.github.mysticism.embedding;
 public final class EmbeddingProviders {
     public static final String PROVIDER_PROPERTY = "mysticism.embedding.provider";
     private EmbeddingProviders() {}
+    public static EmbeddingProvider create() { return configured(); }
     public static EmbeddingProvider configured() {
         return switch (System.getProperty(PROVIDER_PROPERTY, "embedded")) {
             case "embedded" -> new EmbeddedEmbeddingProvider();
-            case "http" -> new EmbeddingService();
-            default -> throw new IllegalArgumentException(PROVIDER_PROPERTY + " must be embedded or http");
+            case "http", "ollama" -> new EmbeddingService();
+            default -> throw new IllegalArgumentException(PROVIDER_PROPERTY + " must be embedded, http or ollama");
         };
     }
 }

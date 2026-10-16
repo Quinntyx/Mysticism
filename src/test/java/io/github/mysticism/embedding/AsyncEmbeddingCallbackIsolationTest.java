@@ -114,7 +114,7 @@ public final class AsyncEmbeddingCallbackIsolationTest {
         var e=new AsyncEmbeddingEngine(p,1,8,2,Duration.ofSeconds(1));e.readiness().get(1,TimeUnit.SECONDS);
         Field field=EmbeddingHelper.class.getDeclaredField("engine");field.setAccessible(true);
         check(field.get(null)==null,"Test refuses to overwrite an active helper engine");field.set(null,e);
-        try { EmbeddingHelper.shutdown(); }
+        try { EmbeddingHelper.shutdown();check(e.awaitClosed(Duration.ofSeconds(2)),"Helper resource cleanup finished"); }
         finally {e.close();field.set(null,null);}
         check(!p.closeHeld,"Helper shutdown closes provider under lifecycle monitor");
         check(p.helperAccessible,"Provider close cross-locks lifecycle monitor");

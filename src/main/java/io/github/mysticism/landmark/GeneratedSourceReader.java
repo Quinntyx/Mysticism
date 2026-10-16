@@ -15,12 +15,25 @@ import java.util.concurrent.*;
  * vanilla's async read-only NBT scanner (including pending saves), NEVER getChunk/create/tickets.
  * Detached NBT palettes are decoded on our bounded worker, with no world/registry access there. */
 final class GeneratedSourceReader {
-    final String dimension; final Bounds bounds; final ServerWorld world;
+    /** Owner-thread adapter; saved rows are detached generated-only observations. */
+    interface Source {
+        LiveChunk loaded(ChunkPos position);
+        CompletableFuture<List<SourceLandmarks.Cell>> saved(ChunkPos position, Bounds bounds);
+    }
+    record LiveChunk(Object identity, java.util.function.Function<BlockPoint,SourceLandmarks.Cell> sample) {}
+    final String dimension; final Bounds bounds; final ServerWorld world; final Source source;
+    Object liveIdentity;
     final SourceLandmarks.Cell[] cells; final List<ChunkPos> chunks=new ArrayList<>();
     final Executor executor; int chunkIndex,cellIndex,lastSampled; boolean cancelled;
     CompletableFuture<List<SourceLandmarks.Cell>> disk;List<SourceLandmarks.Cell> diskRows;int diskCursor;
     GeneratedSourceReader(ServerWorld world,Bounds bounds,Executor executor) {
-        this.world=world;this.dimension=world.getRegistryKey().getValue().toString();this.bounds=bounds;this.executor=executor;
+        this(world,world.getRegistryKey().getValue().toString(),bounds,executor,source(world,executor));
+    }
+    GeneratedSourceReader(String dimension,Bounds bounds,Executor executor,Source source) {
+        this(null,dimension,bounds,executor,source);
+    }
+    private GeneratedSourceReader(ServerWorld world,String dimension,Bounds bounds,Executor executor,Source source) {
+        this.world=world;this.dimension=dimension;this.bounds=bounds;this.executor=executor;this.source=source;
         long volume=Math.multiplyExact(Math.multiplyExact(bounds.maxX()-bounds.minX(),bounds.maxY()-bounds.minY()),bounds.maxZ()-bounds.minZ());
         if(volume>32768)throw new IllegalArgumentException("source region volume");
         cells=new SourceLandmarks.Cell[(int)volume];
@@ -32,35 +45,70 @@ final class GeneratedSourceReader {
         lastSampled=0;if(cancelled)throw new CancellationException();
         if(chunkIndex==chunks.size())return true;
         ChunkPos cp=chunks.get(chunkIndex);
+        LiveChunk live=source.loaded(cp);
+        // A reloaded chunk is authoritative, even while an old/absent disk scan is pending.
+        // Start its slice again: never combine partial observations from different adapters.
+        if(live!=null && (disk!=null || liveIdentity!=null && liveIdentity!=live.identity())) {
+            discardCurrentSamples(cp);
+            if(disk!=null)disk.cancel(false);
+            disk=null;diskRows=null;diskCursor=0;cellIndex=0;
+        }
         if(disk!=null) {
             if(!disk.isDone())return false;if(diskRows==null)diskRows=disk.getNow(List.of());
             int end=Math.min(diskRows.size(),diskCursor+budget);
             while(diskCursor<end){lastSampled++;var cell=diskRows.get(diskCursor++);cells[index(bounds,cell.position())]=cell;}
-            if(diskCursor==diskRows.size()){disk=null;diskRows=null;diskCursor=0;chunkIndex++;cellIndex=0;}
+            if(diskCursor==diskRows.size()){disk=null;diskRows=null;diskCursor=0;chunkIndex++;cellIndex=0;liveIdentity=null;}
             return chunkIndex==chunks.size();
         }
-        WorldChunk live=world.getChunkManager().getWorldChunk(cp.x,cp.z);
         if(live==null) {
-            // Capture world-specific immutable dimensions on server thread BEFORE the callback.
-            int bottom=world.getBottomY(),height=world.getHeight();Bounds region=bounds;
-            var scanner=new LimitedCollector();
-            disk=world.getChunkManager().getChunkIoWorker().scanChunk(cp,scanner)
-                .thenApplyAsync(v->Arrays.stream(decode(scanner.getRoot(),cp,region,bottom,height)).filter(Objects::nonNull).toList(),executor);
+            // Saved data may lack sections/cells. Partial live rows cannot prove those missing
+            // cells: discard them before merging the detached saved observation.
+            discardCurrentSamples(cp);cellIndex=0;liveIdentity=null;
+            disk=source.saved(cp,bounds);
             return false;
         }
-        Bounds slice=new Bounds(Math.max(bounds.minX(),cp.getStartX()),bounds.minY(),Math.max(bounds.minZ(),cp.getStartZ()),Math.min(bounds.maxX(),cp.getStartX()+16L),bounds.maxY(),Math.min(bounds.maxZ(),cp.getStartZ()+16L));
+        liveIdentity=live.identity();
+        Bounds slice=slice(cp);
         int volume=(int)((slice.maxX()-slice.minX())*(slice.maxY()-slice.minY())*(slice.maxZ()-slice.minZ()));int sampled=0;long deadline=System.nanoTime()+1_500_000L;
         while(cellIndex<volume && sampled<budget && (sampled==0||System.nanoTime()<deadline)) {
             BlockPoint p=point(slice,cellIndex++);int i=index(bounds,p);sampled++;lastSampled++;
-            if(p.y()<world.getBottomY() || p.y()>=world.getTopY())continue;
-            BlockPos pos=new BlockPos((int)p.x(),(int)p.y(),(int)p.z());var state=live.getBlockState(pos);
-            Map<String,String> properties=new TreeMap<>();state.getEntries().forEach((key,value)->properties.put(key.getName(),name(key,value)));
-            String biome=live.getBiomeForNoiseGen(pos.getX()>>2,pos.getY()>>2,pos.getZ()>>2).getKey().map(k->k.getValue().toString()).orElse(null);
-            if(biome!=null)cells[i]=new SourceLandmarks.Cell(p,new BlockPalette.State(Registries.BLOCK.getId(state.getBlock()).toString(),properties),biome,
-                p.y()>live.sampleHeightmap(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,pos.getX()&15,pos.getZ()&15));
+            cells[i]=live.sample().apply(p);
         }
-        if(cellIndex==volume){chunkIndex++;cellIndex=0;}
+        if(cellIndex==volume){chunkIndex++;cellIndex=0;liveIdentity=null;}
         return chunkIndex==chunks.size();
+    }
+    private Bounds slice(ChunkPos cp) {
+        return new Bounds(Math.max(bounds.minX(),cp.getStartX()),bounds.minY(),Math.max(bounds.minZ(),cp.getStartZ()),Math.min(bounds.maxX(),cp.getStartX()+16L),bounds.maxY(),Math.min(bounds.maxZ(),cp.getStartZ()+16L));
+    }
+    private void discardCurrentSamples(ChunkPos cp) {
+        Bounds slice=slice(cp);
+        // Clear contiguous x-runs without allocating/visiting cells in other chunks.
+        for(long y=slice.minY();y<slice.maxY();y++)for(long z=slice.minZ();z<slice.maxZ();z++) {
+            int start=index(bounds,new BlockPoint(slice.minX(),y,z));
+            Arrays.fill(cells,start,start+(int)(slice.maxX()-slice.minX()),null);
+        }
+    }
+    private static Source source(ServerWorld world,Executor executor) {
+        return new Source() {
+            public LiveChunk loaded(ChunkPos cp) {
+                WorldChunk chunk=world.getChunkManager().getWorldChunk(cp.x,cp.z);
+                if(chunk==null)return null;
+                return new LiveChunk(chunk,p->{
+                    if(p.y()<world.getBottomY() || p.y()>=world.getTopY())return null;
+                    BlockPos pos=new BlockPos((int)p.x(),(int)p.y(),(int)p.z());var state=chunk.getBlockState(pos);
+                    Map<String,String> properties=new TreeMap<>();state.getEntries().forEach((key,value)->properties.put(key.getName(),name(key,value)));
+                    String biome=chunk.getBiomeForNoiseGen(pos.getX()>>2,pos.getY()>>2,pos.getZ()>>2).getKey().map(k->k.getValue().toString()).orElse(null);
+                    return biome==null?null:new SourceLandmarks.Cell(p,new BlockPalette.State(Registries.BLOCK.getId(state.getBlock()).toString(),properties),biome,
+                        p.y()>chunk.sampleHeightmap(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,pos.getX()&15,pos.getZ()&15));
+                });
+            }
+            public CompletableFuture<List<SourceLandmarks.Cell>> saved(ChunkPos cp,Bounds bounds) {
+                // Capture world dimensions on server thread, no world/registry access on worker.
+                int bottom=world.getBottomY(),height=world.getHeight();var scanner=new LimitedCollector();
+                return world.getChunkManager().getChunkIoWorker().scanChunk(cp,scanner)
+                    .thenApplyAsync(v->Arrays.stream(decode(scanner.getRoot(),cp,bounds,bottom,height)).filter(Objects::nonNull).toList(),executor);
+            }
+        };
     }
     CompletableFuture<SourceLandmarks.Region> resultAsync(){var copy=cells.clone();return CompletableFuture.supplyAsync(()->new SourceLandmarks.Region(dimension,bounds,Arrays.stream(copy).filter(Objects::nonNull).toList(),Arrays.stream(copy).allMatch(Objects::nonNull)),executor);}
     private static int index(Bounds b,BlockPoint p){return (int)((p.x()-b.minX())+(b.maxX()-b.minX())*((p.z()-b.minZ())+(b.maxZ()-b.minZ())*(p.y()-b.minY())));}
@@ -74,7 +122,7 @@ final class GeneratedSourceReader {
         @Override public NbtScanner.Result visitLongArray(long[] values){if(values.length>4096||(words+=values.length)>524288)throw new IllegalArgumentException("chunk packed array budget");return super.visitLongArray(values);}
         @Override public NbtScanner.Result visitString(String value){if(value.length()>1024||(characters+=value.length())>4194304)throw new IllegalArgumentException("chunk descriptor budget");return super.visitString(value);}
     }
-    private static SourceLandmarks.Cell[] decode(NbtElement root,ChunkPos cp,Bounds bounds,int bottom,int height) {
+    static SourceLandmarks.Cell[] decode(NbtElement root,ChunkPos cp,Bounds bounds,int bottom,int height) {
         int volume=(int)((bounds.maxX()-bounds.minX())*(bounds.maxY()-bounds.minY())*(bounds.maxZ()-bounds.minZ()));
         SourceLandmarks.Cell[] result=new SourceLandmarks.Cell[volume];
         if(!(root instanceof NbtCompound n) || !Set.of("full","minecraft:full").contains(n.getString("Status")))return result;

@@ -90,7 +90,7 @@ public class Mysticism implements ModInitializer, DedicatedServerModInitializer 
                 SpiritWorldGenerator.CODEC);
 
         ServerLifecycleEvents.SERVER_STARTED.register(this::onServerStarted);
-        ServerLifecycleEvents.SERVER_STOPPING.register(server -> EmbeddingHelper.shutdown());
+        ServerLifecycleEvents.SERVER_STOPPING.register(EmbeddingHelper::shutdown);
         ServerWorldEvents.LOAD.register(this::onWorldLoad);
     }
 
@@ -101,7 +101,7 @@ public class Mysticism implements ModInitializer, DedicatedServerModInitializer 
 
     private void onServerStarted(MinecraftServer server) {
         LOGGER.info("Server started - initializing EmbeddingHelper without toast");
-        EmbeddingHelper.initializeServer();
+        EmbeddingHelper.initializeServer(server);
         ItemEmbeddingIndexState itemIndex = ItemEmbeddingIndexState.get(server);
         var spatialIndex = io.github.mysticism.world.state.SpatialEmbeddingIndexState.get(server);
         // Loading state never performs inference; no startup joins or model downloads.

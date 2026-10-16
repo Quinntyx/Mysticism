@@ -18,47 +18,31 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
         @Override void close();
     }
     interface Loader { Model load(Path path, BooleanSupplier cancelled) throws Exception; }
-    interface Asset extends AutoCloseable { Path resolve() throws Exception; @Override void close(); }
+    interface Asset extends AutoCloseable {
+        Path resolve() throws Exception;
+        default Model load(Loader loader, BooleanSupplier cancelled) throws Exception {
+            Path path = resolve();
+            if (cancelled.getAsBoolean()) throw new CancellationException("Native v2 asset loading cancelled");
+            return loader.load(path, cancelled);
+        }
+        @Override void close();
+    }
     private final Asset asset;
     private final Loader loader;
     private final ReentrantLock work = new ReentrantLock();
     private volatile boolean closed;
     private Model model; // guarded by work, including JNI lifetime
+    private boolean disposed;
+    private Throwable disposalFailure;
 
     public EmbeddedEmbeddingService() {
-        asset = new Asset() {
-            private PinnedEmbeddingModel pinned;
-            private boolean stopped;
-            public Path resolve() throws Exception {
-                PinnedEmbeddingModel selected;
-                synchronized (this) {
-                    if (stopped) throw new CancellationException("Model provisioning cancelled");
-                    // Even home/cache metadata checks belong on the preparation worker.
-                    if (pinned == null) pinned = PinnedEmbeddingModel.configured();
-                    selected = pinned;
-                }
-                return selected.resolve();
-            }
-            public void close() {
-                PinnedEmbeddingModel selected;
-                synchronized (this) { stopped = true; selected = pinned; }
-                if (selected != null) selected.close();
-            }
-        };
+        asset = new LocalNomicV2ModelAsset();
         loader = LlamaEmbeddingModel::new;
     }
-    /** Resource transport hashes are not model approval. The built-in adapter additionally
-     * enforces the exact pinned weights/tokenizer, including length and immutable profile.
-     * A bundle never triggers network provisioning, even if the normal cache path permits it.
-     */
+    /** A bundle transports resources; the built-in backend still verifies the exact
+     * approved weights/tokenizer before AND after native loading. Never provision online. */
     static EmbeddedEmbeddingService fromBundle(EmbeddedRuntimeResources.Bundle bundle) {
-        PinnedEmbeddingModel.requireProfile();
-        var pinned = new PinnedEmbeddingModel(bundle.require("model"), PinnedEmbeddingModel.SOURCE,
-                PinnedEmbeddingModel.SHA256, PinnedEmbeddingModel.BYTES, false, java.time.Duration.ofMinutes(10));
-        return new EmbeddedEmbeddingService(new Asset() {
-            public Path resolve() throws Exception { return pinned.resolve(); }
-            public void close() { pinned.close(); }
-        }, LlamaEmbeddingModel::new);
+        return new EmbeddedEmbeddingService(new LocalNomicV2ModelAsset(bundle.require("model")), LlamaEmbeddingModel::new);
     }
     EmbeddedEmbeddingService(Asset asset, Loader loader) { this.asset = asset; this.loader = loader; }
     @Override public EmbeddingProfile profile() { return EmbeddingProfile.current(); }
@@ -68,9 +52,8 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
         try {
             requireOpen();
             if (model != null) return;
-            Path path = asset.resolve();
-            requireOpen();
-            Model candidate = loader.load(path, () -> closed || Thread.currentThread().isInterrupted());
+            Model candidate = asset.load((path, cancelled) -> track(loader.load(path, cancelled)),
+                    () -> closed || Thread.currentThread().isInterrupted());
             try {
                 requireOpen();
                 if (candidate.dimensions() != EmbeddingSpace.NATIVE_DIMENSIONS)
@@ -79,27 +62,41 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
                 requireOpen();
                 model = candidate; candidate = null;
             } finally { if (candidate != null) candidate.close(); }
-        } finally { releaseIfClosed(); work.unlock(); }
+        } finally { work.unlock(); }
     }
     @Override public Vec384f getEmbedding(String descriptor) throws Exception {
         validateDescriptor(descriptor);
         work.lockInterruptibly();
         try {
             requireOpen();
-            if (model == null) throw new IllegalStateException("Embedded inference not prepared");
+            if (model == null) throw new EmbeddingModelException("Embedded inference not prepared");
             Vec384f vector = infer(model, descriptor);
             requireOpen();
             return vector;
-        } finally { releaseIfClosed(); work.unlock(); }
+        } finally { work.unlock(); }
     }
     private static Vec384f infer(Model model, String descriptor) {
         validateDescriptor(descriptor);
         String input = "search_document: " + descriptor;
         // Use the actual GGUF tokenizer (including special tokens), never a character heuristic.
-        int tokens = model.tokens(input);
-        if (tokens < 1 || tokens > NativeEmbeddingOutput.MAX_TOKENS)
+        int tokens;
+        try { tokens = model.tokens(input); }
+        catch (RuntimeException | LinkageError failure) {
+            throw modelFailure("tokenization", failure);
+        }
+        if (tokens < 1) throw new EmbeddingModelException("Embedded native v2 tokenizer returned no tokens");
+        // A valid tokenizer reporting input overflow is a descriptor error, not model loss.
+        if (tokens > NativeEmbeddingOutput.MAX_TOKENS)
             throw new IllegalArgumentException("Nomic v2 input must have 1..512 tokens; truncation is forbidden");
-        return decodeEmbedding(model.embed(input));
+        try { return decodeEmbedding(model.embed(input)); }
+        catch (RuntimeException | LinkageError failure) {
+            throw modelFailure("inference/output validation", failure);
+        }
+    }
+    private static EmbeddingModelException modelFailure(String operation, Throwable failure) {
+        if (failure instanceof EmbeddingModelException modelFailure) return modelFailure;
+        return new EmbeddingModelException("Embedded native v2 " + operation + " failed: "
+                + EmbeddingReadiness.describe(failure), failure);
     }
     private static void validateDescriptor(String descriptor) {
         if (descriptor == null || descriptor.isBlank() || descriptor.length() > 8192)
@@ -122,19 +119,42 @@ public final class EmbeddedEmbeddingService implements EmbeddingProvider {
     private void requireOpen() {
         if (closed || Thread.currentThread().isInterrupted()) throw new CancellationException("Embedded inference closed/cancelled");
     }
-    private void releaseIfClosed() {
-        if (closed && model != null) { Model previous = model; model = null; previous.close(); }
+    /** Track even post-load verification failure cleanup performed inside the asset.
+     * A failed candidate teardown must poison the lifecycle lease just like normal close. */
+    private Model track(Model delegate) {
+        if (delegate == null) throw new IllegalStateException("Native loader returned no model");
+        return new Model() {
+            public int dimensions() { return delegate.dimensions(); }
+            public int tokens(String input) { return delegate.tokens(input); }
+            public float[] embed(String input) { return delegate.embed(input); }
+            public void close() {
+                try { delegate.close(); }
+                catch (RuntimeException | Error failure) { recordDisposalFailure(failure); throw failure; }
+            }
+        };
     }
+    private void recordDisposalFailure(Throwable failure) {
+        if (disposalFailure == null) disposalFailure = failure;
+        else if (disposalFailure != failure) disposalFailure.addSuppressed(failure);
+    }
+    @Override public void requestStop() { closed = true; }
     @Override public void close() {
-        closed = true;
-        // Native loading/execution may not honour interrupts immediately. Do not wait for it
-        // (or deallocate underneath JNI) on a Minecraft lifecycle/tick thread.
-        CompletableFuture.runAsync(asset::close);
-        if (work.tryLock()) {
-            Model previous;
-            try { previous = model; model = null; } finally { work.unlock(); }
-            if (previous != null) CompletableFuture.runAsync(previous::close);
-        }
-        // Otherwise the in-progress worker owns release in its finally block.
+        requestStop();
+        // The ENGINE never calls this on a server/deadline thread or while work is active.
+        // Complete teardown here, not in another future: the outer process lease must be
+        // retained through actual JNI close, including a hung or failed native teardown.
+        work.lock();
+        try {
+            if (!disposed) {
+                disposed = true;
+                try { asset.close(); }
+                catch (RuntimeException | Error failure) { recordDisposalFailure(failure); }
+                Model previous = model; model = null;
+                if (previous != null) try { previous.close(); }
+                catch (RuntimeException | Error failure) { /* tracked close retained the cause */ }
+            }
+            if (disposalFailure instanceof RuntimeException failure) throw failure;
+            if (disposalFailure instanceof Error failure) throw failure;
+        } finally { work.unlock(); }
     }
 }

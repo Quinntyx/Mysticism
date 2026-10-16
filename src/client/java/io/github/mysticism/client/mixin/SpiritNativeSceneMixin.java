@@ -26,6 +26,13 @@ public abstract class SpiritNativeSceneMixin {
         if (spirit()) result.cancel();
     }
 
+    @Inject(method = "drawBlockOutline", at = @At("HEAD"), cancellable = true)
+    private void mysticism$hideCarrierOutline(CallbackInfo result) {
+        // Defense against stale/custom block hits. Do not suppress generic shape outlines,
+        // which may be legitimate mesh/debug/interaction feedback.
+        if (spirit()) result.cancel();
+    }
+
     @Inject(method = "renderEntity", at = @At("HEAD"), cancellable = true)
     private void mysticism$hideCarrierEntities(Entity entity, double x, double y, double z,
             float tickDelta, MatrixStack matrices, VertexConsumerProvider vertices, CallbackInfo result) {

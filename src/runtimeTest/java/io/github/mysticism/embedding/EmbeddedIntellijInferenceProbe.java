@@ -73,7 +73,7 @@ public final class EmbeddedIntellijInferenceProbe {
         }
         String bundle = System.getProperty(EmbeddedRuntimeResources.BUNDLE_PROPERTY);
         if (bundle == null) {
-            try (var pinned = PinnedEmbeddingModel.configured()) {
+            try (var pinned = new LocalNomicV2ModelAsset()) {
                 System.out.println("Real launch model resolved and SHA256 verified: " + pinned.resolve());
             }
         }

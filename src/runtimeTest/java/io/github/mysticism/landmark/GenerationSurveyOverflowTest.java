@@ -26,6 +26,11 @@ public final class GenerationSurveyOverflowTest {
     private static final BlockPalette.State AIR=new BlockPalette.State("minecraft:air",Map.of());
     private static void check(boolean ok,String message){checks++;if(!ok)throw new AssertionError(message);}
     private static String biome(int x){return x<8?"minecraft:forest":"minecraft:desert";}
+    /** Historical lossy path, intentionally NOT the current backpressured admission. */
+    private static <T> void legacyRecencyAdmission(LinkedHashSet<T> hints,T seed,int capacity){
+        if(!hints.remove(seed)&&hints.size()>=capacity)hints.removeFirst();
+        hints.add(seed);
+    }
     private static GenerationSurvey.ColumnView columns(){
         return new GenerationSurvey.ColumnView(){
             public int height(int x,int z){return 64;}
@@ -65,8 +70,8 @@ public final class GenerationSurveyOverflowTest {
             lifecycle.loaded(server,DIM,chunkX,0,-64,320,columns());
             // Reproduce the former admission loss: both survey probes and the center share
             // the recency budget. The new generation path does NOT depend on that set.
-            SourceLandmarks.admit(hints,new BlockPos(chunkX*16+8,65,8),SourceLandmarks.HINT_BUDGET);
-            for(var p:surveyed)SourceLandmarks.admit(hints,p,SourceLandmarks.HINT_BUDGET);
+            legacyRecencyAdmission(hints,new BlockPos(chunkX*16+8,65,8),SourceLandmarks.HINT_BUDGET);
+            for(var p:surveyed)legacyRecencyAdmission(hints,p,SourceLandmarks.HINT_BUDGET);
         }
         // This is the same queue handoff used by the actual SERVER_STARTED callback.
         var work=lifecycle.started(server);
