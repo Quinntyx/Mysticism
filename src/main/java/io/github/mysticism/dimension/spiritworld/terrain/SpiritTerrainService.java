@@ -286,7 +286,9 @@ public final class SpiritTerrainService {
         SourcePosition at=mapped.get();if(at.landmarkId().isEmpty())return false; // Pending native entry view is not permission to materialize.
         ServerWorld world=world(p.getServer(),at.dimension);
         if(world==null || !clearBody(world,at.position))return false;
-        float yaw=p.getYaw(),pitch=p.getPitch();p.teleport(world,at.position.x,at.position.y,at.position.z,yaw,pitch);
+        float yaw=p.getYaw(),pitch=p.getPitch();
+        io.github.mysticism.net.SpiritTransitionPayload.beforeTeleport(p,world,at.position,yaw,pitch);
+        p.teleport(world,at.position.x,at.position.y,at.position.z,yaw,pitch);
         p.setVelocity(Vec3d.ZERO);p.fallDistance=0;cancelEnter(p);return true;
     }
     private static Vec3d blockFeet(BlockPos position){return new Vec3d(position.getX()+.5,position.getY(),position.getZ()+.5);}

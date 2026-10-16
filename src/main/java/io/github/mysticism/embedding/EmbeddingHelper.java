@@ -2,6 +2,7 @@ package io.github.mysticism.embedding;
 
 import io.github.mysticism.vector.Vec384f;
 import java.time.Duration;
+import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -9,45 +10,63 @@ import java.util.concurrent.*;
 public final class EmbeddingHelper {
     private static volatile AsyncEmbeddingEngine engine;
     private static volatile CompletableFuture<Void> readiness=CompletableFuture.failedFuture(new IllegalStateException("Embeddings not started"));
-    private static volatile String failure="Not started";
+    private static volatile EmbeddingReadiness inactive = new EmbeddingReadiness(EmbeddingReadiness.Phase.STOPPED, new IllegalStateException("Embeddings not started"));
     private EmbeddingHelper(){}
     public static void initializeServer(){initializeServer(Integer.getInteger("mysticism.embedding.workers",2));}
     public static synchronized void initializeServer(int threads){
         if(engine!=null)return;
         EmbeddingProvider provider=null;
         try{
-            provider=new EmbeddingService();
-            engine=new AsyncEmbeddingEngine(provider,threads,256,8192,Duration.ofMillis(Long.getLong("mysticism.embedding.deadlineMillis",30000)));
-            AsyncEmbeddingEngine started=engine;
-            readiness=started.readiness();failure="Initializing";
-            readiness.whenComplete((v,e)->{
-                synchronized(EmbeddingHelper.class){
-                    if(engine==started)failure=e==null?"Ready":"Unavailable: "+e;
-                }
-            });
+            provider=EmbeddingProviders.create();
+            String cache=System.getProperty("mysticism.embedding.cacheFile","cache/mysticism/embeddings-v2.bin");
+            long preparation = provider instanceof EmbeddedEmbeddingService ? 900000 : 30000;
+            engine=new AsyncEmbeddingEngine(provider,threads,256,8192,
+                    Duration.ofMillis(Long.getLong("mysticism.embedding.deadlineMillis",30000)),
+                    Duration.ofMillis(Long.getLong("mysticism.embedding.preparationDeadlineMillis",preparation)),
+                    cache.isBlank()?null:Path.of(cache));
+            readiness=engine.readiness();
         }catch(Throwable t){
             if(provider!=null)try{provider.close();}catch(Throwable closing){t.addSuppressed(closing);}
-            failure="Unavailable: "+t;readiness=CompletableFuture.failedFuture(t);
+            inactive=new EmbeddingReadiness(EmbeddingReadiness.Phase.FAILED,t);readiness=CompletableFuture.failedFuture(t);
         }
     }
     public static EmbeddingProfile profile(){return EmbeddingProfile.current();}
-    public static CompletableFuture<Void> readiness(){return readiness.copy();}
-    public static boolean isReady(){AsyncEmbeddingEngine e=engine;return e!=null && e.isReady();}
+    public static CompletableFuture<Void> readiness(){
+        AsyncEmbeddingEngine e=engine;
+        // Independent delivery reservations: one listener must not pin all world-entry listeners
+        // on a single shared future's synchronous completion stack.
+        return e==null?readiness.copy():e.readiness();
+    }
+    public static EmbeddingReadiness state(){AsyncEmbeddingEngine e=engine;return e==null?inactive:e.state();}
+    public static boolean isReady(){return state().ready();}
     /** Compatibility only. Never call on a server tick/startup thread. */
-    public static void awaitReady(){readiness.join();}
+    public static void awaitReady(){readiness().join();}
     public static void shutdown(){
         AsyncEmbeddingEngine stopped;
         synchronized(EmbeddingHelper.class){
             stopped=engine;engine=null;
-            readiness=CompletableFuture.failedFuture(new IllegalStateException("Embeddings stopped"));failure="Stopped";
+            var failure=new IllegalStateException("Embeddings stopped");
+            inactive=new EmbeddingReadiness(EmbeddingReadiness.Phase.STOPPED,failure);
+            readiness=CompletableFuture.failedFuture(failure);
         }
         // Provider close and future delivery must not run while holding the shared lifecycle lock.
         if(stopped!=null)stopped.close();
     }
     public static CompletableFuture<Vec384f> getEmbedding(String descriptor){AsyncEmbeddingEngine e=engine;return e==null?CompletableFuture.failedFuture(new IllegalStateException("Embeddings unavailable")):e.embed(descriptor);}
     public static Optional<Vec384f> getEmbeddingBlocking(String descriptor){try{return Optional.of(getEmbedding(descriptor).get());}catch(InterruptedException e){Thread.currentThread().interrupt();return Optional.empty();}catch(Exception e){return Optional.empty();}}
-    public static CompletableFuture<Vec384f> composeDescriptors(List<DescriptorVectors.WeightedDescriptor> descriptors){return DescriptorVectors.embed(descriptors);}
-    public static String getInitializationStatus(){return failure;}
+    public static CompletableFuture<Vec384f> composeDescriptors(List<DescriptorVectors.WeightedDescriptor> descriptors){
+        AsyncEmbeddingEngine e=engine;
+        // Never switch to a replacement server's provider part-way through an old composition.
+        return DescriptorVectors.embed(descriptors,e==null
+                ? ignored->CompletableFuture.failedFuture(new IllegalStateException("Embeddings unavailable"))
+                : e::embed);
+    }
+    public static String getInitializationStatus(){var snapshot=state();return switch(snapshot.phase()){
+        case READY -> "Ready";
+        case INITIALIZING -> "Initializing";
+        case STOPPED -> "Stopped";
+        case FAILED -> "Unavailable: "+EmbeddingFailures.describe(snapshot.failure());
+    };}
     public static int getCacheSize(){AsyncEmbeddingEngine e=engine;return e==null?0:e.cacheSize();}
     public static int getInflightSize(){AsyncEmbeddingEngine e=engine;return e==null?0:e.inflightSize();}
 }
